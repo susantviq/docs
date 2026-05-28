@@ -1,0 +1,147 @@
+---
+title: "Out-of-Stock Products, WooCommerce"
+sidebarTitle: "Out-of-Stock Products"
+description: "Products with stock_status=outofstock OR stock_quantity&lt;=0. Source-of-truth feeding the ads_on_oos cross-channel kill-shot. How to read it, why it matters,..."
+---
+
+**Card class:** Hero  •  **Category:** Ecommerce Platform
+
+> Products with stock_status=outofstock OR stock_quantity&lt;=0. Source-of-truth feeding the ads_on_oos cross-channel kill-shot.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Real-time count of WooCommerce products that are currently out of stock. The ground-truth feeding the [Ads on OOS](/nerve-centre/kpi-cards/woocommerce/ad-spend-on-oos-products) cross-channel kill-shot.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(products WHERE stock_status = 'outofstock') OR (manage_stock = true AND stock_quantity <= 0)`. Includes both manually-flagged OOS items and inventory-managed items that hit zero. |
+| **REST API endpoint** | `GET /wp-json/wc/v3/products?stock_status=outofstock` and `GET /wp-json/wc/v3/products?in_stock=false`. Field used: `stock_status` (enum: `instock`, `outofstock`, `onbackorder`) and `stock_quantity` (integer). |
+| **VAT / tax / shipping / discounts** | Not applicable, this is a product-state count. |
+| **Refunds / cancelled / failed orders** | Not applicable. |
+| **Variations** | Each product variation (color, size) is counted separately if it tracks stock independently. A parent product with 5 variations where 2 are OOS counts as 2 OOS items, not 1 OOS product. |
+| **`onbackorder` status** | **NOT counted** as OOS. WC treats backorder-allowed as still purchasable. Some merchants want backorders flagged; that is a separate roadmap card. |
+| **Currency** | Currency-agnostic (count). |
+| **Channels / sources** | The product is OOS or it is not, regardless of channel. But if the merchant uses a marketplace plugin (Amazon, eBay) that maintains its own inventory pool, this card reflects only the Woo-side stock. Marketplace-side OOS is invisible here. |
+| **Self-hosted vs managed-Woo** | Same definition. Self-hosted Woo with object-cache misconfiguration can show stale OOS counts (cached for hours). Managed-Woo typically uses Redis/Memcached correctly. |
+| **Time window** | `RT` (real-time, polled every 10-15 minutes from the REST API) |
+| **Alert trigger** | `>0` (any OOS SKU still listed and not hidden), driven by `sentiment_key: out_of_stock_count` |
+| **Roles** | owner, operations, marketing |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your WooCommerce data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US homewares brand on Pressable managed-Woo with 1,840 active products, ~6,200 variations across colour and size. Inventory polled every 10 minutes.
+
+| Item bucket | Count | Note |
+| --- | --- | --- |
+| Simple products with `stock_status = outofstock` | 84 | Manually flagged or hit zero |
+| Variations with `stock_quantity <= 0` (inventory-managed) | 312 | Specific size/colour combos sold out |
+| Products on `backorder` (allowed) | 27 | NOT counted as OOS |
+| Products with `manage_stock = false` and OOS flag manual | 19 | Counted |
+| **Total OOS (this card)** | **415** | |
+
+Three observations:
+
+1. **Variations dominate the count.** 312 of 415 OOS items are variations (specific size/colour) rather than entire products. The full SKU may still be sellable in other variants. The [Ads on OOS](/nerve-centre/kpi-cards/woocommerce/ad-spend-on-oos-products) card joins this against ad-active SKUs to flag the high-impact subset.
+2. **Self-hosted server with object cache misconfiguration shows stale counts.** A previous host this brand used cached `wc_get_product_stock_status` for 6 hours. The OOS count showed 380 in the morning, jumped to 415 at lunchtime (cache expired) and dropped to 350 by evening (warehouse restocked but cache showed pre-restock data for hours). Pressable Redis configuration eliminated the lag.
+3. **Plugin-induced data shape variance: WooCommerce Subscriptions.** Subscription products do not normally track stock, but some merchants enable inventory management on them. Subscriptions plugin then reduces stock on each renewal, which can drive a subscription product to OOS even though it is intangible. Watch for `_subscription_renewal` orders alongside [Customer Churn](/nerve-centre/kpi-cards/woocommerce/customer-churn).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Out of Stock |
+| --- | --- |
+| [WC Low Stock](/nerve-centre/kpi-cards/woocommerce/low-stock-products) | The leading indicator. Catches the runway before OOS hits. |
+| [WC Stock Value](/nerve-centre/kpi-cards/woocommerce/stock-value-snapshot) | The dollar view of inventory. Pair to see whether OOS is concentrated on high-revenue SKUs. |
+| [WC Ads on OOS](/nerve-centre/kpi-cards/woocommerce/ad-spend-on-oos-products) | The cross-channel kill-shot. Joins this card against active Google Ads / Facebook Ads to find spend wasted on unbuyable inventory. |
+| [WC Top Products](/nerve-centre/kpi-cards/woocommerce/top-products-by-revenue) | Tells you whether OOS items are revenue-leaders (urgent restock) or long-tail (low priority). |
+| [BC Inventory Distribution](/nerve-centre/kpi-cards/bigcommerce/inventory-distribution) | Cross-platform peer for agencies. |
+| [Shopify Inventory Alerts](/nerve-centre/kpi-cards/shopify/products-with-zero-negative-stock) | SaaS-platform peer. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in WooCommerce Admin:**
+
+[WP Admin → Products → Filter by Stock status: Out of stock](/wp-admin/edit.php?post_type=product&stock_status=outofstock). Counts simple products only. For the variation-level count, use [WP Admin → WooCommerce → Reports → Stock → Out of stock](/wp-admin/admin.php?page=wc-reports&tab=stock&report=out_of_stock).
+
+**Why our number may legitimately differ from WooCommerce Admin:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Object cache lag**. WC caches stock status; if Redis / Memcached is misconfigured, WP Admin shows stale data while the REST API (which Vortex IQ uses) reads fresh. | Either |
+| **Self-hosted server uptime**. Indexer runs every 10-15 min; brief outages mean values can be 15-30 min stale. | Self-resolves |
+| **Plugin-version compatibility**. Some inventory plugins (Stock Synchronisation, ATUM) maintain a separate stock store. The Vortex IQ engine reads `wp_postmeta._stock_status`, plugin-store state may not match. | Either |
+| **Backorder treatment**. WP Admin "Out of stock" filter is also keyed off `_stock_status`; this card matches when both are on the canonical field. | Should match |
+| **Currency plugin behaviour**. Not relevant; inventory is currency-independent. | n/a |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship |
+| --- | --- |
+| Marketplace plugins (Amazon Connector, eBay Connector) maintain their own inventory pools | This card reflects Woo-side stock only. The same SKU may be in-stock on Amazon but OOS on Woo if pools are not synced. |
+| [`google_ads.gads_disapproved_products`](/nerve-centre/google_ads/gads_disapproved_products) | Google Merchant Center disapproves products listed as OOS in the feed. A high count here often shows up in Merchant Center 24-48 hours later. |
+
+---
+
+<details>
+<summary><em>Same-metric documentation cross-reference</em></summary>
+
+- [`shopify.inventory_alerts`](/nerve-centre/kpi-cards/shopify/products-with-zero-negative-stock)
+- [`bigcommerce.bc_inventory_dist`](/nerve-centre/kpi-cards/bigcommerce/inventory-distribution)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Self-hosted vs managed-Woo, why does it matter for OOS?**
+Object cache misconfiguration on self-hosted Woo can show stale stock for hours. Managed-Woo hosts almost always run Redis or Memcached correctly. If your OOS count appears to "jump" rather than drift, suspect cache.
+
+**Status-filter selection, why exclude `onbackorder`?**
+Backorder-allowed products are still purchasable, just delayed. Treating them as OOS would over-flag and noise the alert. If your business model relies heavily on backorders (e.g. furniture), use the Low Stock card instead.
+
+**Refund-object accounting, does it affect OOS?**
+No. Refunds restore stock if `manage_stock = true` and `_restock_refunded_items` is enabled (a 2024+ default). The OOS state updates accordingly within minutes.
+
+**Plugin-induced data shape variance, what plugins might affect this?**
+- ATUM Inventory Management stores stock in a custom table; we read the WC core meta fallback.
+- Stock Synchronisation for WooCommerce can sync stock from another Woo install on a delay; the OOS count drifts during sync.
+- Google Listings & Ads plugin reflects this card's count in the Merchant Center feed.
+- WooCommerce Subscriptions: subscription products tracked as inventory will hit OOS on renewal cycles.
+
+**Multi-currency configuration, does it affect OOS?**
+No, inventory is currency-independent.
+
+**Why does Woo and Stripe disagree?**
+Stripe does not track inventory. The two metrics are unrelated.
+
+**Today is jumpy, why?**
+Inventory levels move minute-to-minute. The card is real-time but polled every 10-15 min; expect small drifts. For action prioritisation, run Vortex Mind on the Ads on OOS card.
+
+**Sync-lag from self-hosted server slowness, debug:**
+If the indexer cannot reach the host, OOS state freezes at the last good poll. After recovery, watch for a sudden jump as the catch-up reflects ~1-3 hours of inventory movement.
+
+**My WP Admin shows different OOS counts, debug:**
+1. Refresh WP Admin (purge object cache if Redis-backed).
+2. Check whether a custom inventory plugin overrides `_stock_status`.
+3. Verify variations are being counted in WP Admin (the Products list shows simple products only by default, the Stock report shows variations).
+4. If the gap persists, contact support.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Out-of-Stock Products* is one of hundreds of KPI pulses Vortex IQ tracks across WooCommerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

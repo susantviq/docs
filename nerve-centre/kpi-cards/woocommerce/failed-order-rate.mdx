@@ -1,0 +1,160 @@
+---
+title: "Failed Order Rate, WooCommerce"
+sidebarTitle: "Failed Order Rate"
+description: "Orders with status=failed / total. Spikes = payment gateway misconfig, fraud rule too aggressive, or 3DS challenge breakage. Check gateway l... How to read..."
+---
+
+**Card class:** Hero  •  **Category:** Ecommerce Platform
+
+> Orders with status=failed / total. Spikes = payment gateway misconfig, fraud rule too aggressive, or 3DS challenge breakage. Check gateway logs first.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of order attempts in the period that ended in `failed` status. The leading indicator for payment-gateway issues, fraud-rule misconfiguration, or 3DS friction.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(orders WHERE status = 'failed') / COUNT(orders WHERE status IN ('completed', 'processing', 'failed', 'cancelled'))` x 100. Each failed-payment attempt is one order row in WC. |
+| **REST API endpoint** | `GET /wp-json/wc/v3/orders?status=failed`, plus the broader status set for the denominator. |
+| **VAT / tax treatment** | Currency- and tax-agnostic count ratio. |
+| **Status filter** | Numerator is `failed` only. Denominator is "real attempts" = `completed + processing + failed + cancelled`. `pending` (cart skeletons) and `on-hold` (waiting for offline payment) are excluded so that the rate measures payment-gateway success specifically. |
+| **Shipping / discounts** | Not applicable (count metric). |
+| **Refunds** | Not applicable; failed orders never charged. |
+| **Cancelled orders** | Counted in the denominator but not the numerator. Cancellations are merchant / customer choice; failures are technical. |
+| **Currency** | Currency-agnostic ratio. |
+| **Channels / sources** | Not filtered. Web-checkout and REST-API-created orders both count. POS plugin orders rarely fail because the in-person card-present flow has different gateway settings. |
+| **Self-hosted vs managed-Woo** | Same definition. Self-hosted Woo with custom payment gateway plugins shows higher noise (less battle-tested code paths). Managed-Woo on the WC Stripe Gateway typically runs &lt; 1% failure. |
+| **Time window** | `T/7D vsP` |
+| **Alert trigger** | `>3%` rate, or +50% vsP |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your WooCommerce data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK fashion brand on self-hosted Woo (Bluehost shared hosting), running WC Stripe Gateway with 3DS Strong Customer Authentication enforced. Period: 5 Apr 26 to 11 Apr 26 (7D), versus prior 7D.
+
+| Status | Count | Note |
+| --- | --- | --- |
+| `completed` | 412 | Paid + fulfilled |
+| `processing` | 92 | Paid, awaiting fulfilment |
+| `failed` | 38 | Gateway returned an error or 3DS timed out |
+| `cancelled` | 14 | Customer-initiated, abandoned |
+| **Denominator** | **556** | |
+
+```text
+Failed Order Rate  =  38 / 556 x 100  =  6.83%
+```
+
+Versus prior 7D where the rate was 1.4% (8 / 572). The card flags +5.43 ppt rise and trips both the >3% threshold and the +50% vsP threshold. Four things to notice:
+
+1. **The cause is almost certainly external, not Woo.** A jump of this size in 7 days is rarely a Woo-side bug. Common culprits: (a) a 3DS configuration drift, the merchant's bank rolled out new SCA challenge logic that started failing legitimate cards; (b) a fraud-rule plugin (e.g. Stripe Radar) tuned too aggressively after a fraud event; (c) a payment-gateway plugin update with a regression. Check Stripe Dashboard → Logs first.
+2. **Self-hosted server slowness contributes.** This brand's Bluehost shared host had elevated response times (P95 > 8s) for 3 days during the spike. WC's checkout flow is synchronous, slow server = checkout timeout = `failed` status. Managed-Woo hosts rarely show this pattern. The SREs at Bluehost confirmed a noisy-neighbour issue on 8-9 Apr 26.
+3. **`failed` is a Woo-specific edge case.** Other platforms call this "abandoned at payment" or "declined". WC explicitly stores `failed` as a separate status that the gateway sets when authorisation fails. If your gateway plugin does not set `failed` correctly (some legacy plugins leave the order in `pending` instead), this card under-reports. Check the gateway plugin docs.
+4. **Plugin-induced data shape variance is real.** Stripe Gateway sets `failed`. PayPal Standard rarely does (it leaves the order in `pending`). Authorize.Net plugin behaves like Stripe. Square WC plugin sets `failed` only on declined-card events, not on timeouts. So the absolute rate depends on which gateway sets which status when. Use the [Payment Methods](/nerve-centre/kpi-cards/woocommerce/revenue-by-payment-method) card to check the gateway mix.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Failed Order Rate |
+| --- | --- |
+| [WC Alert: Failed Order Spike](/nerve-centre/kpi-cards/woocommerce/failed-order-spike-alert) | The trigger card. Pairs with this one for the alert chain. |
+| [WC Total Orders](/nerve-centre/kpi-cards/woocommerce/total-orders) | The denominator size. A 6% rate on 50 orders is 3 failures (noise); on 5,000 orders it is a real outage. |
+| [WC On-Hold Orders](/nerve-centre/kpi-cards/woocommerce/on-hold-orders) | Companion failure mode. On-hold are payment-pending, not failed. Different fixes. |
+| [WC Payment Methods](/nerve-centre/kpi-cards/woocommerce/revenue-by-payment-method) | Tells you which gateway is failing. Stripe-Gateway-specific spikes look very different from PayPal Standard misconfigurations. |
+| [WC Conversion Rate](/nerve-centre/kpi-cards/woocommerce/conversion-rate) | Orders per session. A failed-order spike often shows up as a conversion-rate dip first. |
+| [BC Failed Orders Count](/nerve-centre/kpi-cards/bigcommerce/bc-failed-orders-count) | Cross-platform peer for agencies. |
+| [Stripe Decline Rate](/nerve-centre/kpi-cards/stripe/decline-rate) | The Stripe-side view of the same events. Useful for root-causing. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in WooCommerce Admin:**
+
+[WP Admin → WooCommerce → Orders](/wp-admin/edit.php?post_type=shop_order&post_status=wc-failed) filtered to status `failed`. WC does not expose a built-in failure-rate report; the standard reports (`/wp-admin/admin.php?page=wc-reports`) skip `failed` entirely. The reliable counts come from the gateway side, Stripe Dashboard → Payments → Failed.
+
+Other WP Admin views that look like the same number but are not:
+
+- **WP Admin → Reports → Sales by date**: excludes `failed` from both numerator and denominator. Will not show this rate.
+- **Stats overview widget**: shows total revenue only.
+
+**Why our number may legitimately differ from gateway logs:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Time-zone**. WC stores order timestamps in WP-site timezone; Vortex IQ on UTC. | Boundary-day effects |
+| **Self-hosted server uptime**. Slow / unreachable WP server = customer-initiated retry = duplicate `failed` rows. | Ours higher during outages |
+| **Plugin-version compatibility**. Some gateways do not set `failed` and leave the order in `pending`. | Ours under-reports |
+| **Gateway plugin idempotency bugs**. A retry that succeeds the second time can leave behind a `failed` skeleton from the first attempt. | Ours slightly higher |
+| **Currency plugin behaviour**. Currency switches mid-checkout can produce bogus `failed` rows. | Rare; investigate per-merchant |
+
+**Cross-connector reconciliation against Stripe:**
+
+| Card | Expected relationship | Causes of divergence |
+| --- | --- | --- |
+| [`stripe.stripe_decline_rate`](/nerve-centre/kpi-cards/stripe/decline-rate) | Stripe rate >= WC rate for Stripe-only stores | Stripe sees every authorisation attempt including ones the WC plugin does not record (e.g. when checkout aborts client-side after Stripe Elements returns an error). Stripe rate typically sits 0.5-2 ppt above this card. |
+
+---
+
+<details>
+<summary><em>Same-metric documentation cross-reference</em></summary>
+
+- [`bigcommerce.bc_failed_orders_count`](/nerve-centre/kpi-cards/bigcommerce/bc-failed-orders-count)
+- [`shopify.cancellation_rate`](/nerve-centre/kpi-cards/shopify/cancellation-rate) (Shopify lacks a true `failed` status; cancellation is the closest peer)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Self-hosted vs managed-Woo, why does it matter for failure rate?**
+Self-hosted Woo on shared hosting introduces a structural failure path: a slow server can cause the customer's payment to be authorised by the gateway but the WC callback to time out, leaving the order in `failed` even though the card was charged. Managed-Woo hosts (Woo.com Cloud, WP Engine) rarely show this. If your failure rate exceeds 3% and your gateway logs show successful authorisations for the same orders, host capacity is the cause.
+
+**Status-filter selection, why exclude `pending` and `on-hold` from the denominator?**
+`pending` is cart skeletons (no payment attempted). `on-hold` is BACS / bank transfer (no card transaction). Neither involves a gateway call, so neither belongs in the failure-rate denominator. The metric is "of attempts that called a payment processor, what share failed".
+
+**Refund-object accounting, does it affect this card?**
+No, refunds happen post-success; this card is pre-success. The two metrics are orthogonal.
+
+**Plugin-induced data shape variance, what gateways set `failed` correctly?**
+- **WC Stripe Gateway**: yes, sets `failed` on declined cards and 3DS timeouts.
+- **WC PayPal Standard / Payments**: inconsistent; many failures stay in `pending`.
+- **WC Square**: sets `failed` on declines, leaves timeouts in `pending`.
+- **Authorize.Net for WC**: yes, sets `failed`.
+- **Klarna / Afterpay plugins**: set `failed` on rejection, leave underwriting-review in `on-hold`.
+- **BACS / Cheque / Direct Bank Transfer**: never sets `failed`; uses `on-hold`.
+
+**Multi-currency configuration, does it affect failure rate?**
+Currency-agnostic ratio. But: 3DS challenge logic varies by issuer country, EU cards have ~5x higher 3DS friction than US cards. A multi-currency store with EU customer mix structurally runs higher failure than a US-only store. Per-currency failure-rate cards are on the roadmap.
+
+**Why does WooCommerce and Stripe disagree on failure rate?**
+Stripe sees every authorisation attempt including client-side Stripe Elements errors that never make it to WC (so no WC order row is created). Stripe rate >= WC rate, typically 0.5 to 2 ppt higher. If Stripe shows 8% and WC shows 1%, your Stripe Elements integration is dropping events before WC sees them, contact your developer.
+
+**Today is jumpy, why?**
+Failure rate is a small-sample ratio. A single host outage during checkout produces a cluster of failures that spike the daily rate. Use 7D rolling.
+
+**Sync-lag from self-hosted server slowness, debug:**
+If failure rate appears to spike then drop without explanation, check whether the WP host had a brief slowdown. Some `failed` orders re-process and flip to `processing` after the host recovers; the rate self-heals.
+
+**My WP Admin shows different counts, debug playbook:**
+1. Match date range, ensure timezone alignment.
+2. Verify the Vortex IQ indexer last-poll time. If recent, the data is fresh.
+3. Check whether your gateway plugin sets `failed` consistently (see plugin list above).
+4. Cross-check Stripe Dashboard. If Stripe shows N successful auths but WC shows N + 5 failed orders, you likely have a host-timeout issue producing duplicate failed shells.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Failed Order Rate* is one of hundreds of KPI pulses Vortex IQ tracks across WooCommerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

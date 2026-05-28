@@ -1,0 +1,150 @@
+---
+title: "Labels Printed Not Collected, ShipTheory"
+sidebarTitle: "Labels Printed Not Collected"
+description: "Shipments that have a printed label but never made it onto a carrier manifest - lost revenue, often warehouse / collection-cutoff issues. How to read it, w..."
+---
+
+**Card class:** Hero  •  **Category:** Shipping & Courier
+
+> Shipments that have a printed label but never made it onto a carrier manifest - lost revenue, often warehouse / collection-cutoff issues.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Shipments where the **label was printed but never made it onto the carrier's collection manifest** for >24 hours. The label exists, the warehouse may even believe the parcel went out, but the carrier never collected it: it is invisible-lost revenue. The most common operational dark-corner in 3PL setups, and the card that surfaces it before the customer notices.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(shipments WHERE status = 'LabelPrinted' AND created_at < now-24h AND no carrier_collection_event)`. Real-time read against ShipTheory's shipment state machine. |
+| **API endpoint** | `GET /shipments` (ShipTheory v1) filtered by `status = LabelPrinted` and `created_at < now - 86400s`. The card reads `shipment_id`, `created_at`, `sub_carrier`, `service`, `recipient_postcode`, `last_status_update_at`. |
+| **Delivery success criterion** | Inverse: this card counts shipments that **never even started**, so delivery criteria do not apply. |
+| **On-time threshold** | Not applicable. |
+| **Returns / RTO** | Outbound only. Returns labels in `LabelPrinted` for >24h are tracked the same way and pooled here. |
+| **Service level scope** | All services and sub-carriers pooled. The pattern of "label printed, never collected" is service-agnostic; the most common cause is upstream warehouse workflow. |
+| **Why this matters** | A printed label is a financial commitment (carrier already invoices on print, not on collection for most ShipTheory carriers). A label-printed-not-collected parcel is **paid-for shipping that produces zero revenue**. Multiplied across a quarter, this is material margin leakage. |
+| **Common causes** | (1) Warehouse missed the daily collection cutoff. (2) Parcel went into wrong despatch bay. (3) Carrier driver did not pick up due to manifest paperwork issue. (4) Warehouse system created the label as test then never voided. (5) 3PL pick-pack process queued the label but the parcel was set aside. |
+| **Currency** | Not applicable. |
+| **Time window** | `T` (today, real-time) |
+| **Alert trigger** | `any in 'LabelPrinted' >24h`. Any single shipment in `LabelPrinted` status more than 24 hours after label creation trips the alert. The 24h threshold is generous; UK same-day cutoffs typically expect collection within 4 to 8 hours of label print. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your ShipTheory data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+The UK home & garden merchant. Reading taken at 09:00 GMT on 12 Mar 26.
+
+| Sub-carrier | Labels printed >24h ago without collection | Avg age (hours) | Oldest |
+| --- | --- | --- | --- |
+| Royal Mail Tracked 24 | 8 | 28 | 36h |
+| DPD Next Day | 2 | 27 | 30h |
+| Evri Standard | 14 | 31 | 48h |
+| Yodel Direct | 5 | 42 | 72h |
+| **Total** | **29** | **31** | **72h** |
+
+The card reads **29** parcels stuck in `LabelPrinted` for >24 hours, longest 72h. Five things to notice:
+
+1. **Five parcels at >48h are almost certainly not just delayed collection.** They have likely been mis-routed within the warehouse: set aside in a wrong despatch bay, or excluded from a manifest by paperwork error, or printed-but-physically-not-packed. Investigate physically before assuming carrier.
+2. **The Yodel cluster (5 parcels at avg 42h) suggests a Yodel collection-cutoff issue.** Yodel's UK collection cadence is typically once-daily; if your warehouse missed the cutoff Monday, parcels print Monday-Tuesday and sit until Wednesday. Confirm cutoff time with the depot lead.
+3. **14 Evri parcels is the largest cluster.** Likely cause: Evri's manifest API is the noisiest of UK carriers; some parcels print but the manifest record fails to commit cleanly. Resync via ShipTheory's "regenerate manifest" action; usually clears 60 to 80% of the queue.
+4. **Royal Mail Tracked 24 with 8 parcels stuck >24h is concerning.** Royal Mail collection is multiple-times-daily for OBA accounts; 24h+ stuck means physical not in collection bay. Operationally: warehouse walkthrough now, verify each parcel is physically present, route to next collection.
+5. **29 parcels at avg GBP 35 order value = GBP 1,015 of revenue at risk.** This is the conservative case (just labels-stuck-print); the true cost includes customer-trust impact, support-ticket load, and refund risk if the parcels never recover.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+Manifest-gap is a unique signal, there is no "rate" or "share" version, just a queue. Pair with these to size impact and find cause.
+
+| Card | Why pair it with Labels Printed Not Collected | What the combination tells you |
+| --- | --- | --- |
+| [Label-Generation Success Rate](/nerve-centre/kpi-cards/ship-theory/label-generation-success-rate) | Labels printed successfully but stuck in collection limbo. | If label-gen is healthy but manifest-gap rising, the issue is post-print physical or carrier-handover, not API. |
+| [Shipments](/nerve-centre/kpi-cards/ship-theory/shipments) | Volume context. | Manifest-gap as percentage of daily volume contextualises severity. 29 stuck on 4,000 daily is 0.7%, manageable. 29 on 200 daily is 14%, crisis. |
+| [On-Time Delivery Rate](/nerve-centre/kpi-cards/ship-theory/on-time-delivery-rate) | Downstream effect. | Manifest-gap parcels that eventually move out will be late by definition; OTD drops 1 to 2 days after the gap clears. |
+| [Late Shipments](/nerve-centre/kpi-cards/ship-theory/late-shipments) | Where the gap eventually lands. | Recovered parcels from this card show up in next week's late count. |
+| [Failed Deliveries](/nerve-centre/kpi-cards/ship-theory/failed-deliveries) | Where parcels go if they never recover. | Persistent never-recovered manifest-gap parcels age into "lost in warehouse"; some get filed as lost-parcel claims. |
+| Cross-connector: [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Upstream view. | If Shopify shows unfulfilled but ShipTheory shows label printed, the gap is between label-print and ShipTheory-status-back-to-Shopify. |
+| Cross-connector: 3PL warehouse-management system audit | The physical truth. | Walk the warehouse with the export from this card; reconcile printed-label list vs physical-parcel list. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ShipTheory's own dashboard:**
+
+[ShipTheory Dashboard](https://app.shiptheory.com/) → **Shipments → Filter: Status = Label Printed**. The portal lists every shipment in the `LabelPrinted` state with age. Sort by created_at to find the oldest. ShipTheory also exposes a "Manifest Health" dashboard at *Reports → Manifest Status* showing per-sub-carrier collection commit rates.
+
+**Why our number may legitimately differ from ShipTheory's portal:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **24h cutoff vs portal default** | Either | Card uses 24h; portal default sometimes shows all `LabelPrinted` regardless of age. Filter portal to "Older than 24h" for like-for-like. |
+| **Status webhook lag** | Ours sometimes higher | If carrier collection event posted but ShipTheory webhook delayed, card briefly shows stuck. Resolves in next poll. |
+| **Voided labels** | Either | Voided labels typically transition to `Voided` status; if void was attempted but not committed, label may stay in `LabelPrinted`. Fix in portal: re-attempt void. |
+| **Partially-collected manifests** | Either | Some carriers post partial-manifest events (some parcels collected, others not). The card reads per-shipment status. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Shopify thinks "fulfilled" once label is printed; this card surfaces the gap. | Shopify webhook timing, manual fulfilment overrides. |
+| 3PL warehouse-management system | The physical state. | Card vs WMS reconciliation is the operational audit. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multi-platform stacks)</em></summary>
+
+Manifest-gap surfacing is unique to ShipTheory among the connectors covered here. Most multi-carrier orchestrators do not separately surface the labels-printed-not-collected state; merchants discover the gap reactively when customers complain. ShipTheory's explicit `LabelPrinted` state and ShipTheory's own UI for it makes this card possible.
+
+- ShippyPro and Sendle do not have direct equivalents at the same surface level; the closest is monitoring `created_at` vs first-tracking-event timestamp and manually reconciling.
+
+</details>
+
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is this card unique to ShipTheory?**
+ShipTheory exposes the explicit `LabelPrinted` state distinct from `OnManifest` and `Collected`. Most other multi-carrier orchestrators conflate label-print and manifest-add into a single status, hiding the gap. ShipTheory's UK-3PL-focused product surfaces this because it is the operational dark-corner that mid-market 3PL setups regularly fall into.
+
+**What is the most common cause?**
+Warehouse missed the daily collection cutoff. UK carriers run collection windows (typically 14:00 to 17:00 for next-day services, earlier for premium); if pick-pack runs late, labels print after cutoff and parcels wait until next day. The 24h alert is calibrated to catch labels missing the next-day cutoff.
+
+**A label sits in `LabelPrinted` for 4 days. What happened?**
+Almost always a physical-warehouse problem. The parcel was set aside, mis-sorted to a wrong despatch bay, included in test prints that did not get voided, or lost between picking and packing stations. Action: walk the warehouse with the export from this card; physical reconciliation usually resolves.
+
+**Why is Yodel my worst sub-carrier on this metric?**
+Two reasons. (1) Yodel collection is once-daily for many ShipTheory accounts; if you miss the window, parcel waits 24 to 48 hours minimum. (2) Yodel's manifest API has historically been less reliable than peers; some commits silently fail. Resync via "regenerate manifest" usually clears.
+
+**Royal Mail OBA stuck shipments, what to do?**
+Royal Mail collects multiple times daily for OBA accounts; if Royal Mail labels are stuck >24h, the parcel is almost certainly not in the collection bay. Physically locate the parcel, place in the bay before the next scheduled collection (typically every 4 to 6 hours during business hours), confirm collection event the same day.
+
+**Does this card include returns labels?**
+Yes. Returns Easy Print labels in `LabelPrinted` >24h are pooled here. They are typically less urgent (customer has not posted it back yet) but the card still surfaces them for completeness; suppress via filter if not material.
+
+**How does this connect to refunds?**
+Persistent manifest-gap parcels eventually become refunds. Customer waits, parcel does not arrive, customer complains, merchant refunds (and either re-ships or files a claim). The card surfaces the leading edge before the customer notices; acting on it prevents the refund cascade.
+
+**Can I auto-void labels stuck >X hours?**
+Yes, via the API. Some merchants run a nightly script that voids labels >48h old in `LabelPrinted` (avoiding the carrier's print-charge accumulating on un-collected labels). Be careful: voided labels cannot be re-collected, so make sure the underlying order is also re-set to `unfulfilled` to retry print.
+
+**Christmas peak, does this card spike?**
+Yes, materially. Q4 manifest-gap counts can run 5 to 10x normal as warehouses run hot, cutoffs slip, and carrier collection windows tighten. Plan: raise the alert threshold for Q4 to 48h or 72h, run twice-daily warehouse audits, communicate proactively with customers when stuck parcels exceed 2 days.
+
+**Why is this hero-tier?**
+Because manifest-gap is silent revenue leakage. Other operational cards measure things going wrong visibly (lateness, exceptions, claims); this card measures things never starting. The difference is the customer feedback loop: late parcels generate tickets and are visible; never-collected parcels look "in transit" until eventually they don't, and by then the trust damage is already done.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Labels Printed Not Collected* is one of hundreds of KPI pulses Vortex IQ tracks across ShipTheory and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

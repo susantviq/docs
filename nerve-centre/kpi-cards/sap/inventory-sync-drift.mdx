@@ -1,0 +1,137 @@
+---
+title: "Inventory Sync Drift, SAP"
+sidebarTitle: "Inventory Sync Drift"
+description: "SKUs whose on-hand count differs between S/4HANA Cloud (system of record) and commerce platform. Sync-failure detector. How to read it, why it matters, and..."
+---
+
+**Card class:** Cross-Channel  •  **Category:** Ecommerce Platform
+
+> SKUs whose on-hand count differs between S/4HANA Cloud (system of record) and commerce platform. Sync-failure detector.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Materials whose on-hand quantity differs between S/4HANA Cloud (the financial and operational system of record) and the commerce platform's storefront-side inventory display. Sync-failure detector. Each row shows the SAP quantity, the commerce-side quantity, the drift in units, and the affected commerce platforms.
+
+| | |
+| --- | --- |
+| **What it counts** | For each material mapped between SAP and a commerce platform, compare `MARC.LABST` (SAP plant-level on-hand) to the commerce-platform's `inventory_quantity` (or equivalent). Drift = absolute difference in units. Card flags drift > 5 units (configurable). |
+| **Tax treatment** | n/a, this is a unit-count comparison. |
+| **Shipping** | n/a. |
+| **Discounts** | n/a. |
+| **Refunds** | n/a. |
+| **Cancelled / voided orders** | Open Sales Documents reduce SAP-side available-to-promise; commerce platforms typically reflect this in their displayed inventory. The card uses unrestricted on-hand (`LABST`) by default; configurable to ATP. |
+| **Currency** | n/a. |
+| **Plant / Channel scope** | Per plant per commerce platform. |
+| **Time window** | `RT` |
+| **Alert trigger** | `any SKU drift >5 units` |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your SAP data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US enterprise B2B distributor on S/4HANA Cloud. Snapshot 03 May 26.
+
+**Headline:** 38 materials with drift > 5 units across 3 commerce platforms. Estimated lost-sale exposure: $84,000 if drift causes inability to fulfil.
+
+**Top 8 drift cases:**
+
+| Material | Plant (SAP) | Commerce platform | SAP qty | Commerce qty | Drift | Drift dir | Likely cause |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| MAT-A23 | 1010 | Shopify Plus | 142 | 220 | 78 | Commerce overstated | Sync delayed; SAP shipped stock not reflected on Shopify |
+| MAT-B41 | 1010 | BigCommerce | 84 | 0 | 84 | Commerce understated | Webhook lost when SAP received stock |
+| MAT-C18 | 1020 | Adobe Commerce | 320 | 380 | 60 | Commerce overstated | Sales not yet reflected (commerce shows pre-sale qty) |
+| MAT-D62 | 1010 | Shopify Plus | 14 | 32 | 18 | Commerce overstated | Stock-in-transit double-counted |
+| MAT-E55 | 2010 | BigCommerce | 0 | 12 | 12 | Commerce overstated | Plant scope mis-mapped |
+| MAT-F09 | 1020 | Adobe Commerce | 88 | 80 | 8 | Commerce understated | Recent goods receipt not yet pushed |
+| MAT-G82 | 1010 | Shopify Plus | 240 | 248 | 8 | Commerce overstated | Cycle-count adjustment in SAP not synced |
+| MAT-H14 | 1010 | BigCommerce | 64 | 58 | 6 | Commerce understated | Inbound shipment landing tomorrow |
+
+**Investigation walkthrough:**
+
+1. **MAT-A23: 78-unit drift, commerce overstated.** Shopify is showing 220 units available; SAP says 142. If a customer orders 200, Shopify accepts the order but SAP's ATP fails when the Sales Document arrives. The order ends up on inventory hold, then escalates to either a stock-out apology or an emergency replenishment. Root cause: sync from SAP -> Shopify is delayed by 3+ hours when a goods issue posts.
+2. **MAT-B41: 84-unit drift, commerce understated.** SAP just received 84 units (movement type 101) but the BigCommerce-side webhook lost the message. Customers see "out of stock" on a product that actually has 84 units. This is direct lost demand; the OOS-with-demand card surfaces the impact.
+3. **MAT-E55: plant scope mis-mapping.** Plant 2010 (Toronto) has 0 units of this material; commerce shows 12. The integration is wrongly pulling from a different plant. Configuration fix: align plant-to-channel mapping in the integration.
+4. **The pattern matters more than individual rows.** If drift is consistently "commerce overstated", the SAP -> commerce sync is failing; if consistently "commerce understated", the commerce -> SAP sync is failing.
+5. **Action playbook:**
+    - Configure SAP outbound IDoc / OData event triggers on goods movements (movement types 101, 161, 261, 601, 651) so commerce platforms see updates within minutes.
+    - Configure inbound webhooks from commerce platforms when an order ships; SAP creates the Sales Document immediately rather than batch-syncing.
+    - Add a periodic full reconciliation (overnight) as a safety net.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Inventory Sync Drift |
+| --- | --- |
+| [Total Inventory Value](/nerve-centre/kpi-cards/sap/sap-total-inventory-value) | The financial source of truth for inventory. |
+| [Low Stock Alerts](/nerve-centre/kpi-cards/sap/low-stock-alerts) | Drift can mask real low-stock conditions. |
+| [OOS with Open Sales Document Demand](/nerve-centre/kpi-cards/sap/oos-with-open-sales-document-demand) | The customer-facing impact of failed syncs. |
+| [Open Sales Document Value](/nerve-centre/kpi-cards/sap/sap-open-so-value) | Inventory blocks driving Sales Document hold-ups. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in S/4HANA Cloud:**
+
+> **Stock Overview** transaction MMBE / MB52 -> SAP-side ground truth
+> **Material Inventory Values** Fiori app
+> **Embedded Analytics**: CDS view `I_MaterialStock`
+
+Direct deep-link: `https://my{tenant}.s4hana.cloud.sap/sap/bc/ui2/flp#MaterialInventoryValues-display`
+
+**Why our list may legitimately differ from a manual MMBE check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Stock type** | Either | Card uses unrestricted on-hand by default. Commerce platforms may use ATP (subtracting open orders). Toggle in field map. |
+| **Plant scope** | Either | Card respects dashboard CC scope. |
+| **Polling cadence** | Small | Card refreshes every 15 minutes. Drift can self-resolve in minutes if syncs catch up. |
+| **Stock-in-transit** | Either | Owned in-transit visible to SAP but rarely published to commerce. Configurable. |
+
+**Cross-connector reconciliation:**
+
+| Source | Role |
+| --- | --- |
+| S/4HANA Cloud `I_MaterialStock` | SAP qty source of truth |
+| Shopify / BigCommerce / Adobe Commerce / SAP Commerce Cloud | Commerce-side qty |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Should drift ever be zero?**
+In theory yes; in practice small drifts (&lt;= 5 units) within sync-cadence windows are normal. The card flags only material drift.
+
+**SAP qty includes safety stock; commerce shows usable. Do they differ structurally?**
+Yes if the integration publishes safety-stock-adjusted ATP rather than gross on-hand. Configure the field map to publish either gross or ATP consistently and the drift normalises to integration lag only.
+
+**Materials sold across multiple commerce platforms, how is drift computed?**
+Per (material, plant, channel) tuple. A material on Shopify and BigCommerce shows two rows if both differ from SAP.
+
+**Drift threshold tuning?**
+Default 5 units. High-velocity DTC apparel: 20 units (more sync churn, less impact). Low-velocity B2B parts: 1 unit (rare drift, high impact).
+
+**Multi-Company-Code: same material in two CCs / two plants, how shown?**
+Per plant. CC 1000 plant 1010 and CC 1000 plant 1020 are independent rows.
+
+**SAP -> commerce sync method matters?**
+Yes. Real-time event-driven (IDoc / OData event push) keeps drift small. Scheduled batch syncs (hourly or daily) accumulate drift. Vortex IQ's card surfaces the symptom; the fix is in the integration architecture.
+
+**Will drift ever resolve itself?**
+Most drift resolves within minutes to hours as syncs catch up. Drift older than 24 hours indicates a broken sync that needs investigation.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Inventory Sync Drift* is one of hundreds of KPI pulses Vortex IQ tracks across SAP and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

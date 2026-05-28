@@ -1,0 +1,174 @@
+---
+title: "Conversion-Tracking-Broken Alert, Google Ads"
+sidebarTitle: "Conversion-Tracking-Broken Alert"
+description: "Tag fires fail silently, and Smart Bidding will retrain on the bad signal within 24h. Catch fast. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Ad Platform
+
+> Tag fires fail silently, and Smart Bidding will retrain on the bad signal within 24h. Catch fast.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The single most consequential alert in this connector. The Google Ads conversion tag fires from your site to Google whenever someone purchases. If that tag breaks (a developer ships a deploy, a GTM container is overwritten, a cookie banner blocks the script), conversions stop reaching Google **and Smart Bidding retrains on the bad signal within 24 hours**, redirecting spend toward worse audiences before you notice. The alert watches click-to-conversion ratio in real time and flags the moment the ratio falls off baseline, hours faster than ROAS-based alerts.
+
+| | |
+| --- | --- |
+| **The formula** | Click-to-conversion ratio anomaly: `clicks / max(conversions, 1)` watched in 30-minute windows. Alert fires when the ratio for the current 30-min window exceeds 200% of the trailing-7-day same-hour-of-day baseline AND the absolute click volume is at least 50, filter on volume avoids low-data noise. |
+| **GAQL resource + metric** | `FROM customer` aggregated hourly. Fields: `metrics.clicks`, `metrics.conversions`. The card watches the ratio's deviation, not the absolute conversions count. |
+| **Account currency (single by design)** | Not currency-relevant (the alert tracks count ratios, not value). |
+| **Conversion attribution model (configurable)** | Whatever you have in Google Ads. The alert is robust to model changes within reason: a DDA&lt;->Last click switch causes a one-time spike then re-baselines. If the alert fires within 48 hours of a known model change, treat as suspect. |
+| **View-through inclusion (excluded by default)** | Watches primary `conversions` only. View-through doesn't enter; this alert focuses on click-to-purchase tracking, the high-value pixel-fire path. |
+| **Bot / IVT filter** | Google's Invalid Click Filter applies. A bot-spike inflates clicks without conversions, which **does** look like tag-broken to this alert. The 30-minute observation window helps: real bot spikes typically last hours and have a known signature; tag breakage shows the same pattern but persists. The disambiguation is in [Spend Anomaly](/nerve-centre/kpi-cards/google-ads/spend-anomaly), if spend also spiked, it's bots, not a tag break. |
+| **Micros conversion** | Not applicable. |
+| **Real-time vs ingestion lag** | Hourly evaluation. Conversions take 1-4 hours to ingest, so the alert deliberately uses 30-minute observation windows ending 60-90 minutes ago to give ingestion a chance to catch up. The "30 minutes" in the trigger is a *measurement* window, not a *real-time* window. |
+| **MCC aggregation** | Per child account. MCC managers see one alert per affected account. |
+| **Time window** | `RT` (real-time, hourly evaluation). |
+| **Alert trigger** | Clicks rising (or stable) while conversions are below 50% of expected for greater than 30 minutes. Plain-English: "the ratio of clicks-per-conversion is more than double normal in a 30-min window." |
+| **Roles** | owner, marketing, engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Google Ads data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK fashion brand. Tuesday 14 Apr 26, 11:30 local. The alert fires at 13:00 with the message "Conversion tracking likely broken: click-to-conversion ratio at 240% of baseline since 11:30."
+
+| 30-min window | Clicks | Conversions | Clicks per conv. | Baseline (same hour, 7D avg) | Ratio vs baseline |
+| --- | --- | --- | --- | --- | --- |
+| 09:00-09:30 | 42 | 3 | 14.0 | 14.5 | 96% (normal) |
+| 09:30-10:00 | 51 | 4 | 12.8 | 13.2 | 97% (normal) |
+| 10:00-10:30 | 49 | 4 | 12.3 | 13.0 | 95% (normal) |
+| 10:30-11:00 | 55 | 4 | 13.8 | 13.5 | 102% (normal) |
+| **11:00-11:30** | **58** | **2** | **29.0** | **13.5** | **215% (alert seed)** |
+| **11:30-12:00** | **62** | **0** | **62.0+** | **13.0** | **>477% (FIRE)** |
+| **12:00-12:30** | 64 | 1 | 64.0 | 13.5 | 474% (still firing) |
+
+What this scenario tells the analyst:
+
+1. **The alert fires while the ROAS card still looks fine.** ROAS is a daily aggregate; at 13:00 the morning bad data is masked by yesterday's full-day good data. The conversion-tracking-broken alert catches it within 90 minutes; ROAS-based alerts typically catch it 18-24 hours later. **This is the "save your day" alert**.
+2. **By 13:00 Smart Bidding has already started misbehaving.** Smart Bidding feeds on conversion signals; with conversions stalled to zero, it sees high-CPC clicks producing nothing and starts shifting bids toward less-competitive (worse) auctions. By 18:00, your campaigns are bidding on the wrong inventory; by tomorrow morning, Smart Bidding has retrained on 12 hours of bad signal and recovery takes 7-14 days even after the tag is fixed.
+3. **Diagnostic checklist (in order)**:
+   - Open the order-confirmation page in incognito. Place a £1 test order. Watch Tag Assistant or GTM debugger for the AW-XXXX/conversion fire.
+   - If the tag does NOT fire: check (a) was a deploy made to the success page in the last 24 hours? (b) was a GTM container republished? (c) was a cookie-consent change made (CMP blocking the tag)? Fix immediately.
+   - If the tag DOES fire on test order but not on real orders: the issue is conditional logic, perhaps a customer-segment filter, a JS error on certain product types, or a checkout flow change that bypasses the success page entirely.
+   - Cross-check GA4 Realtime > Conversions; if GA4 also shows the drop, the issue is the broader tag layer (GTM, CMP), not the Google Ads pixel specifically.
+   - Cross-check commerce platform (Shopify Orders > Today, BigCommerce Recent Orders); if real orders are happening, only measurement broke.
+4. **Don't pause campaigns on this alert.** The traffic is converting in real life; only the measurement broke. Pausing campaigns would cost real revenue while you fix a measurement problem.
+5. **After the fix, document the gap.** If the tag was broken from 11:30-13:30, those 2 hours of conversion data are permanently lost. Smart Bidding will re-stabilise over 5-10 days. Mark this period in your reporting so future ROAS comparisons exclude it.
+
+Quick sanity tests:
+
+- Alert fires + commerce orders held = tag break, fix the pixel.
+- Alert fires + commerce orders also dropped = real performance issue, this alert is a false positive in this case (or the conversion really did stop happening).
+- Alert fires for less than 30 minutes then resolves = transient (a deploy that auto-rolled-back, a CDN cache flush). Note it.
+- Alert fires WITH spend anomaly = could be bot traffic, not tag break. Different fix.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Conversion-Tracking-Broken Alert |
+| --- | --- |
+| [Google Ads Clicks vs Conversions](/nerve-centre/kpi-cards/google-ads/clicks-vs-conversions) | The chart this alert summarises. Open it to see the full ratio over time and confirm the alert isn't a one-off spike. |
+| [Google Ads Conversion Drop](/nerve-centre/kpi-cards/google-ads/conversion-drop-alert) | Lower-frequency alert at the daily level. If both fire on the same day, the cause is definitely a conversion-side issue. |
+| [Google Ads ROAS Drop Alert](/nerve-centre/kpi-cards/google-ads/roas-drop-alert) | The downstream alert. Tag breakage shows here first by 18-24 hours, then ROAS drop alert fires. |
+| [Google Ads Spend Anomaly](/nerve-centre/kpi-cards/google-ads/spend-anomaly) | Disambiguator. If spend also spiked at the same time, the cause is more likely bot traffic than a tag break. |
+| [Google Ads CPC Anomaly](/nerve-centre/kpi-cards/google-ads/cpc-anomaly) | If CPC also spiked, an auction-side change happened concurrently; treat the tag-broken alert with caution (could be both). |
+| [GA4 Revenue by Channel](/nerve-centre/kpi-cards/google-analytics/revenue-by-channel) | Independent measurement check. If GA4 also shows the drop, the broader tag layer (GTM, CMP) is the problem. If GA4 is fine, only the Google Ads pixel broke. |
+| [Shopify Total Revenue](/nerve-centre/kpi-cards/shopify/total-revenue) | The truth side. If commerce-platform orders held while this alert fired, no real performance issue, just measurement to fix. |
+| [BigCommerce Total Revenue](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | Same as Shopify. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Google Ads UI:**
+
+[Google Ads > Tools > Conversions](https://ads.google.com/aw/conversions). The conversion-action list shows status: "Recording conversions" (healthy), "No recent conversions" (warning, often a tag break), or "Tag inactive" (the tag isn't reaching Google at all). This is where the issue surfaces FIRST in Google's own UI; their warning is slower than this alert (typically 24-48 hours of no fires), but it confirms when it appears.
+
+[Google Ads > Tools > Tag Assistant](https://tagassistant.google.com) (separate tool) lets you simulate a conversion fire on any URL and verify the tag.
+
+[Google Ads > Reports > Predefined > Time > Hour](https://ads.google.com/aw/reports), with Click-to-Conv. ratio if available. The hourly view shows the broken-tracking signature clearly.
+
+Other Google Ads views that *look* like the same number but aren't:
+
+- **All conversions count**: includes view-through. A primary-only drop with all-conversions stable is unusual but possible (one specific pixel broke).
+- **Predefined > Conversions report**: shows per-conversion-action volume; useful for isolating WHICH conversion action broke.
+- **Search Lost IS**: a coverage metric, irrelevant here.
+- **Tag Manager (GTM) preview mode**: outside Google Ads, but the most diagnostic tool for confirming the tag fires.
+
+**Why our number may differ from Google Ads UI (rare):**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| Real-time event-ingestion lag (1-4 hour). Card uses 30-min observation windows ending 60-90 min ago to give ingestion a chance. | Card may show a tracking issue before Google's UI flags it (typical) or after (rare). |
+| Google Ads' own "No recent conversions" warning has a slower trigger (typically 24-48h). | This alert fires earlier; Google Ads UI lags. |
+| Attribution-model change. Switching DDA &lt;-> Last click can briefly look like a tracking break. | False positive risk for ~24h after model switch. |
+| Currency. Not relevant. | None. |
+
+**Why the BUSINESS metric often differs (the IMPORTANT one):**
+
+A "conversion-tracking-broken" alert is **not** a revenue problem; it is a measurement problem. The crucial reconciliation:
+
+- Real orders are still happening at the commerce platform; check Shopify/BigCommerce/Adobe Orders > Today.
+- GA4 Realtime > Conversions may also show the drop (if the broader tag layer is broken) or may look normal (if only the Google Ads pixel broke).
+- Smart Bidding starts misbehaving within 24 hours of bad signal. Even after fixing the tag, expect 5-10 days of campaign re-stabilisation. The lost data is permanent; document the gap.
+
+Cross-connector reconciliation:
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) (UTM-filtered to Google CPC) | If this alert fires but Shopify Google-CPC orders are normal, the cause is measurement, not performance. | Pixel break, CMP blocking, GTM republish. |
+| [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | Same logic as Shopify. | Same. |
+| [`google_analytics.ga_revenue_by_channel`](/nerve-centre/kpi-cards/google-analytics/revenue-by-channel) (Paid Search) | If GA4 Paid Search revenue ALSO drops, the broader tag layer (GTM container, consent) is broken. If GA4 is normal, only the Google Ads pixel broke. | Different tag stacks; only the AW-conversion pixel may be affected. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The alert just fired. What do I do FIRST?**
+Run a £1 test order on the brand site in incognito. Watch the GTM debugger or Tag Assistant for the conversion fire on the success page. If the tag does not fire, the pixel is broken; pull a developer in immediately. If the tag does fire on the test order but real conversions are still missing, the issue is conditional logic (broken on certain product categories, certain customer segments, or a checkout flow change). Most fixes are rolled back deploys, GTM republish, or CMP rule adjustment.
+
+**Why is this alert more important than the ROAS drop alert?**
+Speed and stakes. Tag breaks distort Smart Bidding's training within 24 hours; bid optimisation drifts toward worse audiences. Catching the break in 90 minutes (this alert) versus 18-24 hours (ROAS-based) means Smart Bidding has retrained on hours of bad data instead of a full day. Recovery time after fix: typically 5-10 days, with a few percent of efficiency lost permanently.
+
+**Will this alert fire when I deliberately reduce conversion volume (e.g., turning off a low-quality pixel)?**
+Yes, briefly. If you intentionally disable a conversion action, the click-to-conversion ratio will spike because the same clicks now produce fewer conversions. Either suppress the alert during the change window, or annotate it as expected.
+
+**Why does the alert use 50% threshold and not stricter?**
+Conversion data is naturally noisy in 30-minute windows. A 50%-of-expected threshold catches structural breaks while tolerating routine noise. Stricter thresholds (e.g., 80%-of-expected) would fire constantly on quiet hours.
+
+**My alert fired but Tag Assistant shows the tag firing fine, what now?**
+Three more checks: (1) Open the order-confirmation page on a real customer's session (not your incognito test); some pixel breaks affect only specific browser/device combinations. (2) Check the GTM container Versions tab; was a new container version published in the last 24 hours? (3) Check CMP/cookie-banner rules; Consent Mode v2 may be blocking the tag for users who decline cookies, and a CMP config change could have flipped it default-deny.
+
+**My PMax campaigns trigger this alert often, why?**
+PMax routes traffic to Discover/YouTube/Display surfaces where conversion paths are longer (view-through-heavy). The primary-conversions ratio is naturally higher (more clicks per conversion). The alert baseline accounts for hour-of-day patterns, but PMax volatility can still produce false positives. Consider a higher threshold for accounts with PMax > 50% of spend.
+
+**What's the relationship between this alert and Smart Bidding's "learning" status?**
+Smart Bidding consumes conversion signals. When the tag breaks, Smart Bidding's signal goes to zero, and within 24 hours it begins to "learn" from the absence (interpreting it as poor inventory). Even after the tag is fixed, you'll see "Limited" or "Learning" status on Smart Bidding campaigns for 5-10 days as it rebuilds the model. There's no shortcut; just wait it out.
+
+**Multi-currency setup, how does this alert work?**
+Each Google Ads account has its own conversion stream and its own ratio. The alert fires per-account independently. Multi-currency advertisers see one alert per affected account.
+
+**Can I trust this alert at very low click volumes?**
+The minimum-click-volume gate (50 clicks per 30-min window) prevents low-data noise from triggering. Accounts with consistent volumes below 100 clicks/hour may rarely see this alert; for those accounts, the daily [Conversion Drop](/nerve-centre/kpi-cards/google-ads/conversion-drop-alert) is more useful.
+
+**The alert fires but my CMP shows everyone consents, can I still have a tag issue?**
+Yes. Common other causes: a JS error on the success page (run dev tools console on order completion to check), checkout flow rewrites that bypass the success page entirely (some Shopify themes route to /thank-you instead of /orders/123 and the tag is on the wrong URL), or a Shopify Plus checkout extension overriding the tag.
+
+**What if the broken tag is for one specific conversion action (e.g., signup) but purchase conversions still fire?**
+The alert may not fire because the aggregate ratio holds. For per-action tracking, see [Conversion Actions](/nerve-centre/kpi-cards/google-ads/conversion-actions-breakdown) which breaks down conversions by action type and surfaces single-action drops.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Conversion-Tracking-Broken Alert* is one of hundreds of KPI pulses Vortex IQ tracks across Google Ads and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

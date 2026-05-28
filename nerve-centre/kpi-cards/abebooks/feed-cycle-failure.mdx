@@ -1,0 +1,171 @@
+---
+title: "Feed Cycle Failure, AbeBooks"
+sidebarTitle: "Feed Cycle Failure"
+description: "Triggered when /outbox/listings has no confirmed ack in 48h, feed is blind, all listing changes stuck. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Marketplace
+
+> Triggered when /outbox/listings has no confirmed ack in 48h, feed is blind, all listing changes stuck.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> P1 alert. Fires when the AbeBooks outbound listings feed (`/outbox/listings`) has not received a confirmed ack from AbeBooks in 48 hours. While the alert is active, every listing edit (price change, stock change, condition update, new listing, delete) is stuck in a queue with no path to AbeBooks. The catalogue is frozen on whatever state the last successful cycle left it in.
+
+| | |
+| --- | --- |
+| **What it counts** | Boolean alert state, 1 if `time_since_last_acked_outbox_upload > 48h`, else 0. Maintains a list of queued-but-undelivered outbox files for visibility (count + total bytes + first-failed timestamp). |
+| **API endpoint + report** | Derived from the FTPS connector's last-successful-ack heartbeat. Vortex IQ polls the AbeBooks FTPS server's `/inbox/acks` directory every 4 hours; if no fresh ack appears for 48h after an outbound upload, the alert fires. |
+| **Severity** | **P1**. Every hour the alert is open, the merchant is operating blind on AbeBooks. The only catalogue state AbeBooks sees is the last-acked snapshot. New stock isn't surfaced; sold-out listings are still sellable; price changes don't propagate. |
+| **What "feed is blind" means in practice** | (1) New books added in your inventory tool stay invisible on AbeBooks. (2) Books that sold on Alibris/Amazon/DTC stay listed (and orderable) on AbeBooks, every order is a stockout cancellation. (3) Repricer changes don't apply, your prices freeze. (4) Listings flagged for delete stay live. |
+| **Fees / commission** | Not applicable directly to the alert. Indirect commission impact: every stockout cancellation triggered by frozen-feed counts toward your seller-error cancellation rate (3% threshold for review). |
+| **Refunds / cancellations** | Not directly. But the alert's downstream effect drives a cancellation spike, watch [Cancellation Rate](/nerve-centre/kpi-cards/abebooks/cancellation-rate) during and 7 days after. |
+| **Currency** | Not applicable. |
+| **Common root causes** | (1) **FTPS credential rotation** at the merchant's hosting provider not reflected in the AbeBooks connector config (~32% of incidents). (2) **AbeBooks-side maintenance window** that overran (~22%). (3) **Network connectivity loss** from the merchant's data centre to AbeBooks's FTPS host (~18%). (4) **Outbound file format violation** that AbeBooks silently rejects without acking (~15%). (5) **Disk-full or quota** on the merchant's outbox staging directory (~9%). (6) **Other** (~4%). |
+| **Multi-marketplace overlap** | Each marketplace runs its own feed; an AbeBooks feed failure typically does NOT affect Alibris or Amazon. The exception: if the cause is merchant-side credential rotation or a network outage at the merchant data centre, all three feeds may fail together. |
+| **Time window** | `RT` (real-time alert state). |
+| **Alert trigger** | `no successful upload >48h`. |
+| **Roles** | owner, operations, engineering. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your AbeBooks data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK independent bookseller, 38,400 active AbeBooks listings, daily outbound feed cycle. Incident timeline 28 Apr 26 to 01 May 26.
+
+| Timestamp (UTC) | Event | Operational consequence |
+| --- | --- | --- |
+| 28 Apr 04:00 | Last successful outbox upload + ack | Catalogue snapshot frozen at this state |
+| 28 Apr 04:00 to 30 Apr 04:00 | Daily upload cycle attempts continue, no ack from AbeBooks | Files queued in outbox; no visible failure to merchant |
+| 30 Apr 04:00 | Alert threshold crossed (48h since last ack) | **Card fires** |
+| 30 Apr 09:14 | Ops team paged, investigation starts | - |
+| 30 Apr 11:32 | Root cause identified: FTPS host's TLS certificate rotated 27 Apr; connector still using old cert chain | Stockout cancellations: 14 between 28 Apr and 30 Apr |
+| 30 Apr 12:48 | Connector config updated with new TLS root cert; reconnect succeeds | First successful upload acked |
+| 30 Apr 13:14 | Backlog of 3 daily files (28, 29, 30 Apr) re-uploaded and acked | All catalogue changes propagate to AbeBooks |
+| 30 Apr 14:02 | Card clears; cancellation-rate effect persists for 7 days | - |
+
+Cumulative impact during the 56-hour outage:
+
+| Impact dimension | Value |
+| --- | --- |
+| Listings frozen (no edits propagated) | 38,400 |
+| Stock changes queued (sold on Alibris/Amazon/DTC, still live on AbeBooks) | 412 |
+| Stockout cancellations triggered as a direct result | 14 |
+| Repricer updates queued | 9,840 |
+| Estimated revenue impact (lost sales + cancellation-rate damage) | £1,450 |
+| Cancellation rate impact for 30D rolling window | +1.1 percentage points |
+
+Six things to notice that are specific to AbeBooks and the book-trade FTPS feed model:
+
+1. **48 hours is the standard threshold but not the only one to use.** A bookseller running a daily feed cycle should alert at 48h; a bookseller running a 4-hourly cycle should alert at 12h or 24h. Tune the threshold to your actual feed cadence; default catches the daily-cycle audience.
+2. **The "queued, no ack" signature is the most common version of feed failure.** AbeBooks's FTPS server doesn't send error responses to most failure modes; it just drops the connection or stops processing. Detection is by ABSENCE of ack, not by error message. This is why the threshold is time-based rather than error-count-based.
+3. **TLS certificate rotation is the #1 cause and the most preventable.** Merchants using their own outbound FTPS client should subscribe to AbeBooks's developer mailing list for advance notice of certificate rotations (typically 30 days advance notice for planned rotations, 0 days for emergency rotations). Vortex IQ's connector handles cert pinning automatically, but custom feed clients often miss this.
+4. **Stockout cancellation cascade is the second-order damage.** During the 56h outage, 412 books sold on other channels were still listed as available on AbeBooks. Of the 14 that buyers attempted to purchase on AbeBooks, every one resulted in a stockout cancellation, which counts toward the 3% cancellation threshold. A 56h outage during a busy week can wipe out 30 days of careful cancellation-rate management.
+5. **The 30 to 90 day reputational tail.** AbeBooks's seller-standing tile averages cancellation rate over 30 days. A 14-cancellation cluster during this outage will sit in the 30D average for the next 30 days; expect the seller-standing tile to show "at risk" until early Jun 26.
+6. **The 9,840 queued repricer updates are interesting.** Most of those are routine 1 to 5 pence pricing nudges that don't matter individually, but in aggregate they represent the catalogue tracking the live market. Letting them queue and fire all at once after the outage causes a one-day price-change spike that some buyers notice; a phased re-upload (1,000 listings/hour) is gentler.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+Feed cycle failure is the P1 operational alert. Pair with these to triage and recover:
+
+| Card | Why pair it with Feed Cycle Failure |
+| --- | --- |
+| [Last Successful Upload](/nerve-centre/kpi-cards/abebooks/last-successful-upload) | The companion card. While the alert is firing, this card shows exactly how long ago the last good cycle was. |
+| [FTPS Connection / Auth Health](/nerve-centre/kpi-cards/abebooks/ftps-connection-auth-health) | The first thing to check on alert. Auth failures are the leading cause of feed failures; a 3+ consecutive auth-failure pattern usually precedes feed failure by 4 to 24h. |
+| [Failed Batches (7d)](/nerve-centre/kpi-cards/abebooks/failed-batches) | The 7-day history view. If failed-batch count was already elevated before this alert, you have a chronic feed-quality issue, not a one-off outage. |
+| [Top Upload Error Types](/nerve-centre/kpi-cards/abebooks/top-upload-error-types) | Cause attribution. After resolving the feed connection, the queued backlog will surface any format violations as soon as it processes; pre-empt by checking error patterns. |
+| [Inbound Orders File Lag](/nerve-centre/kpi-cards/abebooks/inbound-orders-file-lag) | Cross-direction check. Many feed-failure causes (network, DNS, FTPS host outage) affect both inbound and outbound; if both are alerting, the issue is platform-wide not file-specific. |
+| [Cancellation Rate](/nerve-centre/kpi-cards/abebooks/cancellation-rate) | Downstream impact. The stockout-cancellation cascade during the outage shows here over the following 7 to 30 days. |
+| [Suspended Listings](/nerve-centre/kpi-cards/abebooks/suspended-pending-listings) | Downstream impact. Backlogged outbox files often surface format violations on processing; expect a small bump in suspensions when the queue drains. |
+| [Alibris Feed Cycle Failure](/nerve-centre/kpi-cards/alibris/feed-cycle-failure) | The peer-marketplace alert. If both fire simultaneously, the cause is merchant-side (network, credentials at your data centre); if only one fires, it's marketplace-specific. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in the AbeBooks seller dashboard:**
+
+AbeBooks's seller dashboard does NOT publish a feed-health view; the merchant typically only learns of a feed failure via downstream symptoms (drop in revenue, spike in cancellations). Three indirect views help triangulate during an active alert:
+
+1. [**My AbeBooks → Inventory → Upload History**](https://www.abebooks.com/inventory/upload-history). Shows the last N upload attempts AbeBooks recorded; if the most recent entry is >48h old, AbeBooks confirms it has not received your files.
+2. [**My AbeBooks → Inventory → Manage**](https://www.abebooks.com/inventory/manage). Spot-check any listing you know you've recently edited; if the AbeBooks UI shows the OLD price/stock/condition, the change hasn't propagated.
+3. [**AbeBooks Developer Status Page**](https://developers.abebooks.com/status) (when available; intermittent service). Lists known platform-side outages.
+
+**Why our alert may legitimately differ from AbeBooks's own observations:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **AbeBooks-side ack delay** | Card alerts but feed is fine | Occasionally AbeBooks's processing pipeline backs up and acks land 12 to 36h after the actual upload. The card sees no ack and alerts; AbeBooks has the file. The 48h threshold is calibrated to be longer than typical AbeBooks-side delays, but 99th-percentile delays can trip false alerts. Wait one cycle before treating as P1. |
+| **Connector polling cadence** | Card alerts 4h late | Vortex IQ polls the AbeBooks ack directory every 4 hours; an ack landing 30 minutes after a poll is detected up to 4 hours later. Real outages last days, not hours, so this rarely matters. |
+| **Outbox-empty edge case** | Card silent during quiet period | If the merchant has no listing changes to upload for 72 hours (genuinely static catalogue), there's no outbound file and no ack to expect; the card stays silent. The "no ack >48h" threshold only applies when there IS an outbound file pending. |
+| **Manual upload via AbeBooks UI** | Card unaware | If the merchant or staff manually uploads a CSV via the AbeBooks website (bypassing the FTPS feed), AbeBooks acks it but the connector doesn't see the ack. The card stays in alert state until the next FTPS cycle resolves. |
+
+**Cross-connector reconciliation:**
+
+Feed cycle failure is fundamentally per-marketplace; cross-connector reconciliation surfaces shared root causes (merchant-side network, DNS, time service).
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| [`alibris.al_alert_feed_failure`](/nerve-centre/kpi-cards/alibris/feed-cycle-failure) | **Independent feeds.** Each marketplace has its own FTPS host and credentials. | Co-firing alerts strongly suggest merchant-side cause (network, DNS, expired credentials at your data centre). Single-marketplace alerts are usually marketplace-specific. |
+| [`amazon.amzn_alert_feed_failure`](/nerve-centre/amazon/amzn_alert_feed_failure) | **Different protocol.** Amazon uses MWS / SP-API, not FTPS, so the failure modes don't share root causes. | Amazon can fire its own feed alert from rate-limit, schema-validation, or auth-token expiration; AbeBooks rarely sees these failure modes. |
+| [`shopify.alert_webhook_failure`](/nerve-centre/shopify/alert_webhook_failure) | **Inverse direction.** Shopify pushes to you (webhooks); AbeBooks polls from you (FTPS). Different mechanic entirely. | Shopify webhook failures don't propagate to AbeBooks at all. |
+
+---
+
+<details>
+<summary><em>Marketplace-peer documentation cross-reference</em></summary>
+
+Feed-cycle alerts exist on every marketplace connector. Each marketplace's failure modes differ; the cross-link is for navigation when multiple alerts are firing simultaneously.
+
+- [`alibris.al_alert_feed_failure`](/nerve-centre/kpi-cards/alibris/feed-cycle-failure)
+- [`amazon.amzn_alert_feed_failure`](/nerve-centre/amazon/amzn_alert_feed_failure)
+- [`ebay.ebay_alert_feed_failure`](/nerve-centre/ebay/ebay_alert_feed_failure) (when connected)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The alert just fired. What do I do in the next 30 minutes?**
+Three checks, in order: (1) **Test FTPS auth manually.** From a known-good machine, attempt FTPS login to AbeBooks's host with the connector's stored credentials. If it fails, you have a credential or TLS-cert issue, fix that. (2) **Check the connector's outbox staging directory.** If files have queued for >48h, processing has been blocked, validate disk space, file permissions, and any rotation/cleanup cron jobs. (3) **Open AbeBooks's developer status page.** If AbeBooks is in the middle of a maintenance window, the alert will auto-clear when their service resumes; no action needed but document for compliance.
+
+**My alert just cleared, but my cancellation rate is still climbing. Why?**
+The alert clears when the next ack is received; the operational damage from the outage takes 7 to 30 days to age out. During the outage, books that sold elsewhere stayed live on AbeBooks; buyers who attempted to purchase those got stockout cancellations. Those cancellations stay in the rolling 30D average for the next 30 days. Watch [Cancellation Rate](/nerve-centre/kpi-cards/abebooks/cancellation-rate) for the recovery.
+
+**Multi-marketplace, can a single network outage trip both AbeBooks and Alibris feed alerts?**
+Yes, if the cause is at the merchant data centre (DNS, ISP, firewall rule). If the cause is at the marketplace side (AbeBooks-only outage, Alibris-only outage), only one alert fires. The first triage step when both alerts fire together is "is my outbound network healthy?", not "is AbeBooks up?".
+
+**Listing-quality / Buy Box impact, what's the second-order damage?**
+The cancellation cascade described in the worked example is the primary second-order effect. Beyond that: AbeBooks's [Listing Quality Score](/nerve-centre/kpi-cards/abebooks/listing-quality-score) sees no positive signals during the outage (no new listings, no condition updates, no fresh imagery), and the score decays slightly. Recovery to baseline takes 2 to 4 weeks of normal feed operation.
+
+**Inventory-sync lag during the outage, what's the right behaviour?**
+Two strategies: (a) **Conservative**, when you detect feed failure, manually mark all AbeBooks listings as "out of stock" via the AbeBooks website upload to prevent stockout cancellations. Pros: no cancellations during outage. Cons: zero AbeBooks revenue during outage, and re-enabling 38,000 listings post-outage causes a temporary AbeBooks ranking suppression. (b) **Permissive**, leave listings live, accept the stockout cancellations, recover post-outage. Pros: some AbeBooks revenue continues. Cons: cancellation-rate damage. Most booksellers under 1,000 daily orders use (b); larger sellers use (a).
+
+**ISBN match quality, can it cause feed failures?**
+Indirectly. Malformed ISBN-10 / ISBN-13 in your outbound file can cause AbeBooks to silently reject the entire file (not just the malformed rows) on some legacy AbeBooks parsers. The signature is "card alerts after a recent inventory-data refresh". Open [Top Upload Error Types](/nerve-centre/kpi-cards/abebooks/top-upload-error-types) immediately after recovery; ISBN-format violations dominate when this pattern is the cause.
+
+**Why doesn't AbeBooks just send an email when my feed breaks?**
+AbeBooks does send email warnings on persistent failures, but the email cadence is once-weekly batch and the threshold is 7+ days, far slower than the 48h alert this card provides. Treat AbeBooks's own emails as a backstop, not a primary alert mechanism.
+
+**Rare books vs commodity books, does the outage hurt them differently?**
+Yes. Commodity books have high volume, so each frozen-feed day produces multiple stockout cancellations on the popular ISBNs. Rare books have low volume; a 56h outage may produce ZERO rare-book cancellations because no rare-book buyer happened to attempt purchase during the window. The outage's reputational impact concentrates on commodity stock.
+
+**When does the alert turn off vs when do I act?**
+The alert auto-clears when the next ack is received. But "act" until you've also: (1) drained the outbox queue (re-uploaded queued files); (2) confirmed all listings are in their intended state via spot-check on AbeBooks's UI; (3) reviewed the cancellation cluster from the outage and proactively contacted any affected buyers with a discount code or apology to limit feedback damage. Full recovery is 2 to 4 weeks; the alert clearing is just the first 5%.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Feed Cycle Failure* is one of hundreds of KPI pulses Vortex IQ tracks across AbeBooks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

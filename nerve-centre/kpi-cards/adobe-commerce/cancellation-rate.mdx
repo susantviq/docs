@@ -1,0 +1,179 @@
+---
+title: "Cancellation Rate, Adobe Commerce"
+sidebarTitle: "Cancellation Rate"
+description: "Cancellation Rate for Adobe Commerce stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Ecommerce Platform
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Percentage of orders that ended in `state = canceled` rather than progressing to fulfillment. Pre-shipment money-back. On Adobe Commerce, cancellations capture two distinct flows: customer-initiated cancels (changed mind, found cheaper elsewhere) and merchant-initiated cancels (fraud detection, OOS at picking, payment failed authorisation). Both end in the same state but tell different stories.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(orders where state = canceled) / COUNT(all orders)` over the period. The numerator includes voluntary customer cancels via the storefront, ops-initiated cancels via Admin > Sales > Orders > Cancel, and gateway-driven cancels (a `pending_payment` order that timed out or was declined moves to `canceled`). |
+| **API field** | `state` from `GET /rest/V1/orders`; filter `state = "canceled"`. |
+| **VAT / tax treatment** | Count-based ratio; tax doesn't bias it. Companion value-at-risk uses `grand_total` of cancelled orders (tax-inclusive on B2C, often exempt on B2B). |
+| **Shipping inclusion** | Count-based; n/a for the ratio. |
+| **Discounts** | Count-based; n/a for the ratio. |
+| **Credit Memo refund treatment** | This card tracks `state = canceled` (pre-shipment), NOT Credit Memos (post-shipment refunds). Cancellations and Credit Memos are two distinct money-back surfaces; merchants who watch only one miss the other. |
+| **`state` machine inclusion** | Numerator: only `canceled`. Denominator: all states (so the ratio is "cancellations as % of all orders"). |
+| **`pending_payment` quirk** | A `pending_payment` order that times out (Adobe Commerce default: 24h, configurable in Stores > Configuration > Sales > Sales) auto-transitions to `canceled`. Included. If your gateway is silently failing callbacks, cancellation rate spikes not because customers are cancelling but because Adobe is auto-cancelling pending orders. Cross-check [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown). |
+| **Multi-currency `grand_total` vs `base_grand_total`** | n/a for the count ratio. The companion value-at-risk uses `base_grand_total`. |
+| **Store View scope (`store_id`)** | All Store Views by default. Per-Store-View variants useful because B2B cancellation is typically near zero while B2C cancellation is 1 to 3%; the blended view masks segment differences. |
+| **Time window** | `30D vsP`. |
+| **Alert trigger** | `>3%`. Healthy DTC stores baseline at 0.5 to 2%; B2B near 0%. >3% is meaningful regardless of segment mix. |
+| **Sentiment key** | `cancellation_rate` |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+```
+COUNT(state=canceled) / COUNT(_id)
+  WHERE date BETWEEN [period_start, period_end]
+```
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A specialty footwear brand on Adobe Commerce 2.4.6 with US, UK, and B2B Store Views. Trailing 30-day window ending Monday 4 May 26.
+
+**Cancellation rate by Store View:**
+
+| Store View | Total orders | Cancelled | Rate |
+| --- | --- | --- | --- |
+| US consumer | 2,610 | 86 | 3.3% |
+| UK consumer | 2,040 | 41 | 2.0% |
+| B2B portal | 1,420 | 4 | 0.3% |
+| **Blended** | **6,070** | **131** | **2.2%** |
+
+**Prior 30-day blended rate:** 1.4% (84 of 6,140).
+
+**The alert fires** because blended rate is 2.2% (within 3% threshold technically, but the 30-day vs prior shows 1.4% to 2.2% which is a 57% relative increase). Worth investigating.
+
+**Drilldown of the 86 US cancellations:**
+
+| Cause (per Adobe order notes) | Count | % of cancellations |
+| --- | --- | --- |
+| Customer-initiated (cancelled via storefront) | 12 | 14% |
+| Ops-initiated (manual cancel, fraud) | 8 | 9% |
+| Auto-canceled from `pending_payment` timeout | 51 | 59% |
+| Ops-initiated (OOS at picking) | 9 | 11% |
+| Other / unclear | 6 | 7% |
+
+What the investigation reveals:
+
+1. **The cancellation increase is dominated by `pending_payment` timeouts** (51 of 86, 59%). Customers reached order-create but the gateway never callback-confirmed; after 24 hours Adobe auto-canceled.
+2. **Cross-checking [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) for the period**: `pending_payment` count is up 65% over the trailing 30 days. This is the smoking gun.
+3. **Pulling Stripe webhook logs for the period**: 47 failed webhook deliveries to the merchant's Adobe endpoint over the last 30 days, mostly clustered in the last 14 days. The merchant migrated to a new firewall on day 16 of the period; the firewall is occasionally rate-limiting Stripe webhook IPs.
+4. **The fix**: whitelist Stripe webhook source IP ranges in the firewall, replay the failed webhooks. Within hours, the `pending_payment` backlog drains, the canceled orders unfortunately stay canceled (Adobe doesn't reverse `canceled` state), but new orders flow normally.
+5. **The cost**: 51 cancelled orders × ~$72 average US AOV = ~$3,670 of unrecovered revenue. Some customers will retry and place a new order; many will not.
+6. **The OOS-at-picking cancellations (9)** are a separate operational issue worth tracking: the `salable_qty` was zero by the time the picker reached the bin, meaning either the [Out-of-Stock Spike Alert](/nerve-centre/kpi-cards/adobe-commerce/out-of-stock-spike-alert) is not catching the supplier-stall pattern fast enough or the buffer between cart-reservation and picking is too small.
+7. **The B2B rate of 0.3%** is normal; B2B accounts almost never cancel.
+
+The point of this card: cancellation rate alone is ambiguous (genuine cancels vs gateway timeouts vs ops actions). Pairing with order-state distribution and gateway data distinguishes the cause within minutes.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Cancellation Rate |
+| --- | --- |
+| [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) | Distinguishes gateway-timeout cancels from genuine cancels. The most useful diagnostic pair. |
+| [Cancelled Over Time](/nerve-centre/kpi-cards/adobe-commerce/cancelled-orders-over-time) | Trend view. Spikes correlate to gateway issues, fraud campaigns, or system migrations. |
+| [Refund Rate](/nerve-centre/kpi-cards/adobe-commerce/refund-rate) | The post-shipment money-back. Cancellations + Credit Memos = full money-back surface. |
+| [Refund-Rate Spike Alert](/nerve-centre/kpi-cards/adobe-commerce/refund-rate-spike-alert) | If refunds spike alongside cancellations, both are post-purchase pain; if only one moves, different cause. |
+| [Total Revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | Revenue is gross; cancellation rate is the proxy for unrealised revenue. |
+| [Total Orders](/nerve-centre/kpi-cards/adobe-commerce/total-orders) | The denominator. |
+| [`stripe.stripe_payment_decline_rate`](/nerve-centre/stripe/stripe_payment_decline_rate) | Decline rate spike causes a `pending_payment` timeout cascade. |
+| [`shopify.cancellation_rate`](/nerve-centre/kpi-cards/shopify/cancellation-rate) | Cross-platform peer. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Adobe Commerce Admin:**
+
+> **Sales > Orders** filtered by Status = "Canceled" gives the cancelled-order list. Sort by Purchase Date for the time view.
+
+> **Reports > Sales > Orders** with the date range set; Adobe Admin's report shows totals per status, you compute the ratio manually.
+
+For per-cause segmentation:
+
+> **Sales > Orders > [Order ID] > Comments** shows the cancellation note (typically auto-generated for gateway-timeout cancels: "Order canceled because of payment timeout"). Manual cancels include the operator's user comment.
+
+Other Adobe Commerce Admin views that look relevant but are not:
+
+- **Reports > Sales > Tax**: tax aggregations.
+- **Reports > Sales > Coupons**: coupon usage.
+- **Sales > Invoices**: invoiced orders only; cancelled orders are not invoiced.
+
+**Why our number may legitimately differ from the Admin status filter:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Time-zone**. Admin in Store View timezone; card UTC. Window boundaries shift. | ±1 day inclusion |
+| **`status` vs `state`**. Admin's filter shows by `status`; this card uses `state`. The two usually agree (default workflow maps `state = canceled` to `status = canceled`) but custom status renames can desync them. | Material if custom status workflow exists |
+| **Manual ops actions**. Operator cancels via Admin > Sales > Orders > Cancel are immediate; gateway-timeout auto-cancels can take 24+ hours. The card sees the timestamp of state transition. | Negligible at 30D |
+| **Sync lag**. Card uses OpenSearch sync (5-15 min); Admin live. | Negligible |
+
+**Cross-connector reconciliation (when these connectors are connected for this merchant):**
+
+| Pair | Expected relationship | What divergence tells you |
+| --- | --- | --- |
+| [`stripe.stripe_payment_decline_rate`](/nerve-centre/stripe/stripe_payment_decline_rate) | Stripe decline spike causes `pending_payment` timeout cancellations 24h later | Strong leading indicator. |
+| [`stripe.stripe_chargebacks`](/nerve-centre/stripe/stripe_chargebacks) | Cancelled orders don't generate chargebacks (no money was captured) | Chargebacks are post-shipment; cancellations are pre-shipment. The two metrics are independent. |
+| Customer service ticket volume (Zendesk / Intercom) | Customer-initiated cancels usually generate a ticket | Cancellation rate up + ticket volume flat = automated/timeout cancels, not customer choice. |
+
+---
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+- [`shopify.cancellation_rate`](/nerve-centre/kpi-cards/shopify/cancellation-rate)
+- [`bigcommerce.cancellation_rate`](/nerve-centre/kpi-cards/bigcommerce/cancellation-rate)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My cancellation rate spiked but my customer-service inbox is quiet, what happened?**
+Customers didn't cancel; Adobe auto-cancelled `pending_payment` orders that timed out. Look at order notes: "Order canceled because of payment timeout" or similar means gateway callback failed. Cross-check Stripe/PayPal webhook logs for failed deliveries. Fix: replay webhooks, address whatever broke the gateway-to-Adobe path.
+
+**What's the difference between `state = canceled` and a Credit Memo?**
+Cancellation is pre-shipment, no money captured. Credit Memo is post-shipment refund of captured payment. They are distinct events; cancellations are tracked here, Credit Memos in [Refund Rate](/nerve-centre/kpi-cards/adobe-commerce/refund-rate). Together they cover the full money-back surface area.
+
+**Adobe Commerce vs Magento Open Source: difference?**
+None at the calculation layer; both editions use the same `state` machine. Adobe Commerce's B2B Companies module adds the concept of company-level approval workflows, where an order can sit in `pending` (awaiting approval) before reaching `processing`. If approval fails or expires, the order moves to `canceled`. This is an Adobe-only cancellation cause.
+
+**Why include `pending_payment` timeouts in cancellation rate?**
+Because the customer-facing experience is identical: an order that doesn't ship is a cancelled order, regardless of why. Excluding timeouts would understate the customer's perceived cancellation experience. The companion drilldown (cancellation cause breakdown) lets you separate genuine cancels from timeouts when you need to.
+
+**My multi-store Adobe Commerce, B2B has 0% cancellation, normal?**
+Yes. B2B accounts almost never cancel: orders are budgeted, approved, and contractually committed. The rare exceptions are credit-check failures or AP rejection, which are typically &lt;1%. If your B2B portal is showing >2% cancellation rate, investigate: usually it's gateway issues on B2B-specific payment routes (some B2B portals route to a separate payment service or use net-30 invoice issuance).
+
+**Why is my cancellation rate higher than industry benchmarks of 0.5%?**
+Adobe Commerce stores often run higher because (a) `pending_payment` timeouts are included (Shopify, BigCommerce handle gateway-failed orders differently in their data models), (b) ops-initiated cancels for OOS-at-picking are routine on multi-source MSI installations, (c) B2B installations may show 0% but blended consumer-only stores see 1-3%. Use Adobe-Commerce-matched peer benchmarks, not generic ecommerce.
+
+**A flash sale ran and cancellation rate spiked, why?**
+Flash sales drive impulse orders, some of which are reconsidered and cancelled before shipment. A 1-2 pt spike during a sale is normal; >5 pt spike suggests the sale terms were unclear (customers didn't realise the discount didn't apply, regretted, cancelled).
+
+**A fraud-detection rule auto-cancels suspicious orders, are those counted?**
+Yes. Any cancel-state order is counted, regardless of cause. If your fraud rules cancel 3% of orders, that 3% will appear here. Configure the manifest to filter on order comment or fraud-flag if you want to exclude rule-based cancels from the customer-facing rate.
+
+**Why does the rate look different between Adobe Admin and this card?**
+Most common cause: Admin's filter is by `status`, this card uses `state`. If you have custom statuses (e.g. you renamed "canceled" to "Cancelled - Customer Request"), the Admin filter shows that status; this card sees the underlying `state`. Both are correct; they answer slightly different questions.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Cancellation Rate* is one of hundreds of KPI pulses Vortex IQ tracks across Adobe Commerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

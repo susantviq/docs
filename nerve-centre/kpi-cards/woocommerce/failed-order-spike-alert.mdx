@@ -1,0 +1,139 @@
+---
+title: "Failed-Order Spike Alert, WooCommerce"
+sidebarTitle: "Failed-Order Spike Alert"
+description: "Sudden burst of status=failed orders, gateway outage, fraud-rule misfire, or 3DS breakage. Check the payment gateway plugin first. How to read it, why it ..."
+---
+
+**Card class:** Hero  •  **Category:** Ecommerce Platform
+
+> Sudden burst of status=failed orders, gateway outage, fraud-rule misfire, or 3DS breakage. Check the payment gateway plugin first.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Real-time alert that fires when failed-order rate spikes. Vortex IQ's first canary for gateway outage, fraud-rule misfire, or 3DS breakage on a Woo store.
+
+| | |
+| --- | --- |
+| **What it counts** | Rolling-1h `COUNT(orders WHERE status = 'failed') / COUNT(orders WHERE status IN ('completed', 'processing', 'failed', 'cancelled'))` x 100. Fires when this rate >5% AND >2σ above the 7D baseline. |
+| **REST API endpoint** | Polled from `/wp-json/wc/v3/orders` every 10 minutes; alert engine evaluates rolling 1-hour windows. |
+| **VAT / tax / shipping / discounts** | Not applicable, count-based alert. |
+| **Status filter** | Numerator: `failed` only. Denominator: payment-attempt orders (`completed + processing + failed + cancelled`). Excludes `pending` (no attempt) and `on-hold` (offline payment). |
+| **Refunds / cancelled / failed orders** | Cancelled is in the denominator; failed is the numerator. |
+| **Currency** | Currency-agnostic. |
+| **Channels / sources** | All web checkout. POS plugin orders rarely fail. |
+| **Self-hosted vs managed-Woo** | Self-hosted on flaky hosting can trip the alert during host slowdowns (checkout timeouts produce `failed` rows). Managed-Woo rarely false-positives this way. |
+| **Time window** | `RT` (rolling-1h evaluation, polled every 10 min) |
+| **Alert trigger** | rolling-1h failed-order rate >5% AND >2σ vs 7D baseline |
+| **Roles** | owner, operations, finance |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your WooCommerce data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US homewares brand on managed-Woo, normal failure rate ~0.6%. Tuesday 9 Apr 26, 14:20 UTC.
+
+| Hour bucket | `failed` count | `completed + processing` | Rate | Alert? |
+| --- | --- | --- | --- | --- |
+| 13:00-13:59 (baseline) | 1 | 142 | 0.7% | No |
+| 14:00-14:59 (event) | 38 | 92 | 29.3% | YES |
+
+The card fires at 14:20 with payload "WC failed-order rate 29.3% rolling-1h, 41x baseline". Three observations:
+
+1. **The cause was a Stripe Radar tuning regression.** A new fraud rule pushed by Stripe at 14:08 UTC blocked legitimate UK debit cards with a high false-positive rate. The merchant rolled back the rule by 14:55 UTC; rate returned to baseline within 90 minutes.
+2. **Self-hosted Woo would have looked similar but with a different cause.** On flaky shared hosting, a 5-minute server slowdown can produce the same alert pattern. Managed-Woo (this brand) ruled that out; on self-hosted Bluehost the merchant would also need to check the host status page.
+3. **Plugin-induced data shape variance: the alert depends on the gateway plugin setting `failed`.** WC Stripe Gateway sets `failed` correctly. PayPal Standard does not, so a PayPal-only store would NOT trip this alert during a similar gateway outage, instead orders would pile up in `pending`. Use [Payment Methods](/nerve-centre/kpi-cards/woocommerce/revenue-by-payment-method) to confirm gateway mix.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this alert |
+| --- | --- |
+| [WC Failed Order Rate](/nerve-centre/kpi-cards/woocommerce/failed-order-rate) | The underlying rate. Use to see history before the alert fired. |
+| [WC Total Orders](/nerve-centre/kpi-cards/woocommerce/total-orders) | Sample size context, low-volume stores trip 5% on 1 failure. |
+| [WC Payment Methods](/nerve-centre/kpi-cards/woocommerce/revenue-by-payment-method) | Identifies which gateway is failing. |
+| [WC Conversion Rate](/nerve-centre/kpi-cards/woocommerce/conversion-rate) | Often dips before the alert fires. |
+| [Stripe Decline Rate](/nerve-centre/kpi-cards/stripe/decline-rate) | Stripe-side view of the same failures, useful for root-causing. |
+| [BC Failed Orders Count](/nerve-centre/kpi-cards/bigcommerce/bc-failed-orders-count) | Cross-platform peer. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in WooCommerce Admin:**
+
+[WP Admin → WooCommerce → Orders, filtered to status `failed`](/wp-admin/edit.php?post_type=shop_order&post_status=wc-failed). For real-time gateway diagnostics, the Stripe Dashboard (or PayPal Activity, etc.) is the source of truth.
+
+**Why our alert may fire when the merchant sees nothing wrong:**
+
+| Reason | Direction |
+| --- | --- |
+| **Time-zone**. Alert evaluated UTC; WP Admin shows WP-site timezone. The hour-bucket may not align with merchant view. | Both report the same events |
+| **Self-hosted server uptime**. A brief slowdown produces a transient spike. | Self-resolves; alert auto-clears |
+| **Plugin-version compatibility**. Gateway plugin update can briefly mis-set `failed` then correct itself. | Self-resolves |
+| **Currency plugin**. Currency switch mid-checkout can produce spurious `failed` rows. | Investigate per-merchant |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship |
+| --- | --- |
+| [`stripe.stripe_decline_rate`](/nerve-centre/kpi-cards/stripe/decline-rate) | Stripe rate confirms whether the issue is gateway-side or Woo-side. If Stripe is calm and Woo is spiking, the issue is the WC Stripe Gateway plugin or the host. |
+
+---
+
+<details>
+<summary><em>Same-metric documentation cross-reference</em></summary>
+
+- [`bigcommerce.bc_failed_orders_count`](/nerve-centre/kpi-cards/bigcommerce/bc-failed-orders-count)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Self-hosted vs managed-Woo, which is more prone to false alerts?**
+Self-hosted Woo on shared hosting can produce transient spikes during traffic surges or noisy-neighbour events. The 2σ baseline filter catches most noise, but it is worth knowing your host pattern.
+
+**Status-filter selection, why this set?**
+The denominator is "real attempts that called the gateway", which excludes `pending` (cart skeleton) and `on-hold` (offline payment). A failed-rate alert on the wrong denominator either over-fires or under-fires.
+
+**Refund-object accounting, does it affect this alert?**
+No, refunds are post-payment.
+
+**Plugin-induced data shape variance, what plugins affect alert sensitivity?**
+- WC Stripe Gateway: sets `failed` reliably, alert is well-calibrated.
+- PayPal Standard: rarely sets `failed`, the alert may not fire during a PayPal outage. Use [Total Orders](/nerve-centre/kpi-cards/woocommerce/total-orders) drop alerts instead.
+- Custom gateway plugins: behaviour varies; verify with a test transaction.
+
+**Multi-currency, how does it affect alert sensitivity?**
+EU customers face heavier 3DS friction and so trip 5% rates more easily. Per-currency alerts are on the roadmap.
+
+**Why does Woo and Stripe disagree during an alert?**
+If Stripe shows no decline spike but Woo shows a `failed` spike, the issue is between the gateway and Woo, host slowness, plugin regression, or webhook misfire.
+
+**Today is jumpy, why?**
+Rolling-1h evaluation smooths most noise, but a 30-minute traffic surge can trip the alert for one window then auto-clear.
+
+**Sync-lag from self-hosted server slowness, can it cause false alerts?**
+Yes, if the indexer skipped a window then catches up. The alert engine de-duplicates same-cause alerts within 30 min to mitigate.
+
+**My WP Admin shows fewer failures than the alert, debug:**
+1. Confirm timezone alignment (UTC vs WP-site).
+2. Check whether the gateway plugin is correctly setting `failed`.
+3. Cross-check the gateway provider's dashboard.
+4. If gap persists, contact support.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Failed-Order Spike Alert* is one of hundreds of KPI pulses Vortex IQ tracks across WooCommerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,128 @@
+---
+title: "Commerce Orders Without Business Central Sales Order, Microsoft Dynamics 365"
+sidebarTitle: "Commerce Orders Without Business Central Sales Order"
+description: "Commerce orders that never created a Business Central Sales Order. Each row is a revenue-leak investigation. How to read it, why it matters, and how to act..."
+---
+
+**Card class:** Cross-Channel  •  **Category:** Ecommerce Platform
+
+> Commerce orders that never created a Business Central Sales Order. Each row is a revenue-leak investigation.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Commerce orders that exist on the commerce platform but have no matching BC Sales Order or Posted Sales Invoice. Each row is a revenue leak: the customer paid (or committed to pay) but BC has no record. Until mapped, it never hits the GL.
+
+| | |
+| --- | --- |
+| **What it counts** | Commerce orders in the trailing 30 days where no BC Sales Header has the matching `External Document No.`. Excludes cancelled commerce orders and Sales Quotes. |
+| **Reason flags per row** | `Unmapped Customer` (commerce customer has no BC Customer record), `Connector Error` (AL Extension logged a sync failure), `Mapping Conflict` (commerce order mapped to wrong Company), `Awaiting Sync` (within last 15 minutes, may resolve), `Field Validation` (commerce order missing required field for BC posting). |
+| **VAT / tax treatment** | Net of tax for value reporting. |
+| **Currency** | Each row in commerce-platform currency + Reporting Currency equivalent. |
+| **Multi-Company** | Each row carries the *expected* BC Company Name based on the field map. If the mapping is ambiguous, flagged as `Mapping Conflict`. |
+| **Time window** | `RT` (real-time, 30D rolling commerce-side query) |
+| **Alert trigger** | `>0 unmapped orders` (any unmapped order > 24 hours old fires the alert) |
+| **Sentiment key** | `unmapped_orders` |
+| **Roles** | owner, finance, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Microsoft Dynamics 365 data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US wholesale distributor on BC + BigCommerce B2B + Adobe Commerce. 30-day window 14 Mar 26 to 12 Apr 26.
+
+| Commerce Order ID | Platform | Customer Name | Order Value | Reason | Age | Suggested Action |
+| --- | --- | --- | --- | --- | --- | --- |
+| ADC-PO-44821 | Adobe Commerce | Wholesale-X | $18,400 | Unmapped Customer | 21 days | Create BC Customer record, retry sync |
+| BC-PO-2284502 | BigCommerce | Newcorp Trading | $14,200 | Unmapped Customer | 14 days | Create BC Customer record |
+| ADC-PO-44903 | Adobe Commerce | Wholesale-X | $9,800 | Unmapped Customer | 9 days | (same customer as #44821, will resolve together) |
+| BC-PO-2285021 | BigCommerce | Acme Tech | $8,400 | Connector Error: VAT Posting Group missing | 5 days | Update Customer VAT Posting Group |
+| SH-#10044128 | Shopify | DTC retail customer | $284 | Unmapped Customer | 2 days | Auto-create BC Customer (DTC default flow) |
+| ADC-PO-44712 | Adobe Commerce | Distrib-Z | $7,600 | Mapping Conflict (matches Company UK + US) | 18 days | Resolve Company assignment |
+| **Top 6 total** | | | **$58,684** | | | |
+
+Five things to notice:
+
+1. **Wholesale-X has $28K stuck across two orders.** Same root cause: customer record never created in BC. The BC Functional Consultant creates the Customer once and both orders re-sync automatically. Vortex IQ groups same-customer rows in the export.
+2. **Wholesale-X is 21 days old.** That is 3 weeks of revenue invisible to the GL. The customer has likely received the goods (BigCommerce shipment confirmed) and may even be late-paying without anyone noticing because there is no Customer Ledger Entry to age.
+3. **Connector Error on Acme Tech is a VAT Posting Group misconfiguration.** Customer was migrated from another ERP without the VAT Posting Group field. The AL Extension fails the SO creation. Fix: complete the Customer Card.
+4. **Mapping Conflict on Distrib-Z is a multi-Company issue.** Customer exists in both UK and US BC Companies; the AL connector cannot determine which to use. Fix: workspace setting to either default to a Company or explicit per-customer mapping.
+5. **The DTC Shopify case ($284) is auto-resolvable.** BC's standard DTC sync flow auto-creates a Customer record from the commerce order; this row exists because the order is &lt; 24 hours old and the next AL connector run will pick it up. Vortex IQ does not alert at &lt; 24hr age to suppress this noise.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Commerce Orders Without BC SO |
+| --- | --- |
+| [Revenue Gap vs Commerce](/nerve-centre/kpi-cards/microsoft-dynamics/revenue-gap-vs-commerce) | This card's rows feed into the headline gap. |
+| [Revenue Gap, Detailed Breakdown](/nerve-centre/kpi-cards/microsoft-dynamics/revenue-gap-detailed-breakdown) | The full breakdown including this card's rows. |
+| [Inventory Sync Drift](/nerve-centre/kpi-cards/microsoft-dynamics/inventory-sync-drift) | Same root cause: AL connector mapping issues. |
+| [Open Sales Orders](/nerve-centre/kpi-cards/microsoft-dynamics/msd-open-sales-orders) | The successfully-synced complement. |
+| [Active Customers](/nerve-centre/kpi-cards/microsoft-dynamics/msd-active-customers) | When a commerce customer needs a BC Customer record, this card shows the gap. |
+| [Revenue Gap Spike Alert](/nerve-centre/kpi-cards/microsoft-dynamics/revenue-gap-spike) | Fires when this card grows. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Business Central:**
+
+> **AL Extension Connector Logs** (varies by connector vendor: Insight Works, Sana Commerce, dynamicweb, etc.)
+> **Sales > Sales Orders** filtered to External Document No. IS BLANK (no commerce ID, possibly manually created)
+> **Customer List** filtered to last sync errors
+
+There is no native BC tile that surfaces "commerce orders we could not map". The card automates the comparison.
+
+**Why our list may legitimately differ from a manual export:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sync timing** | Card more inclusive | Card includes orders &lt; 24hrs old; the connector log only includes orders that have failed retry. |
+| **Multi-platform aggregation** | Card more comprehensive | The connector log per-AL-Extension shows one platform; this card shows all. |
+| **Field map mapping** | Either | Card uses workspace mapping; manual exports use BC's default field. |
+
+**Cross-connector reconciliation:**
+
+This card IS the cross-connector reconciliation for the Unmapped subset of the [Revenue Gap](/nerve-centre/kpi-cards/microsoft-dynamics/revenue-gap-vs-commerce) headline. Other connectors do not see this dimension because they do not query the BC side.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**A new commerce customer placed their first order. Will it always be unmapped?**
+For B2B: yes briefly, until a BC Customer record is created. Most B2B AL connectors require manual customer onboarding (KYC, VAT validation, credit limit). The order sits unmapped until the customer is created. For DTC: most connectors auto-create a BC Customer record with default settings.
+
+**Can Vortex IQ auto-create the BC Customer for me?**
+Not yet. The AI OS Action Engine roadmap includes safe auto-mapping for low-risk DTC cases. B2B always requires human review.
+
+**Why is the same customer's order unmapped multiple times?**
+Because the customer record is missing. Once created, all that customer's orders sync; until then, every new order from them adds another row.
+
+**Multi-Company: which Company should the order go to?**
+The field map can specify. Default rules: by ship-to country (UK shipments to UK Company, US to US Company), by commerce platform tag (Shopify Plus → DTC Company), or by customer-specific override.
+
+**Connector Error rows: what is the most common cause?**
+VAT Posting Group missing on the Customer (especially on EU customers migrated without full setup). Customer Posting Group missing. Currency Code mismatch. Item No. on the order line not in BC's Item table.
+
+**How long should an order stay in this card?**
+&lt; 24 hours: normal sync delay. 1-3 days: BC Functional Consultant queue. > 3 days: escalate. > 7 days: revenue at material risk; alert fires daily.
+
+**Mapping Conflict resolution: what does Vortex IQ recommend?**
+Workspace setting + BC Functional Consultant action. Vortex IQ flags but does not write back to BC.
+
+**Does this card show CSV export?**
+Yes, sorted by age descending. The export is the BC Functional Consultant's daily worklist.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Commerce Orders Without Business Central Sales Order* is one of hundreds of KPI pulses Vortex IQ tracks across Microsoft Dynamics 365 and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

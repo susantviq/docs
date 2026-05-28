@@ -1,0 +1,162 @@
+---
+title: "Payment Methods, Adobe Commerce"
+sidebarTitle: "Payment Methods"
+description: "Payment Methods for Adobe Commerce stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Ecommerce Platform
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Distribution of orders by payment method (`payment.method` code in Adobe Commerce). Adobe and Magento support a sprawling catalogue of payment methods: card-via-Stripe, Braintree, Authorize.Net, PayPal Express, PayPal Checkout, Apple Pay, Google Pay, bank transfer, cash on delivery, purchase order (PO), Amazon Pay, Klarna, AfterPay, plus per-merchant custom methods. The card surfaces the mix by count and by `grand_total`, helping the merchant spot routing failures and gateway dependencies.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(orders) GROUP BY payment.method` and `SUM(grand_total) GROUP BY payment.method` over the 30-day window. The `method` field is a Magento internal code (`stripe_payments`, `braintree`, `paypal_express`, `checkmo`, `purchaseorder`, etc.); the card maps to a friendly display label via the merchant's payment-method config. |
+| **API field** | `payment.method` and `payment.additional_information` from the orders index. Adobe Commerce REST: `GET /rest/V1/orders` returns nested `payment` object. |
+| **Why this matters** | Payment-method mix changes are leading indicators of friction. A sudden drop in PayPal share usually means PayPal SDK script is blocked on the storefront (often after a CSP change). A sudden rise in `checkmo` (check) suggests card capture is failing and customers are switching to manual. |
+| **VAT / tax treatment** | n/a for the count slice. Tax-inclusive `grand_total` for the value slice (matches [Total Revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue)). |
+| **Shipping inclusion** | Included in `grand_total` per method. |
+| **Discounts** | Deducted from `grand_total` per method. |
+| **Cancelled orders** | Included by default. A cancelled order's payment method still counts (it shows what the customer attempted). Toggle to exclude `canceled` for "captured-only" view. |
+| **Refunds** | Not subtracted, this is order creation by method, not net contribution. |
+| **`pending_payment` quirk** | Adobe Commerce sets `payment.method` at order creation, regardless of whether the gateway captured. A `pending_payment` order with `method=stripe_payments` shows under Stripe in the count, even if Stripe never captured. To see "actually-captured" mix, exclude `pending_payment` and `payment_review` states. |
+| **Multi-currency** | The value slice mixes currencies in `grand_total`. Use `base_grand_total` for FX-neutral. |
+| **Multi-store scope** | All Store Views by default. Per-Store-View slicing via legend. Different Store Views often have very different payment-method mixes (US allows ACH bank transfer; UK does not). |
+| **Time window** | `30D` rolling. |
+| **Alert trigger** | None on this card directly. Alert on a single method's % share dropping >50% week-on-week (suggests outage). |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Adobe Commerce data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A B2B+DTC apparel merchant on Adobe Commerce 2.4.7. UK + US Store Views. Snapshot 13 May 26, 30-day rolling. 4,820 orders, $950,000 grand total.
+
+**Payment method distribution:**
+
+| Method (Magento code) | Display label | Order count | % count | `grand_total` | % value | Avg AOV |
+| --- | --- | --- | --- | --- | --- | --- |
+| `stripe_payments` | Card (Stripe) | 2,890 | 60.0% | $462,000 | 48.6% | $160 |
+| `braintree_paypal` | PayPal | 720 | 14.9% | $128,000 | 13.5% | $178 |
+| `purchaseorder` | Net-30 PO (B2B) | 308 | 6.4% | $182,000 | 19.2% | $591 |
+| `applepay` | Apple Pay | 480 | 10.0% | $74,200 | 7.8% | $155 |
+| `klarna_kp` | Klarna | 180 | 3.7% | $38,400 | 4.0% | $213 |
+| `amazon_payment` | Amazon Pay | 132 | 2.7% | $32,800 | 3.5% | $248 |
+| `banktransfer` | Bank transfer | 78 | 1.6% | $26,400 | 2.8% | $338 |
+| `checkmo` | Check by mail | 22 | 0.5% | $4,200 | 0.4% | $191 |
+| Other / custom | various | 10 | 0.2% | $2,000 | 0.2% | $200 |
+| **Total** | | **4,820** | **100%** | **$950,000** | **100%** | $197 |
+
+**Insight pattern:**
+
+1. **Stripe is 60% of orders but only 48.6% of value.** Stripe-paid customers have a lower AOV ($160) than the average ($197) because Stripe is dominant for the lower-AOV DTC traffic. Higher-AOV B2B customers route through `purchaseorder` (PO).
+2. **PO is 6.4% of orders and 19.2% of value.** Critical revenue contribution; one PO failure equals 30+ Stripe orders. Track [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) for `pending_payment` orders specifically on the PO method, those represent net-30 invoices in flight.
+3. **PayPal at 14.9% count, 13.5% value.** Roughly mirroring; PayPal is broad-AOV. A drop here is often a SDK/script-block issue on the storefront. Cross-link with [`paypal.pp_total_volume`](/nerve-centre/paypal/pp_total_volume) to confirm Adobe and PayPal agree on the count.
+4. **Apple Pay at 10%.** Significant; mostly DTC mobile-checkout. If iOS Safari traffic drops, Apple Pay drops with it. Check the storefront's domain-association file (`/.well-known/apple-developer-merchantid-domain-association`); if expired, Apple Pay silently disappears from the checkout sheet.
+5. **`checkmo` (check by mail) at 0.5%.** Tiny but worth watching, a sudden rise from 0.5% to 5% is the gateway-failure signature: card capture broke, customers fell back to "check by mail". This is the most reliable canary for a card-payment outage.
+6. **Cross-link with [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown):** if `pending_payment` is high specifically on `stripe_payments` orders, the Stripe-callback path is broken. Look at PayPal share, if PayPal share is rising while Stripe share is stable but `pending_payment` is rising, the Stripe success-callback is the issue (orders created, payment captured at Stripe, but Adobe never received the success webhook).
+7. **Action queue:** (a) verify Apple Pay domain certificate not expiring, (b) audit PO `pending_payment` queue for stuck invoices, (c) set up alerts for `checkmo` share crossing 1.5%.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Payment Methods |
+| --- | --- |
+| [Gateway Revenue](/nerve-centre/kpi-cards/adobe-commerce/revenue-by-payment-gateway) | Same data, slightly different lens (gateway-grouped). |
+| [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) | `pending_payment` per method reveals callback failures. |
+| [Total Revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | The denominator for value share. |
+| [Total Orders](/nerve-centre/kpi-cards/adobe-commerce/total-orders) | The denominator for count share. |
+| [Revenue Drop Alert](/nerve-centre/kpi-cards/adobe-commerce/revenue-drop-alert) | Method-specific drops are the early signal of a gateway outage. |
+| [`stripe.stripe_charge_count`](/nerve-centre/stripe/stripe_charge_count) | Stripe-side count; should approximately match `stripe_payments` here. |
+| [`paypal.pp_transaction_count`](/nerve-centre/paypal/pp_transaction_count) | PayPal-side; should match `braintree_paypal` and any other PayPal methods. |
+| [`stripe.stripe_apple_pay_count`](/nerve-centre/stripe/stripe_apple_pay_count) | If using Stripe-routed Apple Pay, this card's `applepay` method should match Stripe's tagged Apple Pay charges. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Adobe Commerce Admin:**
+
+> **Sales > Orders** with the **Payment Method** column displayed. Group manually by method to count. Adobe does not have a "payment method distribution" report natively in 2.4.x.
+
+For per-method gateway settings:
+
+> **Stores > Configuration > Sales > Payment Methods** lists every configured method with its enabled state. A method that's "enabled" in config but missing from this card has zero recent transactions (it's either offline or customers aren't selecting it).
+
+**Why our number may legitimately differ from a manual Admin computation:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Multi-Store-View visibility**. A method enabled on US Store View only won't appear in UK orders. The grand total here aggregates everything; per-Store-View slice exposes the difference. | None on aggregate |
+| **Method-code vs display-label**. The card shows display labels (configured per method); Admin shows method codes. The merchant might think `braintree_paypal` and `paypal_express` are the same method when they're separate codes; the card breaks them out. | Admin-grouping might collapse what we keep separate |
+| **`pending_payment` and `canceled` inclusion**. Defaults to include. A merchant manually counting from "Sales > Orders" filtered to status=Complete will see a smaller count. Match the filters for like-for-like. | Card higher than captured-only Admin filter |
+| **Custom payment methods**. A merchant with a custom-coded method needs an entry in the config-mapping for the friendly label. Until that's added, the card shows the raw code. | Cosmetic, no count impact |
+| **Time-zone, sync lag**. Standard. | Minor |
+
+**Cross-connector reconciliation (when these connectors are connected for this merchant):**
+
+| Card | Expected relationship | What divergence tells you |
+| --- | --- | --- |
+| [`stripe.stripe_charge_count`](/nerve-centre/stripe/stripe_charge_count) | Should match `stripe_payments` count here | If Stripe is materially higher, the merchant has direct-to-Stripe orders not flowing through Adobe (rare). If Adobe is higher, some `stripe_payments` orders are in `pending_payment` that never hit Stripe. |
+| [`paypal.pp_transaction_count`](/nerve-centre/paypal/pp_transaction_count) | Should match all PayPal-related methods (`braintree_paypal` + `paypal_express` + others) | Standard, gateway and Adobe should agree. |
+| [`amazon.amazon_pay_volume`](/nerve-centre/amazon/amazon_pay_volume) | Should match `amazon_payment` | Amazon Pay has its own callback path; failures here flag the integration. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+- [`shopify.payment_methods`](/nerve-centre/kpi-cards/shopify/payment-methods)
+- [`bigcommerce.payment_methods`](/nerve-centre/kpi-cards/bigcommerce/payment-methods)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why are PayPal Express and PayPal Checkout shown separately?**
+Because they are separate Magento method codes (`paypal_express` and `paypal_billing_agreement` and `braintree_paypal` are three different things, all routing through PayPal's API but with different checkout flows). The card keeps them separate; group them via the Vortex IQ workspace's payment-method aliases if you want a unified PayPal view.
+
+**A method is enabled in config but doesn't appear on the card, why?**
+No transactions in the period. Either the method is misconfigured (customers see it but the gateway returns errors), or customers aren't selecting it (they prefer another option). Check **Stores > Configuration > Sales > Payment Methods** for the method's "Title" and "Sort Order"; methods low on the list often get ignored.
+
+**`checkmo` (check by mail) is rising, what's happening?**
+Almost always a card-payment failure. Customers' card attempts are failing (invalid token, expired cert, gateway down) and they fall back to "pay by check". Check the gateway's status page and your Adobe Commerce error logs (`var/log/payment.log`).
+
+**My multi-store has Apple Pay on US but not UK, why?**
+Apple Pay requires per-domain certificate verification. Each Store View domain needs its own Apple Pay merchant ID and `apple-developer-merchantid-domain-association` file. UK Store View probably doesn't have the cert. **Stores > Configuration > Sales > Payment Methods > Apple Pay** is per Store View scope; configure separately.
+
+**Klarna and AfterPay show low share, are they worth keeping?**
+Buy-Now-Pay-Later (BNPL) methods convert at 1.5-2x compared to standard card for high-AOV DTC. Even at 4% share, they may be saving 20-30% of would-be-abandoned high-AOV checkouts. Cross-link with [`google_analytics.ga_checkout_funnel`](/nerve-centre/google_analytics/ga_checkout_funnel) to measure the BNPL incremental conversion.
+
+**Why does the card include `canceled` orders?**
+Because cancellation reflects what the customer attempted. A method showing high cancellation share (e.g. `bank_transfer` at 30% canceled) is a friction signal, customers start the bank transfer then give up. Toggle to exclude `canceled` for "captured-only" view.
+
+**A custom payment method shows as a raw code, can I rename it?**
+Yes via the Vortex IQ workspace's payment-method label config. Map the raw Magento code to a friendly label; the card respects it on next refresh.
+
+**`purchaseorder` (PO) orders sit in `pending_payment` for days, normal?**
+Yes for B2B. PO orders intentionally wait for AP department approval and net-30 invoice payment. Adobe's `pending_payment` state is the right place for them. Operations should monitor the residence time; over 35 days suggests a payment-collection issue (cross-link with [`stripe.stripe_invoice_aging`](/nerve-centre/stripe/stripe_invoice_aging) or your AR system).
+
+**Why doesn't `paypal.pp_transaction_count` exactly match my PayPal share here?**
+Three causes: (1) PayPal Adaptive Payments and PayPal Standard are separate paths; (2) some Adobe-side `paypal_express` orders never reach PayPal (customer abandoned mid-flow); (3) PayPal-side may include subscription billing not visible to Adobe. Aggregate over 30 days and they should match within 2-5%.
+
+**Can I see method share over time?**
+Yes via the time-series view of this card (toggle to "trend" mode). Useful for catching gradual mix shifts (e.g., Apple Pay rising over 6 months, PayPal slowly declining).
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Payment Methods* is one of hundreds of KPI pulses Vortex IQ tracks across Adobe Commerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

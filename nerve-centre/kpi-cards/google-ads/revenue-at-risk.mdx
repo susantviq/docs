@@ -1,0 +1,185 @@
+---
+title: "Revenue at Risk (active incidents), Google Ads"
+sidebarTitle: "Revenue at Risk (active incidents)"
+description: "Live $/min loss from an incident, every dollar of paused spend recovers ROAS during the outage window. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Cross-Channel  •  **Category:** Ad Platform
+
+> Live $/min loss from an incident, every dollar of paused spend recovers ROAS during the outage window.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Cross-channel real-time card: when a site incident is OPEN (checkout down, payment processor outage, search broken, key landing page 5xx), this card tracks the live £/minute of Google Ads spend that's continuing to flow into a site that cannot convert. Every minute the ads run during the outage is fully wasted spend AND wasted brand impressions ("they showed me an ad and I couldn't buy"). Pausing campaigns during incidents is the single highest-ROI action available; this card surfaces the exact £/minute saved by doing so.
+
+| | |
+| --- | --- |
+| **The formula** | While an incident is OPEN at the commerce platform (signal: checkout error rate > 5%, payment success rate &lt; 80%, or critical-page 5xx > 10/min), this card computes Google Ads `cost_micros / 1,000,000` per minute extrapolated from the trailing-10-min spend rate. Cumulative loss is per-minute spend × incident duration. |
+| **GAQL resource + metric** | `FROM customer` for live spend rate (uses `metrics.cost_micros` aggregated to a 10-min trailing rate via `segments.date` + an internal time bucket). Cross-joined to commerce-platform incident state from Shopify Order API health, BigCommerce checkout monitoring, or Adobe Commerce checkout heartbeat. |
+| **Account currency (single by design)** | Account currency from `customer.currency_code`. The card is currency-aware; £/min displayed in account currency. |
+| **Conversion attribution model (configurable)** | Not relevant during the incident (no conversions happening); attribution model affects the recovery window after the incident closes. |
+| **View-through inclusion (excluded by default)** | Not relevant. The card focuses on spend during a no-conversion window. |
+| **Bot / IVT filter** | Google's Invalid Click Filter applies to spend (filters bots before reporting). However, during an incident, Google's bidding may also detect the lower CR and reduce spend automatically; this card captures whatever Google is still spending in the window. |
+| **Micros conversion** | `cost_micros / 1,000,000` to derive £/min and £ cumulative. |
+| **Real-time vs ingestion lag** | This card is hyper-real-time. Commerce-platform incident detection runs every 60 seconds; Google Ads spend is updated as fast as the API allows (typically every 1-5 minutes). The card prioritises latency over precision; expect ±15% on the £/min figure but tight on the directional alert. |
+| **MCC aggregation** | Per child account; if multiple Google Ads accounts target the same commerce-platform store, the engine sums spend across the affected accounts during the incident. |
+| **Time window** | `RT` (real-time, only populated while an incident is OPEN). |
+| **Alert trigger** | `> $0` of spend during an open incident triggers the card. The card is visually escalating: at £100 cumulative loss it's amber; at £500 it's red; at £1,000+ the recommendation switches from "consider pausing" to "pause now". |
+| **Roles** | owner, finance, operations, engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Google Ads data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK fashion brand. Tuesday 14 Apr 26, 14:30 local. Their payment processor (Stripe) opens an incident affecting card payments to the EU. Checkout error rate spikes to 38%. The card opens its incident overlay.
+
+| Time elapsed | Status | Live £/min | Cumulative loss | Recommendation |
+| --- | --- | --- | --- | --- |
+| 14:30 (T+0) | Incident detected | £0.95/min | £0 | Monitoring |
+| 14:35 (T+5min) | OPEN | £0.92/min | £4.65 | Monitoring |
+| 14:45 (T+15min) | OPEN | £0.94/min | £14.05 | **Consider pause** |
+| 15:00 (T+30min) | OPEN | £0.96/min | £28.80 | **Pause campaigns** |
+| 15:30 (T+60min) | OPEN | £0.98/min | £58.50 | **Pause campaigns NOW** (red) |
+| 17:00 (T+150min) | OPEN | £0.94/min | £146.20 | Cumulative loss accelerating |
+| 17:23 (T+173min) | RESOLVED | - | £162.80 | Re-enable in 30 min |
+
+What this scenario tells the analyst (the playbook):
+
+1. **The alert opens within 60 seconds of incident detection.** Faster than any human can notice from the order dashboard ("Where are today's orders?"). The £/min shown lets the on-call team make a quick economic decision: do we pause spend now or ride it out?
+2. **The first 15 minutes are usually "wait and see"**. Most checkout incidents resolve in 5-15 minutes (transient payment-processor blips, CDN cache flush, briefly-deployed code that auto-rolled-back). Pausing campaigns has a recovery cost (Smart Bidding may take hours to relearn after re-enable), so for short incidents, pausing is net negative.
+3. **Past 30 minutes, pause becomes net positive.** At ~£1/min spend, 30 minutes is £30 wasted. Smart Bidding recovery cost from a 30-min pause is typically 5-10% efficiency loss for 12-24 hours, perhaps £40-80. Still close to break-even. At 60+ minutes, the cumulative loss exceeds Smart Bidding recovery cost; pause clearly wins.
+4. **At T+173min (resolved), the brand has lost £162.80 of spend during the outage.** Had they paused at T+30, they'd have saved £130 of spend (capping loss at ~£32) and lost perhaps £80 of post-resume Smart Bidding efficiency. Net win: £50. A small win per incident, but compounded across the 4-8 incidents/year a typical brand suffers, this is £400-£1,600/year of recoverable spend.
+5. **The incident also prevented £900+ of revenue** (the brand was averaging £15/min revenue before the incident; 173 min of zero conversions = ~£2,600 estimated revenue lost). This card focuses on the £162 of recoverable spend, not the £2,600 of unrecoverable revenue. Engineering's job is to prevent the £2,600 by reducing incident frequency; marketing's job is to recover the £162 by pausing.
+
+Quick reaction protocol (recommended on-call playbook):
+
+- T+0 to T+15min: monitor. Most incidents resolve in this window.
+- T+15min: if still OPEN, alert the marketing on-call.
+- T+30min: pause Search and PMax campaigns if still OPEN. Keep brand-defense (Branded Search) running, those clicks have low cost and high conversion intent post-recovery.
+- T+resolution: wait 15-30 minutes after resolution before re-enabling, allow checkout to fully stabilise.
+- Post-incident: document the cumulative loss; use the figure to make the engineering case for reliability investment.
+
+Quick sanity tests:
+
+- Card sits at £0/min: no incident OPEN, healthy.
+- Card opens but resolves within 5min: routine; no action needed.
+- Card frequently passes £100 cumulative: reliability problem; engineering needs the £/incident figure to prioritise.
+- Card never opens: either no incidents (good) or no integration (set up commerce-platform health monitoring).
+- Multi-store: one incident affects one store; check which store the incident is on before pausing the wrong account.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Revenue at Risk |
+| --- | --- |
+| [Google Ads Spend Anomaly](/nerve-centre/kpi-cards/google-ads/spend-anomaly) | Watching spend rate during an incident. If Smart Bidding hasn't auto-cut spend during a no-conversion window, you may need to pause manually. |
+| [Google Ads Conversion Drop](/nerve-centre/kpi-cards/google-ads/conversion-drop-alert) | The downstream effect; conversions go to zero during checkout incidents. Both cards fire together. |
+| [Google Ads Alert: Conversion Tracking Broken](/nerve-centre/kpi-cards/google-ads/conversion-tracking-broken-alert) | Disambiguator. If the conversion-tracking-broken alert fires WITHOUT a commerce-platform incident, it's a tag break, not a real outage. Different action. |
+| [Shopify Order Volume](/nerve-centre/shopify/order_volume) | The truth side. Shopify order volume crashing to zero confirms the incident is real and affecting customer purchases. |
+| [BigCommerce Checkout Errors](/nerve-centre/bigcommerce/checkout_errors) | The numerator-side detection: surfacing checkout 5xx that triggers this card. |
+| [Adobe Commerce Performance Monitor](/nerve-centre/adobe_commerce/performance) | Same role for Adobe Commerce stores. |
+| [Datadog Active Incidents](/nerve-centre/datadog/active_incidents) | Engineering-side incident tracking. Cross-reference for root cause. |
+| [Google Ads Total Spend](/nerve-centre/kpi-cards/google-ads/total-spend) | Context for the cumulative loss. £162 lost in a £27,000 monthly spend is small; in a £3,000 monthly spend it's 5%, more material. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Google Ads UI:**
+
+[Google Ads > Overview](https://ads.google.com/aw/overview) shows live(-ish) spend, but with 1-5 minute lag and no incident overlay. This card is the only place where Google Ads spend is overlaid with commerce-platform incident state in real time.
+
+[Google Ads > Tools > Conversions > Status](https://ads.google.com/aw/conversions) shows pixel-fire status; during a checkout incident, you'll see conversions stop firing here within 10-30 minutes (slower than this card detects).
+
+[Commerce platform admin > Orders](https://admin.shopify.com) for Shopify, [BigCommerce > Orders](https://login.bigcommerce.com), or [Adobe > Sales > Orders](https://admin.adobe.com) is the truth side: order volume going to zero confirms the incident impact.
+
+Other Google Ads / commerce views that *look* like this number but aren't:
+
+- **Google Ads > Recommendations**: Google may eventually recommend pausing low-CR campaigns, but typically 24-48 hours after the incident, far too slow.
+- **Smart Bidding "Limited" status**: Smart Bidding does eventually detect an incident and cut spend, but with 30-60 minute lag. This card is faster.
+- **Commerce-platform "Status" pages**: useful for confirming the incident is platform-wide; but no per-store impact figure.
+- **Datadog / New Relic dashboards**: engineering-side; show error rates and latency but not £/min of paid-traffic loss.
+
+**Why our number may differ from Google Ads UI (rare):**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| Real-time event-ingestion lag (1-5 min for Google Ads spend rate). | The £/min figure is ±15% from true; the directional alert is reliable. |
+| Smart Bidding self-throttle. Google may auto-cut spend within the incident window. | Card may show declining £/min as Smart Bidding catches up; this is correct behaviour, not a card error. |
+| Commerce-platform incident detection threshold. The card opens at checkout error rate > 5%; brief blips below this don't trigger. | Some merchant-perceived "incidents" may not register here if they were transient. |
+| Currency. Both use account currency. | None. |
+
+**Why the BUSINESS metric often differs (the IMPORTANT one):**
+
+The £/min loss this card displays is the spend-side recovery only. The full business impact is much larger:
+
+- **Lost revenue during the incident**: at typical 4-5x ROAS, £1/min of spend would have produced £4-5/min of revenue. The full opportunity cost during a 60-minute outage is £240-£300, not the £60 of spend the card highlights.
+- **Brand damage from "showed me an ad, couldn't buy"**. Customers who arrive during an outage typically don't return; cost-per-disappointed-customer is hard to quantify but real.
+- **Smart Bidding learning damage**. Even after the incident closes, Smart Bidding has learned from a window of zero-conversion data and may take 12-24 hours to re-stabilise.
+- **Google Ads Quality Score impact**. Repeated landing-page errors affect Quality Score, raising future CPC. Marginal but compound.
+
+The card focuses on the recoverable line item (paused spend) because that's actionable in real time. The other costs require preventing the incident in the first place.
+
+Cross-connector reconciliation:
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| [`shopify.order_volume`](/nerve-centre/shopify/order_volume) | Shopify orders should drop to ~zero during the incident window. If they don't, the incident isn't customer-affecting. | Some incidents only affect specific payment methods (e.g., Stripe down but PayPal up); orders continue at reduced volume. |
+| [`bigcommerce.checkout_errors`](/nerve-centre/bigcommerce/checkout_errors) | The numerator-side detection signal. | None expected, this card consumes that signal. |
+| [`datadog.active_incidents`](/nerve-centre/datadog/active_incidents) | Engineering-side incident; useful for root cause. | A platform incident may be open in Datadog but not affecting customers (back-end service outage with frontend cache); this card opens only on customer-affecting outages. |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) | After the incident, today's revenue total will be down by the lost-window's typical revenue contribution. | None expected; this card flags spend-side, that card flags revenue-side. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card just opened. What's my action?**
+First 15 minutes: monitor. Most checkout incidents resolve quickly. At T+30 minutes if still OPEN, pause Search and PMax campaigns; keep Branded Search running. After resolution, wait 15-30 min before re-enabling. Document the cumulative loss for engineering's incident review.
+
+**Should I always pause campaigns during an incident?**
+No. Pausing has its own cost, Smart Bidding takes 12-24 hours to re-stabilise after a pause. For incidents under 15-20 minutes, the spend savings are less than the post-resume efficiency loss. The break-even is around 30 minutes; above that, pausing is net positive.
+
+**Why isn't Branded Search recommended for pausing?**
+Branded Search has the highest conversion intent. Customers searching your brand name during an outage will (a) probably try again later when they see another reminder, or (b) immediately go to a competitor if they don't see your ad. Keeping Branded Search running during an outage maintains brand-defence at low cost.
+
+**The card opened but my Shopify orders are still flowing, why?**
+Some incidents are partial: payment processor X is down but Y still works, or international payments are blocked but domestic still works. The card opens on a checkout error rate > 5% threshold; some orders continue at reduced volume. Use [Shopify Order Volume](/nerve-centre/shopify/order_volume) to confirm the magnitude of the impact.
+
+**My commerce platform's status page says everything is operational, but this card opened, why?**
+Commerce-platform status pages report on the platform itself, not on third-party services. The most common incident pattern is a payment processor (Stripe, Klarna) outage that affects only checkout; the platform itself is fine. The card detects customer-impact (checkout error rate); the status page reports infrastructure.
+
+**Multi-store setups, does the card know which store has the incident?**
+Yes, the card joins per-store. If the merchant runs multiple stores (DE, UK, US separately), each store has its own card and its own £/min figure. Pausing decisions are per-account, per-store.
+
+**Smart Bidding throttled my spend during the incident automatically, do I still need to pause?**
+Maybe not. Smart Bidding's auto-throttle is slower than this card (typically 30-60 minute lag) but does eventually detect zero-conversion windows and reduce spend. If your £/min trajectory is dropping naturally during the incident, Smart Bidding is doing the work. If it's holding steady, manual intervention helps.
+
+**How do I configure the incident-detection threshold?**
+The default is checkout error rate > 5% AND payment success rate &lt; 80% (combined). Brands with naturally noisy checkout (high cart abandonment, A/B tests on payment) may want stricter thresholds. Tune via VortexIQ support.
+
+**Multi-currency, how does the £/min work?**
+Each Google Ads account is single-currency. The £/min figure is in the account's currency. For multi-currency MCC setups, each affected account has its own card.
+
+**The card was open for 5 minutes then closed, but I think there was a real incident. Can I see the history?**
+The history is in [Datadog Active Incidents](/nerve-centre/datadog/active_incidents) or your engineering monitoring tool. This card is real-time only; closed incidents don't persist on the card itself, but the cumulative loss figure is logged and contributes to a monthly "incident impact" metric in the executive dashboard.
+
+**My PMax campaign keeps spending during incidents and Smart Bidding doesn't catch it, why?**
+PMax has slower self-throttling than regular Search campaigns; its optimiser has more inventory to spread spend across, so it takes longer to recognise a zero-conversion window. Manual pause is more effective for PMax during incidents.
+
+**Does this card track my agency's reactions to the alert?**
+The card itself just surfaces the data. Action-tracking (who paused, when, what was the outcome) is part of the Vortex IQ Nerve Centre incident-review module, separate from this card.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Revenue at Risk (active incidents)* is one of hundreds of KPI pulses Vortex IQ tracks across Google Ads and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

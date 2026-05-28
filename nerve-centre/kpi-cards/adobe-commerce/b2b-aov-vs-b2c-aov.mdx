@@ -1,0 +1,195 @@
+---
+title: "B2B AOV vs B2C AOV, Adobe Commerce"
+sidebarTitle: "B2B AOV vs B2C AOV"
+description: "B2B AOV vs B2C AOV for Adobe Commerce stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Ecommerce Platform
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Compares the trailing 30-day Average Order Value of B2B accounts against B2C consumers, expressed both as the per-segment AOV and the delta. Adobe Commerce merchants typically see B2B AOV at 4 to 12x B2C; a contracting delta is an early warning that B2B accounts are shifting volume to other suppliers, downgrading product-mix, or splitting purchases into smaller POs to game line-of-credit limits.
+
+| | |
+| --- | --- |
+| **What it counts** | `AVG(grand_total)` partitioned by customer segment. B2B segment: orders where `extension_attributes.company_attributes.company_id IS NOT NULL` (Adobe Commerce B2B module) OR `customer_group_id` is a B2B-tagged group. B2C segment: everyone else. The card surfaces three numbers: B2B AOV, B2C AOV, and the multiplier (B2B / B2C). |
+| **API field** | `grand_total`, `customer_group_id`, and `extension_attributes.company_attributes.company_id` from `GET /rest/V1/orders`. Customer group classification from `GET /rest/V1/customerGroups`. |
+| **VAT / tax treatment** | **Tax-inclusive on consumer (B2C); typically tax-exclusive on B2B** because most B2B orders are tax-exempt at the resale-certificate level. This creates a comparison hazard: B2C `grand_total` includes 20% VAT (UK) or US sales tax, B2B does not. The card uses raw `grand_total` for both, surfacing the inclusive-vs-exclusive distinction in the FAQ. For pure mix comparison, normalise to `subtotal` (pre-tax). |
+| **Shipping inclusion** | Included on both. B2B ships freight (LTL/parcel), often at higher absolute cost; included `shipping_amount` somewhat narrows the AOV gap. |
+| **Discounts** | Already deducted. B2B accounts often have negotiated tier pricing applied as `customer_group_price` or `special_price`; `grand_total` is post-tier. |
+| **Credit Memo refund treatment** | NOT subtracted. Gross AOV. B2B refund rates are typically 1 to 3% and stable, so the un-netted view is rarely misleading. |
+| **`state` machine inclusion** | All states except `canceled`. `pending_payment` is included on both segments because B2B net-30 orders intentionally sit in pending_payment until AP processes the invoice. Excluding them would distort the B2B figure heavily. |
+| **`pending_payment` quirk** | Included for both segments (see above). For B2B specifically, an account whose orders accumulate in `pending_payment` may have a broken AP integration; check [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) filtered to B2B for stuck POs. |
+| **Multi-currency `grand_total` vs `base_grand_total`** | Uses `base_grand_total` so multi-currency stores roll up cleanly. The display alongside per-currency breakdown is also exposed for merchants who want to see USD-only and GBP-only AOV. |
+| **Store View scope (`store_id`)** | All Store Views by default. For merchants with a dedicated B2B Store View and separate consumer Store Views, the segment classification by Store View is more reliable than `customer_group_id`. Configure the manifest to use Store View routing if your B2B portal is its own Store View. |
+| **Time window** | `30D vsP` (trailing 30 days vs prior 30 days for delta computation). |
+| **Alert trigger** | `B2B AOV drop >15% vsP`. The threshold is asymmetric: B2B AOV rising is a feature, not a problem; we only alert on contraction. |
+| **Sentiment key** | `aov_trend` |
+| **Roles** | owner, finance, marketing |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+```
+AVG(grand_total)
+  WHERE date BETWEEN [period_start, period_end]
+```
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A janitorial-supply distributor on Adobe Commerce 2.4.6 with the B2B Companies module enabled. Mixed B2B (180 active Companies) and B2C (consumer side, ~3,400 active customers in last 12 months). Snapshot taken Monday 4 May 26.
+
+**30-day AOV by segment:**
+
+| Segment | Orders (last 30D) | Total `base_grand_total` | AOV | Multiplier vs B2C |
+| --- | --- | --- | --- | --- |
+| B2B (Companies) | 1,420 | $912,800 | $642.82 | 9.4x |
+| B2C (consumer) | 4,650 | $317,540 | $68.29 | 1.0x (baseline) |
+| **All segments** | 6,070 | $1,230,340 | $202.69 | n/a |
+
+**Prior 30-day AOV (comparison period):**
+
+| Segment | Orders | Total `base_grand_total` | AOV |
+| --- | --- | --- | --- |
+| B2B | 1,380 | $1,062,600 | $770.00 |
+| B2C | 4,710 | $322,100 | $68.39 |
+
+**Delta:**
+
+| Segment | Current AOV | Prior AOV | Change |
+| --- | --- | --- | --- |
+| B2B | $642.82 | $770.00 | **-16.5%** |
+| B2C | $68.29 | $68.39 | -0.1% |
+
+**The alert fires** because B2B AOV dropped 16.5%, exceeding the 15% threshold. B2C is stable so the issue is B2B-specific.
+
+What the investigation reveals:
+
+1. **B2B order volume is up slightly** (1,420 vs 1,380, +2.9%). Total B2B revenue is down 14.1% ($912k vs $1,062k). Smaller orders, slightly more of them.
+2. **Splitting B2B by Company size cohort** (top 20% LTV vs middle 60% vs bottom 20%):
+   - Top-20% Companies: AOV $1,180 vs prior $1,210, -2.5%. Within range.
+   - Middle-60% Companies: AOV $480 vs prior $560, -14.3%. Material.
+   - Bottom-20% Companies: AOV $190 vs prior $310, **-38.7%**. Severe.
+3. **The signal**: small and mid-tier B2B accounts are placing smaller orders. The pattern is classic credit-tightening: when an AP department starts splitting POs to stay under approval thresholds, AOV contracts even though order count is steady or higher.
+4. **Cross-checking [B2B Accounts Gone Quiet](/nerve-centre/kpi-cards/adobe-commerce/b2b-accounts-gone-quiet)**: silence count is also up, 8 mid-tier Companies are flagged this week vs typical 2 to 3. Some accounts are smaller-and-more-frequent; some are vanishing.
+5. **Most likely cause**: a category-wide credit tightening (merchants in this distributor's customer base are responding to their own cash pressure by reducing purchase quantities). This is macroeconomic rather than operational; the action is on the merchant's side (reach out to mid-tier accounts, offer longer payment terms in exchange for committed volumes).
+6. **Less likely but worth ruling out**: a competitor running a price campaign on the merchant's top SKUs. Cross-check [Top Refunded SKUs](/nerve-centre/kpi-cards/adobe-commerce/top-refunding-customers) for product-quality issues; cross-check pricing against direct competitors via manual review.
+7. **Action**: Sales team contacts the bottom-20% B2B Companies to discuss. Three of the affected accounts will say "AP cut PO sizes by 30%, can you help with terms?". Two will say "we shifted some volume to a competitor, your prices on category X are no longer best". Both responses are actionable.
+
+The point of this card: a 16% B2B AOV contraction would be invisible in [Total Revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) if B2C revenue happens to be growing concurrently. The segmentation isolates the signal.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+B2B AOV is most informative when paired with cohort and silence cards.
+
+| Card | Why pair it with B2B AOV vs B2C AOV |
+| --- | --- |
+| [B2B Revenue Share](/nerve-centre/kpi-cards/adobe-commerce/b2b-revenue-share) | The denominator. AOV change matters more when B2B is a high revenue share. |
+| [B2B Accounts Gone Quiet](/nerve-centre/kpi-cards/adobe-commerce/b2b-accounts-gone-quiet) | Sister card. Smaller orders + more silenced accounts together signal a category-wide credit issue. |
+| [AOV](/nerve-centre/kpi-cards/adobe-commerce/average-order-value) | The blended figure that this card decomposes. Stable blended AOV with diverging segments is invisible without this card. |
+| [Order Frequency](/nerve-centre/kpi-cards/adobe-commerce/customer-order-frequency) | If B2B AOV is shrinking but order frequency is rising, accounts are splitting POs (a signal in itself). |
+| [Customer Segments](/nerve-centre/kpi-cards/adobe-commerce/customer-spend-segments) | Segment-level revenue distribution. AOV is one dimension; this card adds count and revenue contribution. |
+| [Total Revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | The aggregate consequence. A 16% B2B AOV drop on a B2B-heavy book bends the revenue curve within 4 to 8 weeks. |
+| [Repeat Customer Rate](/nerve-centre/kpi-cards/adobe-commerce/repeat-customer-rate) | B2B repeat rate is normally near 100%; if it dips alongside AOV contraction, accounts are not just buying less but buying elsewhere. |
+| [`shopify.shopify_b2b_aov_delta`](/nerve-centre/shopify/shopify_b2b_aov_delta) | Cross-platform peer for agencies. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Adobe Commerce Admin:**
+
+For B2B-specific (Adobe Commerce paid edition with Companies module enabled):
+
+> **Customers > Companies** lists all Company entities. Click any Company > Orders tab to see per-account order history. Adobe does not natively compute AOV per Company; you can export the orders to CSV and average in a spreadsheet.
+
+For Customer Group routing (works on both Adobe Commerce and Magento Open Source):
+
+> **Customers > Customer Groups** to define the B2B group(s). **Customers > All Customers** filtered by group, then click any customer > Orders tab. Same manual averaging required.
+
+For aggregate sales:
+
+> **Reports > Sales > Orders** can be filtered by Customer Group via the Filters drop-down on Adobe Commerce 2.4.4+. The "Items Ordered" and "Total" columns let you compute a rough AOV per group manually.
+
+Other Adobe Commerce Admin views that look relevant but are not:
+
+- **Reports > Customers > Customers by Orders Total**: lifetime totals, not 30-day AOV.
+- **Reports > Customers > Customers by Number of Orders**: count, not value.
+- **Sales > Orders > Filter by Group**: per-order list, not aggregated.
+
+**Why our number may legitimately differ from a manual Admin computation:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Time-zone**. Admin in Store View timezone, card runs UTC. The 30-day window boundaries shift slightly. | ±1 day inclusion/exclusion |
+| **Currency**. Admin sums in `base_currency` per Store View. The card uses `base_grand_total` rolled up. Multi-currency stores see slight differences. | Material on multi-currency mixes |
+| **`canceled` exclusion**. Card excludes; Admin Reports > Sales includes by default unless filtered. | Card AOV slightly higher (cancellations are typically smaller orders) |
+| **B2B classification**. Card uses `extension_attributes.company_attributes.company_id` OR `customer_group_id`. Manual classification by Group only would miss customers attached to a Company but not in a B2B Group. | Card shows more B2B orders |
+| **Sync lag**. Card uses OpenSearch sync (5-15 min); Admin is live. | Negligible at 30D window |
+
+**Cross-connector reconciliation (when these connectors are connected for this merchant):**
+
+| Pair | Expected relationship | What divergence tells you |
+| --- | --- | --- |
+| [`stripe.stripe_total_revenue`](/nerve-centre/kpi-cards/stripe/total-charge-volume) on B2B-tagged charges | Stripe should match Adobe B2B revenue for Stripe-paid B2B orders | Material gap means many B2B orders are paid via net-30 invoice (not Stripe). Normal. |
+| ERP / accounting system per-Company AOV | Should match within sync lag | Divergence usually means manual orders entered in ERP but not Adobe (a process gap, not a card bug). |
+| [`google_analytics.ga_revenue_by_segment`](/nerve-centre/google_analytics/ga_revenue_by_segment) | GA4 has no native B2B/B2C dimension; would need custom dimension | If a custom dimension exists, GA4 will undercount by 10-25% (tracking gap) but the segment ratio should match. |
+
+---
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The same B2B-vs-consumer AOV concept exists on Shopify Plus B2B and BigCommerce B2B Edition.
+
+- [`shopify.shopify_b2b_aov_delta`](/nerve-centre/shopify/shopify_b2b_aov_delta)
+- [`bigcommerce.bc_b2b_aov_delta`](/nerve-centre/bigcommerce/bc_b2b_aov_delta)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is B2B AOV so much higher than B2C, is that real?**
+Yes, and it varies by category. Wholesale distribution typically sees 8 to 15x; manufacturing 5 to 10x; specialty retail 3 to 6x. The drivers: B2B orders are case-pack or pallet quantities, not single units; B2B accounts often consolidate weekly into one PO rather than ordering as needed; B2B pricing tiers grant volume discounts that incentivise larger baskets. For an Adobe Commerce merchant the multiplier is a useful sanity check on B2B health; a multiplier shrinking month-on-month is a warning even if absolute B2B AOV looks acceptable.
+
+**Adobe Commerce vs Magento Open Source: does this card work on the free edition?**
+Partially. The Adobe Commerce paid edition's B2B Companies module gives explicit Company-to-Customer mapping which is the cleanest classification source. Magento Open Source merchants must rely on Customer Groups; you must define a "Wholesale" or "B2B" group and assign customers to it manually (or via API). The card supports both; configure the manifest to point at your B2B group(s) on Open Source.
+
+**My B2C is tax-inclusive but B2B is tax-exempt, the AOV comparison is biased, what should I do?**
+You're right that the raw `grand_total` comparison overstates B2C relative to B2B in the UK/EU (where consumer tax is included) and on tax-paying B2C in US states. For pure mix comparison, configure the card to use `subtotal` (pre-tax). The card defaults to `grand_total` because most merchants want to compare what's actually in the bank; for analytical purity, switch to `subtotal`. The FAQ in the [AOV](/nerve-centre/kpi-cards/adobe-commerce/average-order-value) card discusses the tax treatment in more detail.
+
+**Why include `pending_payment` orders in the B2B figure?**
+B2B net-30 orders typically sit in `pending_payment` until the customer's AP department processes the invoice. Excluding them would cause the B2B AOV to be wildly volatile (only "captured" orders would count, missing the bulk of B2B activity). The card includes them, which represents the genuine sales pipeline. If your installation has many `pending_payment` orders that never resolve (broken AP integration), check [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) filtered to B2B Companies.
+
+**My multi-store Adobe Commerce, B2B is on a separate Store View, can I filter by it?**
+Yes, configure the manifest to use Store View routing. If your B2B portal Store View is identifiable (typical setup: `b2b_uk`, `b2b_us` Store Views), filter `store_id` rather than relying on `customer_group_id`. Store View routing is more reliable when multiple Customer Groups are involved (e.g. tiered B2B pricing groups: Bronze, Silver, Gold) all mapped to the B2B portal.
+
+**Why does the alert only fire on contraction, not expansion?**
+B2B AOV expansion means accounts are buying more, a positive signal that doesn't need an alarm. Contraction is the warning signal. If you specifically want to monitor expansion (e.g. for cross-sell program success measurement), configure a positive-direction variant in the manifest.
+
+**The card shows a 9.4x multiplier, what's a normal range?**
+Highly category-dependent. Janitorial supply, foodservice, and packaging distributors typically see 8 to 12x. Industrial manufacturing 5 to 8x. Specialty B2B (premium fashion wholesale, luxury hospitality supply) 3 to 5x. A multiplier well outside category norms suggests either misclassification (consumer customers tagged as B2B, or vice versa) or an unusual business model. Compare to peers via VortexIQ benchmark data if uncertain.
+
+**How does this card handle a customer whose first order was retail but who later registered as a B2B Company?**
+The card uses the order-time classification: each order is bucketed by the customer's segment at the time of order placement. A customer who upgraded from B2C to B2B mid-quarter has their pre-upgrade orders in B2C and post-upgrade in B2B. This is correct; counting all-time-by-current-status would distort retroactive segment averages.
+
+**My B2B AOV jumped 30% suddenly, is that a problem?**
+Probably not but worth investigating. Likely benign causes: a single very large PO (look for one outlier order in the period), a new B2B contract win (check whether a new high-value Company entity appeared in the period), an inflation pass-through (you raised prices and B2B accepted). Rare problem causes: a misclassified consumer order (a B2C customer accidentally placed an order through a B2B portal). Cross-check with order count; if order count is steady but AOV is up, average is driving; if order count fell and AOV rose, only large orders survived (a different signal: small-account churn).
+
+**Why doesn't B2C AOV move much in the example?**
+Consumer AOV is heavily anchored by category and product mix; sudden moves typically reflect product-line changes, promotional campaigns, or seasonality. The B2B contraction in the worked example was a credit-availability shift on the buyer side, not a merchant-side change, hence B2C is unaffected. The point of the segmentation is exactly this: signals localised to one segment are invisible in the blended AOV.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*B2B AOV vs B2C AOV* is one of hundreds of KPI pulses Vortex IQ tracks across Adobe Commerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

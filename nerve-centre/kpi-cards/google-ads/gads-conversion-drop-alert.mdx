@@ -1,0 +1,168 @@
+---
+title: "Conversion Drop Alert, Google Ads"
+sidebarTitle: "Conversion Drop Alert"
+description: "Conversion Drop Alert detects when Google Ads conversions drop materially. Tracked live in Vortex IQ Nerve Centre."
+---
+
+**Card class:** Hero  •  **Category:** Ads
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Alerts when Google Ads conversions drop significantly versus a recent baseline.** **A 25%+ overnight conversion drop is rarely a real demand drop, it is almost always a tracking failure**: GTM tag broken, conversion goal misconfigured, conversion linker disabled, or the BC checkout-event GTM tag stopped firing. The card is the early-warning signal that catches conversion-tracking gaps before the merchant burns through 7-14 days of ad spend on data the platform can't optimise.
+
+| | |
+| --- | --- |
+| **What it counts** | Detects when current-period conversions fall below a rolling-baseline threshold. The threshold is dual: (a) absolute drop greater than 15% over the rolling 7-day window vs the prior 7-day window, OR (b) absolute drop greater than 25% in any 24-hour period. Either trigger fires the alert. |
+| **Sample type** | Google Ads conversions (purchases) data, refreshed on the standard data refresh. |
+| **Why this alert matters** | (1) **Catches tracking failures fast**: most conversion drops are tracking issues; the 24-hour trigger catches them within a day rather than a week. (2) **Protects ad spend**: Google Ads bidding optimises against conversion data. Broken tracking sends Smart Bidding into the dark, leading to wasted spend. (3) **Diagnoses release regressions**: GTM tag changes, theme updates, BC integration changes can all break conversion firing without obvious symptoms. |
+| **Reading the value** | (1) No alert: conversions tracking normally. (2) Alert with 15-25% drop: investigate but may be real demand softening. (3) Alert with 25%+ drop in 24h: almost certainly a tracking issue; pause investigations and check GTM. (4) Cross-reference `gads_total_revenue` and BC's `total_orders` for the ground-truth sales picture. |
+| **Currency** | percent (drop magnitude). |
+| **Time window** | `7D vsP` rolling, with 24h sub-window for sudden drops. |
+| **Alert trigger** | `conversions_change_pct < -15` (over 7D) OR `conversions_change_pct < -25` (over 24h). |
+| **Sentiment key** | `gads_conversion_drop_alert` (alert state when triggered). |
+| **Roles** | owner, marketing, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+```
+gads_conversion_drop_alert fires when:
+  (current_7d_conversions - prior_7d_conversions) ÷ prior_7d_conversions × 100 < -15
+  OR
+  (last_24h_conversions - average_24h_baseline) ÷ average_24h_baseline × 100 < -25
+```
+
+The 24h trigger uses a rolling 7-day baseline average to avoid false positives on weekend/weekday mix.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK-based BC store, conversion drop alert reading on Wednesday 15 May 26.
+
+| Period | Conversions | Change | Notes |
+| --- | ---: | ---: | --- |
+| 7 days ago - today | 213 | -22.4% | **Alert fired** |
+| Prior 7 days | 274 | baseline | - |
+| Last 24h | 22 | -42% | Severe sub-window drop |
+| 24h baseline (rolling 7d avg) | 38/day | - | Expected |
+
+Cross-reference signals:
+- BC `total_orders` last 7 days: 462 (BC-side sales unchanged; Google Ads "lost" the conversions despite real sales)
+- `gads_total_spend` unchanged at £45K
+- `gads_ctr` unchanged at 3.2%
+- Recent release deploy: GTM container update on Monday 13 May (2 days before alert)
+
+What the alert is telling us:
+
+1. **Sales are actually fine; tracking is broken.** BC reports 462 orders (real sales), Google Ads reports 213 conversions. Google Ads is missing roughly half the conversions. **This is conversion-tracking failure, not demand drop.**
+
+2. **Smoking gun: GTM update on Monday.** The release timing aligns with the conversion drop start. Likely cause: GTM container was updated, conversion linker tag disabled or broken, conversion event firing condition changed.
+
+3. **The financial impact of letting this run:**
+   - Google Ads Smart Bidding optimises based on conversion data. With half the conversions invisible, **bidding optimises for the wrong audiences and decisions**.
+   - 7-14 days of broken tracking can result in 20-40% wasted ad spend as Smart Bidding degrades.
+   - In this case: 7 days × £6,500/day spend = £45,500 of ads optimised on broken data.
+
+4. **Recommended response, in priority order:**
+   - **Hour 1**: Verify in Google Ads the conversion event is firing as expected. Use the Google Ads Tag Assistant.
+   - **Hour 1**: Check the GTM container changelog for any changes to: conversion linker tag, purchase event tag, BC integration trigger.
+   - **Hour 2**: Test the checkout flow; check that purchase event fires in browser console.
+   - **Day 1**: Roll back the GTM container change if the broken tag is identified.
+   - **Day 1**: Use Google Ads' "Conversion adjustment" feature to retroactively credit the missed conversions if possible.
+   - **Day 2-7**: Re-train Smart Bidding on the corrected data; expect 7-14 days for bid optimisation to recover.
+
+5. **What to NOT do:**
+   - **Don't pause campaigns yet**. Pausing during a tracking issue means the resumed campaigns lose all bid history.
+   - **Don't accept the alert as a real demand drop without checking BC's order data.** Always cross-reference BC `total_orders` first.
+   - **Don't manually adjust Smart Bidding** until tracking is fixed. Let Google's algorithm work with corrected data.
+
+6. **Common root causes when this alert fires:**
+   - GTM container update breaking the conversion event tag (most common)
+   - BC theme/checkout customisation breaking the purchase event firing
+   - Conversion linker disabled or expired
+   - Cookie consent changes (gtag consent mode v2 misconfigured)
+   - Cross-domain tracking broken (referrer exclusion list outdated)
+   - Apple ITP / browser blocking (gradual; usually flagged separately)
+
+The diagnostic flow:
+
+1. **See the alert.** Compare Google Ads conversions vs BC total_orders.
+2. **If BC orders unchanged**: tracking issue. Investigate GTM, conversion linker, cookie consent.
+3. **If BC orders also dropped**: real demand event. Investigate site speed, OOS, paid spend changes.
+4. **Fix the cause; re-train bidding.**
+
+Rapid-response playbook:
+
+| Time horizon | Action |
+| --- | --- |
+| First 1 hour | Cross-check BC orders; confirm tracking vs demand. |
+| First day | Identify GTM / consent / tag root cause; fix. |
+| First week | Smart Bidding re-trains; conversion data recovers. |
+| Day 14 | Confirm performance returned to baseline. |
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why merchants reach for it |
+| --- | --- |
+| [`gads_total_revenue`](/nerve-centre/kpi-cards/google-ads/total-revenue) | Revenue companion. |
+| [`gads_total_spend`](/nerve-centre/kpi-cards/google-ads/total-spend) | Spend; should track conversions. |
+| [`gads_roas`](/nerve-centre/kpi-cards/google-ads/roas) | ROAS; collapses when tracking breaks. |
+| [`gads_alert_conversion_tracking_broken`](/nerve-centre/kpi-cards/google-ads/conversion-tracking-broken-alert) | More specific tracking-broken alert. |
+| [`total_orders`](/nerve-centre/kpi-cards/bigcommerce/total-orders) | BC-side ground truth for cross-check. |
+| [`ga4_alert_conversion_drop`](/nerve-centre/kpi-cards/google-analytics/conversion-rate-drop-alert) | GA4-side companion alert. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Google Ads:** Tools → Conversions; Diagnostic insights for tracking issues.
+
+**Why our alert may differ from Google's own:**
+
+| Reason | Direction | What to do |
+| --- | --- | --- |
+| **Threshold sensitivity.** Google's alert may use 30%+ drops; this card alerts earlier at 15-25%. | Vortex IQ earlier | n/a; earlier is better. |
+| **Per-campaign vs account-wide.** Google may flag per-campaign; this card is account-wide. | Variable | Cross-reference. |
+| **Data delay.** Conversions report with up to 72-hour delay in some cases. | Variable | Allow 72h before treating recent drops as real. |
+
+**Quick rule:** always cross-check BC `total_orders` before assuming the alert is a real demand event.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Q: The alert fired but BC orders are normal. What does that mean?**
+Tracking is broken. The conversions are happening; Google Ads just can't see them. Most common cause: a GTM container change broke the conversion event tag. Check GTM changelog, fix the tag, use Conversion Adjustments to backfill if possible.
+
+**Q: The alert fired and BC orders also dropped. What does that mean?**
+Real demand event. Investigate: site speed regression, OOS bestsellers, payment failure, deliverability issue, competitive event. Cross-reference `psi_perf_score_summary`, `out_of_stock_count`, `failed_orders_trend`.
+
+**Q: We just upgraded our checkout app. Could that be the cause?**
+Very likely. Checkout customisations frequently break the BC → GTM → Google Ads conversion chain. Test the new checkout in incognito and verify the `purchase` event fires in browser console. If it doesn't, the new checkout app needs configuration to fire the event.
+
+**Q: Should I pause campaigns while diagnosing?**
+Generally no. Pausing kills bid history; resuming starts from cold and may take 2-4 weeks to recover. Better: keep campaigns running while you fix tracking; Smart Bidding will re-train on corrected data within 7-14 days.
+
+**Q: Why is the threshold at -15% and not stricter?**
+-15% over a week is the boundary between "natural variance" and "real signal". Setting tighter (e.g., -10%) creates alert fatigue from weekend-vs-weekday or seasonal noise. The 24-hour sub-window at -25% catches the urgent cases.
+
+**Q: We use offline conversions (in-store sales reported via API). Are those covered?**
+Yes if uploaded via the standard offline conversion API and configured as conversion goals. The card monitors all conversions Google Ads counts, regardless of online or offline source.
+
+**Q: Conversion adjustments, how do they work?**
+After fixing tracking, you can upload corrected conversion data via Google Ads' Conversion Adjustment API. This back-fills the missed conversions and updates Smart Bidding. Most agencies miss this step; it's worth doing for any multi-day tracking outage.
+
+**Q: How is this different from `gads_alert_conversion_tracking_broken`?**
+This card is the broad conversion drop alert (which includes tracking failures and real demand drops). The other card is a specific tracking-failure detection that triggers on patterns like sudden zero-conversions in active campaigns. Both can fire together; this card fires on more scenarios.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Conversion Drop Alert* is one of hundreds of KPI pulses Vortex IQ tracks across Google Ads and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

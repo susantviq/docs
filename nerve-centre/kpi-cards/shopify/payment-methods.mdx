@@ -1,0 +1,179 @@
+---
+title: "Payment Methods, Shopify"
+sidebarTitle: "Payment Methods"
+description: "Payment Methods for Shopify stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Ecommerce Platform
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Order-count split by payment gateway used at checkout. Reads which gateways customers actually picked, in what proportion. The single best diagnostic for fee optimisation, dispute exposure, and Shop Pay adoption.
+
+| | |
+| --- | --- |
+| **What it counts** | `GROUP BY paymentGatewayNames.keyword → COUNT(orders)`. Each order's `paymentGatewayNames` array contributes one count to *each* gateway listed. An order paid in two transactions (gift card + Shop Pay) contributes once to both buckets. |
+| **API endpoint** | `Admin GraphQL. Order.paymentGatewayNames` (GraphQL `[String!]`). Gateway labels are normalised by Shopify: `shopify_payments`, `paypal`, `gift_card`, `manual`, `bogus`, `klarna`, `afterpay`, `stripe` (rare, only for stores using Stripe outside Shopify Payments), and any custom-built gateway slug. |
+| **VAT / tax treatment** | Not applicable (count metric). |
+| **Shipping** | Not applicable. |
+| **Discounts** | Not applicable. |
+| **Refunds** | Not applicable to the count itself; the card counts the *checkout-time* gateway, not refund flow. A Shop Pay order refunded back to the same card still counts under `shopify_payments`. |
+| **Cancelled / voided orders** | Included. Cancelled orders still have a `paymentGatewayNames` because the customer chose a gateway before voiding; this card preserves the choice signal. |
+| **Currency** | Multi-currency safe (count, not money). Each gateway count rolls up across all currencies the gateway processed. |
+| **Channels / sources** | Mostly online. POS orders typically tag `shopify_payments` (chip-and-PIN through the Shop POS terminal), Buy Button defaults to `shopify_payments`, and marketplace-channel orders may show external gateway labels (`amazon_pay`) where supported. |
+| **Shopify Payments dominance** | On stores eligible for Shopify Payments (US/UK/AU/EU/CA most categories), Shopify Payments processes 60 to 75% of orders by default, because Shop Pay accelerated checkout funnels traffic into it. Outside-eligible regions (most of South Asia, parts of Africa, anywhere Shopify Payments isn't live) the gateway split looks completely different. |
+| **Test orders** | Tagged with `bogus` or `manual` gateway. Visible in this card unless explicitly filtered. Most production stores have a handful from QA. |
+| **Time window** | `30D` (default). Gateway adoption shifts slowly; the 30-day view is enough to see Shop Pay or Apple Pay rise after a checkout-tweak experiment. |
+| **Alert trigger** | None on the card. A sudden gateway-share collapse usually maps to a payment-processor outage; cross-check the gateway's status page first. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+```
+GROUP BY paymentGatewayNames.keyword
+  WHERE date BETWEEN [period_start, period_end]
+```
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK DTC apparel brand on Shopify (Advanced plan), Shopify Payments enabled, PayPal Express on, Klarna on for orders over £80. Reporting period: 12 Apr 26 to 11 May 26.
+
+| Gateway | Order count | Share | Notes |
+| --- | --- | --- | --- |
+| `shopify_payments` (incl. Shop Pay, Apple Pay, Google Pay) | 4,820 | 70.4% | Bulk of online traffic + Shop Pay accelerated checkout |
+| `paypal` | 1,140 | 16.7% | Older customers, mobile shoppers without saved cards |
+| `klarna` | 412 | 6.0% | Higher-AOV orders (avg £142 vs store AOV £68) |
+| `gift_card` | 280 | 4.1% | Plus partial-tender orders combining gift card + card |
+| `apple_pay` (separate trace, mostly in shopify_payments) | 91 | 1.3% | Edge case where Apple Pay routed via external Stripe |
+| `manual` (cash on delivery, bank transfer) | 88 | 1.3% | B2B-tagged orders |
+| `bogus` (test) | 15 | 0.2% | Dev / QA |
+| **Total order rows** | **6,846** | (sums above 100% due to multi-tender) | |
+
+Five things to notice:
+
+1. **Shopify Payments at 70.4% is healthy for UK Advanced plan stores.** Industry benchmark is 65 to 78% on Advanced; 80%+ usually means PayPal isn't enabled or Shop Pay opt-in is forced. Below 60% suggests checkout friction (PayPal opt-out hidden, Shop Pay button slow to render). The fee implications matter: every order on `shopify_payments` saves the 0.5% non-Shopify-Payments tariff Shopify levies on competing gateways.
+2. **PayPal at 16.7% is structural, not retrievable.** PayPal-preferring shoppers are demographically older and mobile-skewed; trying to push them to Shop Pay typically loses the order rather than converting the gateway. **Don't treat PayPal share as a target to reduce**, treat it as a captured-segment metric to maintain.
+3. **Klarna's high AOV (£142 vs £68 baseline) is the lever.** Klarna users spend 2x the average order. The card surfaces this as a count, but the implication is in the value card. Showing Klarna eligibility earlier in the funnel (PDP, not just at checkout) typically lifts overall AOV by 5 to 12% on stores with significant Klarna share.
+4. **The `gift_card` 4.1% is dual-tender.** Most of those 280 orders also paid the balance via Shop Pay or PayPal, so they're double-counted in the table. The card shows behaviour ("did the customer use a gift card at all?"), not exclusive choice. Stores aggressively running gift-card promos see this share rise mechanically.
+5. **The `bogus` 15 are noise.** A QA agency or dev partner running checkout regression tests; should not be treated as production volume. Stores with very high `bogus` counts (>1%) usually have a misconfigured test gateway live in production, fix before reading any other gateway split.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+Payment Methods on its own is a snapshot. Pair with these for the full picture:
+
+| Card | Why pair it with Payment Methods |
+| --- | --- |
+| [Total Orders](/nerve-centre/kpi-cards/shopify/total-orders) | The denominator. Gateway shares only matter against the order base. A 70% Shop Pay share on 100 orders is interesting; on 10,000 orders it's strategic. |
+| [AOV](/nerve-centre/kpi-cards/shopify/average-order-value) | Per-gateway AOV reveals which gateways drive higher-value orders. Klarna and Afterpay AOV is typically 1.5 to 2.5x baseline; Shop Pay AOV is roughly equal to the store average. |
+| [Checkout Failure Rate](/nerve-centre/shopify/checkout_failure_rate) | A drop in a major gateway share usually means checkout is failing for that gateway specifically. This card surfaces "what's working"; that one surfaces "what's failing". |
+| [Conversion Rate](/nerve-centre/shopify/ecommerce_conversion_rate) | Adding a new gateway (Apple Pay, Shop Pay, Klarna) typically moves conversion 1 to 4%. The before/after on this card paired with conversion confirms the impact. |
+| [`stripe.stripe_payment_methods`](/nerve-centre/stripe/stripe_payment_methods) | When Stripe is the gateway behind Shopify Payments (true for most US/UK stores), Stripe sees the card-network split (Visa / MC / Amex / etc.). The two cards together give you gateway-share and card-network-share. |
+| [`paypal.pp_charges_count`](/nerve-centre/paypal/pp_charges_count) | Should equal the `paypal` count on this card within ±2%. PayPal-side counts are the system of record; gaps indicate sync lag. |
+| [`google_analytics.ga_payment_method_breakdown`](/nerve-centre/google_analytics/ga_payment_method_breakdown) | GA4 sees customer-selected payment method via the `purchase` event's `payment_type` parameter. Reconciles roughly with this card; ad-blocker / consent gap applies. |
+| [`bigcommerce.payment_methods`](/nerve-centre/kpi-cards/bigcommerce/payment-methods) | Same definition. Documentation cross-link. |
+| [`adobe_commerce.payment_methods`](/nerve-centre/kpi-cards/adobe-commerce/payment-methods) | Same definition. Documentation cross-link. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Shopify Admin:**
+
+> [Analytics → Reports → "Sales by payment method"](https://admin.shopify.com/reports/sales_by_payment_method)
+
+The closest twin in Shopify Admin. Shows revenue per gateway (not just count); set the date range to match this card's window and the proportions should align order-for-order.
+
+Other Shopify Admin views that look similar but are not the same:
+
+- **Settings → Payments**: lists the gateways *enabled* on the store, not their actual usage. Useful for confirming what the customer was offered, not what they picked.
+- **Finances → Payouts**: Shopify Payments payouts only. Does not include PayPal, Klarna, or external gateways. Useful for cash flow, not gateway share.
+- **Orders → All orders → filter by Payment status**: an order-level view; reconstructs gateway split by manually counting tagged orders.
+
+**Why our number may legitimately differ from Shopify Admin:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Multi-tender orders** | Ours higher (sum >100%) | An order paid with gift-card + Shop Pay contributes one count to *each* gateway in our card; Shopify's "Sales by payment method" report typically attributes the order to the dominant tender (the one carrying the most £). |
+| **Time zone** | Boundary days | Shopify Admin uses store TZ, this card uses UTC. |
+| **Cancelled orders** | Both include | Both include cancelled orders. |
+| **Test orders** | Ours slightly higher | `bogus` and `manual` test gateways are not yet filtered. |
+| **Gateway label normalisation** | Either | Shopify's labels can change over time (Shop Pay vs Shopify Payments, Apple Pay nested under Shopify Payments depending on version). The card uses the raw `paymentGatewayNames` array; Shopify's report sometimes consolidates. |
+| **Sync lag** | Ours lower for "today" | 5 to 15 minute index lag. |
+| **Shopify Plus B2B Edition** | Either | B2B Edition orders may use bespoke gateway labels (`b2b_credit_terms`, `manual`, custom slugs). These can either appear here or get bucketed as `manual` depending on configuration. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| [`stripe.stripe_charges_count`](/nerve-centre/stripe/stripe_charges_count) | `shopify_payments` count ≈ Stripe charges (since Stripe processes Shopify Payments under the hood) | Stripe sees authorisations and captures separately. A failed-then-retried payment looks like 2 Stripe events but one Shopify order. Expect 5 to 10% gap. |
+| [`paypal.pp_charges_count`](/nerve-centre/paypal/pp_charges_count) | `paypal` count ≈ PayPal charges count | PayPal Express vs PayPal Pro on the same store can both show as `paypal` here but as different products in PayPal. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The Payment Methods split exists with the same purpose on other commerce platforms; the underlying gateway labels and the multi-tender semantics differ.
+
+- [`bigcommerce.payment_methods`](/nerve-centre/kpi-cards/bigcommerce/payment-methods)
+- [`adobe_commerce.payment_methods`](/nerve-centre/kpi-cards/adobe-commerce/payment-methods)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does the chart show more counts than I have orders?**
+Multi-tender orders. An order paid with a gift card *and* a credit card contributes once to `gift_card` and once to `shopify_payments`. The total of all gateway slices can exceed your order count by 5 to 15% on stores with active gift-card programs. This is the right behaviour, the card answers "which gateways did customers actually engage with?", not "what was the dominant gateway per order?".
+
+**Where is Shop Pay in this list?**
+Inside `shopify_payments`. Shop Pay is an *accelerated checkout* flow that uses Shopify Payments under the hood; orders pay through `shopify_payments` regardless of whether the customer clicked the Shop Pay button or filled the regular form. To split Shop Pay specifically, look at the `checkoutToken.experience` field (Plus only) or use Shopify's Shop Pay analytics report under Apps.
+
+**Why is my Apple Pay / Google Pay share so low (or zero)?**
+Same reason: those wallets generally route through `shopify_payments` and don't get their own gateway label. If you're seeing dedicated `apple_pay` rows, you're routing Apple Pay through an external gateway (rare in modern setups). For most merchants, "Apple Pay used %" lives inside the Shop Pay metric, accessible through the *Shop Pay analytics* app, not this card.
+
+**Should I push customers off PayPal toward Shop Pay?**
+Generally no. PayPal users self-select; pushing them off usually loses the order, not converts the gateway. The correct read of this card is gateway *availability* health (is each enabled gateway converting at expected share?) not gateway *forced-substitution*. The exception is when fees materially differ; on small stores under £200K/year revenue, PayPal's flat fee can be 30 to 50 basis points more expensive than Shop Pay, in which case promoting Shop Pay (without removing PayPal) is the right move.
+
+**What does `manual` mean?**
+A merchant-recorded payment that didn't go through an automated gateway. Common cases: cash on delivery, bank transfer, B2B invoice payment marked paid in admin. Most stores see &lt;1% `manual` share unless they actively offer those terms (B2B Edition, India COD, EU bank-transfer-friendly categories).
+
+**Does this card include subscription billings?**
+Yes, every Shopify Subscriptions billing creates a new order with its own `paymentGatewayNames`. The customer's saved card pays via whichever gateway tokenised the payment method (almost always `shopify_payments`). Subscription-heavy stores typically show 80%+ Shopify Payments share *because* the recurring base reuses the same tokenised payment.
+
+**Multi-currency stores, does the card aggregate or split by currency?**
+Aggregates. The card is gateway-by-count across all currencies. To see per-currency gateway share (e.g. "Klarna's share of EUR-denominated orders only"), use Ask Viq with a currency filter.
+
+**Shopify Plus vs basic plan, behavioural differences?**
+Plus stores can run custom JavaScript in checkout (Checkout Extensions, Shop Functions) which sometimes injects custom gateway slugs. Plus stores using B2B Edition see `b2b_credit_terms` or similar custom labels. Basic plan stores see only the standard set: `shopify_payments`, `paypal`, `gift_card`, `manual`, `bogus`, plus whichever third-party gateways the merchant explicitly enabled.
+
+**My PayPal share dropped from 18% to 4% overnight, what happened?**
+Three usual causes: (1) PayPal's risk engine started declining your traffic (an account-health issue requiring a PayPal review), (2) PayPal Express button stopped rendering on the page (a checkout-app conflict; check the live page in incognito), or (3) the customer journey changed (you launched Shop Pay first-touch and customers now click that before scrolling to PayPal). Pull [Checkout Failure Rate](/nerve-centre/shopify/checkout_failure_rate) split by gateway to disambiguate. If failures spiked at the same time, it's (1); if failures held but share collapsed, it's (2) or (3).
+
+**Refresh cadence?**
+Webhook-driven, 5 to 15 minute index lag. The current-day chart fills in throughout the day.
+
+**B2B vs DTC, how does the gateway split differ?**
+Dramatically. B2B orders often use `manual` (invoice-pay), `b2b_credit_terms`, or wire-transfer custom gateways. DTC is dominated by Shopify Payments + PayPal + BNPL. A blended store shows a hybrid that doesn't represent either segment cleanly; segment by purchasing-entity type for any decision based on this card.
+
+**Action playbook when a major gateway share drops:**
+1. Check the gateway's status page first. Stripe / PayPal / Klarna outages are public and short-lived; the card recovers automatically.
+2. Test the live checkout in incognito. Confirm each gateway button still renders. Apps (loyalty, upsell, fraud) sometimes break checkout buttons silently after an update.
+3. Look at [Checkout Failure Rate](/nerve-centre/shopify/checkout_failure_rate) split by gateway. A spike in declines on one gateway is a fraud-rule or 3DS-config issue.
+4. Review recent gateway-config changes (Settings → Payments). A merchant turning on 3DS aggressive mode or Klarna eligibility floors silently shifts share.
+5. If nothing on your side changed, contact the gateway. PayPal especially can change risk thresholds without notice and starve your traffic for 24 to 72 hours.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Payment Methods* is one of hundreds of KPI pulses Vortex IQ tracks across Shopify and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

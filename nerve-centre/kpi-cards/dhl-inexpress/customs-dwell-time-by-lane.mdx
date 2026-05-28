@@ -1,0 +1,118 @@
+---
+title: "Customs Dwell Time by Lane, DHL InExpress"
+sidebarTitle: "Customs Dwell Time by Lane"
+description: "Per-lane customs dwell time (hours). Surfaces specific origin/destination combos where commercial-invoice or HS-code data is causing repeate... How to read..."
+---
+
+**Card class:** Cross-Channel  •  **Category:** Shipping & Courier
+
+> Per-lane customs dwell time (hours). Surfaces specific origin/destination combos where commercial-invoice or HS-code data is causing repeated friction.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Average hours each cross-border lane spends in customs hold per consignment. The sharpest customs-friction diagnostic in the connector: each lane is one origin-destination pair; the long-dwell lanes are where commercial-invoice data, HS-code accuracy, or destination-customs algorithms are causing repeated friction. The `>24h` alert flags lanes where customer-experience cost is material.
+
+| | |
+| --- | --- |
+| **What it counts** | `AVG(time_in_status='CustomsHold' OR 'AwaitingClearance' OR 'Customs') GROUP BY (origin_country, destination_country)`. Includes only consignments that actually entered customs (international lanes); excludes domestic. |
+| **`only_when: destination_country != origin_country`** | Card filters to cross-border lanes only. |
+| **Customs status detection** | DHL InExpress tracking events include explicit customs codes; the card sums time spent in any of them and divides by consignment count per lane. |
+| **Lane definition** | ISO country pair. `GB → DE` is one lane; `GB → DE` via Frankfurt vs via Leipzig are pooled (sub-routing not exposed in the API). |
+| **Origin-country edge cases** | Northern Ireland post-Brexit Trader Support flow may show as GB→GB or GB→IE depending on product type; verify configuration. |
+| **Time window** | `30D` |
+| **Alert trigger** | `any lane >24h`. 24 hours of customs dwell is roughly the point where customer-perception of delay becomes material on Express service promises. |
+| **Roles** | owner, operations, finance |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your DHL InExpress data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK home-fragrance DTC merchant. Reading 12 Mar 26, trailing 30 days. Cross-border-only consignments.
+
+| Lane | Volume | Avg customs dwell | Status |
+| --- | --- | --- | --- |
+| GB → DE | 480 | 6h 20m | Healthy |
+| GB → NL | 290 | 5h 40m | Healthy |
+| GB → FR | 360 | 8h 50m | Healthy |
+| GB → IE | 240 | 11h 10m | Healthy |
+| GB → US | 270 | 14h 40m | Healthy |
+| GB → ES | 110 | 28h 30m | **Alert: >24h** |
+| GB → IT | 50 | 41h 50m | **Alert: >24h** |
+
+The card flags **Spain (28.5h) and Italy (41.8h)**. Three things to notice:
+
+1. **Italy at 41.8 hours is structurally long.** That's nearly two days lost to customs alone, on a product DHL promises in 3 to 4 days. Net of customs, the carrier-network leg is on time; HS-code accuracy and commercial-invoice quality are the levers, not DHL.
+2. **Spain at 28.5 hours is borderline.** Often a HS-code mismatch on a specific SKU subset. Check the top-5 Italy- and Spain-bound SKUs against EU TARIC HS-code recommendations; one mis-classified hero SKU can drag the whole lane.
+3. **Germany at 6.3 hours is the operational baseline.** That's roughly the network-baseline customs dwell on a clean merchant on a clean lane. Aim every cross-border lane at &lt;12 hours; >24h is the action threshold.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair |
+| --- | --- |
+| [International Express OTD](/nerve-centre/kpi-cards/dhl-inexpress/international-express-otd) | The customer-facing outcome; this card is the upstream cause. |
+| [Duty-Billing Mismatch Rate](/nerve-centre/kpi-cards/dhl-inexpress/duty-billing-mismatch-rate) | The financial-accuracy corollary; mismatched duties accompany customs holds. |
+| [Exception Rate](/nerve-centre/kpi-cards/dhl-inexpress/exception-rate) | Customs holds appear as exceptions; this card splits the customs subset by lane. |
+| [Customs Dwell Time at DPDLocal](/nerve-centre/kpi-cards/dpdlocal/exception-rate) | Cross-carrier sanity check; if both DHL and DPDLocal show long dwell on the same lane, the issue is destination-customs-policy, not your data. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MyDHL+:**
+
+DHL does not produce a per-lane average-dwell view natively; the closest is the per-shipment customs-status timeline visible on each tracking page. The card aggregates the timeline events.
+
+**Why our number may differ from a manual aggregate:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Customs-status taxonomy** | Either | DHL InExpress occasionally introduces new customs-status codes; the card uses the documented set. New codes default to "out-of-customs". |
+| **Status-event lag** | Ours lower | DHL surfaces customs-status events typically within 30 to 60 minutes of the underlying event; very recent consignments may have understated dwell. |
+| **Multi-stage customs** | Ours pools | Some lanes (US, IT) have entry customs + onward-domestic-customs steps; the card pools them. Per-stage breakdown is on the roadmap. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship |
+| --- | --- |
+| Per-lane refund rate (commerce sibling, filtered by destination_country) | Should correlate with this card's lane order. Lanes with >24h dwell typically see 1 to 3 percentage-point higher refund rate. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My Italy lane is always slowest. Is there anything I can do?**
+Three usual levers, in order. (1) **Run an HS-code review** on your top-50 Italy-bound SKUs against EU TARIC; mis-classified codes are the single biggest cause of Italy customs holds. (2) **Switch to DDP** if currently DDU; Italy customs handles DDP parcels faster because duty is pre-paid by DHL via your account. (3) **Improve commercial-invoice data**; ensure `country-of-origin`, `goods-description`, `EORI`, and per-line item value are fully populated. Most ERP / OMS systems leave fields blank by default that DHL's API tolerates but Italian customs does not.
+
+**The card flags US >24h. Is that abnormal?**
+Slightly. US customs is fast for low-value DTC parcels under $800 (Section 321 de minimis), so 14 to 18 hours is the network-baseline. >24h often signals (a) parcel value over $800 forcing formal customs entry (slower), (b) restricted-product flag (cosmetics, supplements, anything with a herbal claim), or (c) random-inspection hold (uncontrollable, ~3% baseline rate).
+
+**My customs dwell is healthy but my OTD is still bad. What gives?**
+The customs leg is fine; the network leg is the problem. Use [International Express OTD](/nerve-centre/kpi-cards/dhl-inexpress/international-express-otd) per-lane to see if it's the carrier-network leg. Often the answer is to switch from InExpress to DHL Express Worldwide on the affected lanes.
+
+**Why does the card pool sub-routes within a country?**
+DHL's API does not expose intermediate sortation hubs; from the merchant's perspective, the lane is country-pair. If you suspect a depot-specific issue (Frankfurt vs Leipzig), DHL's account team can pull a sub-routing report; this card cannot.
+
+**Is the alert at >24h tunable?**
+Yes. For premium-electronics or high-AOV merchants, >12h is a more useful threshold; for budget DDU operations, >36h may be right. Tune per-merchant in the card config.
+
+**A new EU rule changed customs handling. Will this card show it?**
+Yes, within 1 to 2 weeks of the regulatory change. The card measures observed dwell; if a new rule (e.g. CBAM, EUDR) increases per-parcel customs touch time, you'll see it lane-by-lane.
+
+**Can I drill into specific consignments held in customs?**
+Yes, click any lane to see the per-consignment dwell distribution and the worst offenders. Useful for triaging high-AOV holds and for collecting evidence for DHL account-team conversations.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Customs Dwell Time by Lane* is one of hundreds of KPI pulses Vortex IQ tracks across DHL InExpress and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

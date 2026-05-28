@@ -1,0 +1,186 @@
+---
+title: "Revenue Gap vs Commerce, SAP"
+sidebarTitle: "Revenue Gap vs Commerce"
+description: "The killer reconciliation finding for mid-market ecom ops: dollar value of orders that never made it to S/4HANA Cloud GL plus the reason. How to read it, w..."
+---
+
+**Card class:** Hero  •  **Category:** Ecommerce Platform
+
+> The killer reconciliation finding for mid-market ecom ops: dollar value of orders that never made it to S/4HANA Cloud GL plus the reason.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The dollar value of commerce-platform revenue that has not yet hit the S/4HANA Cloud General Ledger, broken down by reason. Calculated as `commerce_total_revenue minus sap_revenue_booked_gl` for the same window, with reason codes attached to each missing dollar. The single most-asked finding from any Finance Manager or SAP Functional Analyst running an enterprise commerce business on S/4HANA Cloud.
+
+| | |
+| --- | --- |
+| **What it counts** | The signed gap between the sum of `total_revenue` across every connected commerce platform (SAP Commerce Cloud, Shopify Plus, BigCommerce, Adobe Commerce) and `revenue_booked_gl` in S/4HANA Cloud for the matching window. The reason breakdown classifies each missing dollar into one of: Pending Billing (delivery created, no Billing Document yet), Voided / Rejected Sales Document, Credit Memo Refund, Unmapped Marketplace (no Business Partner record), Period Boundary Timing, FX Translation, EBRR Deferred Revenue, or Unknown. |
+| **Tax treatment** | **Net of tax on both sides.** Commerce platform tax is stripped if the platform reports tax separately (Shopify `taxesIncluded = false` mode, BigCommerce default, Adobe Commerce). SAP-side revenue is naturally net of output VAT / GST / sales tax (those post to dedicated tax payable accounts via Tax Code mapping in OB40). Inclusive-tax modes are normalised at compute time, otherwise the gap would always show a structural 20% UK VAT mismatch. |
+| **Shipping** | Both sides include shipping revenue. Mismatch only occurs if your VKOA configuration in SAP maps freight conditions to a non-revenue freight-recovery account; in that case, freight on the commerce side is unmatched on the SAP side and lands in the Unknown bucket. |
+| **Refunds** | Counted on both sides. Commerce gross is subtracted by refunds for parity; SAP-side Credit Memos (Billing Document type G2) are pulled in. |
+| **Currency** | Commerce-platform revenue is FX-translated to the S/4HANA Cloud Group Currency at rate type M (period average) sourced from the SAP TCURR table via the OData rate-table API. A residual FX-translation gap appears in the breakdown as `FX Translation` if the currency mix is large or if the commerce platform captures spot rate vs SAP's monthly average. |
+| **Multi-Company-Code** | Group Reporting tenants: card sums across all connected Company Codes that have commerce platforms tagged to them in the field map (CC 1000 = UK Ltd Shopify, CC 2000 = US Inc Adobe Commerce, etc). Single-Company-Code: trivially scoped to that CC. |
+| **Time window** | `30D` (no vsP comparison; the gap itself is the trend) |
+| **Alert trigger** | `>$10k unreconciled` (default), tunable per workspace |
+| **Sentiment key** | `revenue_gap` |
+| **Roles** | owner, finance |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your SAP data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US enterprise wholesale apparel distributor (annual revenue ~$280M) running SAP S/4HANA Cloud Public Edition. Connected commerce platforms: SAP Commerce Cloud B2B (the legacy Hybris stack, branded D2C portal), Shopify Plus DTC, BigCommerce B2B with Net-30 terms, Adobe Commerce wholesale portal. Three Company Codes (US, CA, MX). The 30-day window covers 04 Apr 26 to 03 May 26.
+
+| Source | Window total (USD, group rate type M) |
+| --- | --- |
+| SAP Commerce Cloud B2B | $9,420,000 |
+| Shopify Plus DTC | $4,180,000 |
+| BigCommerce B2B Net-30 | $6,820,000 |
+| Adobe Commerce wholesale portal | $2,140,000 |
+| **Commerce gross (sum)** | **$22,560,000** |
+| S/4HANA Cloud GL booked revenue | $20,140,000 |
+| **Gap (this card)** | **$2,420,000** |
+
+Reason breakdown the card surfaces:
+
+| Reason | Amount | Explanation |
+| --- | --- | --- |
+| Pending Billing | $1,260,000 | 184 BigCommerce + Adobe Commerce B2B Sales Documents in S/4 with goods issue posted but no Billing Document yet (delivery-to-billing lag, billing-due-list runs scheduled weekly). |
+| Credit Memo Refunds | $480,000 | 412 Credit Memos (Billing Document type G2) posted in window against orders booked in commerce gross. |
+| Voided / Rejected | $186,000 | 47 cancelled orders showing in commerce platform's lifetime totals but rejected at Sales Document level in SAP (rejection reason set in VA02). |
+| Unmapped Marketplace | $214,000 | Adobe Commerce wholesale portal has 14 customer accounts not yet mapped to S/4 Business Partner records, so the Sales Document creation failed and the orders are stuck in the integration error queue. |
+| Period Boundary Timing | $128,000 | Orders placed 11pm 03 May 26 in the commerce platforms; rolled into S/4 Sales Documents 04 May 26 due to integration scheduler. |
+| FX Translation | $94,000 | Adobe Commerce captured CAD transactions at spot rate; SAP TCURR rate table booked at month-average rate type M. The residual is the FX timing gap. |
+| EBRR Deferred Revenue | $42,000 | The commerce platforms include a 12-month maintenance contract sold this period; SAP S/4HANA Event-Based Revenue Recognition defers 11/12 of it to future periods. Policy-correct, not a defect. |
+| Unknown / Investigate | $16,000 | 3 BC orders + 5 Adobe Commerce orders flagged but no audit trail; the SAP Functional Analyst's Monday morning worklist. |
+
+Five things to notice:
+
+1. **The biggest leak is Pending Billing ($1.26M).** This is not lost revenue, it is stuck working capital. Goods have shipped, the customer is on the hook, but no Billing Document means no AR record, no DSO clock, and no GL booking. The card lets the Finance Manager drill into the Sales Document list (deep-link into Manage Sales Documents Fiori app) and chase Operations to run the next billing-due-list (transaction VF04). If billing-due-list runs weekly and the Net-30 terms start at billing date, every day of delay is a day of pure cash-conversion-cycle drag.
+2. **Unmapped Marketplace ($214K) is real revenue at risk.** If the customer mapping is wrong on Adobe Commerce (commerce-platform `customer_id` not joined to a SAP Business Partner record), those orders may never sync. The Finance Manager pings the SAP Functional Analyst to fix the Business Partner master data; otherwise next month's gap is even bigger and the integration error log keeps growing.
+3. **Credit Memo Refunds ($480K) is policy, not error.** This is the structural gap between gross commerce headlines and net GL booking. It will always exist; what matters is whether the rate is constant or rising. Rising = quality / fulfilment / pricing problem. Constant = baseline noise.
+4. **EBRR Deferred Revenue ($42K) is the SAP-specific bucket that NetSuite users will not recognise.** S/4HANA Cloud's Event-Based Revenue Recognition (or the heavier Revenue Accounting and Reporting / RAR module) automatically defers contract revenue at billing time. If the merchant's commerce platform sells multi-period maintenance, subscriptions, or extended warranties, this bucket is non-zero by design. The card surfaces it as a separate category so Finance does not chase it as a defect.
+5. **Alert fires at >$10K unreconciled in the Unknown bucket.** Pending Billing, Credit Memos, EBRR, and Unmapped are explained gaps; only Unknown trips the sentiment. At $16K Unknown, the card is just over threshold and the SAP Functional Analyst's weekly reconciliation review starts here.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+This card is the trigger; the action lives on its companions.
+
+| Card | Why pair it with Revenue Gap vs Commerce |
+| --- | --- |
+| [Revenue Gap, Detailed Breakdown](/nerve-centre/kpi-cards/sap/revenue-gap-detailed-breakdown) | The drill-down. Each missing dollar with the originating commerce order ID and the SAP-side reason. The Finance Manager / Functional Analyst's daily worklist. |
+| [Revenue Booked into GL](/nerve-centre/kpi-cards/sap/revenue-booked-into-gl) | The denominator on the SAP side. Tells you how big the absolute booked revenue is so the gap percentage makes sense. |
+| [Open Sales Document Value](/nerve-centre/kpi-cards/sap/sap-open-so-value) | Pending Billing's forward-looking sibling. Shows what is queued to become GL revenue once the next billing-due-list runs. |
+| [Sales Documents Blocked on Inventory or Credit](/nerve-centre/kpi-cards/sap/sales-documents-blocked-on-inventory-or-credit) | Why Pending Billing is stuck. Inventory holds, credit holds, missing approvals via FSCM-CR. |
+| [Commerce Orders Without S/4HANA Cloud Sales Document](/nerve-centre/kpi-cards/sap/commerce-orders-without-s-4hana-cloud-sales-document) | Specifically the Unmapped Marketplace bucket. The list of commerce orders without a paired SAP Sales Document. |
+| [Credit Memo Value](/nerve-centre/kpi-cards/sap/sap-credit-memos-value) | The Credit Memo Refunds bucket as its own time series. Tells you whether Credit Memo (G2) volume is rising structurally. |
+| [Sales Document to Invoice Lead Time](/nerve-centre/kpi-cards/sap/sales-document-to-invoice-lead-time) | The order-to-bill velocity figure that explains how big Pending Billing should be. |
+| [shopify.total_revenue](/nerve-centre/kpi-cards/shopify/total-revenue) | The DTC half of the commerce-side numerator. |
+| [bigcommerce.total_revenue](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | The B2B half on BC platforms. |
+| [adobe_commerce.total_revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | The B2B half on Adobe Commerce. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in S/4HANA Cloud:**
+
+There is no single native S/4HANA Cloud report for this metric, that is precisely why Vortex IQ surfaces it. The closest manual approach inside SAP is:
+
+> Run the **Manage Sales Documents** Fiori app (`F1873`) filtered to status `Awaiting Goods Issue OR Awaiting Billing`, sum `Net Value`. Then compare manually to the commerce platform's last-30-day total revenue export.
+
+A SAP Functional Analyst can build this view and a parallel CDS query in 15 to 30 minutes. Most do not, because the cross-platform comparison requires pulling commerce data manually, and the moment you do that you have lost reproducibility. Vortex IQ runs this every 15 minutes against the live OData endpoints and the commerce-platform APIs in parallel.
+
+Direct deep-links: `https://my{tenant}.s4hana.cloud.sap/sap/bc/ui2/flp#SalesDocument-manage` and the SAP Analytics Cloud "Sales Order Cockpit" content-pack story.
+
+Adjacent SAP reports that *look* related but are not:
+
+- **Sales Document Register** (transaction VA05 / Fiori app `Sales Order Fulfilment Issues`): shows all open Sales Documents but without commerce-side comparison.
+- **Customer Aging** (transaction FBL5N): AR-based, looks at unpaid Billing Documents, not pre-Billing-Document gap.
+- **SAP Analytics Cloud Sales Performance story**: smooths the gap into a monthly trendline; loses the per-order traceability and runs at 24-hour SAC refresh cadence.
+
+**Why our number may legitimately differ from a manual reconciliation:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Connector sync lag** | Card may overstate gap | SAP S/4HANA Cloud OData polling runs every 15 minutes by default. A commerce order placed in the last sync window appears in commerce gross but not yet in SAP Sales Document list. |
+| **Business Partner mapping gaps** | Card overstates gap | If a commerce customer does not yet have a SAP Business Partner record (BP role FLCU01 customer in BP transaction), the Sales Document cannot be created. The integration logs this as Unmapped Marketplace and the gap shows the gross order. Until the SAP Functional Analyst maps it via BP, the gap persists. |
+| **FX rate cadence** | Small | Commerce platform may capture spot rate; SAP TCURR may be configured at month-average rate type M. The FX Translation bucket isolates this. |
+| **Tax reclassification** | Either | If the commerce platform sends an inclusive-tax order and the SAP tax engine (SAP DRC for compliance, plus the Tax Code lookup) recomputes at a different jurisdiction (e.g. ship-to address state), the line totals differ even though gross paid is the same. |
+| **Period boundary** | Card overstates by 1-2 days of orders | Orders placed late on the last day of the window are in commerce gross but not yet in SAP GL. They show up on the next period's reconciliation. |
+| **Multi-Company-Code scope mismatch** | Card understates gap | If only some Company Codes are connected via the field map, commerce platforms tagged to unconnected Company Codes are excluded. |
+| **Group Reporting elimination** | Card narrower at consolidated view | Inter-company sales between Company Codes inflate per-CC totals but eliminate at the Group level; the card respects the dashboard scope. |
+
+**Cross-connector reconciliation, the killer finding:**
+
+This card IS the cross-connector reconciliation; it has no counterpart on the commerce platforms themselves and no native counterpart inside SAP. The closest sibling on the commerce side is the Pending vs Captured Revenue card on Stripe (which catches Stripe-routed payment captures awaiting settlement), but that compares Stripe-internal state, not commerce-to-ERP.
+
+The full audit trail with originating order IDs, SAP Sales Document numbers (or absent), and integration error log references lives on [Revenue Gap, Detailed Breakdown](/nerve-centre/kpi-cards/sap/revenue-gap-detailed-breakdown). That is the worklist; this card is the headline.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Should this gap ever be zero?**
+No, and you should be suspicious if it is. A small structural gap (Pending Billing + Credit Memos + EBRR + period-boundary timing) is healthy. Zero gap means either the connector is not pulling new commerce orders, or someone is force-closing the period before reconciliation. Aim for a stable gap that scales with revenue, with the Unknown bucket near zero.
+
+**How big should the gap be vs total revenue?**
+A typical enterprise commerce business on S/4HANA Cloud runs at 8 to 18% gross commerce vs net GL revenue gap inside a 30-day window:
+
+- Pending Billing: 4 to 12% (higher for B2B Net-30, lower for DTC; the billing-due-list cadence drives this).
+- Credit Memo Refunds: 3 to 8% (varies by category, apparel skews high; industrial low).
+- EBRR Deferred Revenue: 0 to 5% (only if you sell multi-period contracts).
+- Voided / Rejected: 1 to 3%.
+- Unknown: ideally &lt; 0.3% of commerce gross.
+
+If your gap is > 22%, something structural is wrong with the integration, the Business Partner mapping, or accounting policy. Vortex IQ logs the breakdown so the cause is visible.
+
+**What is the difference between this and the [Revenue Gap, Detailed Breakdown](/nerve-centre/kpi-cards/sap/revenue-gap-detailed-breakdown) card?**
+This card is the headline ($X total gap, classified by reason). The detailed breakdown is the per-order list with commerce IDs, SAP Sales Document numbers (or absent), and audit comments. The Finance Manager checks this card; the SAP Functional Analyst works the breakdown.
+
+**Why is BigCommerce B2B always the biggest gap on SAP?**
+B2B Net-30 introduces a structural ship-to-bill lag of 7 to 30 days. Goods ship from the warehouse on a Delivery Document (LF type), but Billing Documents generate on the billing-due-list schedule (transaction VF04 typically run weekly or fortnightly via background job, not at goods issue). During that lag the order is real revenue economically but not yet GL revenue. DTC orders typically bill at goods issue (within 24 hours), so the lag is much smaller.
+
+**Does the card account for ASC 606 / IFRS 15 deferred revenue?**
+Yes. If your tenant uses Event-Based Revenue Recognition (EBRR) or SAP Revenue Accounting and Reporting (RAR), the S/4HANA Cloud GL booked figure already excludes deferred revenue. Commerce gross still includes the full sale (it is a customer payment, not a recognition decision). The gap surfaces as `EBRR Deferred Revenue` in the breakdown, which is policy-correct, not a defect. Pre-EBRR / pre-RAR setups will show this bucket at zero because revenue posts in full at billing.
+
+**Multi-currency Group Reporting tenants: does the FX Translation bucket overstate?**
+The bucket isolates the residual after rate type M (period average) is applied via the SAP TCURR rate table. If your Company Codes transact in 5+ currencies, expect the FX bucket to be 0.4 to 1.5% of commerce gross. Anything larger usually means the field map's FX rate type is misconfigured (e.g. using rate type B buying-rate when Group Reporting expects M).
+
+**What does the alert look like in practice?**
+At >$10K Unknown, the Nerve Centre fires a sentiment alert and Ask Viq surfaces the question "What is the £14K reconciliation drift this week?" with a deep-link to the breakdown card and to the Manage Sales Documents Fiori app. The Finance Manager typically resolves it in 20 to 45 minutes by mapping a missing Business Partner, releasing a credit hold via FSCM-CR, or escalating a stuck delivery to the SAP Functional Analyst.
+
+**Group Reporting consolidation vs single-Company-Code, does the card behave differently?**
+Same logic, simpler scope. Single-Company-Code skips the FX Translation bucket and the Group Reporting elimination logic. Most fields are identical.
+
+**Sales Document vs Billing Document vs Cash App, where does each fit?**
+
+- Commerce order -> SAP Sales Document: fast (minutes via OData). If this fails, gap appears as Unmapped Marketplace.
+- Sales Document -> Delivery -> Billing Document: slow (hours to days, billing-due-list cadence). If this is stuck, gap appears as Pending Billing.
+- Billing Document -> Cash Application (FB05 / F-30): slow (days to weeks). NOT in this card; this gap is captured by [DSO](/nerve-centre/kpi-cards/sap/days-sales-outstanding).
+- Refund -> Credit Memo (G2): variable, depends on Returns process configuration. Captured as Credit Memo Refunds bucket.
+
+**T-codes the Functional Analyst will use to investigate?**
+For the Pending Billing bucket: VF04 (run billing-due-list), VF03 (display Billing Document), VL03N (display Delivery), VA03 (display Sales Document). For Unmapped Marketplace: BP (Business Partner master maintenance), CMD_EI_API logs (master data integration). For Credit Memos: VF03 type G2.
+
+**SAP Analytics Cloud already shows me sales performance, why do I need this card?**
+SAP Analytics Cloud (SAC) reports on what S/4 already booked. SAC stories pull from SAP Embedded Analytics CDS views; they show the GL-booked total, sliced by dimension. SAC has no view of the commerce platform's gross sales, so the gap itself is invisible. SAC tells you the SAP-side answer; this card tells you the SAP-vs-reality difference.
+
+**Multi-jurisdiction tax (UK MTD, German DSFinV-K, Indian e-invoicing) impact?**
+The card is net-of-tax on both sides, so jurisdictional tax differences do not move the headline. Where they bite is integration error logs: SAP DRC (Document and Reporting Compliance) may reject a Billing Document if the commerce-platform tax data does not match the destination jurisdiction's e-invoicing rules. Those rejections show up in the Unmapped / Unknown buckets until resolved.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Revenue Gap vs Commerce* is one of hundreds of KPI pulses Vortex IQ tracks across SAP and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

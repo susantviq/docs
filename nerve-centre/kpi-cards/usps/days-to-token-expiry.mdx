@@ -1,0 +1,115 @@
+---
+title: "Days to Token Expiry, USPS"
+sidebarTitle: "Days to Token Expiry"
+description: "Days to Token Expiry for USPS stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Shipping & Courier
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Days remaining before the USPS Web Tools API credential the merchant uses to validate addresses, retrieve rates, and create labels stops working. USPS API credentials do not expire by default but can be revoked or rotated for security; the card tracks last-known-good state plus any explicit expiry the merchant has configured.
+
+| | |
+| --- | --- |
+| **What it counts** | If the credential has an expiry stamp, `(expires_at - now()) / 86400`. If credentials have indefinite life, the card reads "Indefinite" and only flips to a countdown if a security event (suspected breach, account suspension, rotation requested) triggers a finite TTL. |
+| **Token type** | USPS Web Tools API uses a permanent USERID assigned at registration with [USPS Web Tools](https://www.usps.com/business/web-tools-apis/). Newer USPS API products (Pricing API v3, Tracking API v3) are migrating to OAuth 2.0 client-credentials with 1-year TTL. The card tracks whichever credential type the connector uses. |
+| **What "expired" actually breaks** | Once the credential is revoked or expires, calls to USPS endpoints (`AddressValidate`, `RateV4`, `eVS Label`, `TrackV2`) return "Authentication failed" or HTTP 401. Label generation breaks; address validation breaks; rate lookups for checkout shipping calculator break (impacts conversion). |
+| **Detection mechanism** | Vortex IQ inspects credential metadata at every call. For permanent USERID credentials, the card reads "Indefinite" until a failed-auth response triggers re-evaluation. For OAuth credentials, the card reads the token's `expires_at` stamp. |
+| **Renewal path** | For Web Tools USERID: contact USPS Web Tools Support at [USPS Internet Customer Care Center](https://www.usps.com/web-tools-apis/) to reactivate a suspended USERID. Typically 1 to 3 business days. For OAuth credentials: log into USPS Developer Portal and rotate via the project's API Keys section. |
+| **Notification cadence** | Card alerts at &lt;14 days (warn) and &lt;7 days (critical) for OAuth credentials. For USERID credentials, alerts trigger only on failed-auth observed events. Vortex IQ also sends in-app banners and email at 14, 7, 3, and 1 day. |
+| **Time window** | `RT` (real-time, refreshed hourly) |
+| **Alert trigger** | `<14 days` (warn) / `<7 days` (critical) |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your USPS data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US DTC merchant connected USPS Web Tools on 04 Mar 25. Reading taken on 12 Mar 26.
+
+| Date | Days to expiry | Card state | What happened |
+| --- | --- | --- | --- |
+| 04 Mar 25 | Indefinite | green | Initial connection. Web Tools USERID issued. |
+| 22 Aug 25 | Indefinite | green | Migrated to USPS Tracking API v3 (OAuth). New TTL 365 days. Card now shows countdown. |
+| 22 Feb 26 | 28 | green | Approaching warn threshold. |
+| 06 Mar 26 | 16 | green | First Vortex IQ pre-warn email. |
+| 08 Mar 26 | 14 | amber | Warn alert tripped. |
+| 12 Mar 26 | 10 | amber | Reading at this example. |
+
+The card reads **10 days** with amber sentiment. Three things to do:
+
+1. **Rotate the OAuth credential this week.** Open USPS Developer Portal, regenerate the client_id and client_secret pair for the project, paste into Vortex IQ Settings → Connectors → USPS. Total downtime: under 5 minutes if done proactively.
+2. **Schedule annual rotation reminder.** USPS OAuth credentials default to 365 days. Add a calendar reminder for 11 months from now.
+3. **Watch for legacy USERID also.** If the connector is on USPS Web Tools v3 OAuth for tracking but still uses the older Web Tools USERID for AddressValidate, both need to be active. Migration to v3 across all endpoints is ongoing through 2026.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Days to Token Expiry | What the combination tells you |
+| --- | --- | --- |
+| [API Error Rate](/nerve-centre/kpi-cards/usps/api-error-rate) | Captures partial failures between rotation events. | Expiry counts down deterministically; error-rate spikes flag transient USPS Web Tools outages or rate-limit overruns. |
+| [Label Generation Success Rate](/nerve-centre/kpi-cards/usps/label-generation-success) | Downstream workload that breaks on auth failure. | Sudden drop in label success with green expiry = something else broke (rate limits, payload errors); drop with red expiry = auth. |
+| [Shipments Total](/nerve-centre/kpi-cards/usps/shipments) | Volume context. | Volume falling to zero with expiry at zero confirms expiry is the cause. |
+| Cross-connector: [`fedex.fed_auth_token_expiry_days`](/nerve-centre/kpi-cards/fedex/days-to-token-expiry) | Multi-carrier connector-health view. | If both expire close together, plan rotation jointly. |
+| Cross-connector: [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Downstream impact. | Unfulfilled-order spike co-occurring with expiry-at-zero is the unmistakable expiry-caused outage signature. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in USPS's own dashboard:**
+
+USPS Web Tools (legacy USERID): no expiry view; USERIDs are permanent unless revoked. Check status by attempting an API call. USPS Developer Portal (OAuth, v3 APIs): **My Projects → [Project] → API Keys** shows credential creation date and TTL.
+
+**Why our number may legitimately differ from USPS's portal:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Credential type** | Either | Legacy USERID has indefinite life; OAuth has 365-day TTL. The card reflects the connector's active credential type. |
+| **Manual revocation** | Card may show stale | If USPS Web Tools admin revokes a USERID without notification, the card continues to read "Indefinite" until the next failed-auth event. |
+| **Migration state** | Either | Merchants migrating from Web Tools v1 to v3 OAuth may have both credential types active; the card reads whichever is configured. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| [`fedex.fed_auth_token_expiry_days`](/nerve-centre/kpi-cards/fedex/days-to-token-expiry) | Peer carrier connector. | Different lifetime conventions; FedEx defaults to 365-day OAuth, USPS legacy defaults to indefinite. |
+| [`easypost.eas_auth_token_expiry_days`](/nerve-centre/kpi-cards/easypost/days-to-token-expiry) | Aggregator alternative. | EasyPost issues a single permanent API key but masks the underlying USPS credential lifecycle. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My USPS Web Tools USERID has been working for years. Will it ever expire?**
+USERIDs are permanent unless revoked. USPS may revoke for: (a) suspected security breach, (b) account inactivity (>2 years no use), (c) terms-of-service violations. The card reads "Indefinite" until any of these triggers a failed-auth event. Best practice: rotate USERID proactively every 12 to 24 months for security hygiene.
+
+**Should I migrate to USPS API v3 OAuth?**
+Yes if rolling out new integrations. USPS is deprecating Web Tools v1 over 2026 to 2027. New connectors should use v3 with OAuth. Existing v1 connectors continue to work but should be migrated within 12 months of card prompts.
+
+**The card says "Indefinite" but my labels just stopped printing. What happened?**
+Check three things. (1) **Failed-auth response.** Confirm the credential is still valid; the card lags failed-auth observation by up to 1 hour. (2) **Rate limit hit.** USPS Web Tools rate-limits at 8 requests/second; sustained burst can return 429 errors that look like auth failures. (3) **USPS service outage.** Check [USPS Service Updates](https://www.usps.com/serviceupdates).
+
+**Can I have multiple USPS connectors with different USERIDs?**
+Yes. Each Vortex IQ workspace can connect multiple USPS instances (e.g. one for the US LLC, one for a different business unit). Each card reads its own connector's credential.
+
+**My credential was suspended due to suspected unusual activity. How do I recover?**
+Contact USPS Web Tools support at [USPS ICCC](https://www.usps.com/web-tools-apis/) with your USERID and a description of your normal usage pattern. Reactivation typically takes 1 to 3 business days. While suspended, you cannot print labels or validate addresses; switch to retail-counter postage as a stopgap.
+
+**Are USERIDs different from CRID and MID?**
+Yes. **USERID** authenticates Web Tools API calls. **CRID (Customer Registration ID)** identifies the business in PostalOne!. **MID (Mailer ID)** identifies the manufacturer of mail-piece barcodes. The card tracks USERID/OAuth credential only; CRID and MID are separate accounts that don't expire.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Days to Token Expiry* is one of hundreds of KPI pulses Vortex IQ tracks across USPS and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

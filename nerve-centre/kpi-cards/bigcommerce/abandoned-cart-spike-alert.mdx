@@ -1,0 +1,171 @@
+---
+title: "Abandoned Cart Spike Alert, BigCommerce"
+sidebarTitle: "Abandoned Cart Spike Alert"
+description: "Checkout step now bleeding, broken shipping calc, payment gateway timeout, slow page. Live signal not lagged to morning report. How to read it, why it mat..."
+---
+
+**Card class:** Non-Hero  •  **Category:** Ecommerce Platform
+
+> Checkout step now bleeding, broken shipping calc, payment gateway timeout, slow page. Live signal not lagged to morning report.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Real-time alarm when checkout abandonment spikes above 75% AND deviates more than two standard deviations from the prior seven-day baseline. Catches a broken shipping calculator, a timed-out payment gateway, a Stencil theme regression after a deploy, or a sudden Cloudflare slowdown, **before the merchant notices on the morning sales report.** Where Shopify merchants get checkout-stability signals from Shop Pay's near-uniform UX, BigCommerce merchants run more theme variation and more payment gateways, so abandonment swings are louder and need a real-time alarm.
+
+| | |
+| --- | --- |
+| **What it counts** | Per-minute rolling-1h `(checkouts_started - checkouts_completed) / checkouts_started` against a same-hour baseline averaged over the prior seven days. Fires when current rate >75% absolute AND z-score >2 against the baseline. The dual-condition approach prevents false positives during low-volume hours where one-or-two missed checkouts can spike the percentage to 90%+. |
+| **API endpoint** | BC Storefront Checkout API webhook stream (`store/cart/created`, `store/order/created`) plus the OpenSearch `incomplete_orders` index. The denominator is the count of `cart_created` events; the numerator is `cart_created - order_created` over the same time window. |
+| **VAT / tax treatment** | n/a, abandonment is a count metric. |
+| **Shipping** | n/a, but a shipping-calculator failure is the single most common cause of this alert firing. The shipping rate API returning 5xx makes the checkout step unable to complete; customers retry once, then leave. |
+| **Discounts** | n/a, but coupon-validation failures (a recently-expired code reactivated by mistake) also trigger this alert. Customers apply the code, the validator rejects, customers leave. |
+| **Refunds** | n/a, real-time alert. |
+| **`Incomplete` orders** | Counted as the abandonment numerator. BC writes an `Incomplete` (`status_id = 0`) record for every cart that reached payment-step but never finalised; these are exactly the abandoners we count. |
+| **Cancelled orders** | Excluded; cancellations happen post-order and are not abandonment. |
+| **Currency** | Multi-currency aggregated. The alert measures completion rate, which is currency-agnostic; a payment-gateway outage that affects all currencies fires once globally rather than per-currency. For per-currency outages (a regional Stripe acquirer down) configure the alert per-channel and per-currency. |
+| **Channels** | **All web channels (`channel_id = 1` and any custom Channels API web channel).** POS is excluded because POS doesn't use the checkout funnel. Marketplace channels (Amazon, Walmart) are excluded because their checkout happens off-platform. **B2B portal carts are included if the merchant has B2B Edition active**, B2B abandonment patterns are different (longer cycle, more re-quotes) and are a leading indicator of pricing-level mismatches. |
+| **B2B Edition behaviour** | B2B portal abandonment baselines are typically 5-15 percentage points higher than DTC because of the quote / approval workflow inherent to B2B. The alert auto-tunes its baseline per customer group when B2B Edition is detected; don't apply the DTC threshold to a B2B portal. |
+| **7-day baseline** | Same-hour same-day-of-week over the prior seven days, averaged and z-score computed. Holidays in the baseline window distort the comparison; expect false positives the day after Memorial Day, Bank Holiday Monday, etc. |
+| **Time window** | `RT` (rolling 60-minute window evaluated each minute). |
+| **Alert trigger** | `abandonment >75% AND >2σ vs 7D baseline` |
+| **Roles** | owner, marketing, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your BigCommerce data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US fashion retailer on BigCommerce Pro running a Stencil theme with Stripe + PayPal as gateways. Tuesday 14 Apr 26, 14:00-15:00 UTC. Same-hour 7-day baseline: 142 carts started, 51 orders completed, 64.1% abandonment.
+
+| Hour | Started | Completed | Abandonment | Z-score | Status |
+| --- | --- | --- | --- | --- | --- |
+| 13:00 UTC | 138 | 49 | 64.5% | +0.1σ | Normal |
+| 14:00 UTC | 156 | 18 | **88.5%** | **+4.2σ** | **ALERT FIRES** |
+| 15:00 UTC | 122 | 12 | **90.2%** | **+5.1σ** | **STILL FIRING** |
+
+What's interesting:
+
+1. **The 88.5% absolute rate alone wouldn't fire on a quiet hour.** A 14:00 UTC hour with only 20 carts and 17 abandoners reads 85% but is just sample noise. The dual condition (>75% AND >2σ) ensures we only fire on hours with statistically significant deviation. **The z-score is doing the real work here, not the absolute threshold.**
+2. **Investigation sequence in the first 2 minutes**: (a) Open the storefront in incognito, navigate to a product, add to cart, proceed to checkout, get to the shipping-rate step. (b) Did the page hang? Did the shipping rate fail to populate? Did Stripe / PayPal load correctly? (c) Check Stripe / PayPal status pages. (d) Check BC Settings → Shipping → Real-time rate connectors (UPS, USPS, FedEx, ShipperHQ); rate-API outages are the #1 cause.
+3. **The Stripe iframe was returning 503s.** Stripe's status page confirmed a 35-minute partial outage in their US-East acquirer at 14:05-14:40 UTC. Customers saw the payment iframe fail to load, retried once, left.
+4. **Lost revenue estimate**: 156-18 = 138 abandoners on the alert hour, ~30% would have completed normally = 41 lost orders. At AOV $85 that's $3,485 in one hour. **The whole point of catching this in real time is to recover by switching to PayPal as the primary processor for the duration of the outage**, BC's payment settings allow swapping default gateway in under a minute.
+5. **The mitigation actually worked.** At 14:42 UTC the merchant disabled Stripe and made PayPal the default; by 15:00 the abandonment rate was still elevated (90.2%) because the outage was still resolving in customer browsers, but completion volume had normalised by 15:30. **Lesson: real-time alerts buy you the option to fail over to alternative payment paths during gateway outages, but only if you're watching.**
+
+The rapid-response playbook (when this alert fires):
+
+1. **Run a test order yourself.** Incognito browser, fresh session, complete a real (or pre-approved test) checkout. Reproduce the failure or confirm it's intermittent.
+2. **Check status pages**: status.bigcommerce.com, status.stripe.com, status.paypal.com, your shipping-rate provider's status (status.shippo.com, etc.).
+3. **Check recent deploys**. If a Stencil theme push went out in the last 4 hours, that's the cause until proven otherwise; roll back.
+4. **Check coupon validity**. A recently-disabled coupon code reactivating accidentally, or a price-list with an invalid SKU, can cascade through the checkout step.
+5. **Failover the gateway.** Most BC stores have at least two payment gateways configured. Make the working one the default for the duration of the outage; revert when status pages clear.
+6. **Notify the team** via #incidents channel. Even false positives benefit from being acknowledged.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Abandoned Cart Spike Alert |
+| --- | --- |
+| [BC Alert Revenue Drop](/nerve-centre/kpi-cards/bigcommerce/revenue-drop-alert) | The macro-revenue version. Both fire on most checkout outages; if abandonment fires but revenue drop doesn't, the issue is funnel-specific (just shipping or just payment), not a full outage. |
+| [BC Decline Rate](/nerve-centre/kpi-cards/bigcommerce/declined-transaction-rate) | If decline rate spiked alongside abandonment, the gateway is genuinely outage-class. If decline rate is flat but abandonment spiked, it's a UX issue (page slow, validator rejecting). |
+| [BC Incomplete Rate](/nerve-centre/kpi-cards/bigcommerce/incomplete-cart-rate) | The longer-window equivalent. This card is the real-time alarm; Incomplete Rate is the trend on which to evaluate post-outage cleanup. |
+| [BC Failed Orders Count](/nerve-centre/kpi-cards/bigcommerce/bc-failed-orders-count) | The combined failure pulse, useful for first-5-minutes diagnostic. |
+| [BC Channel Conversion Rate](/nerve-centre/kpi-cards/bigcommerce/conversion-rate-by-channel) | A spike here pulls conversion rate down for the affected hour; pair to confirm the funnel-side impact. |
+| [BC Alert Channel Revenue Drop](/nerve-centre/kpi-cards/bigcommerce/channel-revenue-drop-alert) | Often co-fires when one specific channel's checkout is broken. |
+| [BC Orders by Device](/nerve-centre/kpi-cards/bigcommerce/orders-by-device) | Mobile-only abandonment spikes are usually theme issues; desktop-only are usually iframe / gateway issues. The split tells you where to look. |
+| [Total Revenue](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | Context for prioritisation, abandonment-spike on a peak hour costs more than the same percentage spike on a quiet hour. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in BigCommerce Control Panel:**
+
+BigCommerce **does not surface a native real-time abandonment-rate alarm.** The closest views are [Analytics → Abandoned Carts](https://login.bigcommerce.com/deep-links/manage/analytics/abandoned-carts) (Plus / Pro / Enterprise) which shows a daily rollup, and [Marketing → Abandoned Cart Saver](https://login.bigcommerce.com/deep-links/manage/marketing/abandoned-cart-saver) which lists individual abandoned carts but not the rate. Neither updates in under 6 hours, so neither is useful during a live outage.
+
+For real-time diagnosis:
+
+1. [Settings → Shipping → Real-time rates](https://login.bigcommerce.com/deep-links/manage/settings/shipping) shows whether the rate API is responding.
+2. [Settings → Payments](https://login.bigcommerce.com/deep-links/manage/payments) shows current gateway connection health.
+3. [Storefront → Themes → Visit store](https://login.bigcommerce.com/deep-links/manage/storefront/themes), then complete a test checkout to reproduce.
+4. [Webhooks → Recent activity](https://login.bigcommerce.com/deep-links/manage/store-setup/webhooks) shows webhook delivery latency and failures.
+
+**Why our alert may fire on legitimately-quiet hours:**
+
+| Reason | Direction |
+| --- | --- |
+| **Holidays not yet on the 7-day baseline.** Bank Holiday Monday in the baseline depresses normal-Monday expectations and can amplify a Tuesday alert. | False positive |
+| **DST transitions**. Same-hour comparison shifts by 1 hour twice a year. | False positive (1-2 days post-flip) |
+| **Promotional cycles**. The hour after a flash sale starts often has elevated abandonment as bargain-hunters add and bounce. | False positive (anticipated) |
+| **Theme deploy window**. A Stencil theme push during a quiet hour creates a brief outage caught by the alert; if you push during business hours expect a fire. | True positive (avoidable) |
+| **Genuine gateway / shipping outage**. The intended trigger. | True positive |
+| **Coupon-validation regression**. A discount or price-list rule rejects valid baskets. | True positive |
+| **Bot traffic**. A spike in cart-add events from scraper bots that don't proceed to checkout temporarily inflates the abandoner count. | False positive |
+
+**Cross-connector reconciliation (when payment processors and analytics are connected):**
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| [`stripe.stripe_decline_rate`](/nerve-centre/kpi-cards/stripe/decline-rate) | A genuine Stripe outage co-fires both alerts within minutes | If only the BC alert fires but Stripe decline rate is flat, the issue is upstream of the payment step (shipping, theme, coupon). |
+| [`paypal.pp_decline_rate`](/nerve-centre/kpi-cards/paypal/decline-failure-rate) | Same logic for PayPal-side issues | PayPal outages affect a subset of carts; expect the BC alert to read 30-60% rather than 90%+ when PayPal-only is broken. |
+| [`google_analytics.ga_checkout_abandonment`](/nerve-centre/google_analytics/ga_checkout_abandonment) | GA4 funnel reports show the same trend with 4-6 hour lag | GA4's hourly granularity needs configuration; the default daily report is too slow for incident response. |
+| [`datadog.dd_5xx_rate`](/nerve-centre/kpi-cards/datadog/5xx-response-rate) | Storefront 5xx spikes co-fire with this alert | Datadog catches the technical signal; this card catches the merchant-facing impact. Both running together is the right pattern. |
+
+**The real-time abandonment alert shape is BC-aligned with similar alerts on Shopify (per `checkout_token`) and Adobe Commerce (per `quote_id`); merchant-facing semantics are equivalent across platforms.**
+
+---
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+- [`shopify.alert_abandoned_cart_spike`](/nerve-centre/shopify/alert_abandoned_cart_spike) (planned)
+- [`adobe_commerce.alert_quote_abandonment_spike`](/nerve-centre/adobe_commerce/alert_quote_abandonment_spike) (planned)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The alert fired but my cart-recovery emails went out fine. Is this a false positive?**
+Possibly not. Cart-recovery emails fire on the BC `Incomplete` status, which is the abandonment we're measuring. The recovery email is the *response* to the abandonment, not evidence the abandonment didn't happen. **If your cart-recovery flow had a sudden burst of emails matching the alert window, that's actually confirmation the alert is real, not refutation.**
+
+**My BC abandonment dashboard says my abandonment rate is 60%, well below the 75% threshold. Why does this card alert?**
+Because BC's dashboard is daily; this card is hourly. A 60% daily rate hides a 90% bad-hour and a 50% good-hour. The alert exists specifically to catch the bad hours that the daily rollup smooths over. **A 90%-abandonment hour is roughly 3x as much lost revenue as a 70%-abandonment hour, even though the daily average barely moves.**
+
+**My multi-storefront BC instance has six storefronts. Does the alert fire per-storefront or store-wide?**
+By default, per-storefront. Each storefront has its own baseline and alert. A theme regression on Storefront A doesn't trigger an alert on Storefronts B-F. Configure store-wide aggregation under Settings → Alerts → Aggregation if you want a single alert; we recommend per-storefront for multi-brand merchants who run different themes per storefront.
+
+**Why does B2B Edition need a different baseline?**
+Because B2B portal abandonment is structurally higher than DTC. A 60% abandonment rate on B2B is healthy (quote-and-think cycles take 24-72 hours; "abandonment" within an hour just means the buyer is going to come back later). Applying the DTC 75% threshold to a B2B portal generates 5-10 false alarms per week. The auto-tune detects the customer-group split and applies a B2B-appropriate (typically 85% absolute, 2.5σ) threshold.
+
+**My Stripe iframe occasionally fails for a single user but the alert never fires. Why?**
+Because individual-user failures don't move the rate enough to cross the threshold. The alert is designed for systemic outages (everyone affected) rather than per-user UX issues. For per-user abandonment investigation use the [BC Abandonment Recovery](/nerve-centre/bigcommerce/bc_abandonment_recovery) card, which surfaces individual-cart diagnostics.
+
+**Should I forward this alert to engineering or marketing?**
+**Engineering first, marketing CC.** Most fires are technical (gateway, theme, shipping) and need engineering action. Marketing should be aware so they can pause email / ad sends pointing at a broken funnel, but the action lever is engineering. **Exception: if the alert fires during a known flash-sale launch, marketing leads the response (the surge itself is causing temporary checkout congestion).**
+
+**My BigCommerce store has a Headless / Storefront API frontend. Does this alert work?**
+Yes, if your headless frontend writes to BC's Checkout API normally (the common pattern). The alert measures BC's checkout webhook stream, which fires regardless of frontend. **However, if your headless frontend bypasses BC's checkout entirely (rare, but some agencies do this for speed), the cart-created webhook may not fire and the alert will under-report.** Verify by completing a test order and confirming the `cart/created` webhook fires.
+
+**I just made the headline alert threshold tighter (>70% instead of >75%). Now I get 5 alerts a day. What gives?**
+75% is the floor; below 70% the noise floor is too loud. Most healthy stores baseline at 60-72% normal abandonment, so a 70% threshold sits inside the noise distribution rather than above it. **If you want louder alerting, configure z-score sensitivity (lower the σ from 2 to 1.5) rather than the absolute floor**, that catches genuine deviation while preserving the noise floor.
+
+**Can I silence the alert during a planned theme deploy?**
+Yes, scheduled silences under Settings → Alerts → Silence windows. **We strongly recommend silencing for the 30 minutes around any theme deploy** rather than relying on "the deploy is fine" assumptions. If the deploy is fine, the silence harmlessly unmutes; if the deploy breaks, you'll see it on the next non-silenced window.
+
+**My alert fires every Monday at 9 AM. Why?**
+Almost certainly a calendar effect. Your 7-day baseline now includes Sunday's low-volume hour averaged with weekday hours, depressing the expected count. When real Monday traffic hits, the absolute completion-rate may be normal but the deviation reads high. **Tune to "same hour, same day-of-week, last 4 weeks"** rather than rolling 7 days; the option is in Settings → Alerts → Baseline mode.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Abandoned Cart Spike Alert* is one of hundreds of KPI pulses Vortex IQ tracks across BigCommerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

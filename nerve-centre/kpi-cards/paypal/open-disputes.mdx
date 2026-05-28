@@ -1,0 +1,172 @@
+---
+title: "Open Disputes, PayPal"
+sidebarTitle: "Open Disputes"
+description: "Disputes in WAITING_FOR_SELLER_RESPONSE, clock is ticking on evidence (default 10 days). How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Payment Gateway
+
+> Disputes in WAITING_FOR_SELLER_RESPONSE, clock is ticking on evidence (default 10 days).
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Live count of PayPal disputes (T19xx) currently waiting for the merchant's evidence response. The clock is ticking, PayPal's default response window is **10 days** for most case types. Miss it and the dispute auto-closes against you. Any non-zero value triggers an alert because every open case has a deadline.
+
+| | |
+| --- | --- |
+| **The formula** | `COUNT(event_code STARTS T19 AND status IN [P, WAITING_FOR_SELLER_RESPONSE])`. Open T19 events, not yet resolved, awaiting your action. |
+| **Event code filter** | T19xx only (PayPal dispute family). Includes Inquiries, formal Disputes, escalated Claims, Pre-Arbitration, and bank-routed Chargebacks. All T19 sub-types count if their status is open. |
+| **Status filter** | `P` (pending review) + `WAITING_FOR_SELLER_RESPONSE`. Resolved cases (won, lost, abandoned, closed) are excluded. The card shows what needs your attention RIGHT NOW. |
+| **Why it matters** | PayPal cases auto-close against the merchant if the response window expires without evidence submitted. Default windows: 10 days for buyer-protection cases (INR / SNAD / Unauthorised), 7-14 days for bank-routed chargebacks depending on card network. The case is lost if the deadline passes; lost cases count toward your dispute rate (and the 1.0% Visa cap). |
+| **What "evidence" means** | Tracking numbers + delivery confirmation for INR cases; product photos + listing snapshots + shipping confirmation for SNAD cases; signed delivery + IP + device fingerprint for Unauthorised cases. PayPal's Dispute Center walks you through the upload process per case. |
+| **Refunds** | A pre-emptive refund usually closes the case in your favour without needing evidence. T11 (refund) on the disputed payment typically resolves T19 (dispute) on the next status sync. |
+| **Currency** | **n/a (count, currency-neutral).** Multi-currency PayPal accounts get a single, valid open-disputes count. The dollar value is in [PP Dispute Value](/nerve-centre/kpi-cards/paypal/dispute-value). |
+| **Pending status (P) handling** | `P` here means "PayPal is reviewing the dispute itself" not "payment is pending". Counted in this card. |
+| **Seller Protection** | Coverage doesn't change whether a dispute is open; it changes whether you'll lose money on it if the dispute is decided against you. See [PP Seller Protection Coverage](/nerve-centre/kpi-cards/paypal/seller-protection-coverage-rate). |
+| **Page cap** | 10,000 transactions per `/v1/reporting/transactions` call. Open disputes are sparse so the cap rarely matters; if you have > 10k open disputes you have a much bigger problem than reconciliation. |
+| **Time window** | `RT` (real-time, refreshes every sync, typically every 5-15 minutes during business hours). |
+| **Alert trigger** | `> 0`. Any open dispute triggers the alert because each one has a ticking deadline. |
+| **Roles** | owner, finance, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your PayPal data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US-based home-goods brand. The PayPal dispute queue at 09:00 UTC on 12 Apr 26:
+
+| Case ID | Reason | Filed | Days remaining | Amount | Evidence ready? |
+| --- | --- | --- | --- | --- | --- |
+| PP-CASE-7821 | INR (Item Not Received) | 09 Apr 26 | 8 | $124.99 | Tracking uploaded, delivery confirmed |
+| PP-CASE-7799 | SNAD (Not As Described) | 06 Apr 26 | 5 | $89.50 | Listing screenshots needed |
+| PP-CASE-7755 | Unauthorised | 02 Apr 26 | 1 | $349.00 | Shipped to verified address, evidence uploaded |
+| PP-CASE-7740 | INR | 28 Mar 26 | 0 (today) | $52.00 | Customer called, refund issued |
+| PP-CASE-7732 | Bank chargeback (Visa) | 25 Mar 26 | -2 (overdue) | $199.99 | NOT YET UPLOADED |
+| PP-CASE-7720 | SNAD | 22 Mar 26 | 7 | $76.00 | Pending listing review |
+| PP-CASE-7715 | Inquiry | 20 Mar 26 | 9 | $45.00 | Customer-initiated, awaiting reply |
+
+```text
+PP Disputes Open
+  count = 7 (all T19 with status IN [P, WAITING_FOR_SELLER_RESPONSE])
+```
+
+Five things worth noticing:
+
+1. **PP-CASE-7732 is overdue.** The 7-day Visa chargeback response window expired 2 days ago. PayPal will auto-close this case against the merchant on the next batch run; the $199.99 will be debited from the next payout AND the case counts toward the 1.0% chargeback monitoring threshold. This is the single most urgent item on the queue, evidence cannot recover it now (the deadline has passed) but the merchant should still upload a chargeback rebuttal in case PayPal allows a late submission.
+2. **PP-CASE-7755 has 1 day left.** Unauthorised cases require the strongest evidence pack (signed delivery confirmation, IP / device fingerprint, billing-shipping match). The merchant has uploaded; this should resolve in their favour because Seller Protection generally covers Unauthorised when shipped to the verified address.
+3. **PP-CASE-7740 was customer-resolved with a refund.** It still appears in this card until PayPal's status syncs catch up (usually within 24 hours of the refund). On the next refresh it should drop off.
+4. **The merchant has 7 open disputes totalling ~$936** ([PP Dispute Value](/nerve-centre/kpi-cards/paypal/dispute-value) shows the dollar view). At 4,820 successful payments in the rolling 30-day window, the *active dispute density* is 0.145%, well below the 0.9% alert; but if any of these become "lost" they count toward [PP Dispute Rate](/nerve-centre/kpi-cards/paypal/dispute-rate) which has the regulatory cap.
+5. **Reason mix: 2 INR, 2 SNAD, 1 Unauthorised, 1 Inquiry, 1 bank chargeback.** That's a balanced distribution suggesting no single root cause is dominant. A pattern of mostly INR would point to fulfilment issues; mostly SNAD to listing accuracy; mostly Unauthorised to a fraud attack. None of these dominate here, so the operator works the cases individually rather than chasing a systemic fix.
+
+The dashboard playbook: open the case with the *least* days remaining first, regardless of dollar value. A small case lost to deadline still counts the same toward your dispute rate as a large one. Then work down the queue. Cases with strong evidence ready (delivery confirmation, listing accuracy proof) win 80%+ on PayPal; cases with weak evidence often lose regardless of merit.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with PP Disputes Open |
+| --- | --- |
+| [PP Dispute Value](/nerve-centre/kpi-cards/paypal/dispute-value) | Dollar value of the open queue. Combine count + value to triage. |
+| [PP Dispute Reason Mix](/nerve-centre/kpi-cards/paypal/dispute-reason-code-mix) | Are the open cases concentrated in INR (logistics fix), SNAD (listings fix), or Unauthorised (fraud fix)? |
+| [PP Dispute Response Time](/nerve-centre/kpi-cards/paypal/avg-dispute-response-time) | Average days you take to respond. If too high, operational fix needed; if low, you're just unlucky on case count. |
+| [PP Buyer Protection Win Rate](/nerve-centre/kpi-cards/paypal/buyer-protection-win-rate) | The downstream outcome card. Of cases you defend, what fraction do you win? |
+| [PP Dispute Rate](/nerve-centre/kpi-cards/paypal/dispute-rate) | Trailing 30-day rate. This card is "right now"; that one is "trend". |
+| [PP Chargeback Lifecycle](/nerve-centre/kpi-cards/paypal/dispute-lifecycle-stage-mix) | Lifecycle states (Inquiry → Chargeback → Pre-Arbitration → Arbitration). Helps prioritise late-stage cases. |
+| [PP Seller Protection Coverage](/nerve-centre/kpi-cards/paypal/seller-protection-coverage-rate) | Coverage on the underlying payments. High coverage = open disputes hurt less if lost. |
+| [Stripe Disputes Needs Response](/nerve-centre/stripe/stripe_disputes_needs_response) | The Stripe twin. Multi-processor merchants often run both queues from a unified ops dashboard. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PayPal Business:**
+
+- [PayPal Resolution Center](https://www.paypal.com/disputes), the live case queue with response-deadline countdowns. This is the canonical view, the merchant takes action here.
+- [PayPal Business → Activity → Disputes filter](https://www.paypal.com/businessmanage/activities) for an aggregated transactional view.
+- [PayPal Seller Performance dashboard](https://www.paypal.com/businessmanage/sellerperformance) for context on whether your open-disputes count is contributing to seller-performance flags.
+
+Other views that look like this but aren't:
+
+- "Cases" tile on the home dashboard groups all dispute states (open + closed) into one number.
+- "Refunds and reversals" feed includes T11 refunds, which are not disputes.
+- "All transactions" filtered by status "Disputed" usually shows historical disputes regardless of current state.
+
+**Why our number may legitimately differ from PayPal Business:**
+
+| Reason | Direction of divergence | What to do |
+| --- | --- | --- |
+| **Refresh lag**. Card refreshes every 5-15 minutes; new disputes filed in between are not yet visible. | Vortex IQ may be **lower** for the most recent few minutes | Wait for next refresh; PayPal Resolution Center is real-time. |
+| **Status sync timing**. A dispute the merchant just refunded out of may still appear here for up to 24 hours until PayPal closes the case formally. | Vortex IQ may be **higher** | Refresh within 24 hours; cross-check Resolution Center for ground truth. |
+| **Status enum granularity**. PayPal exposes finer-grained statuses (UNDER_REVIEW, OPEN, RESPONSE_RECEIVED, RESOLVED) than our simple "open / closed" bucketing. Edge-state cases may differ. | Tiny | Use Resolution Center for definitive case state. |
+| **Time zone**. PayPal Business uses your account-configured timezone for the "deadline" countdown; Vortex IQ uses UTC. Cases that look "1 day remaining" in one view may look "2 days remaining" in the other depending on tz. | Boundary effects | Resolution Center is authoritative for response deadlines. |
+| **Inquiry vs formal dispute**. PayPal sometimes upgrades inquiries to formal disputes mid-case. The status may change between syncs. | Tiny | Wait for next refresh. |
+
+**Cross-connector reconciliation:**
+
+| Comparison | Expected relationship | When divergence is legitimate |
+| --- | --- | --- |
+| `pp_disputes_open` ↔ [`stripe.stripe_disputes_needs_response`](/nerve-centre/stripe/stripe_disputes_needs_response) | Two independent queues, no equality expected. PayPal disputes typically file faster (easier buyer-side flow) and resolve faster (PayPal's mediation is more streamlined). | A PayPal-only spike usually means a customer satisfaction issue concentrated in PayPal-paid orders (international buyers, mobile shoppers). Stripe-only spike usually means a fraud wave on card-on-file customers. |
+| `pp_disputes_open` ↔ commerce platform "open returns" | Loosely related, both signal customer dissatisfaction. | A return is a peaceful customer; a dispute is an escalating customer. Rising returns + flat disputes = generous returns policy working. Rising disputes + flat returns = something is short-circuiting your returns flow into a dispute (return RMA process broken, contact form unreachable). |
+
+**Quick rule for support tickets:** if a merchant says *"PayPal Resolution Center shows 8 cases, your card shows 7"* that's almost always sync timing, the most recently filed case is in PayPal but not yet in our cache. Wait one refresh.
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The Stripe twin is [`stripe.stripe_disputes_needs_response`](/nerve-centre/stripe/stripe_disputes_needs_response). Both cards count cases requiring merchant action. PayPal's response window (10 days for buyer protection) is shorter than Stripe's (typically 14-21 days for card chargebacks); operationally PayPal disputes are more time-pressured.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What happens if I miss a dispute deadline?**
+The case auto-closes against you. PayPal debits the disputed amount from your next payout, charges a chargeback fee (typically $20), and the case counts toward your dispute rate (which has the 1.0% Visa/Mastercard regulatory cap). Missing deadlines is the single most-avoidable cause of merchant losses in the dispute flow.
+
+**Can I just refund the dispute to make it go away?**
+Yes. A refund issued through PayPal usually closes the case in your favour without needing evidence (PayPal interprets it as resolution-by-mutual-agreement). The refund counts as a refund, not a lost dispute, so it doesn't hit your dispute rate. The trade-off: refund cost vs evidence-and-defend cost. For low-value cases (&lt; $50), refunding is almost always cheaper than the operational time of building an evidence pack.
+
+**What evidence wins PayPal disputes?**
+Depends on case type:
+
+- **INR**: tracking number with carrier delivery confirmation. Tracking that shows "in transit" but never delivered usually loses; tracking that shows "delivered" usually wins.
+- **SNAD**: original product listing screenshot, shipping photos showing the item packed correctly, return policy clearly visible to buyer at purchase.
+- **Unauthorised**: signed delivery confirmation (especially for high-value), IP address match between order and historical buyer logins, billing-shipping address match.
+- **Inquiry** (informal): just respond promptly with a polite explanation. 60% close without escalating.
+
+**Why is my count higher in PayPal Resolution Center than in this card?**
+Two reasons usually: (1) refresh lag, the most recently filed case is in PayPal but our cache is 5-15 minutes behind; (2) PayPal sometimes counts cases in transitional states (status changing) that our `IN [P, WAITING_FOR_SELLER_RESPONSE]` filter excludes briefly. Wait one refresh; if the gap persists, PayPal Resolution Center is authoritative.
+
+**Are inquiries counted here?**
+Yes if they're awaiting your response. Inquiries are early-stage cases where the buyer asked PayPal to mediate without filing a formal dispute. They have shorter response windows (typically 7 days) but most close in your favour after a polite reply explaining the situation.
+
+**How do I respond to bank chargebacks routed through PayPal?**
+Differently from buyer-protection cases. Bank chargebacks (the 2 in our worked example) are filed by the issuing bank under Visa or Mastercard rules; PayPal forwards them to you with a network-specific evidence template. Win rates are lower (typically 25-35%) because card networks have stricter evidence requirements than PayPal's own buyer-protection programme. Pre-emptive refund usually doesn't close them, the bank has already moved the money.
+
+**The card shows 0, am I done forever?**
+No, just for now. New disputes can be filed up to 180 days after the original payment. Watch [PP Dispute Rate Trend](/nerve-centre/kpi-cards/paypal/dispute-rate-trend) for the trailing trend; if disputes are filed weeks or months after orders, you'll see a long tail.
+
+**Why is the alert at >0 not a higher threshold?**
+Because every open case has a deadline. Even one open case with 8 days left can become a lost case at day 11 if forgotten. The card is binary-by-design, when it's non-zero, action is required. For trend-monitoring use [PP Dispute Rate](/nerve-centre/kpi-cards/paypal/dispute-rate) instead.
+
+**Can I bulk-respond to multiple disputes at once?**
+PayPal Resolution Center supports per-case responses only. There's no bulk-evidence-upload UI in PayPal Business. Some third-party dispute-management apps integrate with PayPal's API to streamline the flow; for high-dispute-volume merchants those tools pay back quickly.
+
+**My multi-currency PayPal account, does this card work?**
+Yes, count-based metrics are currency-neutral. A multi-currency account gets a single open-disputes count across all currencies. The dollar value (in [PP Dispute Value](/nerve-centre/kpi-cards/paypal/dispute-value)) sums across currencies without FX, so multi-currency stores should also use the per-currency breakdown for triage.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Open Disputes* is one of hundreds of KPI pulses Vortex IQ tracks across PayPal and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

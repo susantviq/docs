@@ -1,0 +1,127 @@
+---
+title: "Days to Token Expiry, Parcelforce Worldwide"
+sidebarTitle: "Days to Token Expiry"
+description: "Days to Token Expiry for Parcelforce Worldwide stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Shipping & Courier
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Live count of days remaining until the Parcelforce ParcelManager API credential (or OAuth token, depending on integration mode) expires. When this hits zero, label generation stops, tracking webhooks stop, and the merchant cannot ship until a human re-authenticates. The card is the early-warning trip-wire for a connector outage; treat anything below 14 days as a calendar event for the ops team.
+
+| | |
+| --- | --- |
+| **What it counts** | `floor((credential_expires_at - now) / 86400)` in days. Reads the credential metadata stored at integration-creation time and refreshed on each successful API call. |
+| **Credential type** | Parcelforce's ParcelManager API issues per-account API keys with a typical 12-month lifetime. Some merchants use OAuth flows (where applicable) with shorter token cycles; the card adapts to whichever credential type is connected. |
+| **What expiry means operationally** | Label generation via `par_label_generation_success` will start failing within hours of expiry. Tracking webhooks (POD events) stop flowing. Existing in-flight consignments continue to deliver but no new dispatch is possible. |
+| **Auto-refresh behaviour** | If the integration was set up with refresh-token support, Vortex IQ silently rotates the access token before expiry and this card resets to the new credential lifetime. If the integration is API-key only (no refresh path), the merchant must rotate the key in ParcelManager and update the connector. |
+| **Service level scope** | Connector-wide. Affects all services equally; an expired credential breaks Express24 and Globaldirect identically. |
+| **Currency** | N/A |
+| **B2B vs B2C** | Not applicable to credential lifetime. |
+| **Time window** | `RT` (real-time, polled on card read) |
+| **Alert trigger** | `<14 days`, the gauge sentiment trips. The 14-day window gives ops a clean two-week calendar slot to coordinate a credential rotation without dispatch disruption. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Parcelforce Worldwide data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK multi-channel merchant connected Parcelforce on 14 May 25 with an API key issued by Parcelforce on the same day. Expiry is 14 May 26. Reading taken at 09:00 GMT on 30 Apr 26.
+
+| Field | Value |
+| --- | --- |
+| Credential type | ParcelManager API key |
+| Issued at | 14 May 25 |
+| Expires at | 14 May 26 |
+| Days remaining | **14** |
+| Alert state | Tripped (=14, on the threshold) |
+
+The card reads **14**, exactly on the alert threshold, prompting the ops team to schedule a rotation. Five things to notice:
+
+1. **Two weeks is enough notice but not a luxury.** Parcelforce's API-key rotation in ParcelManager requires a portal login by an account owner, generation of a new key, and a copy-paste into the Vortex IQ connector. End-to-end ~10 minutes when nothing breaks; budget 1 to 2 hours for coordination across portal-access, ops, and a verification dispatch test.
+2. **Schedule the rotation before a quiet day, not on the expiry day.** A rotation that happens 7 days early gives a 7-day buffer if the new key has any propagation delay. Parcelforce's API has been observed to take up to 30 minutes to recognise newly-issued keys; rotating on expiry day is risk for no benefit.
+3. **Coordinate with `par_label_generation_success`.** That card is the operational symptom; this card is the leading indicator. If both cards turn red simultaneously, the rotation has failed mid-flight and dispatch is at risk.
+4. **B2B-account merchants should rotate during weekday daytime, not weekend.** B2B reseller dispatch on Express9 / Express10 expects pre-09:00 label generation; weekend rotations that drift into Monday-morning Parcelforce-side propagation are the worst-case scenario. DTC-only merchants have more flex.
+5. **Set a calendar reminder for 11 months out.** Parcelforce's typical 12-month key lifetime means the merchant should know each year when the rotation is due. The card surfaces it at 14 days; the calendar reminder gives 30 days.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+Token expiry is a connector-health early-warning. Pair with these for the full operational health picture:
+
+| Card | Why pair it with Days to Token Expiry | What the combination tells you |
+| --- | --- | --- |
+| [Label Generation Success](/nerve-centre/kpi-cards/parcelforce/label-generation-success) | The first operational symptom of token expiry. Falls below 98% when credentials are mid-rotation or partially expired. | If both turn red at once, rotation is in flight and may have failed. Investigate immediately. |
+| [API Error Rate](/nerve-centre/kpi-cards/parcelforce/api-error-rate) | 401 / 403 auth errors spike when token is mid-rotation or just expired. | A spike in API errors with token expiry inside 14 days = the new credential has not propagated yet. |
+| [Shipments](/nerve-centre/kpi-cards/parcelforce/shipments) | Volume drops to zero on token expiry as label generation halts. | A shipments-flatline-with-expiry-imminent is the catastrophic outcome. The 14-day alert is to prevent this. |
+| Cross-connector: connector health for `apc.apc_auth_token_expiry_days` | Same role on APC. Multi-carrier merchants should track all credential expiries on a single ops-calendar. | Coordinated rotation week reduces ops cost. |
+| Cross-connector: any of the marketplace / commerce credentials | Common pattern: Shopify Admin API, BigCommerce, Adobe Commerce, etc. | Quarterly credential-rotation review across all connected services is industry-standard ops hygiene. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Parcelforce's own dashboard:**
+
+[Parcelforce ParcelManager](https://parcelmanager.parcelforce.com/) → **Account Settings → API Access**. The page shows each issued API key with its issue date, expiry date, and an action button to rotate. The closest like-for-like field is **Expires on**.
+
+**Why our number may legitimately differ from Parcelforce's portal:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Time zone** | Boundary | Parcelforce uses UK local time on the issuance and expiry timestamps. The card uses the same. No discrepancy in steady-state. |
+| **Multi-key accounts** | N/A | If the merchant has issued multiple API keys (test, production, staging), the card reads the credential connected to Vortex IQ. ParcelManager may show a longer-lived key alongside the connected one. |
+| **Refresh-token vs API-key mode** | N/A | OAuth integrations show a shorter token cycle (typical 24 hours) but auto-refresh; the card reads the underlying refresh-token expiry. ParcelManager presents the OAuth client expiry. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| Cross-connector: any other shipping carrier auth-expiry card | Same operational role across carriers. | Different credential lifetimes, different rotation cadences. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What happens if we miss the rotation window?**
+Label generation stops the moment the credential expires. New consignments cannot be booked. Existing in-flight consignments continue to deliver and tracking webhooks may continue to flow until Parcelforce-side cleanup, but no dispatch is possible. Recovery is roughly 30 to 90 minutes once a new credential is issued and connected.
+
+**Who needs portal access to rotate?**
+The Parcelforce account owner (the named individual on the contract). Most merchants set up a shared ops-team email for the portal login and bring multiple ops-team members onto the account; this avoids the situation where the only person who can rotate is on holiday.
+
+**Why does the alert fire at 14 days, not 7 or 30?**
+Operational realism. 30 days is too noisy, with the alert sitting orange for a month. 7 days is too tight for typical merchant ops cadences, especially on weekend / Friday boundaries. 14 days gives a clean two-week calendar slot, includes one full Saturday-Sunday gap, and matches what most enterprise ops teams use for similar credential trip-wires. Override per-workspace if needed.
+
+**Does Parcelforce ever revoke keys before expiry?**
+Rarely. Parcelforce will revoke if the key is suspected leaked or misused, or if the underlying account is closed. The card reads the *intended* expiry; an unscheduled revocation will surface on `par_api_error_rate` (401 / 403 spike) before the card catches up on the next read. Treat any 401 / 403 spike as urgent regardless of this card.
+
+**Can we automate rotation?**
+Parcelforce does not currently support programmatic API-key rotation; the rotation is a manual portal action. OAuth-mode integrations (where supported) auto-refresh access tokens silently. The card surfaces a 14-day reminder; that is the automation today.
+
+**The card says 14 days but the new key was issued yesterday; why has it not reset?**
+Two possible reasons. (1) The new key has not been pasted into the Vortex IQ connector yet; the card reads the connected credential, not the most-recently-issued portal credential. (2) Card cache: read-time is sub-minute, but stale-cache windows of up to 5 minutes have been observed on Parcelforce-API-edge during their portal-side propagation. Check the Vortex IQ connector settings and update if needed.
+
+**What if we have multiple Parcelforce accounts (different rate cards, different cohorts)?**
+Each Parcelforce account has its own API key and its own expiry. The card surfaces the credential of the connected integration only. If the merchant runs multiple accounts (DTC + B2B reseller), set up each as a separate Vortex IQ Parcelforce connector and each card surfaces its own count.
+
+**Does this card behave differently during Q4 peak?**
+No. The credential lifetime is independent of dispatch volume. However, the operational cost of expiry is much higher during peak (a half-day of label-generation downtime in early December is catastrophic, vs absorbable in March). Consider an early rotation if the credential expires inside the November-December peak window; rotate in October to give a clean buffer.
+
+**Can we monitor multiple credentials in one dashboard?**
+Yes; the connector-management area lists all connected integrations with their token-expiry-days. The card here is the per-connector view; the cross-connector view sits on the connector-management page.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Days to Token Expiry* is one of hundreds of KPI pulses Vortex IQ tracks across Parcelforce Worldwide and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

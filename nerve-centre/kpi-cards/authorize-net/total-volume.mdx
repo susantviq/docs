@@ -1,0 +1,190 @@
+---
+title: "Total Volume, Authorize.net"
+sidebarTitle: "Total Volume"
+description: "Total Volume for Authorize.net stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Payment Gateway
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The total dollar amount that successfully **flowed through Authorize.Net** in the period, gross of refunds, gross of interchange and scheme fees, gross of chargebacks. This is the gateway-level view of "money that touched the Visa-owned legacy gateway", not "money that landed at your bank acquirer".
+
+| | |
+| --- | --- |
+| **What it counts** | Every settled transaction returned by `getTransactionListRequest` (or pulled from the Settled Batch via `getSettledBatchListRequest` + `getTransactionListForBatch`) where `transactionStatus = settledSuccessfully`, summed by `settleAmount` (or `authAmount` for not-yet-settled-but-captured rows). Includes Accept Hosted / Accept.js card-not-present, AIM card-not-present, and CIM tokenised rebills. |
+| **API endpoint** | [`getTransactionListRequest`](https://developer.authorize.net/api/reference/index.html#transaction-reporting) on the Transaction Reporting API; for batch-level cross-checks use [`getSettledBatchListRequest`](https://developer.authorize.net/api/reference/index.html#transaction-reporting-get-settled-batch-list). API is JSON-or-XML at `api.authorize.net/xml/v1/request.api`; the legacy SOAP surface is deprecated but still reachable. |
+| **VAT / sales-tax treatment** | **Inclusive.** The figure is whatever the customer was charged at checkout. Authorize.Net is a gateway, not a tax engine; sales-tax handling sits upstream in the commerce platform (Shopify, BigCommerce, Adobe Commerce, Magento, custom). The `tax.amount` field on the request is informational, NOT subtracted here. |
+| **Currency** | **USD-dominant.** Authorize.Net is a US-only gateway tied to a US merchant account; the vast majority of merchants operate USD only. Multi-currency Authorize.Net (CAD, GBP, EUR, AUD, NZD) is supported only on a small set of merchant accounts where the underlying acquirer offers multi-currency processing; for those, each currency is summed in its own native amount with no FX. |
+| **Fees / processing cost** | **Gross.** Interchange, dues and assessments, and the acquirer's discount-rate markup are NOT deducted. Authorize.Net itself adds a per-transaction gateway fee (typically USD 0.10 to 0.15) and a monthly gateway fee (typically USD 25); neither is reflected in this card. The merchant's true net is visible only on the bank acquirer's monthly statement, not on `dashboard.authorize.net`. |
+| **Refunds** | **NOT deducted.** Refunds (`refundTransaction`) are a separate `transactionType` and tracked by [`aut_refund_volume`](/nerve-centre/kpi-cards/authorize-net/refund-volume). A fully refunded USD 100 sale still contributes USD 100 here. |
+| **Disputes / chargebacks** | **NOT deducted.** Chargebacks arrive on the Authorize.Net `getUnsettledTransactionListRequest` flow as `voided` or via the FDS notification feed; they do not retroactively suppress this number. Tracked separately in [`aut_chargeback_rate`](/nerve-centre/kpi-cards/authorize-net/chargeback-rate). |
+| **Failed / declined payments** | **Excluded.** Only `transactionStatus = settledSuccessfully` (and where applicable `capturedPendingSettlement`) is summed. `declined`, `expired`, `voided`, `failedReview` are excluded; declines roll up to [`aut_decline_rate`](/nerve-centre/kpi-cards/authorize-net/decline-rate). |
+| **3DS / Cardinal Cardinal Commerce treatment** | Authorize.Net's 3DS is delivered via the bundled Cardinal Commerce integration (Visa-owned, hence integrated by default). 3DS-passed and 3DS-frictionless transactions both count here. 3DS-failed end as `declined` and are excluded. |
+| **Recurring vs one-time (ARB / CIM)** | Both included. Automated Recurring Billing (ARB) rebills and CIM card-on-file `chargeCustomerProfile` charges both produce `transactionType = authCaptureTransaction` and contribute. |
+| **Payout timing** | **Per transaction date** (when the customer paid), NOT per acquirer-funding date (when the bank funded your business account). Authorize.Net settles in nightly batches (cut-off typically 16:00 PT), but bank-funding is acquirer-controlled and runs T+1 to T+2 business days. See [`aut_avg_settlement_days`](/nerve-centre/kpi-cards/authorize-net/avg-settlement-time). |
+| **Time window** | `30D vsP` (default 30D vs the prior 30D). |
+| **Alert trigger** | `drop >15% vsP`, driven by `sentiment_key: revenue_trend`. |
+| **Roles** | owner, finance |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Authorize.net data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US legacy mid-market merchant ("Heartland Hardware Co.", an Ohio-based 28-year-old industrial supply distributor) runs Magento 2 with Authorize.Net AIM as the default gateway, an Elavon merchant account behind it, plus a CIM-backed customer portal for B2B reorders. The 30-day window covers 03 Apr 26 to 02 May 26.
+
+| Channel | Transactions | Amount | transactionType | transactionStatus | Notes |
+| --- | --- | --- | --- | --- | --- |
+| Web checkout (Accept.js card-not-present) | 1,840 | USD 412,800 | authCaptureTransaction | settledSuccessfully | Largest channel, B2B + B2C |
+| B2B reorder portal (CIM tokens) | 620 | USD 1,142,000 | authCaptureTransaction | settledSuccessfully | High AOV, repeat customers |
+| ARB recurring (maintenance contracts) | 184 | USD 92,400 | authCaptureTransaction | settledSuccessfully | Monthly rebills |
+| Telephone orders (AIM keyed-in) | 320 | USD 218,600 | authCaptureTransaction | settledSuccessfully | Sales-rep moto |
+| Refunds (period) | 42 refunds | USD 18,900 | refundTransaction | settledSuccessfully | Tracked separately |
+| Chargebacks (period) | 6 cases | USD 4,200 | voided / chargeback | - | Tracked separately |
+| Declined attempts | 198 | - | authCaptureTransaction | declined | Excluded |
+| Voided pre-settlement | 28 | - | voidTransaction | voided | Excluded |
+
+```text
+Authorize.Net total volume (this card):
+  Web                     = USD 412,800
+  B2B portal              = USD 1,142,000
+  ARB recurring           = USD 92,400
+  Phone (MOTO)            = USD 218,600
+                          ----------------
+  Total                   = USD 1,865,800
+
+Net Revenue (after refunds)           = USD 1,865,800 - 18,900     = USD 1,846,900
+After chargebacks                     = USD 1,846,900 - 4,200      = USD 1,842,700
+After Authorize.Net gateway fee (0.10/txn x 2,964 txns) ≈ -296    ≈ USD 1,842,404
+After acquirer discount (Elavon ~ 2.4% blended IC+) ≈ -44,800    ≈ USD 1,797,604
+```
+
+What the merchant might be surprised by:
+
+1. **The card sums across web, MOTO, B2B portal, and ARB without channel labels.** Authorize.Net's API does not natively tag channel; everything is `authCaptureTransaction` regardless of whether it came from Accept.js, an AIM keyed-in MOTO, or an ARB rebill. To split, the merchant must rely on the upstream commerce platform's order metadata or pass a custom `description` / `invoiceNumber` convention. This is a structural limitation versus modern gateways like Stripe (which tag `payment_method_details.card.network` and channel cleanly).
+2. **B2B reorder portal at USD 1.14M dominates.** CIM tokens enabled rapid reorder; B2B AOVs (USD 1,840 average) dwarf web AOV (USD 224). The merchant should treat CIM volume as the strategic asset, not the web channel.
+3. **The 0.10 to 0.15 USD per-transaction gateway fee is invisible here.** On 2,964 transactions at USD 0.10 that is roughly USD 296 in gateway fees, plus the USD 25 monthly gateway fee. None of that is on `dashboard.authorize.net` summary screens; it shows up on the merchant statement. CFOs often discover this only at month-end.
+4. **Acquirer discount rate is the big number, not the gateway fee.** Elavon's blended discount on 2,964 transactions averaging USD 629 each, weighted heavily on commercial cards (level-2 / level-3 data eligible), runs roughly 2.2 to 2.6% all-in. That is roughly USD 44,800 in interchange + acquirer markup, vastly larger than the gateway fee. Heartland Hardware's CFO should ask Elavon about Level 2/3 data submission to drop interchange on commercial cards by 50 to 100 basis points.
+5. **Settlement is acquirer-driven, not Authorize.Net-driven.** Once the nightly batch closes (16:00 PT cut-off), Authorize.Net hands the batch to Elavon. Elavon funds the merchant's business account T+1 to T+2 business days. The Authorize.Net Dashboard's "Settled" status means "handed off", NOT "in your bank yet"; merchants confused on day-of-month boundaries should reconcile against the Elavon statement, not Authorize.Net.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why merchants reach for it next to Total Volume |
+| --- | --- |
+| [`aut_volume_trend`](/nerve-centre/kpi-cards/authorize-net/volume-trend) | This metric trended daily, exposes batch-cut-off-day spikes. |
+| [`aut_total_transactions`](/nerve-centre/kpi-cards/authorize-net/total-transactions) | Transaction count over the same window. Volume divided by transactions = average transaction. |
+| [`aut_avg_transaction`](/nerve-centre/kpi-cards/authorize-net/average-transaction) | The per-transaction lens, exposes mix-shift between B2B / web / MOTO. |
+| [`aut_refund_volume`](/nerve-centre/kpi-cards/authorize-net/refund-volume) | The amount to subtract for a net-of-refunds figure. |
+| [`aut_payouts_pending`](/nerve-centre/kpi-cards/authorize-net/pending-payouts) | Captured but not-yet-acquirer-funded balance. |
+| [`aut_avg_settlement_days`](/nerve-centre/kpi-cards/authorize-net/avg-settlement-time) | Days from capture to bank funding via the acquirer. |
+| [`aut_top_payment_methods`](/nerve-centre/kpi-cards/authorize-net/top-payment-methods) | Card-network split (Visa, Mastercard, Amex, Discover); Amex skews B2B AOV. |
+| Stripe [`stripe_total_revenue`](/nerve-centre/kpi-cards/stripe/total-charge-volume) / PayPal [`pp_total_volume`](/nerve-centre/paypal/pp_total_volume) | Same archetype on competing rails for multi-PSP merchants. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in the Authorize.Net Dashboard:**
+
+Sign in at [account.authorize.net](https://account.authorize.net). The closest comparable view is:
+
+> **Reports → Transaction Statistics → Statistics by Settlement Date** (filter same date range, "Settled" status)
+
+For batch-level cross-checks, the **Reports → Settled Transactions** view shows each nightly batch with its total. Sum of batch totals over the period should equal this card.
+
+Other Authorize.Net views that look similar but answer different questions:
+
+- **Statistics by Submission Date.** Same data sliced by when the transaction was submitted, not when it settled. For a batch that crosses midnight or a weekend (Friday submission, Monday settlement), this view differs from the Settlement Date view by 1 to 3 days. This card aligns with **Submission Date** when capture is immediate, with **Settlement Date** approximately on the next batch.
+- **Unsettled Transactions** (Reports → Unsettled Transactions). Authorisations not yet captured, plus captured-pending-settlement. NOT included in this card unless captured.
+- **Held Transactions** (FDS, Fraud Detection Suite). Transactions held by FDS rules pending merchant review, neither approved nor declined. Excluded from this card until the merchant releases or declines them.
+- **Recurring Billing → Subscription Activity.** ARB rebill view; a subset of this card filtered to ARB-originated transactions.
+
+**Why our number may legitimately differ from the Authorize.Net Dashboard:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Time zone** | Boundary days off | Authorize.Net Dashboard renders batch boundaries in Pacific Time (16:00 PT cut-off, regardless of merchant location). Vortex IQ uses UTC for period boundaries. A US East Coast merchant viewing a batch closed at 19:00 ET (16:00 PT) on 30 Apr 26 sees it on 30 Apr 26 in the Dashboard but possibly on 01 May 26 (UTC) in this card. The shift is one day at most, averages out over a 30-day window. |
+| **Settled vs captured-pending** | Theirs equal or higher | This card optionally includes `capturedPendingSettlement` rows (captured today, settling overnight). The Dashboard's Settled view excludes them until the batch closes. For "today" reads, our number can include in-flight captures the Dashboard does not yet show. |
+| **FDS hold transactions** | Boundary movement | A transaction held by Fraud Detection Suite for review can transition to settled later if the merchant approves. The card snapshot at sync time reflects state-then; if a held transaction is approved retroactively it appears on the next refresh. |
+| **Multi-currency arithmetic** | Ours stacks per-currency | Where the merchant runs multi-currency Authorize.Net (rare, only some Elavon / Vantiv / Worldpay-acquired accounts), this card sums each currency separately. Authorize.Net Dashboard offers a USD-equivalent toggle. |
+| **API rate limits** | Ours lower for very high-volume merchants | Authorize.Net API caps at typically 100 requests/30 seconds; for merchants doing 30,000+ transactions/day the engine paginates 1,000-per-page and may take multiple sync cycles. The most recent 5 to 15 minutes can lag. |
+| **Refresh lag** | Ours lower for "today" | Index updates on a periodic sync; the freshest 5 to 15 minutes of transactions may not be in yet. Yesterday and earlier are fully caught up. |
+
+**Cross-connector reconciliation, what should match what:**
+
+| Comparison | Expected relationship | When divergence is legitimate |
+| --- | --- | --- |
+| `aut_total_volume` ↔ [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) | `aut <= shopify` | Shopify includes orders paid via Stripe, PayPal, Apple Pay, gift cards, manual offline; only Authorize.Net-routed orders contribute here. For an Authorize.Net-primary store, expect 60 to 90% coverage. |
+| `aut_total_volume` ↔ [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | `aut <= bigcommerce` | Same logic. BC supports many gateways; each one displaces Authorize.Net. Heartland Hardware's Magento store would match closer (95%+) because Authorize.Net is the only enabled gateway. |
+| `aut_total_volume` ↔ [`adobe_commerce.total_revenue`](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | `aut <= adobe_commerce` | Adobe Commerce stores often run Authorize.Net alongside Cybersource, Braintree, or PayPal. Coverage typically 50 to 80%. |
+| `aut_total_volume` + [`stripe.stripe_total_revenue`](/nerve-centre/kpi-cards/stripe/total-charge-volume) + [`paypal.pp_total_volume`](/nerve-centre/paypal/pp_total_volume) | approximately equal to commerce_total_revenue (in matching currency) | The gateway volumes summed should approach the commerce platform total. They should never exceed it; if they do, double-counting (a transaction routed twice during a gateway-migration period) or refund timing mismatch is the cause. |
+
+**Quick rule for support tickets:** if a merchant says *"Authorize.Net Dashboard shows USD 100k, your number shows USD 92k"* in the same period, walk through the table above in order. Time-zone (Pacific batch cut-off vs UTC) is the most common cause for "today" complaints; FDS-held reviews are the most common cause for "yesterday" gaps in low-trust new-merchant accounts.
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (same archetype on other payment processors)</em></summary>
+
+The Total Volume metric exists on every payment-processor connector with the same shape:
+
+- [`stripe.stripe_total_revenue`](/nerve-centre/kpi-cards/stripe/total-charge-volume)
+- [`paypal.pp_total_volume`](/nerve-centre/paypal/pp_total_volume)
+- [`viva_payments.viva_total_revenue`](/nerve-centre/kpi-cards/viva-payments/total-revenue)
+- [`cybersource.cs_total_volume`](/nerve-centre/cybersource/cs_total_volume) (where present)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+> Reconciliation questions ("why doesn't this match the Authorize.Net Dashboard / my acquirer statement?") are answered in the **Reconciling against the vendor's own dashboard** section above. Below are the questions that aren't reconciliation.
+
+**"Authorize.Net is owned by Visa, does anything change for me operationally?"**
+No, not at the gateway, API, or merchant-account level. Visa acquired Authorize.Net through the CyberSource / Authorize.Net consolidation in 2010 and the gateway has continued under Visa's commercial-services umbrella since. Day-to-day, the API endpoints, transaction reporting, the Authorize.Net Dashboard, the Cardinal Commerce 3DS bundling, ARB / CIM, and FDS all remain unchanged. The strategic implication is that Visa-card processing benefits from being on Visa's own gateway (slightly faster authorisation, no inter-network hop), but the practical merchant workflow is unaffected.
+
+**"Why is the Authorize.Net API still XML-based, can I use a modern JSON API?"**
+The API supports both XML and JSON request/response since the 2014 modernisation; you can send JSON requests and receive JSON responses by setting the `Content-Type: application/json` header on `api.authorize.net/xml/v1/request.api`. The endpoint path still contains `/xml/v1/` for legacy compatibility, but the payload format is your choice. The legacy SOAP surface and AIM raw key-value-pair API are deprecated but still reachable; new integrations should use the JSON-over-the-XML-endpoint API or the Accept.js / Accept Hosted SDKs.
+
+**"What is the difference between AIM, CIM, and ARB?"**
+- **AIM (Advanced Integration Method).** Direct server-to-server card processing. The merchant captures card data and submits it to Authorize.Net. Highest PCI scope but most flexible; used for MOTO, B2B, and legacy integrations.
+- **Accept.js / Accept Hosted.** Modern client-side card capture; the card data goes directly to Authorize.Net (never touches the merchant's server). Reduces PCI scope to SAQ-A. Recommended for new web integrations.
+- **CIM (Customer Information Manager).** Tokenised card-on-file. Authorize.Net stores the card; the merchant gets a `customerProfileId` + `paymentProfileId` and charges via `chargeCustomerProfile`. Used for B2B reorder portals, saved cards, and one-click checkout.
+- **ARB (Automated Recurring Billing).** Authorize.Net-managed subscription rebills. The merchant defines a schedule; Authorize.Net charges the stored card on schedule. Limited compared to a modern subscription platform (no proration, no metered billing); often replaced by upstream subscription management with CIM as the rail.
+
+All four contribute to this card. The split is not natively reported; merchants typically tag via `description` or `invoiceNumber` to disambiguate.
+
+**"Why is my acquirer's monthly statement total different from this card?"**
+Three reasons. **(1) Timing.** Authorize.Net captures by transaction date; acquirers fund by deposit date, T+1 to T+2 later. End-of-month transactions appear in this card's April but in the acquirer's May statement. **(2) Fees deducted in the acquirer view.** This card is gross of interchange and discount-rate; the acquirer statement is net. The gap is roughly 2.0 to 3.0% depending on card mix. **(3) Reserves.** Some acquirers (especially for newer or higher-risk merchants) hold a rolling reserve, typically 5 to 10% of monthly volume for 90 days. Reserve-held funds appear in this card (the customer paid) but not in the acquirer-funded total.
+
+**"What about Authorize.Net rate limits?"**
+Production tier: typically 100 requests per 30 seconds, with sustained 10 requests/second comfortable. For very high-volume merchants the Transaction Reporting API (the read-side) has a separate cap of 1,000 transactions per page and 1,000 batches per `getSettledBatchListRequest`. The engine paginates and back-fills; for a merchant doing 100,000 transactions/month the historical sync may take 30 to 60 minutes on first connect.
+
+**"Are 3DS-failed transactions counted here?"**
+No. 3DS failures end as `transactionStatus = declined` with reason code `200` (general decline) or `258` (3DS attempt failed) and are excluded. The 3DS-frictionless and 3DS-challenge-passed transactions both count.
+
+**"Does Authorize.Net handle ACH (eCheck.Net) volume here too?"**
+Yes, if the merchant uses eCheck.Net (Authorize.Net's ACH product). eCheck transactions appear with `paymentMethod = eCheck` and `transactionType = authCaptureTransaction` and contribute to this card the same as card transactions. ACH settlement is slower (3 to 5 business days vs T+1 for cards); the [`aut_avg_settlement_days`](/nerve-centre/kpi-cards/authorize-net/avg-settlement-time) card surfaces this when ACH share is meaningful.
+
+**"My recurring ARB rebills, do those count?"**
+Yes. ARB rebills produce `transactionType = authCaptureTransaction` against the stored card on schedule. They are indistinguishable in this card from one-time captures; the `subscriptionId` field on the response identifies them when needed.
+
+**"Why is Authorize.Net often more expensive than Stripe for SMB merchants?"**
+Authorize.Net's all-in cost is the gateway fee (USD 0.10 to 0.15 per transaction + USD 25 monthly) **plus** the acquirer's discount rate (typically interchange-plus 0.30 to 0.80% on top of interchange itself). Stripe's flat 2.9% + 30 cents bundles gateway and acquirer in one fee. For an average USD 100 transaction: Authorize.Net costs roughly USD 2.30 (interchange ~ 1.80% + acquirer markup 0.40% + gateway 0.10) plus a USD 25 monthly; Stripe costs USD 3.20 (2.9% + 0.30) with no monthly. Stripe is cheaper for low-volume / low-AOV merchants; Authorize.Net (with a sharp acquirer) is cheaper for high-volume / high-AOV / B2B-heavy merchants where commercial-card interchange optimisation (Level 2 / Level 3 data) saves more than the bundled-fee simplicity costs.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Total Volume* is one of hundreds of KPI pulses Vortex IQ tracks across Authorize.net and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

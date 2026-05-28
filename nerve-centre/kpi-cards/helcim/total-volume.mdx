@@ -1,0 +1,182 @@
+---
+title: "Total Volume, Helcim"
+sidebarTitle: "Total Volume"
+description: "Total Volume for Helcim stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Payment Gateway
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The total amount that successfully **flowed through Helcim** in the period, gross of refunds, gross of interchange-plus markup, gross of disputes. Money that touched Helcim's processing rails (Helcim Online, Helcim Smart Terminal, Helcim Recurring, virtual terminal), not money that landed in your bank account.
+
+| | |
+| --- | --- |
+| **What it counts** | Every transaction on `GET /v2/card-transactions` where `type IN ('purchase', 'capture')` and `status = 'APPROVED'`, summed by `amount`, in each transaction's `currency`. Includes Helcim Online checkout, Helcim Smart Terminal card-present, Helcim Recurring rebills, and virtual-terminal MOTO captures. |
+| **API endpoint** | [`GET /v2/card-transactions`](https://devdocs.helcim.com/) on the Helcim API v2; cross-referenced with `/payment-plans` for the recurring source-of-truth. API v2 uses an `api-token` header (no OAuth). |
+| **Pricing model** | **Interchange-plus, transparent.** Helcim's positioning vs Square's flat-rate model is to charge interchange (Visa/Mastercard scheme cost) plus a small markup (typically 0.30, 0.50% + a per-transaction fee), rather than a 2.6, 2.9% flat rate. This card is gross of that markup; the markup is itself disclosed in monthly statements. |
+| **VAT / GST / tax treatment** | **Inclusive.** The figure is whatever the customer was charged at terminal or online. Helcim is a payment processor, not a tax engine; tax handling sits upstream (Shopify, BigCommerce, WooCommerce). Canadian merchants commonly bundle GST/HST/PST into the captured amount. |
+| **Currency** | **Multi-currency native, no FX applied here.** Helcim natively settles in CAD and USD (the two main rails), with cross-border acceptance for ~ 90 currencies that get converted at capture time using Helcim's daily FX feed. CAD merchants accepting USD-denominated US customer cards see CAD in this card after conversion at capture. Use `hel_revenue_by_currency` (roadmap) for the unambiguous breakdown. |
+| **Fees / processing cost** | **Gross.** Helcim interchange-plus fees (interchange + 0.30, 0.50% + ~ CAD/USD 0.08 per transaction) are NOT deducted. Net of fees figure is in the Helcim Statement, not on this card. |
+| **Refunds** | **NOT deducted.** Refunds live as separate `type = 'refund'` rows in `/v2/card-transactions` and are tracked by `hel_refund_volume`. A fully refunded CAD 100 transaction still contributes CAD 100 here. |
+| **Disputes / chargebacks** | **NOT deducted.** Disputes are handled via Helcim's chargeback workflow and tracked separately in `hel_chargeback_rate`. A successful charge later disputed still counts here. |
+| **Failed / declined payments** | **Excluded.** Only `status = 'APPROVED'` rows are summed. `DECLINED`, `FAILED`, `REVERSED` are excluded and counted in `hel_decline_rate`. |
+| **3DS 2 treatment** | Both frictionless and challenge-completed flows count here. 3DS challenges that the customer abandoned end as `FAILED` and are excluded; abandonment is tracked separately in `hel_threedsecure_abandon_rate`. Helcim Online supports 3DS 2 via the Helcim.js SDK; many North American card-not-present transactions still bypass 3DS where the issuer doesn't mandate it. |
+| **Recurring vs one-time** | Both included. Helcim Recurring rebills are tokenized card-on-file captures and indistinguishable from one-time captures by `type` (both are `'purchase'`); they're identifiable via the linked `paymentPlanId`. |
+| **Channels** | **Online + POS unified.** Helcim Smart Terminal captures (card-present, EMV chip + PIN), Helcim Online checkout, virtual terminal (MOTO), and Helcim Recurring all flow through the same `card-transactions` rail. |
+| **Payout timing** | **Per transaction date** (when the customer paid), NOT per payout date. Helcim deposits to merchant bank accounts on T+2 business days for CAD merchants and T+2/T+3 for USD merchants (with same-day deposit available as a paid feature). See `hel_avg_settlement_days`. |
+| **Time window** | `30D vsP` (default 30D vs the prior 30D). |
+| **Alert trigger** | `drop >15% vsP`. |
+| **Roles** | owner, finance, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Helcim data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A Calgary-based outdoor-apparel SMB retailer ("Foothills Outfitters") runs two Calgary stores plus a Shopify online store, and migrated from Square to Helcim 90 days ago specifically for the interchange-plus pricing. The 30-day window covers 03 Apr 26 to 02 May 26.
+
+| Channel | Transactions | Amount | Currency | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| Calgary flagship Smart Terminal | 1,840 captures | CAD 162,400 | CAD | APPROVED | Card-present, ~ 70% debit (Interac + Visa Debit) |
+| Calgary Crowfoot Smart Terminal | 1,120 captures | CAD 96,800 | CAD | APPROVED | Card-present |
+| Online Helcim checkout, CA customers | 980 sessions | CAD 84,200 | CAD | APPROVED | Helcim.js, 3DS 2 frictionless ~ 65% |
+| Online Helcim checkout, US customers | 410 sessions | USD 38,900 | USD | APPROVED | Cross-border, settled USD |
+| Helcim Recurring (loyalty subscriptions) | 240 rebills | CAD 7,200 | CAD | APPROVED | Tokenized rebills via paymentPlanId |
+| Refunds (period) | 92 refunds | CAD 8,800 | CAD | - | Tracked separately |
+| Disputes (period) | 3 cases | CAD 410 | CAD | - | Tracked separately |
+| Failed / declined | 286 attempts | - | - | DECLINED / FAILED | Excluded |
+
+```text
+Helcim total volume (this card):
+  CAD (POS + online + recurring) = CAD 162,400 + 96,800 + 84,200 + 7,200      = CAD 350,600
+  USD (online cross-border)                                                    =     USD 38,900
+
+Two currencies sit alongside each other; no FX rolled.
+
+Net Volume (after refunds, CAD only)         = CAD 350,600 - CAD 8,800           = CAD 341,800
+Successfully kept (post-disputes lost)       = CAD 341,800 - CAD 410             = CAD 341,390
+Bank-deposited (post Helcim ix-plus markup ~ 0.4% + interchange ~ 1.4% blended)
+                                             ≈ CAD 341,390 - ~ CAD 6,150        ≈ CAD 335,240
+```
+
+What the merchant should notice:
+
+1. **Interchange-plus economics show up in the gap between gross and net.** On Square, the same CAD 350,600 gross would have cost roughly 2.65% blended (CAD 9,290) for in-person + 2.9% + CAD 0.30 for online (CAD 5,560), total ~ CAD 14,850. On Helcim, the equivalent blended cost on Foothills' tier is ~ CAD 6,150 (interchange ~ 1.4% pass-through + 0.4% markup + per-tx fees). That CAD 8,700/month saving is exactly the migration thesis. This card tracks the gross; the saving lives in the Helcim monthly statement.
+2. **POS dominates.** CAD 259,200 of CAD 350,600 (74%) is in-store Smart Terminal. Foothills is a brick-and-mortar-led business, the Helcim Smart Terminal hardware was the precondition for the migration. A pure-online merchant would see the inverse split.
+3. **CAD and USD displayed side-by-side, not converted.** Foothills' US online customers represent ~ USD 38,900 in this period. The card does NOT roll this into a CAD total; that conversion happens in the Helcim Statement using Helcim's daily FX feed.
+4. **Interac debit is invisible here as a separate line.** Canadian Interac debit (the domestic debit network) flows through `card-transactions` as `cardBrand: INTERAC` and the per-transaction fee is structurally different from Visa/MC interchange. It still shows up in the gross figure; the per-network breakdown is in `hel_top_payment_methods`.
+5. **3DS frictionless rate of 65% on online traffic is North-America-typical.** Canadian and US issuers do not mandate 3DS for most card-not-present transactions, so Helcim only invokes 3DS where the issuer requests it (about 35% of attempts). EU/UK merchants would see 80%+ frictionless rates due to PSD2 SCA mandates.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why merchants reach for it next to Total Volume |
+| --- | --- |
+| [`hel_total_transactions`](/nerve-centre/kpi-cards/helcim/total-transactions) | Transaction count over the same window. Volume divided by transactions equals average ticket. |
+| [`hel_avg_transaction`](/nerve-centre/kpi-cards/helcim/average-transaction) | The per-transaction view, the denominator-aware reading. |
+| [`hel_volume_trend`](/nerve-centre/kpi-cards/helcim/volume-trend) | This metric trended daily over the window; catches mid-period drift. |
+| [`hel_refund_volume`](/nerve-centre/kpi-cards/helcim/refund-volume) | The amount to subtract for a net-of-refunds figure. |
+| [`hel_payouts_pending`](/nerve-centre/kpi-cards/helcim/pending-payouts) | What's in flight from this volume but not yet in your bank. |
+| [`hel_decline_rate`](/nerve-centre/kpi-cards/helcim/decline-rate) | The complementary loss view; high decline rate suppresses this card. |
+| [`hel_top_payment_methods`](/nerve-centre/kpi-cards/helcim/top-payment-methods) | Method mix breakdown (Interac vs Visa vs Mastercard vs Amex). |
+| Stripe [`stripe_total_revenue`](/nerve-centre/kpi-cards/stripe/total-charge-volume) / Square (where present) | Same archetype on competing rails. SMBs evaluating Helcim vs Square reach for both. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in the Helcim Dashboard:**
+
+Sign in at [app.helcim.com](https://app.helcim.com/) and the closest comparable view is:
+
+> **Helcim Dashboard → Payments → All Transactions** (filter by date range; Status: Approved)
+
+The headline tile on the **Dashboard home** also shows period sales. For the channel breakdown, use **Reports → Sales by Source**, which separates Online, Smart Terminal, Virtual Terminal, and Recurring.
+
+Other Helcim views that look similar but answer different questions:
+
+- **Deposits view** (Payments → Deposits). This is *post-fee, post-reserve* settled balance, NOT gross transaction volume. Always lower than this card by the interchange-plus markup amount. Use the monthly statement to bridge.
+- **Disputes view** (Payments → Disputes). Tracks chargeback / dispute cases, not transaction volume.
+- **Smart Terminal device reports** (Devices → Terminals). Per-terminal end-of-day batches. These are a subset of this card (POS-only, one device).
+- **Recurring Payments view** (Payments → Recurring → Plans). Tracks active payment plans and their next-rebill dates, not historical revenue.
+
+**Why our number may legitimately differ from the Helcim Dashboard:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Time zone** | Boundary days off | Helcim Dashboard renders in your account's configured timezone (Calgary merchants default to Mountain Time, Toronto to Eastern, US merchants to their state). Vortex IQ uses UTC for period boundaries. For a 30-day window the gap averages out; for "today" or "yesterday" cards it can shift the figure meaningfully (Calgary is UTC-6/UTC-7). |
+| **Reserve holdbacks** | Theirs lower (Deposits view) | Helcim can hold a small reserve on new merchants or seasonal businesses; the Deposits view nets this off. This card is gross of reserves. |
+| **Cross-border FX** | Theirs may show CAD-rolled, ours splits | Helcim Dashboard offers a "Total in CAD equivalent" toggle for USD-accepting Canadian merchants. This card sums CAD and USD separately. |
+| **Refresh lag** | Ours lower for "today" | The index updates on a periodic sync; the most recent 5, 15 minutes of Smart Terminal captures may not be in yet (Smart Terminal batches end-of-day in some configurations). Yesterday and earlier are fully caught up. |
+| **Voided same-day captures** | Theirs may exclude in real-time, ours sees them at next sync | A POS capture voided within the same business day disappears from the Helcim Dashboard immediately but is still in our snapshot until the next sync. The gap closes within a few hours. |
+
+**Cross-connector reconciliation, what should match what:**
+
+| Comparison | Expected relationship | When divergence is legitimate |
+| --- | --- | --- |
+| `hel_total_volume` ↔ [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) | `helcim ≤ shopify` | Shopify includes orders paid via Stripe, PayPal, Shop Pay, Apple Pay (when routed through Shopify Payments rather than Helcim), gift cards, manual bank transfer, none of which touch Helcim. For a Canadian Shopify store using Helcim as primary, expect Helcim to cover 60, 90% of online revenue. |
+| `hel_total_volume` ↔ [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | `helcim ≤ bigcommerce` | Same logic. BC supports many gateways. |
+| `hel_total_volume` + [`stripe.stripe_total_revenue`](/nerve-centre/kpi-cards/stripe/total-charge-volume) + [`paypal.pp_total_volume`](/nerve-centre/paypal/pp_total_volume) | `≈ commerce_total_revenue` | Cross-PSP merchants summing all rails. The three should approach the commerce total; if they exceed it, suspect double-counting. |
+
+**Quick rule for support tickets:** if a merchant says *"Helcim Dashboard shows CAD 100k, your number shows CAD 80k"* in the same period, walk through the table above in order. Time-zone is the most common cause for "today" complaints in Western Canada accounts (2-hour offset versus UTC); reserve-netting is the most common cause for newly-onboarded merchants comparing this card against the Deposits view.
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (same archetype on other payment processors)</em></summary>
+
+The Total Volume / Total Charge Volume metric exists on every payment-processor connector with the same shape:
+
+- [`stripe.stripe_total_revenue`](/nerve-centre/kpi-cards/stripe/total-charge-volume)
+- [`paypal.pp_total_volume`](/nerve-centre/paypal/pp_total_volume)
+- [`viva_payments.viva_total_revenue`](/nerve-centre/kpi-cards/viva-payments/total-revenue)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+> Reconciliation questions ("why doesn't this match the Helcim Dashboard / my bank?") are answered in the **Reconciling against the vendor's own dashboard** section above. Below are the questions that aren't reconciliation.
+
+**"What is interchange-plus pricing and why does Helcim use it?"**
+Interchange-plus means the merchant pays the actual scheme cost (interchange + assessments, set by Visa/Mastercard, typically 1.10, 2.40% depending on card type) plus a small processor markup (Helcim publishes 0.30% as the standard markup on smaller volume tiers, scaling down to 0.15, 0.20% for higher volume). The alternative is **flat-rate** pricing (Square, Stripe), where the processor charges a single rate (~ 2.65% in-person, 2.9% online) regardless of card type. Interchange-plus is mathematically cheaper for any merchant whose card mix is debit-heavy or has a healthy share of low-interchange consumer credit; flat-rate is simpler and sometimes cheaper for merchants whose mix skews to premium / rewards cards. Helcim publishes the full interchange table on every monthly statement, which is the "transparent" part of the pitch.
+
+**"How does Helcim's pricing compare to Square in plain numbers?"**
+At ~ CAD 50,000 monthly volume with Canadian SMB-typical card mix (mostly Interac debit + Visa/MC consumer credit), Helcim's blended effective rate is around 1.7, 1.9% all-in; Square's flat rate is 2.65% in-person + 2.9% + CAD 0.30 online. The gap is structurally 70, 100 bps. On CAD 50k/month that is CAD 350, 500/month, CAD 4,200, 6,000/year. Below CAD 5,000/month volume the math reverses (Helcim's monthly statement fees, optional add-ons, and admin overhead can outweigh the interchange-plus saving for very small merchants). The breakeven is broadly CAD 3,000, 5,000/month.
+
+**"Does Helcim support 3DS 2 / SCA?"**
+Yes, via the Helcim.js SDK and the `/v2/payment-intents` flow. North American merchants typically don't need it (no SCA mandate), but Helcim supports it for cross-border EU/UK card-not-present traffic and for merchants who want the chargeback liability shift. The 3DS abandon rate is tracked in `hel_threedsecure_abandon_rate`.
+
+**"What happens to Interac debit transactions in this card?"**
+Interac (the Canadian domestic debit network) flows through `card-transactions` with `cardBrand: INTERAC` and a different fee structure (per-transaction flat fee, no percentage). It still contributes to gross volume here. The per-network breakdown is in `hel_top_payment_methods`. US merchants will not see Interac.
+
+**"Helcim supports both CAD and USD merchant accounts, do I see both in this card?"**
+Yes, if you have a multi-currency Helcim account. CAD captures and USD captures appear as separate currency lines (no FX rolling). If you only operate in CAD but accept USD-denominated cards from US customers, those are converted to CAD at capture using Helcim's daily FX feed and show up as CAD here.
+
+**"What about the Helcim Smart Terminal hardware, does it count separately?"**
+No, the Smart Terminal is just one channel that posts to the same `/v2/card-transactions` endpoint. POS captures, online checkout, virtual terminal, and recurring rebills are unified in this card. Use **Reports → Sales by Source** in the Helcim Dashboard for the per-channel split, or wait for the per-channel card on our roadmap.
+
+**"My recurring subscription rebills, do those count here?"**
+Yes. Helcim Recurring uses tokenized card-on-file (with network-token support where available) and rebills as `type = 'purchase'` linked via `paymentPlanId`. They're indistinguishable from one-time captures in this card. A dedicated *Subscription Revenue* card is on the roadmap.
+
+**"Why is the customer-paid total higher than what arrived in my bank?"**
+Three deductions between this card and your bank deposit: (1) Helcim's interchange-plus blended cost (typically 1.7, 2.0% for Canadian SMB), (2) refunds processed in the same window, (3) settlement timing (transactions on the last day of the period typically settle T+2, so they appear in the next deposit). Use the Helcim monthly statement to bridge precisely.
+
+**"Does Helcim work outside North America?"**
+Helcim is licensed as a payment facilitator in Canada and the US only. They will accept cross-border card payments from international customers (any Visa/MC/Amex card globally), but the merchant entity must be Canadian or US. Pan-North-American is fine; pan-global is not Helcim's lane (consider Adyen or Stripe).
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Total Volume* is one of hundreds of KPI pulses Vortex IQ tracks across Helcim and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

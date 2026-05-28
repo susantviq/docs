@@ -1,0 +1,151 @@
+---
+title: "SLO Burn Rate (1h), New Relic"
+sidebarTitle: "SLO Burn Rate (1h)"
+description: "Multi-window burn-rate alerting, anything above 14.4x will eat the monthly budget in a day. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Monitoring
+
+> Multi-window burn-rate alerting, anything above 14.4x will eat the monthly budget in a day.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The rate at which you're consuming your error budget, expressed as a multiple of the budget-spend-rate that would land you exactly at the SLO target by month-end. **1x = on-track, 14.4x = monthly budget burns in a day, 36x = daily budget burns in 40 minutes.** The Google SRE-style fast-burn signal that tells you whether you can afford another minute of degradation.
+
+| | |
+| --- | --- |
+| **What it counts** | `burn_rate = current_error_rate / (1 - slo_target)` evaluated on a 1-hour rolling window. For a 99.9% SLO target, the allowable error rate is 0.1%; an actual error rate of 1.44% over the past hour produces `1.44 / 0.1 = 14.4x` burn rate. |
+| **NerdGraph endpoint** | NRQL via [NerdGraph](https://api.newrelic.com/graphql) on `Transaction` events: `SELECT percentage(count(*), WHERE error IS true) FROM Transaction WHERE appName = 'X' SINCE 1 HOUR AGO`. The result divides by `(1 - slo_target)` from the [Service Level entity](https://docs.newrelic.com/docs/service-level-management/) configured in NR. |
+| **Metric basis** | Ratio of bad events (errors or latency-violations) to total events. The "bad" definition follows the SLI configured on the Service Level entity, e.g., "errors only", "latency >1500ms only", or "errors OR latency >1500ms". |
+| **Aggregation window** | 1-hour rolling for the live KPI; multi-window evaluation (5m / 1h / 6h / 24h) for graduated alerting following [Google's SRE workbook recommendations](https://sre.google/workbook/alerting-on-slos/). |
+| **Browser vs APM scope** | APM-only by default. Browser SLIs can be configured separately by pointing the SLI at `PageView` events; this card reads whichever SLI the merchant has configured on their NR Service Level entity. |
+| **Severity threshold** | The 14.4x threshold corresponds to "you'll exhaust your monthly error budget in 24 hours of sustained burn". Lower thresholds (1x, 6x) are *slow-burn* warnings; 14.4x is *fast-burn* paging. 36x is "drop everything" territory. |
+| **Filtered hosts / services** | Per Service Level entity scope. One card per SLO; merchants typically configure 3, 5 SLOs (storefront availability, checkout latency, payment success rate, search response time). |
+| **Sample basis** | Sample-corrected on high-cardinality accounts. Burn rate is a ratio so sampling preserves accuracy. |
+| **Time zone** | UTC for the window evaluation; account timezone for chart display. |
+| **Time window** | `24H` (rolling 24-hour view of burn rate over time) |
+| **Alert trigger** | `>14.4x (fast burn)`. Multi-window confirmation (must breach on both 5m and 1h windows before paging) reduces false alarms. |
+| **Roles** | owner, engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your New Relic data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A merchant has configured an SLO on the `checkout-api` service: 99.9% availability, measured as the ratio of non-5xx responses to total responses over a rolling 30-day window. The 30-day error budget = `0.1% x total_requests`. With ~12M checkout requests/month, the budget = 12,000 errors.
+
+Reading the card at three points across an evening:
+
+| Time | 1h error rate | Burn rate | Interpretation |
+| --- | --- | --- | --- |
+| 18:00 | 0.06% | **0.6x** | Burning slower than budget allows. Earning credit. |
+| 20:00 | 0.18% | **1.8x** | Burning ~2x budget; sustained 1, 2 days = warning territory. |
+| 21:30 | 1.58% | **15.8x** | **Fast-burn alert fires.** Sustained 24 hours = monthly budget gone. |
+
+**What 14.4x actually means.** The 30-day budget is 0.1% of all requests. A burn rate of 14.4x over the past hour means 1.44% of requests in that hour failed, *14.4 times the rate the budget allows*. If sustained for 24 hours: `14.4 x 0.1% x 12M / 30 days = 14.4 x 12,000 / 30 = 5,760 errors/day = 169,560 errors over 30 days`, far above the 12,000 budget. The alert fires because the *trajectory* if the current rate continues is unrecoverable.
+
+**Why the multi-window check matters.** A single bad 5-minute window can spike the 1h burn rate to 30x briefly even if the underlying 5m rate has already recovered. Multi-window alerting (must be >14.4x on *both* 5m and 1h before paging) prevents this kind of flutter. The Google SRE workbook recommends:
+
+| Severity | 1h burn | 5m burn | Lookback to alert |
+| --- | --- | --- | --- |
+| Fast burn | >14.4x | >14.4x | 5 minutes |
+| Medium burn | >6x | >6x | 30 minutes |
+| Slow burn | >1x | >1x | 6 hours |
+
+**Conversion impact translation.** With error rate at 1.58% on `checkout-api`, ~158 customers per 10,000 requests are hitting a 5xx during checkout. At ~140 checkout requests / minute, that's ~2.2 failed checkouts / minute, or ~133 / hour. At an average AOV of £85 and ~80% recovery probability (some customers retry), the irrecoverable revenue loss is `133 x £85 x 20% = £2,261 / hour`. Sustained for 4 hours = ~£9,000 of GMV impact, plus reputational drag. The fast-burn alert is calibrated to fire well before this becomes catastrophic.
+
+If the underlying issue resolves and the next 1h window settles to 0.4% error rate, the burn rate drops to 4x, still over budget but no longer fast-burn. The card returns to green when the 1h burn drops below 1x; until then the message is "you're spending faster than you can rebuild".
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with SLO Burn Rate |
+| --- | --- |
+| [SLO Compliance (current period)](/nerve-centre/kpi-cards/newrelic/slo-compliance) | Outcome metric. Burn rate is the velocity; compliance is the position. Sustained high burn = compliance drops. |
+| [Error Budget Remaining](/nerve-centre/kpi-cards/newrelic/error-budget-remaining) | The fuel gauge. Burn rate tells you how fast you're spending; budget remaining tells you what's left. |
+| [Days Until SLO Breach (forecast)](/nerve-centre/kpi-cards/newrelic/days-until-slo-breach) | Forward-projection. Combines current burn with remaining budget to estimate when you'd breach. |
+| [Error Rate](/nerve-centre/kpi-cards/newrelic/error-rate) | The numerator of burn rate. Open this when burn rate spikes. |
+| [Operational Health Score](/nerve-centre/kpi-cards/newrelic/operational-health-score) | Composite parent. SLO compliance is 25% of the score; sustained high burn pulls the score down. |
+| [Datadog SLO Burn Rate](/nerve-centre/kpi-cards/datadog/slo-burn-rate) | Cross-connector peer. DD SLOs implement the same SRE-workbook math; numbers should match if SLI definitions are aligned. |
+| [Shopify Checkout Conversion](/nerve-centre/shopify/checkout_conversion) | Customer-side outcome. Sustained fast-burn on availability SLOs typically drops checkout conversion 5, 15%. |
+| [GA4 Conversion Rate](/nerve-centre/kpi-cards/google-analytics/conversion-rate) | Whole-funnel outcome. Pairs to quantify whether the SLO breach is felt by real customers. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in New Relic:**
+
+- [Service Levels](https://one.newrelic.com/service-levels) is the canonical screen. Each Service Level entity has a "Burn rate" tab that displays the same multi-window evaluation.
+- [Alerts & AI > Conditions](https://one.newrelic.com/alerts-ai/conditions) for the alert configuration that backs the 14.4x threshold.
+- [Dashboards](https://one.newrelic.com/dashboards) > "SLO overview" pre-built dashboard.
+
+**Why our number may legitimately differ from New Relic's own screens:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Account timezone vs UTC**. NR Service Levels follow the account timezone for display; Vortex IQ NRQL runs in UTC. Boundary-window rollups can drift 0.1, 0.3x. | Either direction at hour boundaries |
+| **NRQL retention windows**. Burn rate is a 1h rolling window so retention isn't a concern for live evaluation. Historical burn-rate trend over 30+ days uses rolled aggregates. | None for live |
+| **Ingest sampling**. Burn rate is a ratio so sampling preserves accuracy. Counts may differ from raw logs but the rate stays correct. | None |
+| **NerdGraph rate limits**. Default 3,000 points / minute / account. Burn rate queries are cheap; rate-limiting only relevant during heavy investigation. | Stale, not wrong |
+| **SLI definition scope**. Vortex IQ reads the SLI configured on the Service Level entity. If the merchant edits the SLI definition mid-period, the historical numbers shown in NR's UI may use old SLI; Vortex IQ uses current. | Either direction during transitions |
+
+**Cross-connector reconciliation:**
+
+NR Service Levels and [Datadog SLOs](/nerve-centre/kpi-cards/datadog/slo-burn-rate) implement the same Google SRE-workbook math. Burn rate calculations should be identical if the SLI definitions and SLO targets are aligned. **Disagreements are real signal**, not noise. Common causes: (a) one platform is computing on a slightly different event population (NR includes background workers, DD doesn't); (b) one platform's SLI thresholds are different (NR latency SLI at 1500ms, DD at 1000ms); (c) lookback window differs (one is 1h, other is 30m). Audit SLI definitions if cross-platform parity matters.
+
+NR APM-based SLO and GA4-based real-user SLO will typically disagree by 1, 5x burn rate during incidents. APM SLO captures server-side; GA4 SLO captures customer-side. Both are legitimate; the gap reflects client-side overhead (CDN, browser, third-party scripts) that doesn't appear in APM-instrumented Transaction events.
+
+<details>
+<summary>Same-metric peers on other connectors</summary>
+
+| Connector | Card | Notes |
+| --- | --- | --- |
+| Datadog | [`dd_slo_burn_rate`](/nerve-centre/kpi-cards/datadog/slo-burn-rate) | Definitional peer via Datadog SLOs. Same SRE-workbook math; should match if SLI definitions align. |
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**NR vs Datadog: which SLO platform should I use?**
+Either implements the same SRE-workbook math correctly. NR Service Levels has slightly cleaner UX for defining SLIs against existing APM Transaction events; Datadog SLOs has tighter integration with their Monitors product. Many teams use whichever lives closer to their primary observability platform; running peer SLOs on both is overkill unless you specifically need the cross-platform redundancy.
+
+**Apdex math: how does Apdex relate to SLO?**
+Apdex is one possible SLI input, not the SLO itself. You can define an SLO as "Apdex > 0.85 for 99% of 5-minute windows" and the burn rate will track that SLI. More common is a *raw* latency SLI ("p95 &lt; 1500ms") which is easier to alert on and reason about. Apdex and SLO are complementary: Apdex tells you the satisfaction state right now; SLO tells you whether you can afford another minute of bad satisfaction.
+
+**NRQL retention vs SLO retention: how far back can I see burn rate?**
+Burn rate evaluates a rolling 1h window, well inside the 8-day full-resolution NRQL retention. Historical burn-rate trend over 30+ days uses NR's pre-rolled SLO storage (separate from raw event retention). So 90-day burn-rate history works on standard plans.
+
+**Why does my NR burn rate disagree with Datadog by 0.4x?**
+Almost always an SLI definition mismatch. The most common: NR's SLI counts 4xx as "bad" while DD's counts only 5xx, or NR's SLI uses 1500ms latency threshold while DD uses 1000ms. Audit the SLI definitions on each platform; once aligned, burn rate should match within 5%.
+
+**Sampling: does sampling affect burn rate?**
+No. Burn rate is a ratio (bad events / total events) and NR's sample-correction preserves the ratio. The absolute counts may differ from raw logs but the rate stays accurate. SLO compliance and burn rate are unaffected.
+
+**Multi-account: I have a US and EU NR account, can I aggregate burn rate?**
+Burn rates don't aggregate by simple averaging because each may have a different SLO target. Connect each account separately and stack the cards. The Nerve Centre stack panel shows side-by-side burn rates rather than averaging, which is mathematically correct.
+
+**Ingest cost vs visibility: SLOs require dense event data, can I sample down?**
+Yes. The SLO compliance and burn rate calculations are sample-corrected, so dropping sample rate to 25% on non-critical-path transactions doesn't break SLO accuracy. Keep critical-path (checkout, payment) at 100% to maximise sensitivity. Standard recommendation: 100% checkout, 25% browse, 100% errors.
+
+**Alert tuning: my fast-burn alert fires for 5 minutes then quiets, what's happening?**
+The multi-window check (must breach on both 5m and 1h) typically prevents this kind of flutter. If you're seeing it, check: (a) whether the alert is configured single-window (simpler but flutter-prone); (b) whether your SLI definition catches a transient that doesn't matter (e.g., a deploy retry storm). Move to multi-window alerting following the [Google SRE workbook](https://sre.google/workbook/alerting-on-slos/) recipe.
+
+**My burn rate is 50x but error rate is only 0.5%, how?**
+Your SLO target is very aggressive. A 50x burn at 0.5% error rate implies your allowable rate is 0.01%, which corresponds to a 99.99% (four-nines) SLO. That's an unusual target for commerce; most stores configure 99.9% (three-nines) where 0.5% error rate produces a 5x burn. Check the Service Level entity's target value; lowering the target relaxes the burn-rate sensitivity proportionally.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*SLO Burn Rate (1h)* is one of hundreds of KPI pulses Vortex IQ tracks across New Relic and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

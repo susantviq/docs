@@ -1,0 +1,197 @@
+---
+title: "Refund-Rate Spike Alert, Adobe Commerce"
+sidebarTitle: "Refund-Rate Spike Alert"
+description: "Catches a bad batch / mis-priced SKU / regression-after-deploy before the chargeback wave hits. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Ecommerce Platform
+
+> Catches a bad batch / mis-priced SKU / regression-after-deploy before the chargeback wave hits.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Real-time alert that fires when the refund rate (Credit Memos issued per ordered unit) exceeds 2x the trailing 30-day baseline. Designed to catch a bad supplier batch (defective product), a mis-priced SKU (a £30 item rang up at £3 because of a decimal-point error), or a regression-after-deploy (a fulfillment integration is shipping wrong items). Each of these creates a refund wave that snowballs into chargebacks if not caught within hours.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(credit_memos in window) / COUNT(orders in window)` where the window is rolling 1-hour. The 30-day baseline is computed at the same hour-of-week for fair comparison. Fires when the current ratio is more than 2x the baseline mean, gated on absolute count (at least 5 credit memos in the hour) to avoid noise on low-volume stores. |
+| **API field** | Credit Memos via `GET /rest/V1/creditmemos` (separate document type in Adobe Commerce, not a status flag on the order). Order count via `GET /rest/V1/orders`. The card joins via `order_id`. |
+| **VAT / tax treatment** | The refund-rate ratio is count-based, so tax treatment doesn't bias it. The companion "value at risk" estimate uses Credit Memo `grand_total` which is tax-inclusive (matches the original order's `grand_total`). |
+| **Shipping inclusion** | n/a for the count. Credit Memos can include or exclude shipping refund, depending on whether the merchant ticked "refund shipping" when creating the memo; the card counts the memo regardless. |
+| **Discounts** | n/a for the count. Credit Memo `grand_total` deducts the prorated discount automatically. |
+| **Credit Memo refund treatment** | This card IS the Credit Memo monitor. Adobe Commerce uses Credit Memos as separate documents (unlike Shopify which mutates the order). A Credit Memo can be partial (refund 1 of 3 line items) or full. The card counts each memo as one event regardless of partial/full status. |
+| **`state` machine inclusion** | The order side uses all states. Credit Memos are typically issued against orders in `complete` (already invoiced, then partially refunded) or `closed` (fully refunded). A memo against `processing` is unusual but possible (refund before shipment); the card includes them. |
+| **`pending_payment` quirk** | Credit Memos cannot be issued against `pending_payment` orders (no captured payment to refund). Such cancellations show up under [Cancellation Rate](/nerve-centre/kpi-cards/adobe-commerce/cancellation-rate) instead. The two cards together cover the full "money-back" surface area. |
+| **Multi-currency `grand_total` vs `base_grand_total`** | n/a for the count ratio. The value-at-risk uses `base_grand_total` for cross-currency rollup. |
+| **Store View scope (`store_id`)** | All Store Views by default. Per-Store-View variants are recommended because refund spikes are usually localised to one product category or one fulfillment region. |
+| **Time window** | `RT` (real-time, rolling 1-hour). |
+| **Alert trigger** | `refund rate >2x 30D baseline` at same hour-of-week. The 2x multiplier is empirically chosen to filter routine variance; lower (1.5x) for very steady stores, higher (3x) for high-variance stores. |
+| **Sentiment key** | `refund_rate` |
+| **Roles** | owner, operations, finance |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+```
+COUNT(status=refunded) / COUNT(_id)
+  WHERE date BETWEEN [period_start, period_end]
+```
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A houseware retailer on Adobe Commerce 2.4.6 with a US Store View, a UK Store View, and a B2B portal Store View. Snapshot taken Thursday 21 Apr 26, 13:00 BST. The alert just fired.
+
+**30-day baseline (Thursdays 13:00 BST):**
+
+| Stream | Hourly orders | Hourly Credit Memos | Refund rate |
+| --- | --- | --- | --- |
+| US (consumer) | 86 | 2.1 | 2.4% |
+| UK (consumer) | 124 | 3.8 | 3.1% |
+| B2B portal | 14 | 0.2 | 1.4% |
+| Combined baseline | 224 | 6.1 | 2.7% |
+
+**Current hour:**
+
+| Stream | Hourly orders | Hourly Credit Memos | Refund rate | vs baseline |
+| --- | --- | --- | --- | --- |
+| US (consumer) | 92 | 3 | 3.3% | within range |
+| UK (consumer) | 118 | **17** | **14.4%** | **+11.3 pts, ~4.6x baseline** |
+| B2B portal | 16 | 0 | 0% | as expected |
+| **Combined** | 226 | **20** | **8.8%** | **3.3x baseline** |
+
+**The alert fired** because combined refund rate is 3.3x the 30-day baseline at this hour-of-week. The UK stream is 4.6x baseline.
+
+What the investigation reveals:
+
+1. **UK is the problem.** US and B2B are within normal variance.
+2. **Pulling the 17 UK Credit Memos**: 12 of them are against the same SKU, `KETTLE-CC-1L` (a 1-litre stovetop kettle). The remaining 5 are normal scattered returns.
+3. **`KETTLE-CC-1L` order velocity** has been climbing for a week (a TikTok video drove a viral spike). The merchant has been gleeful about the demand. But starting yesterday afternoon, the customer service inbox has had complaints: the kettle handle is loose on arrival.
+4. **Cross-checking [Top Refunded SKUs](/nerve-centre/kpi-cards/adobe-commerce/top-refunding-customers)**: `KETTLE-CC-1L` is now the #1 refunded SKU, accounting for 22% of UK refund volume in the last 24 hours. Last week it was not in the top 20.
+5. **Root cause**: the supplier shipped a defective batch. The merchant received pallets of `KETTLE-CC-1L` from supplier 4 days ago; everything dispatched since then has the loose-handle defect.
+6. **The fix sequence**:
+   - Pause the `KETTLE-CC-1L` ad campaign immediately (use [Active Ads on OOS SKUs](/nerve-centre/kpi-cards/adobe-commerce/active-ads-on-out-of-stock-skus) workflow plus manual pause).
+   - Mark `KETTLE-CC-1L` as out of stock in Adobe Commerce admin (Catalog > Products > KETTLE-CC-1L > Stock Status: Out of Stock). This stops new orders.
+   - Email all UK customers who received `KETTLE-CC-1L` in the last 4 days with proactive replacement offers (about 320 customers per the Sales > Orders search).
+   - Issue an RMA to the supplier for the defective batch.
+   - Resume sales only when verified-good replacement stock arrives.
+7. **Cost-of-detection**: at the moment of the alert, ~90 defective kettles were already in transit to UK customers. Without the alert, the merchant would have discovered the defect through customer service pressure on Friday (when most of the 90 had been delivered and complaint volume crested). Detecting at hour 0 means proactive comms to ~290 of the 320 customers, dramatically improving retention.
+8. **Chargeback-risk avoidance**: refund-rate spikes that go unmanaged for 14+ days correlate strongly with chargeback waves (customers who can't get refunds from the merchant escalate to the card issuer). Catching at hour 0 means refunds processed before chargebacks are filed; merchant reputation with payment processors is preserved.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+This alert is most actionable when paired with product-level and payment-side cards.
+
+| Card | Why pair it with Refund-Rate Spike Alert |
+| --- | --- |
+| [Top Refunded SKUs](/nerve-centre/kpi-cards/adobe-commerce/top-refunding-customers) | The smoking gun. A refund spike concentrated on a single SKU is almost always a defective batch or pricing error. |
+| [Refund Rate](/nerve-centre/kpi-cards/adobe-commerce/refund-rate) | The trailing percentage view. Confirms whether the spike is sustained (genuine product issue) or transient (a single weird hour). |
+| [Refunds Over Time](/nerve-centre/kpi-cards/adobe-commerce/refunds-over-time) | Time-series view. Shows whether the spike is the start of a trend or an isolated event. |
+| [Refund Value](/nerve-centre/kpi-cards/adobe-commerce/refund-value) | Dollar impact. A 4x rate spike on $10 SKUs is small money; on $400 SKUs it is severe. |
+| [Cancellation Rate](/nerve-centre/kpi-cards/adobe-commerce/cancellation-rate) | Pre-shipment refunds (orders cancelled before fulfillment) appear here. Cancellations + Credit Memos together cover the full money-back surface. |
+| [Total Revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | Net cash impact. Credit Memos do not subtract from Total Revenue (gross), so a refund spike masks itself in revenue dashboards; this alert exists to flag it. |
+| [`stripe.stripe_chargebacks`](/nerve-centre/stripe/stripe_chargebacks) | Lagging risk. Unmanaged refund waves become chargeback waves 14 to 30 days later. |
+| [`shopify.shopify_alert_refund_spike`](/nerve-centre/shopify/shopify_alert_refund_spike) | Cross-platform peer for agency teams. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Adobe Commerce Admin:**
+
+For the Credit Memo list:
+
+> **Sales > Credit Memos** lists every memo issued, with date, amount, and the originating order. Filter by date range to see the per-hour count. Adobe Admin shows the absolute count; this card derives a ratio against orders.
+
+For per-SKU refund detail:
+
+> **Reports > Sales > Refunds** aggregates Credit Memo amount by date. Useful for spotting trends but does not break down by SKU; use the manual workflow Sales > Credit Memos > export to CSV > pivot in spreadsheet for SKU detail. Or use the [Top Refunded SKUs](/nerve-centre/kpi-cards/adobe-commerce/top-refunding-customers) card.
+
+For the underlying order side:
+
+> **Sales > Orders** filtered to today gives the order denominator.
+
+Other Adobe Commerce Admin views that look relevant but are not:
+
+- **Reports > Sales > Tax**: tax aggregations, not refund rate.
+- **Reports > Sales > Coupons**: coupon usage.
+- **Sales > Invoices**: separate document; an invoice can be issued without a Credit Memo following.
+- **Sales > Returns** (RMA module if installed): authorisations to return, separate from the actual refund issuance.
+
+**Why our number may legitimately differ from a manual Admin count:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Time-zone**. Admin renders in Store View timezone; the card runs UTC. Hour boundaries shift accordingly. | ±N hours of timezone offset |
+| **Partial Credit Memos**. The card counts each memo as one event regardless of partial/full. The Admin view also lists each memo. The "value-at-risk" companion uses Credit Memo `grand_total` which is the actual refunded amount; partials are smaller than originals. | No count divergence; value divergence |
+| **`canceled` orders**. Cancellations are not Credit Memos; this card does not include them. The Admin "Refunds" report similarly excludes cancellations. | No divergence here |
+| **RMA-only events**. If the merchant uses the Adobe RMA module, return authorisations exist before Credit Memos are issued. This card counts memos, not RMAs. | Card may lag RMA volume by 1-3 days (the typical RMA-to-refund lag) |
+| **Multi-Store-View scope**. Admin scopes to one Store View; the card sums by default. | Vortex IQ higher counts |
+| **Sync lag**. The card uses the most recent OpenSearch sync (5-15 min); Admin is live. | Vortex IQ slightly stale at the boundary |
+
+**Cross-connector reconciliation (when these connectors are connected for this merchant):**
+
+| Pair | Expected relationship | What divergence tells you |
+| --- | --- | --- |
+| [`stripe.stripe_refunds`](/nerve-centre/stripe/stripe_refunds) | Stripe refunds should equal Adobe Credit Memos for Stripe-paid orders, with sub-second lag | If Stripe refund volume is higher than Adobe Credit Memo volume, refunds are being processed in Stripe directly without Adobe knowing (payment ops bypass). If Adobe Credit Memos exceed Stripe refunds, memos are being created without payment refund (likely store credit issued instead). |
+| [`paypal.pp_refunds`](/nerve-centre/paypal/pp_refunds) | Same relationship for PayPal-paid orders | Same diagnostic. |
+| [`stripe.stripe_chargebacks`](/nerve-centre/stripe/stripe_chargebacks) | Lagging effect, expect chargebacks to rise 14-30 days after sustained refund spikes | Customers who don't get refunds escalate to issuer; managing the refund wave avoids the chargeback wave. |
+| Customer service ticket volume | Should rise alongside refund spikes | If tickets are quiet but refunds are spiking, refunds are being issued without customers asking (proactive refund automation, sometimes a sign of fraud-controls overreach). |
+
+---
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The same alert exists with platform-specific definitions on other commerce connectors.
+
+- [`shopify.shopify_alert_refund_spike`](/nerve-centre/shopify/shopify_alert_refund_spike)
+- [`bigcommerce.bc_alert_refund_spike`](/nerve-centre/bigcommerce/bc_alert_refund_spike)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The alert fired but my Stripe dashboard shows normal refund volume, why?**
+Possible causes. First, store credit: a Credit Memo with `refund_to_store_credit = true` issues credit but does not refund the payment processor. Adobe records the memo, Stripe sees nothing. Second, manual cash refunds (rare in ecommerce but happens for B2B and high-touch merchants): the merchant refunded via bank transfer outside Stripe, recorded the Credit Memo for accounting accuracy, but Stripe is uninvolved. Third, sync lag: Stripe webhooks land within seconds, but if the integration is queueing them, you may see a brief Adobe-leads-Stripe gap.
+
+**What's the difference between a Credit Memo and a cancellation, and which does this card track?**
+A cancellation is `state = canceled` with no payment captured, no goods shipped, no Credit Memo. The customer abandons or the merchant cancels before fulfillment. A Credit Memo is a separate document issued after capture (typically after fulfillment, sometimes pre-shipment) that refunds money. This card tracks Credit Memos only. Cancellations are tracked by [Cancellation Rate](/nerve-centre/kpi-cards/adobe-commerce/cancellation-rate). Together they cover the "money-back" surface area; merchants tend to focus on one and miss the other, which is a mistake.
+
+**Adobe Commerce vs Magento Open Source: does this card work on the free edition?**
+Yes. Credit Memos exist in both editions and the document structure is identical. The only edition-specific difference: Adobe Commerce's RMA (Returns Merchandise Authorisation) module adds a structured returns-management workflow, but Credit Memos are still the underlying record on either edition.
+
+**Why does the alert use 2x baseline rather than a fixed rate threshold?**
+Baseline refund rates vary enormously by category: fashion stores baseline at 15 to 30%, hardware stores at 1 to 3%, B2B accounts under 1%. A fixed 5% threshold would constantly fire on fashion and never on hardware. The 2x multiplier normalises against each merchant's own baseline.
+
+**My multi-store Adobe Commerce, can I get per-Store-View alerts?**
+Yes, configure per-Store-View variants. Refund spikes are usually localised; UK consumers may refund a defective batch while US is fine because the defective batch shipped from a UK warehouse. Per-Store-View variants surface the localisation immediately.
+
+**B2B accounts have very low refund rates, will B2B variance trigger false alerts?**
+The card has an absolute-count gate (5 memos in the hour) to avoid noise on low-volume streams. B2B going from 0.2 memos/hour baseline to 1 memo/hour is a 5x ratio, but absolute count is below threshold so it doesn't fire. For B2B-only stores, lower the absolute-count gate to 2 or 3 in the manifest.
+
+**Does the alert distinguish partial refunds from full refunds?**
+Not in the count. A partial refund (1 of 3 line items returned) counts as one memo, same as a full refund. The companion value-at-risk metric uses Credit Memo `grand_total` which captures the actual amount; a partial memo will show smaller. If you specifically need to monitor full-refund spikes (the worst signal: customer returned everything), filter the manifest to `Credit Memo grand_total = order grand_total`.
+
+**Why is the rate calculated from this hour's orders rather than the original orders being refunded?**
+Two approaches are valid. (a) Refunds-this-hour / orders-this-hour: a real-time pulse, captures "are refunds suddenly elevated right now". (b) Refunds-of-orders-from-the-last-30-days / orders-from-the-last-30-days: a quality-of-cohort view. The card uses (a) because the alert is for incident detection. Approach (b) is captured by the [Refund Rate](/nerve-centre/kpi-cards/adobe-commerce/refund-rate) trailing card. Both views matter; this card is for "is the customer service inbox about to flood".
+
+**The viral SKU is converting AND being refunded a lot, do I pause it?**
+Not necessarily. If conversion rate is healthy and refund rate is acceptable on a per-SKU basis, the volume of both rising in lockstep is just demand. The alert's job is to flag when refund rate is rising disproportionately, signalling a quality issue. Cross-check [Top Refunded SKUs](/nerve-centre/kpi-cards/adobe-commerce/top-refunding-customers) and customer-feedback channels (reviews, support tickets) before acting.
+
+**Why doesn't Google Analytics agree?**
+GA4 attributes purchase events; it does not natively track refunds in the standard ecommerce event model (you can custom-implement refund events via Measurement Protocol but most merchants don't). The card uses Adobe-side server data which is the source of truth for Credit Memos.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Refund-Rate Spike Alert* is one of hundreds of KPI pulses Vortex IQ tracks across Adobe Commerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

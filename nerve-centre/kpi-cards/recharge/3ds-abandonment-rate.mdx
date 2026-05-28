@@ -1,0 +1,134 @@
+---
+title: "3DS Abandonment Rate, Recharge"
+sidebarTitle: "3DS Abandonment Rate"
+description: "3DS Abandonment Rate for Recharge stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Payment Gateway
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of Recharge charges that triggered a 3DS challenge and were **abandoned** by the customer (not declined by the issuer). On Recharge specifically, 3DS abandonment is overwhelmingly a *Recharge Checkout first-order* problem, not a rebill problem, recurring rebills should qualify for MIT (Merchant Initiated Transaction) exemption and not face 3DS at all. If you see meaningful abandonment on rebills, your MIT exemption flag is misconfigured. UK and EU first-order traffic typically runs 8, 15% abandon on a 3DS challenge; US traffic doesn't see this card materially.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(charges WHERE 3DS challenged AND customer abandoned) ÷ COUNT(3DS challenged) × 100`. Abandonment = challenge initiated, customer never returned to complete. Distinct from challenge-failed-by-issuer (that's a decline, not an abandon). |
+| **Where 3DS even applies** | EU/UK card-not-present transactions over EUR 30 (PSD2 SCA mandate). US, AU, CA traffic largely doesn't see 3DS on subscription. |
+| **Recharge Checkout first-order vs rebill** | First-orders may face 3DS as fresh-cardholder authentication. Rebills should qualify for MIT exemption. If both populate this card it's a config issue. |
+| **Currency** | Currency-neutral. |
+| **Failed / declined payments** | Excluded; abandonment is a separate state from decline. |
+| **Time window** | `7D vsP` rolling default. |
+| **Alert trigger** | `>20%` absolute; `+5pp` vsP. `sentiment_key: threedsecure_abandon` (gauge inverse, lower = better). |
+| **Reading hints** | UK first-order abandonment 8, 12% normal. >15% suggests friction in 3DS challenge UX (translation issues, slow issuer pages, mobile-popup blocking). |
+| **Roles** | owner, finance, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Recharge data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+"Daily Greens Co" UK customers, 7-day window 26 Apr 26 to 02 May 26.
+
+| Cohort | 3DS challenged | Completed | Abandoned | Issuer-rejected | Abandon rate |
+| --- | --- | --- | --- | --- | --- |
+| Recharge Checkout first-order, UK | 240 | 196 | 28 | 16 | 11.7% |
+| Monthly rebill, UK (mis-flagged, no MIT) | 18 | 12 | 4 | 2 | 22.2% |
+| Annual prepaid renewal, UK (mis-flagged) | 4 | 2 | 1 | 1 | 25.0% |
+
+```text
+Period totals (UK only):
+  Total challenged                      = 262
+  Total abandoned                       = 33
+  
+  Blended abandon rate (this card)      = 33 ÷ 262 × 100 = 12.6%
+  First-order only abandon rate         = 28 ÷ 240 × 100 = 11.7%
+```
+
+What the merchant should notice:
+
+1. **The 22 rebill challenges (18+4) shouldn't exist.** Recurring rebills on saved tokens qualify for MIT (Merchant Initiated Transaction) exemption under PSD2 SCA. If this card shows non-zero rebill challenges, the MIT flag is missing in the Recharge → processor API call. This is a config bug; open a Recharge support ticket.
+2. **First-order abandon at 11.7% is normal range** for UK 3DS friction. Below 8% is excellent (clean challenge UX, fast issuer pages); above 15% suggests a UX problem in the challenge popup (mobile blocking, language mismatch).
+3. **Annual prepaid challenges abandoned 25%** because the customer was challenged by the issuer for a high-value (USD 790) transaction; they were unsure if they really wanted to commit and abandoned. High-value transactions intentionally face higher abandonment. Mitigate with clear pre-challenge UX ("you're about to be authenticated for your annual subscription, please complete the bank prompt").
+4. **US customers don't appear here** because PSD2 SCA doesn't apply outside EEA. A US customer never sees a 3DS prompt unless the issuer chose to step-up authenticate (rare, and not Recharge-driven).
+5. **Issuer-rejected (19 total) is NOT abandonment**, it's decline. The customer attempted, the issuer said no. They're tracked in [`rec_decline_rate`](/nerve-centre/kpi-cards/recharge/decline-rate) as `AUTHENTICATION_REQUIRED` or `AUTHENTICATION_FAILED`.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with 3DS Abandon Rate |
+| --- | --- |
+| [`rec_decline_rate`](/nerve-centre/kpi-cards/recharge/decline-rate) | Cousin metric: 3DS-challenge-failed-by-issuer is decline, not abandon. |
+| [`rec_top_decline_reasons`](/nerve-centre/kpi-cards/recharge/top-decline-reasons) | AUTHENTICATION_REQUIRED cluster reveals MIT mis-config. |
+| [`rec_total_volume`](/nerve-centre/kpi-cards/recharge/total-volume) | Lost volume from abandoned challenges visible here. |
+| [`rec_success_rate`](/nerve-centre/kpi-cards/recharge/success-rate) | Abandonment is in the gap between attempted and successful. |
+| Stripe / Shopify Payments 3DS abandon rate | Underlying processor view. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in the Recharge merchant portal:**
+
+[admin.rechargepayments.com](https://admin.rechargepayments.com). Recharge admin doesn't expose a dedicated 3DS abandon view; the better source is the **underlying processor's dashboard** (Stripe Radar → 3DS, Shopify Payments → Authentication) for the same window. Recharge's **Charges → Failed → AUTHENTICATION_REQUIRED** lists the issuer-rejected slice, which is the cousin to abandons.
+
+**Why our number may legitimately differ from the underlying processor:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Abandon definition window** | Slight differences | "Abandoned" needs a timeout window (typically 30 minutes of no return). Different processors apply different windows. |
+| **First-order vs rebill split** | Recharge admin doesn't split | The processor view often blends first-purchase 3DS with subscription-rebill 3DS. We surface both flavours. |
+
+**Cross-connector reconciliation:**
+
+| Comparison | Expected relationship | When divergence is legitimate |
+| --- | --- | --- |
+| `rec_threedsecure_abandon_rate` ↔ Shopify storefront 3DS abandon rate | Recharge typically lower | Storefront includes one-time purchases with first-time customers; Recharge first-orders are subscription-committed (lower abandon). |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference</em></summary>
+
+- [`stripe.stripe_threedsecure_abandon_rate`](/nerve-centre/stripe/stripe_threedsecure_abandon_rate)
+- [`viva_payments.viv_threedsecure_abandon_rate`](/nerve-centre/kpi-cards/viva-payments/3ds-abandonment-rate)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**"My rebill abandon rate isn't zero, what's wrong?"**
+The MIT (Merchant Initiated Transaction) exemption flag isn't being set in the Recharge → underlying processor API call for rebills. Recurring rebills should be exempt from SCA under PSD2; if the flag is missing, the issuer treats the rebill as fresh-customer auth and challenges. Open a Recharge support ticket.
+
+**"What's a normal first-order 3DS abandon rate for the UK / EU?"**
+8, 12% on Recharge Checkout first-orders is normal. Above 15% suggests a UX problem in the challenge popup (mobile blocking, language mismatch, slow issuer page). Below 8% is excellent.
+
+**"Annual prepaid 3DS abandon is higher, can we reduce it?"**
+High-value (USD 790) prepaid renewals naturally face more friction; some abandonment is "I changed my mind". Pre-challenge UX helps: a clear screen explaining "you'll be authenticated by your bank for the annual subscription, please complete the prompt" before redirect. Recharge Checkout templates support this.
+
+**"Do US customers face 3DS at all?"**
+Rarely. PSD2 SCA only mandates EEA card-not-present. Some US issuers run their own step-up authentication on suspicious patterns, but it's &lt;0.1% of US traffic typically.
+
+**"How does this card relate to AUTHENTICATION_REQUIRED in decline reasons?"**
+AUTHENTICATION_REQUIRED is when the issuer demands a challenge but the merchant didn't initiate one (mis-config, no 3DS support). The challenge never happens; the charge declines. Abandon (this card) is when a challenge DID happen, and the customer didn't complete it. They're complementary metrics.
+
+**"Why is one issuer (e.g. NatWest) abandoning more than another?"**
+Some issuer 3DS pages are slower, less mobile-friendly, or display language mismatches that confuse customers. The fix is on the issuer side; you can't directly improve their pages. Practical mitigation: route higher-friction issuers to alternative payment methods (PayPal Billing Agreement, Shop Pay) at signup.
+
+**"Is 3DS challenge worth the abandonment cost?"**
+For EEA traffic it's not optional, PSD2 mandates it. The abandonment is the unavoidable cost of compliance. The alternative (no 3DS) means the issuer auto-declines, which is worse for conversion.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*3DS Abandonment Rate* is one of hundreds of KPI pulses Vortex IQ tracks across Recharge and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

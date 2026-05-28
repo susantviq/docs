@@ -1,0 +1,174 @@
+---
+title: "Operational Health Score, Datadog"
+sidebarTitle: "Operational Health Score"
+description: "Composite, apdex × inverse error-rate × inverse incident-count × SLO compliance. The CXO single-number. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Monitoring
+
+> Composite, apdex × inverse error-rate × inverse incident-count × SLO compliance. The CXO single-number.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A 0, 100 composite that compresses four Datadog signals (Apdex, error rate, open incidents, SLO compliance) into one number a non-engineering owner can read at a glance. Designed for the question *"is my store fast enough and healthy enough to take orders right now, yes or no?"* This is the merchant translation of an SRE dashboard.
+
+| | |
+| --- | --- |
+| **The formula** | `0.30 × apdex_pct + 0.25 × (100 − 10 × error_rate_pct) + 0.20 × incident_score + 0.25 × slo_compliance_pct`. Each component is clamped to 0, 100 so a single bad signal can drag the composite low but cannot push it negative. |
+| **Apdex component (30% weight)** | Datadog's Apdex score expressed as a percent (0.94 becomes 94). Apdex is the share of requests served fast enough to feel snappy to a shopper (under your service's tolerance threshold, typically 500ms). The strongest single proxy for "does the storefront feel fast?". |
+| **Error-rate amplifier (25% weight)** | `100 − 10 × error_rate_pct` from `/api/v1/query` aggregating error spans across all instrumented services. The ×10 multiplier means a 2% error rate (twice the healthy ceiling of 1%) costs the composite 20 points, intentionally harsh because for a shopper, every error is a failed checkout, search, or cart-add. |
+| **Incident component (20% weight)** | `incident_score = 100 − (sev1_count × 50) − (sev2_count × 25) − (sev3_count × 10)`. One open SEV-1 alone halves the composite. Pulled from `/api/v1/incidents`. |
+| **SLO compliance (25% weight)** | The lowest-compliance service-level objective in the merchant's Datadog account, from `/api/v1/slo`. If you have a 99.9% checkout-availability SLO and you're at 99.6%, this component reads 99.6. |
+| **API endpoints touched** | Metrics (`/api/v1/query`), Monitors (`/api/v1/monitor`), Incidents (`/api/v1/incidents`), SLOs (`/api/v1/slo`). Logs API is NOT a direct input (and so is unaffected by Log Management gating). |
+| **Aggregation window** | Real-time refresh every 60 seconds; underlying components use rolling 7-day windows where appropriate. |
+| **Severity threshold** | All severities feed the incident component. P1/SEV-1 carries 50 points of penalty; P2/SEV-2 carries 25; P3/SEV-3 carries 10. |
+| **Filtered hosts / services** | All instrumented services in the connected Datadog account. To exclude internal Datadog synthetic traffic, add `@user_agent:Datadog/Synthetic` to your global service exclusion tag. |
+| **Time zone** | Account timezone in Datadog Admin (Organization Settings); rolling windows align to that zone. UTC for cross-connector arithmetic when paired with commerce siblings. |
+| **Log Management gating** | Logs API is not used by this composite, so a Datadog account without Log Management enabled still gets a valid Operational Health Score. The gating only affects log-volume cards. |
+| **Time window** | `RT/7D` (real-time gauge over rolling 7 days). |
+| **Alert trigger** | `< 70`, when the composite drops below 70 the merchant gets pinged. The 70 threshold corresponds roughly to "Apdex &lt; 0.85 OR error rate > 3% OR any open SEV-1 OR any SLO below 99%". |
+| **Sentiment key** | `operational_health_score` |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Datadog data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK home and garden brand on Shopify with Datadog APM instrumented across web, checkout, search, and the inventory worker. Snapshot taken on 28 Apr 26 at 14:05 GMT.
+
+| Component | Reading | Score |
+| --- | --- | --- |
+| Apdex | 0.91 across all services | 91 |
+| Error rate | 1.6% (driven by a payment retry loop on the checkout service) | 100 − (10 × 1.6) = **84** |
+| Incidents open | 1 SEV-2 (search latency degraded) | 100 − 25 = **75** |
+| SLO compliance (worst SLO) | Checkout availability 99.7% (target 99.9%) | **99.7** |
+
+```text
+Composite = 0.30 × 91 + 0.25 × 84 + 0.20 × 75 + 0.25 × 99.7
+          = 27.30 + 21.00 + 15.00 + 24.92
+          = 88.22, displayed as 88
+```
+
+Score of 88 is healthy (above the 70 alert threshold) but two things stand out:
+
+1. **Error rate is dragging the composite the most.** A 1.6% error rate cost six composite points. The merchant should open [Error Rate by Service](/nerve-centre/kpi-cards/datadog/error-rate-by-service) to see whether it concentrates on the checkout service (where it directly maps to lost orders) or on a non-revenue path like the inventory worker (where it costs operations team time but not revenue today).
+2. **One open SEV-2 incident.** Search latency degraded means shoppers can browse but find-product is slower than usual. Conversion will dip if it persists; pair with [Conversion Drop During Incidents](/nerve-centre/kpi-cards/datadog/conversion-drop-during-incidents) to quantify.
+
+**Now compare 14:05 to 14:35.** A bad deploy at 14:20 pushed error rate to 4.8% and triggered a SEV-1.
+
+| Component | Reading at 14:35 | Score |
+| --- | --- | --- |
+| Apdex | 0.78 (latency spiked) | 78 |
+| Error rate | 4.8% | 100 − 48 = **52** |
+| Incidents open | 1 SEV-1 + 1 SEV-2 | 100 − 50 − 25 = **25** |
+| SLO compliance | 99.4% (the spike eroded the rolling window) | **99.4** |
+
+```text
+Composite = 0.30 × 78 + 0.25 × 52 + 0.20 × 25 + 0.25 × 99.4
+          = 23.40 + 13.00 + 5.00 + 24.85
+          = 66.25, displayed as 66
+```
+
+The composite is now **66**, below the 70 alert threshold. Vortex IQ pages the engineering on-call AND surfaces a [Revenue at Risk](/nerve-centre/kpi-cards/datadog/revenue-at-risk) figure on the merchant's dashboard so the founder can see the cost in pounds without reading APM dashboards. Sales-side: in the same 30-minute window, Shopify orders dropped from 47/hour to 31/hour, so the financial cost of the deploy was approximately £1,400/hour at this brand's £88 AOV. Two cards, one story.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Operational Health Score | What the combination tells you |
+| --- | --- | --- |
+| [Apdex Score](/nerve-centre/kpi-cards/datadog/apdex-score) | The 30%-weight component. The first card to open when the composite drops to triage user-perceived speed. | If Apdex is the single dragger, it is a latency story, not a stability story. |
+| [Error Rate](/nerve-centre/kpi-cards/datadog/error-rate) | The 25%-weight component (amplified ×10). Drives most score swings. | Error-rate spikes co-move with checkout failure and revenue-at-risk; the strongest single trigger for paging. |
+| [Active Incidents](/nerve-centre/kpi-cards/datadog/active-incidents) | The 20%-weight component. One SEV-1 alone takes the composite below 80. | Reads what is actively broken; pair with `dd_alerts_summary` for monitor-level detail. |
+| [SLO Compliance](/nerve-centre/kpi-cards/datadog/slo-compliance) | The 25%-weight component. Reads the worst SLO in the account. | Slow-bleed degradations show here before they show in the other components. |
+| [Revenue at Risk (live)](/nerve-centre/kpi-cards/datadog/revenue-at-risk) | Translates the composite into pounds-per-hour while the incident is open. | The financial reframing that turns "score 66" into "£1,400/hour leaking until you fix it". |
+| [Critical-Path Tests Status](/nerve-centre/kpi-cards/datadog/critical-path-tests-status) | The synthetic-test view of the same shopper journey the composite measures. | Composite green plus critical-path failing equals "instrumentation gap, customers seeing what Datadog cannot". |
+| [GA4 Property Health](/nerve-centre/kpi-cards/google-analytics/ga4-property-health) | Browser-side measurement-health peer. | Both green equals you trust the dashboards; either red equals investigate before believing the numbers. |
+| [Shopify Total Revenue](/nerve-centre/kpi-cards/shopify/total-revenue) | The truth-side metric the composite is supposed to protect. | When composite drops AND revenue follows, the incident is real; when composite drops and revenue is steady, you are seeing a measurement-side regression. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Datadog:**
+
+Datadog does NOT provide a single "Operational Health Score". This card is a Vortex IQ composite synthesised from four Datadog-native screens. Open each independently to verify a component:
+
+> **[Service Catalog](https://app.datadoghq.com/services)** for per-service Apdex and error-rate context.
+> **[APM → Service List](https://app.datadoghq.com/apm/services)** for the latency and throughput inputs feeding Apdex.
+> **[Monitors → Manage Monitors](https://app.datadoghq.com/monitors/manage)** for the alert/monitor-state count feeding the incident component.
+> **[SLO List](https://app.datadoghq.com/slo)** for the SLO compliance component.
+> **[Incidents](https://app.datadoghq.com/incidents)** for the open-incident severity feed.
+
+**Why our number may legitimately differ from Datadog's component values:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Time zone** | Boundary days off | Datadog UI runs on the account's configured timezone; Vortex IQ aligns rolling windows to UTC for cross-connector arithmetic. |
+| **API rate limits** | Brief gaps | Datadog's API is rate-limited per organization (300 req/h on free tier, higher on Pro/Enterprise). On polling-burst minutes a component may use the cached prior value. |
+| **Log indexing latency** | Not applicable here | The composite does not consume logs, so the typical 30-90 second log indexing lag does not affect this score. |
+| **Monitor state cache** | 60-second drift | Monitor state is refreshed once per minute; a monitor that just transitioned to ALERT may take up to 60 seconds to feed into the incident component. |
+| **SLO calculation lag** | 5-15 minute drift | SLO numerators/denominators are aggregated on a 5-minute schedule on Datadog's side. Sub-15-minute movements may trail. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes the divergence |
+| --- | --- | --- |
+| [`google_analytics.ga_property_health`](/nerve-centre/kpi-cards/google-analytics/ga4-property-health) | Independent browser-side health peer. They should not be the same number; they measure different things. | Datadog measures server-side; GA4 measures browser-side. A real client-side bug (broken JS, ad blocker change) shows in GA4 first; a real server-side bug shows in Datadog first. **Both red simultaneously equals a real, severe incident; either red alone equals a measurement-side investigation.** |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) / [`adobe_commerce.total_revenue`](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | When the composite drops below 80, expect revenue per minute to drop within 5-15 minutes. | The lag is the time between technical degradation and shopper abandonment. Mobile shoppers abandon faster than desktop. |
+| [`stripe.stripe_payment_health_score`](/nerve-centre/kpi-cards/stripe/payment-health-score) | Same composite shape, different domain. Stripe Health is the payments layer; Datadog Health is the application layer. | Both green equals trust the funnel; Stripe red plus Datadog green equals payments-side issue (gateway, Radar rules); Stripe green plus Datadog red equals app-side issue (latency, errors). |
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple monitoring vendors)</em></summary>
+
+The Operational Health Score has a definitional twin on other observability platforms. This is **not** a reconciliation, your Datadog account does not have a parallel New Relic or Dynatrace instance to compare against. These references exist purely so an agency running clients on multiple monitoring stacks can cross-link the same metric across docs.
+
+- New Relic equivalent: a composite of Apdex, error rate, and SLO compliance from NerdGraph (no manifest entry yet).
+- Sentry equivalent: error-rate-only health (no Apdex, no SLO; therefore narrower).
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**I am a non-engineering founder. Why is this card on my dashboard?**
+Because every minute the score is below 70 is a minute when shoppers are bouncing, checkouts are timing out, or search is failing. The score is the merchant-readable version of an SRE dashboard. You do not need to triage Apdex or read traces; you need to know when to phone the engineering team, ask whether the on-call has acknowledged the page, and whether to pause paid-media spend until it is fixed.
+
+**What is the difference between this card and "Active Incidents"?**
+[Active Incidents](/nerve-centre/kpi-cards/datadog/active-incidents) is a count (1 SEV-1, 2 SEV-2, etc). Operational Health Score is a 0, 100 number that *also* reflects performance degradation that has not yet triggered an incident. The composite goes amber before incidents are declared, which is its highest-leverage use: catch the problem during the 5-15 minutes between "metrics moving" and "human declares incident".
+
+**Why is the score below 70 but everything looks fine on Datadog?**
+Three usual causes: (1) An open SLO breach you have not noticed, the SLO compliance component reads the *worst* SLO in your account, so a single neglected `90.0%` target on an internal API can drag the score; (2) A SEV-3 incident that nobody resolved, the incident component still penalises 10 points per open SEV-3; (3) Apdex below 0.85 on the storefront service even when there are no errors, which is the "site is up but slow" pattern. Open the four component cards listed in At a glance to identify which one is dragging.
+
+**Does this score include log volume or log errors?**
+No. The composite uses Metrics, Monitors, Incidents, and SLOs. The Logs API is intentionally excluded because Log Management is a paid tier add-on and many merchants have it disabled. If your Datadog account does not have Log Management enabled, the Logs API returns `400 No valid indexes` and Vortex IQ logs that as INFO once and skips remaining log KPIs, but the Operational Health Score itself is unaffected.
+
+**My Vortex IQ account dashboard says my store is healthy but a customer just emailed to say checkout is broken. Is the score wrong?**
+This is the classic "Datadog says everything is fine but customers are complaining" pattern, and it is real. Three places to check, in order: (1) Open [Critical-Path Tests Status](/nerve-centre/kpi-cards/datadog/critical-path-tests-status), if the synthetic checkout test is failing while APM looks fine, the regression is in a code path Datadog is not instrumenting (third-party script, payment iframe, browser-only error); (2) Open [GA4 Property Health](/nerve-centre/kpi-cards/google-analytics/ga4-property-health) and [JS Errors / Session](/nerve-centre/kpi-cards/datadog/js-errors-session), browser-side errors do not appear in server-side APM; (3) Check your store on a fresh device and incognito tab, real-user monitoring (RUM) catches what synthetic and APM cannot. The composite is good for *server-side* health; for *shopper-side* health, RUM and synthetic are required.
+
+**What does "RUM vs APM" mean in plain English?**
+APM (Application Performance Monitoring) measures the server: how fast did your code respond when the request reached it. RUM (Real User Monitoring) measures the browser: how fast did the page actually feel for a shopper, including network time, JavaScript execution, third-party scripts, and ad-blocker interference. APM can be perfect while RUM is broken (slow CDN, broken payment widget, blocked tracking script). The Operational Health Score reads APM-side; for RUM-side use [Frustrated User Sessions](/nerve-centre/kpi-cards/datadog/frustrated-user-sessions) and [Page Load p95](/nerve-centre/kpi-cards/datadog/page-load-p95).
+
+**My account spans three Datadog organizations (multi-account aggregation). What does the composite show?**
+Vortex IQ supports multiple Datadog connector instances (one per organization) via the standard "Add another connection" flow. Each instance gets its own Operational Health Score; the dashboard does not blend them. If you want a single number across all three, use the "Stacked Panel" feature on the Nerve Centre to compare three scores side-by-side.
+
+**Why is the alert threshold 70 and not 80 or 90?**
+The 70 threshold is calibrated against historical merchant data: scores of 70-89 are common during normal noisy operations and most resolve themselves within 30 minutes. Scores below 70 statistically correlate with measurable revenue impact within the next hour. Setting it at 80 produces too many false-positive pages; setting it at 60 misses real incidents. You can tune the threshold per organization in **Vortex IQ → Settings → Alerts**, but 70 is the default for a reason.
+
+**The score has stale-looking values during overnight hours when traffic is low. Is something wrong?**
+At very low traffic (under 50 req/min) Apdex and error rate can both be statistically noisy, a single slow request moves Apdex meaningfully. Vortex IQ marks the score as "low-confidence" between 02:00 and 06:00 in the account timezone if request volume drops below the threshold; the displayed score is still computed but the alert engine widens its tolerance. This prevents 04:00 false pages.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Operational Health Score* is one of hundreds of KPI pulses Vortex IQ tracks across Datadog and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

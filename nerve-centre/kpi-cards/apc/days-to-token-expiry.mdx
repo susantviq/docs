@@ -1,0 +1,153 @@
+---
+title: "Days to Token Expiry, APC Overnight"
+sidebarTitle: "Days to Token Expiry"
+description: "Days to Token Expiry for APC Overnight stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Shipping & Courier
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Number of days until the API credential the merchant is using to talk to APC Overnight expires. APC's integration uses a token (typically API key + secret bound to the merchant account, with rotation cadence agreed at contract signing) and that credential has a finite lifetime. When it ticks past zero, label generation breaks, tracking webhook ingestion stops, and the entire APC integration goes dark.
+
+| | |
+| --- | --- |
+| **What it counts** | `(token_expiry_date - today) IN DAYS`, computed in real-time from the credential metadata stored on the integration record. Floor at zero. A token already expired reads `0`, never a negative number. |
+| **API endpoint** | Read from the connection record itself, no live call to APC required. The expiry date is captured at credential rotation (manual or automated) and stored on the integration. |
+| **What "expired" means in practice** | APC's API returns 401 Unauthorized on every subsequent call. Label PDFs cannot be generated, manifest uploads fail, tracking webhooks stop being signed correctly. The merchant's warehouse floor will hit "cannot print APC labels" within minutes. |
+| **Service-failure cost of expiry** | For a premium UK express merchant, even an hour of downtime is expensive: every hour of warehouse-floor downtime during 14:00 to 16:30 (the dispatch sprint to hit APC's last collection) flips ~10 to 50 NextDay-12 parcels into day-2 deliveries. Day-2 means lost money-back-on-late refunds *and* customer disappointment on a "by 12pm" promise. |
+| **Rotation cadence** | APC's standard API tokens are 12-month or 24-month, set when the integration was first provisioned. Some account-managed customers run perpetual tokens with manual rotation; most self-serve customers run fixed-window. Vortex IQ does not enforce a rotation policy. |
+| **Recovery path** | New credential issued via APC's developer portal or via the merchant's APC account manager. Paste into Vortex IQ Settings → Connectors → APC Overnight → Reconnect. End-to-end recovery typically 10 to 45 minutes, plus any wait on APC support if the merchant cannot self-serve credentials. |
+| **Real-time vs cached** | This card is real-time, recomputed every read against today's date. The expiry date itself comes from the credential metadata cached at last reconnect; if APC silently rotated the token server-side without informing the merchant, this card will be wrong. Pair with `apc_api_error_rate` for rotation-detection. |
+| **B2B impact differential** | A B2B merchant running scheduled overnight EDI label runs hits the wall at 03:00 the morning the token expires; nobody is in the warehouse to notice until 07:00. By then 100+ next-day labels are missing. Always alert at 14 days, not 7. |
+| **Time zone** | Expiry timestamp is stored UTC, the days-remaining calculation uses UTC midnight as the reference. A merchant in the UK seeing "1 day left" on the morning of the expiry day has roughly 12 to 36 hours of working time, depending on which UK hour the token expires at UTC midnight. |
+| **Time window** | `RT` (real-time, recalculated on every dashboard read). |
+| **Alert trigger** | `<14 days`, the alert flips amber once expiry is less than 14 days away. Tighter than the standard 7-day default because APC's premium-service merchants cannot afford same-day disruption. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your APC Overnight data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK luxury jewellery brand selling £450 average-order-value pieces direct-to-consumer, plus a B2B wholesale book of 22 stockists across the UK. APC NextDay-12 is the consumer carrier (signature-required, insurance to £2,500 per parcel); APC Pallet 24 ships replenishment to wholesale accounts. The integration was set up 24 Sep 24 with a 12-month API token. Reading taken at 09:00 GMT on 12 Mar 26.
+
+```text
+Token issued        24 Sep 24
+Token expires       24 Sep 25  ← already lapsed once, rotated
+Last rotation       19 Sep 25
+Next expiry         19 Sep 26
+Days remaining      191
+Alert threshold     <14 days
+Card sentiment      green (well above threshold)
+```
+
+Five things to notice for this card class:
+
+1. **191 days is comfortable, but not "set and forget".** APC tokens have rotated underneath merchants without notification before, the silent kind, where APC's backend regenerates a key for security reasons after a configuration change. Cross-check against `apc_api_error_rate`. A token that "should" be valid but is throwing 401s has rotated server-side.
+2. **The 14-day alert is the prep warning, not the panic warning.** Two weeks gives ops time to (a) raise a request through APC's developer portal or account manager, (b) schedule the rotation outside dispatch peak (avoid Tuesday and Wednesday afternoons), (c) brief the warehouse on a 30-minute label-print pause window.
+3. **Brand the 14-day alert as a calendar event.** The most reliable rotation pattern is to put a recurring reminder on the operations team's shared calendar 21 days out and 14 days out. Vortex IQ alerts the dashboard at 14; the calendar reminder ensures someone owns it.
+4. **At 7 days remaining, escalate to the APC account manager directly.** Self-serve token rotation through APC's developer portal is reliable but not always fast on a Friday. If &lt;7 days falls over a weekend, do not assume Monday morning is enough lead time.
+5. **At 0 days, stop the integration before APC stops it for you.** A controlled pause (manifest "do not dispatch via APC until token rotated") is preferable to mid-afternoon error storms when warehouse-floor staff hit "print label" 50 times before someone reads the error message. Switch to a manual fallback (APC's web booking portal) for the brief window.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+This card is paired tightly with the operational-health cluster. Read it next to:
+
+| Card | Why pair it with Days to Token Expiry | What the combination tells you |
+| --- | --- | --- |
+| [API Error Rate](/nerve-centre/kpi-cards/apc/api-error-rate) | Detects silent token rotation. | Days-to-expiry showing 100+ but error rate spiking 401s = APC rotated the token server-side. The expiry counter is wrong; act on the error rate. |
+| [Label Generation Success](/nerve-centre/kpi-cards/apc/label-generation-success) | The downstream symptom of token death. | Label success at 100% with token at 191 days = healthy. Label success at 12% with token at 0 days = expected; at 12% with token at 50 days = a different problem. |
+| [Shipments](/nerve-centre/kpi-cards/apc/shipments) | Provides the dispatch-volume context. | A 0-day token on a 1,000-shipment-a-week merchant is a much bigger fire than the same on a 50-shipment merchant. Use to size the urgency. |
+| [Open Claims](/nerve-centre/kpi-cards/apc/open-claims) | Indirect. Claims sometimes need API access to file. | If the token expires, claim-filing automation also breaks. Manual filing through APC's portal still works but slows recovery. |
+| Cross-connector: any other shipper auth-token card | Siblings of the same operational concern. | A merchant with 4 shipper integrations should set the same 14-day calendar reminder convention across all of them; the rotation lifecycle is connector-by-connector but the operational posture is uniform. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in APC's own portal:**
+
+[APC Overnight Customer Portal](https://www.apc-overnight.com/) → log in to **My Account → API Credentials** (or **Developer Portal** for self-serve API customers). The portal lists active credentials with their issue date and expiry date. Compare the expiry date displayed there against the value Vortex IQ has cached.
+
+For account-managed customers, your APC account manager can confirm the expiry on file. They will also know if APC has scheduled a backend rotation (rare but happens during platform upgrades or security incidents).
+
+**Why our number may legitimately differ from APC's portal:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Silent rotation** | Ours stale | APC may rotate the token server-side without notifying. Vortex IQ's cached expiry stays at the old date until a reconnect. The api-error-rate card will detect this faster than this card. |
+| **Multiple credentials on one account** | Either | Some merchants have separate credentials for label generation vs tracking webhooks. Vortex IQ uses one credential per integration; if the merchant rotated the *other* credential, this card is unaffected. |
+| **Time-zone of the expiry** | Boundary days off | APC's portal displays expiry in UK local time, sometimes as just a date with no time. Vortex IQ stores UTC. A "30 Jun 26 expiry" in the portal could be 23:59 UK on 30 Jun 26 (24 hours of working time on the day) or 00:01 UK on 30 Jun 26 (effectively expired the moment the day starts). Confirm the time component if it matters. |
+| **Not-yet-reconnected after rotation** | Ours stale | The merchant rotated in APC's portal but didn't paste the new credential into Vortex IQ Settings. Until they do, this card shows the old expiry, which may already have lapsed. |
+| **Sandbox vs production credentials** | Either | A handful of merchants run separate sandbox credentials for testing. If the integration was reconnected with a sandbox token, the expiry shown is the sandbox lifecycle, not production. Always confirm the credential type at reconnect time. |
+
+**Internal identity (within APC):**
+
+This card has no internal identity, the value is read directly from credential metadata, not derived. The only "reconciliation" is "is the cached expiry the same as APC's portal expiry".
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| [`apc.apc_api_error_rate`](/nerve-centre/kpi-cards/apc/api-error-rate) | A spike in 401-class errors detects silent rotation faster than this card can. Use both. | Token rotated server-side, IP allowlist expired, account suspended for billing. |
+| [`apc.apc_label_generation_success`](/nerve-centre/kpi-cards/apc/label-generation-success) | Downstream symptom. Label success drops the moment auth dies. | Label success can fail for non-auth reasons (PDF rendering, invalid postcode); not every label dip is an auth issue. |
+| Vendor account-management ticket queue (Zendesk Tag = APC) | Provider-side signal. APC notifies the account manager of upcoming rotations through ticket comms, sometimes weeks in advance. | If your CRM has the rotation date logged in a comment, this card and the comment should agree to within a day. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple shippers)</em></summary>
+
+The "days to token expiry" metric exists on every Vortex IQ shipper connector. The pattern is uniform; the contract terms differ. Cross-link only.
+
+- [`parcelforce.par_auth_token_expiry_days`](/nerve-centre/kpi-cards/parcelforce/days-to-token-expiry), Royal Mail's express arm. Tokens typically 24-month with quarterly health-check requirement.
+- [`interlink_express.int_auth_token_expiry_days`](/nerve-centre/kpi-cards/interlink-express/days-to-token-expiry), DPD group's premium UK service. Tokens typically 12-month, auto-rotation supported.
+- [`dhl.dhl_auth_token_expiry_days`](/nerve-centre/dhl/dhl_auth_token_expiry_days), 12-month with mandatory rotation.
+
+Agencies running 4+ shipper accounts should standardise on one operational rhythm, e.g. always rotate on the first Tuesday of the credential's expiry month. The dashboard makes the deadline visible; the calendar discipline avoids the 0-day fire.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is the alert at 14 days, not 7?**
+Premium UK express merchants cannot afford same-day disruption. APC's network is structured around tight dispatch cutoffs (last collections at 16:00 to 16:30 in many depots); a token that lapses mid-afternoon means the day's NextDay-9am parcels miss collection entirely, which means day-2 deliveries on contracts that promised by-9am. 14 days is "have a sensible meeting"; 7 days is "act this week"; 0 days is the fire. Most general-purpose connectors use 7-day; APC justifies the 14-day default.
+
+**What happens if my token actually expires?**
+Label generation through the API stops returning 200s; warehouse staff see "Cannot create APC consignment" errors on the floor. Tracking webhooks signed by the old token are rejected, so customer tracking pages stop updating in real time (the customer-facing "where is my parcel" experience breaks even on parcels already in the network). Existing in-transit parcels still deliver, the depot scans don't depend on the merchant's token. Recovery: rotate token in APC's portal, paste into Vortex IQ Settings → Connectors → APC Overnight → Reconnect, confirm test label prints. Typical 10 to 45 minutes end-to-end.
+
+**Can Vortex IQ rotate the APC token automatically for me?**
+No. APC does not yet support OAuth-style refresh-token flows for its standard API. Rotation is a manual generate-then-paste operation through APC's developer portal or via the account manager. We are tracking when APC adds programmatic rotation; until then, this is a calendar discipline.
+
+**My token says 191 days but my warehouse is getting 401 errors. What gives?**
+Most likely: APC rotated the credential server-side (security event, account configuration change, or backend platform upgrade). Vortex IQ's cached expiry is stale. Confirm by checking `apc_api_error_rate`, if 401s are spiking, the cached expiry is wrong. Reconnect from APC's developer portal: generate a fresh credential, paste in Vortex IQ Settings, the cached expiry will refresh.
+
+**Why does APC have multiple credentials and which one does this card track?**
+Some larger APC accounts split credentials between label-generation and tracking-webhook ingestion (separate keys for separation-of-duty). Vortex IQ uses one credential per integration record. If the merchant set up the integration with the label-gen key, this card tracks that key only. The tracking-webhook key would expire silently from this card's perspective, surfacing only when webhook ingestion fails. Roadmap: dual-credential tracking on the integration model.
+
+**My APC contract is up for renewal, do I need to plan for token rotation?**
+Yes. Contract renewal frequently triggers credential reset, especially if the rate card or account-manager changes. Brief ops to expect a same-week rotation on contract renewal and add an extra calendar reminder for renewal-month-end. The 14-day alert on this card will catch it but the operational team should know it is coming, not be surprised.
+
+**What is the difference between this and the OAuth-token cards on other connectors?**
+APC uses static API credentials (key + secret) with a finite contract-managed lifetime, not OAuth refresh tokens. The "expiry" is calendar-based, not refresh-based. Other connectors (Shopify, Google Ads) use OAuth where the access token refreshes silently every hour and the *refresh token* is what has a multi-month expiry. The cards look the same on the dashboard but the underlying credential model is different; APC has no auto-refresh path.
+
+**Should I rotate the token before it expires, or wait?**
+Rotate proactively at the 7-day mark, on a Tuesday or Wednesday morning, never on a Friday. APC support response times stretch over weekends and rotation issues caught at 14:00 on a Friday can leave the warehouse without label printing through Monday morning's dispatch. The 14-day alert is your "schedule the rotation" trigger; do not aim for the deadline.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Days to Token Expiry* is one of hundreds of KPI pulses Vortex IQ tracks across APC Overnight and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

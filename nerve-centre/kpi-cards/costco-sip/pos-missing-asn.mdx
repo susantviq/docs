@@ -1,0 +1,149 @@
+---
+title: "POs Missing ASN, Costco SIP"
+sidebarTitle: "POs Missing ASN"
+description: "Open POs where the ship-by has passed and no ASN has been dropped to /outbox. Action immediately. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Marketplace
+
+> Open POs where the ship-by has passed and no ASN has been dropped to /outbox. Action immediately.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Live alert table of Costco purchase orders where the contractual ship-by date has passed and the matching Advance Ship Notice (EDI 856 ASN) has not yet been dropped to Costco's `/outbox` SFTP folder. Costco's Strategic Industries Program (SIP) supplier rules treat a missing or late ASN as an automatic chargeback against the supplier. Each row on this card is a chargeback waiting to be assessed; this is the most expensive single failure mode on the Costco SIP integration. Treat the dial as a P1 incident queue, not a KPI.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(purchase_order WHERE ship_by < now() AND no matching ASN in /outbox)`. The card surfaces individual rows in alert-table format, not just a count. Each row shows `po_number`, `ship_by_date`, `hours_overdue`, `total_units`, `total_value`, `dc_destination`. |
+| **EDI source** | Inbound POs come from Costco as **EDI 850** files dropped into the supplier's `/inbox` SFTP folder; ASN responses go back as **EDI 856** files dropped into `/outbox`. The card joins the 850 (open POs with `ship_by`) against the 856 (sent ASNs by `po_number`) to find unmatched POs past the ship-by. |
+| **Cancellations** | Cancelled POs (Costco sends EDI 860 PO Change with `cancellation_indicator=Y`) are excluded; the card only surfaces POs Costco still expects. |
+| **Partial fulfilment** | A PO with a partial ASN (some line-items shipped, others not) counts as **fulfilled for ASN purposes**; Costco accepts partial 856 acknowledgement. The unfulfilled units flow into [Fill Rate](/nerve-centre/kpi-cards/costco-sip/fill-rate) instead. |
+| **Chargeback economics** | Costco's standard SIP supplier-handbook chargeback rate for late ASN is roughly USD 250 per PO plus a percentage-of-value penalty (commonly 3 to 5 percent) on POs more than 24 hours late. The dial does not assess the chargeback automatically; it surfaces the chargeback risk. |
+| **Currency** | All values in USD (Costco SIP operates in USD for US suppliers; CAD for the Canadian SIP variant). The card normalises to the supplier's home currency at the integration layer. |
+| **DC scope** | All Costco depot codes the supplier ships to (typical SIP supplier ships to 8 to 24 distribution centres). The DC mix matters: a missing ASN to Costco's Tracy CA DC (high-velocity West Coast) is operationally more urgent than a missing ASN to Carlisle PA. |
+| **Time window** | `RT` (real-time, refreshes on every inbound 850 / outbound 856 file event). |
+| **Alert trigger** | `any open PO past ship_by`. Triggers immediately. There is no grace period because Costco's rule does not have one. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Costco SIP data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US-based household-goods supplier on Costco SIP, trading roughly 60 to 80 POs per week across 14 Costco distribution centres. Reading taken at 09:00 PT on 12 Mar 26.
+
+| PO Number | DC | Ship-by date | Hours overdue | Units | Total value (USD) | Estimated chargeback exposure |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4500987612 | Tracy CA (W2) | 11 Mar 26 | 19 | 240 cases | 18,420 | ~750 (250 base + 3% × 18,420) |
+| 4500987655 | Mira Loma CA (W3) | 11 Mar 26 | 19 | 96 cases | 7,680 | ~480 (250 base + 3% × 7,680) |
+| 4500987801 | Carlisle PA (E1) | 12 Mar 26 | 1 | 180 cases | 14,200 | ~250 (base only, under 24h late) |
+| **Total open (this card)** | **3 POs** | | | **516 cases** | **40,300** | **~1,480** |
+
+The card surfaces **3 open rows**; alert "any open PO past ship_by" is firing. Five things to notice:
+
+1. **The 19-hour-overdue Tracy and Mira Loma POs are the urgent ones.** They were due to ship yesterday, missed the West Coast outbound window, and Costco's Tracy DC will start refusing receipt at 36 hours overdue. Chase same-day: confirm with the warehouse whether the goods physically shipped (label printed but ASN not generated is a process bug; goods sat on dock is a real fulfilment failure).
+2. **The 1-hour-overdue Carlisle PO is recoverable.** Most ASN delays inside the first few hours are EDI-translator queue lag, not actual fulfilment issues. The card surfaces it as red because Costco's rule does not have a grace period; in practice send the 856 within the next 4 to 8 hours and the chargeback typically does not assess.
+3. **The chargeback exposure is roughly USD 1,480 today.** Past 24 hours overdue Costco's percentage-of-value penalty kicks in (an extra 3 to 5 percent on top of the base USD 250). Past 48 hours overdue Costco may reject the PO entirely and re-source from another supplier, which is significantly more expensive than the chargeback.
+4. **All three POs share a common date.** When 2 or 3 POs land on the same overdue date, the cause is usually upstream: an EDI translator outage, an SFTP authentication issue, a warehouse pick-pack delay across multiple POs. Investigate the common factor before assuming each PO is an independent failure.
+5. **Pair with [Late ASN Count (30d)](/nerve-centre/kpi-cards/costco-sip/late-asn-count) for trend.** A spike in this real-time card paired with a flat 30-day late-ASN count is usually a one-off; a spike paired with a rising 30-day count is a structural pattern that needs process work.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+POs Missing ASN is a P1 incident queue. Pair with these to triage:
+
+| Card | Why pair it with POs Missing ASN | What the combination tells you |
+| --- | --- | --- |
+| [Late ASN Count (30d)](/nerve-centre/kpi-cards/costco-sip/late-asn-count) | The 30-day cumulative count of ASNs sent past ship-by. | The realtime queue plus the trailing-30-day count tells you whether today's incident is one-off or part of a pattern. |
+| [On-Time ASN Rate](/nerve-centre/kpi-cards/costco-sip/on-time-asn-rate) | The percentage form. | Direct chargeback driver; a missing-ASN spike here moves the rate immediately. |
+| [PO Acknowledgment Rate](/nerve-centre/kpi-cards/costco-sip/po-acknowledgment-rate) | Upstream signal. | Missing ACKs precede missing ASNs; if ACK rate dipped 24 to 48 hours ago, the missing-ASN queue is downstream of that. |
+| [Late ASN Burst](/nerve-centre/kpi-cards/costco-sip/late-asn-burst) | The Nerve Centre alert that fires on clusters. | Burst = multiple POs late at once = systemic issue (EDI outage, warehouse breakdown). |
+| [Last Successful Outbound](/nerve-centre/kpi-cards/costco-sip/last-successful-outbound) | When did our /outbox last get read? | If hours-since-last-outbound is high AND missing-ASN queue is rising, the SFTP outbound is the bottleneck, not the warehouse. |
+| [Chargeback Risk (30d)](/nerve-centre/kpi-cards/costco-sip/chargeback-risk) | Dollar form of the consequences. | Today's missing-ASN queue is tomorrow's chargeback assessment; the chargeback-risk dial pre-computes the dollar exposure. |
+| Cross-connector: [`shipbob.sb_orders_open`](/nerve-centre/shipbob/sb_orders_open) | If ShipBob handles fulfilment for Costco POs. | Missing-ASN can be upstream warehouse delay; ShipBob's open-order count and aging tail indicate whether the goods are stuck pre-pick. |
+| Cross-connector: [`jira.tracker_open_issues`](/nerve-centre/jira/tracker_open_issues) | The escalation queue. | Each missing-ASN row should have a Jira issue when it ages past 24 hours; the cross-connector view confirms triage is happening. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Costco's own portal:**
+
+[Costco Supplier Portal](https://www.costco.com/supplier) → **Orders → Open POs** filter to *Past Ship-by*. Costco's view is authoritative for what they expect; the card's view is authoritative for what we have ASN'd. The two should reconcile to the unit; gaps mean either we sent an ASN Costco did not parse, or Costco closed a PO without notifying us.
+
+**Why our number may legitimately differ from Costco's portal:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **EDI translator queue lag** | Ours sometimes higher | A 856 ASN may have left our /outbox but not yet been parsed by Costco's EDI gateway; the supplier-portal view shows "no ASN received" while our card shows "ASN sent". Resolves within 1 to 4 hours typically. |
+| **PO change orders (EDI 860)** | Either | Costco issued a 860 PO Change extending ship-by; if we have not ingested the 860 yet, our card still surfaces the original (now superseded) ship-by. Refresh the inbound feed and the row clears. |
+| **ASN rejection** | Ours lower | Our card reads "ASN sent". If Costco's EDI gateway rejected the 856 (line-item mismatch, GTIN error, packing-config drift), the supplier portal still shows "no ASN" while we believe we sent one. Pair with [Sync Error Count (7d)](/nerve-centre/kpi-cards/costco-sip/sync-error-count). |
+| **Cancelled POs** | Either | Costco issued a 860 cancellation; our card excludes cancelled POs by definition, the portal sometimes still shows them in a transition state for 24 to 48 hours. |
+| **Timezone (PT vs UTC)** | Off by hours | Costco's portal shows ship-by in Pacific Time (Costco corporate is in Issaquah WA); our card stores in UTC. Hours-overdue calculation is consistent but boundary-day display differs. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | Causes of legitimate divergence |
+| --- | --- | --- |
+| [`shipbob.sb_orders_open`](/nerve-centre/shipbob/sb_orders_open) | If ShipBob fulfils Costco POs, missing-ASN POs should map back to open ShipBob orders. | Some POs may fulfil through internal warehouse, not ShipBob. |
+| [`jira.tracker_open_issues`](/nerve-centre/jira/tracker_open_issues) | Each aged missing-ASN PO should have a Jira issue. | Triage gap if the count of card rows >24h exceeds the count of open Jira tickets referencing those PO numbers. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for retailers running multiple wholesale programs)</em></summary>
+
+EDI-driven wholesale-supplier integration patterns exist with conceptually similar definitions across other major US retailer programs. These are not parallel measurements; each is an independent commercial relationship.
+
+- [`amazon.amzn_total_revenue`](/nerve-centre/kpi-cards/amazon/total-revenue) (marketplace peer; not EDI-based)
+- [`walmart_dropship.wm_open_pos_late_asn`](/nerve-centre/walmart_dropship/wm_open_pos_late_asn) (EDI peer)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows a missing-ASN row but I am sure we shipped that PO. What is happening?**
+Three usual causes. (1) **EDI translator queue lag.** The 856 left the warehouse system but has not yet been written to /outbox. Check the EDI translator status; if the queue is backed up, the goods shipped but the paperwork did not. (2) **ASN rejected by Costco gateway.** Costco's EDI gateway parses every 856 and rejects on schema errors (line-item mismatch, GTIN error, packing-config drift). Pair with [Sync Error Count (7d)](/nerve-centre/kpi-cards/costco-sip/sync-error-count); if errors spiked, that is the cause. (3) **PO number mismatch.** The 856 references a PO number Costco does not have on file (typo, leading-zero stripped, wrong test/prod environment). The 856 is technically "sent" from our side but Costco does not match it; surfaces here as "no ASN".
+
+**Costco gave me a chargeback for a PO I see as "complete" in our system. Can I dispute?**
+Yes, file the dispute through the Costco supplier portal within 60 days of the chargeback assessment. Required evidence: (1) timestamped 856 ASN file with delivery confirmation from Costco's gateway, (2) proof of physical delivery (BOL / driver signature), (3) any 860 PO Change records that should have extended the ship-by. Costco's chargeback dispute window is shorter than most retailers and the burden of proof is heavier; preserve evidence for every PO for at least 90 days.
+
+**Why does Costco's portal show 5 missing ASNs and our card shows 3?**
+Most likely two of the five are 856 files our system sent but Costco's gateway rejected silently (no NAK file, just no acknowledgement). Pair with [Sync Error Count (7d)](/nerve-centre/kpi-cards/costco-sip/sync-error-count) and [Last Successful Outbound](/nerve-centre/kpi-cards/costco-sip/last-successful-outbound) to triage. Costco does not always send a NAK on schema rejections; some rejections are surfaced only in the supplier-portal view 24 hours later.
+
+**My warehouse manager says they shipped 4 POs yesterday but our card shows 4 missing ASNs. What is the gap?**
+The gap is between the warehouse-management system and the EDI translator. Common causes: (1) the WMS marked POs as "shipped" but did not trigger the EDI translator job (process gap), (2) the EDI translator job ran but failed to authenticate to /outbox SFTP (credential issue), (3) the WMS shipped POs grouped into one truckload but the EDI translator expects one 856 per PO and could not split them. Trace one specific PO through the WMS-to-EDI pipeline to find the failure point.
+
+**Should I get paged on every new missing-ASN row or only on bursts?**
+Bursts. Single missing-ASN events are usually queue lag and self-resolve within 4 hours; paging on every event creates alert fatigue. Configure the alert to fire only when the count goes from 0 to >2 within 60 minutes (use [Late ASN Burst](/nerve-centre/kpi-cards/costco-sip/late-asn-burst) for the burst alert). For individual events, route to a Slack channel or Jira queue for next-business-day triage.
+
+**Costco extended a ship-by date but our card still shows the row as missing-ASN. Why?**
+Costco issued an EDI 860 PO Change but our integration has not ingested it yet. Force a refresh of the inbound feed; if the 860 file is in /inbox the row clears within minutes. If the 860 was emailed manually (some Costco buyers do this for individual extensions), the supplier needs to manually update the PO's ship-by in the WMS; the card cannot read non-EDI changes.
+
+**What is the difference between "missing ASN" and "late ASN" on the dials?**
+Missing ASN = open PO past ship-by with no ASN sent yet (this card; real-time). Late ASN = PO ship-by passed and ASN was eventually sent, but after the deadline (the [Late ASN Count](/nerve-centre/kpi-cards/costco-sip/late-asn-count) card; 30-day cumulative). A row on this card either becomes a Late ASN entry (we sent the ASN late) or a permanent failure (we never sent the ASN). The dollar consequences differ: missing ASN is unrecoverable; late ASN attracts a smaller chargeback.
+
+**Can I auto-generate the ASN from the WMS shipped event?**
+Yes, this is the typical SIP integration pattern. Configure the EDI translator to subscribe to the WMS "shipment confirmed" webhook, generate the 856 from the WMS shipment record, and drop to /outbox automatically. The card surfaces gaps in this pipeline; if the count is consistently above 0 the auto-generation is broken or partially deployed.
+
+**Why does Costco's chargeback assessment differ from my own card's exposure number?**
+The card uses standard Costco SIP supplier-handbook rates; actual chargebacks may differ based on the supplier's specific contract terms (some Vertragskunden equivalents have negotiated rates), Costco's discretionary application of penalties (some chargebacks are softened on first occurrence), and DC-specific policies (some West Coast DCs assess differently from East Coast). Treat the card's exposure as the worst case; actual is typically 80 to 100 percent of the card's number.
+
+**The card says 3 missing ASNs but it has been at 3 for hours and not changing. Did the integration freeze?**
+Possible; check [Last Successful Inbound](/nerve-centre/kpi-cards/costco-sip/last-successful-inbound) and [Last Successful Outbound](/nerve-centre/kpi-cards/costco-sip/last-successful-outbound). If hours-since-last-inbound is high, the SFTP feed has stopped and the card is reading stale data. The 3 rows on the card may have been resolved hours ago; you cannot tell because the integration is not picking up the new state.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*POs Missing ASN* is one of hundreds of KPI pulses Vortex IQ tracks across Costco SIP and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

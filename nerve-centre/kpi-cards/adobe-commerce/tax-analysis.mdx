@@ -1,0 +1,179 @@
+---
+title: "Tax Analysis, Adobe Commerce"
+sidebarTitle: "Tax Analysis"
+description: "Tax Analysis for Adobe Commerce stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Ecommerce Platform
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Decomposition of tax collected by tax class, jurisdiction (US: state + county + city; UK: standard 20% + reduced 5% + zero-rated; EU: per-country VAT rates), and tax-engine source (native Magento engine vs Avalara AvaTax vs Vertex). Adobe Commerce's tax engine is more flexible than Shopify's but harder to debug; this card surfaces the breakdown so Finance can reconcile to the next VAT/sales-tax return.
+
+| | |
+| --- | --- |
+| **What it counts** | For each tax-bearing order in the period: decompose `tax_amount` into per-jurisdiction or per-rate slices using the `sales_order_tax_item` table. Sum by `tax_id` (tax-rule), by `tax_calculation_rate.code` (jurisdiction), by `tax_class_id` on the product (tax class), and by tax-engine source (native vs Avalara vs Vertex). |
+| **API field** | `tax_amount`, `base_tax_amount`, `tax_percent` per line item (`order_item.tax_amount`); per-rule breakdown via `sales_order_tax` and `sales_order_tax_item`. Avalara additions live in `extension_attributes.avatax_*`; Vertex in `extension_attributes.vertex_*`. |
+| **Why this matters more than Shopify equivalent** | Magento allows per-product tax classes (Goods, Reduced-rate, Zero-rated, Services) configured globally and per-Store-View tax-rule overrides. A single order with 4 line items can attract 4 different tax rates. Shopify keeps it simpler; Adobe sells in jurisdictions where this complexity is necessary (UK reduced-VAT 5% on children's goods, EU services VAT on digital, US per-county sales tax). |
+| **Native vs Avalara vs Vertex** | Native Magento engine: rate stored in `tax_calculation_rate`, applied per `tax_rule`. Avalara: every order's tax is computed via API call to AvaTax; rates returned dynamically; Adobe stores the result. Vertex: similar API model. The card distinguishes the source so Finance knows whether the tax engine of record is Magento itself or a third-party. |
+| **VAT / tax treatment** | The card IS the tax decomposition view. |
+| **Shipping** | Shipping tax (`shipping_tax_amount`) is broken out separately from product tax. UK/EU merchants need this distinction because shipping tax is reportable separately on some HMRC submissions. |
+| **Discounts** | Tax in Magento is calculated on the post-discount subtotal (default behaviour, configurable). The `tax_amount` reflects post-discount tax. The merchant's "Apply Tax On" config (`Stores > Configuration > Sales > Tax > Calculation Settings > Apply Customer Tax`) determines pre/post-discount; the card respects whatever the merchant configured. |
+| **Cancelled orders** | Excluded by default. Cancelled orders' tax shouldn't appear on a VAT return. |
+| **Refunds** | Not subtracted, the card is creation-time. Refunded tax (`creditmemo.tax_amount`) is on Credit Memos and reduces the remitted figure on the VAT return. To get net taxable activity, subtract refunded tax from this card. |
+| **Currency** | Mixed-currency display by default. `base_tax_amount` for VAT-return-relevant base-currency totals. |
+| **Multi-store scope** | All Store Views by default. Per-Store-View slicing essential because tax rules are typically per Store View. |
+| **Time window** | `30D` rolling. Quarterly or monthly windowing usually more useful for tax filing. |
+| **Alert trigger** | None on this card directly. |
+| **Roles** | owner |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Adobe Commerce data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A B2B+DTC merchant on Adobe Commerce 2.4.7 with US (multi-state) + UK Store Views and Avalara AvaTax for US tax. Period: 14 Apr 26 to 13 May 26.
+
+**Tax decomposition by jurisdiction:**
+
+| Jurisdiction / Rate | Tax engine | `SUM(tax_amount)` | Order count | % of total |
+| --- | --- | --- | --- | --- |
+| UK Standard VAT 20% (goods) | Native Magento | £126,000 | 1,820 | 56.0% |
+| UK Reduced VAT 5% (children's clothing line) | Native Magento | £8,400 | 380 | 3.7% |
+| UK Zero-rated (book imprint) | Native Magento | £0 | 240 | 0.0% |
+| US California (combined state+county+city) | Avalara | $24,200 | 980 | 10.8% |
+| US New York | Avalara | $18,700 | 720 | 8.3% |
+| US Texas | Avalara | $11,400 | 540 | 5.1% |
+| US Florida | Avalara | $9,800 | 460 | 4.4% |
+| US other states (38 of them) | Avalara | $26,400 | 980 | 11.7% |
+| **Total US tax** | | **$90,500** | 3,680 | |
+| **Total UK tax** | | **£134,400** | 2,440 | |
+
+**Per-product tax-class breakdown:**
+
+| Tax class | Tax rule applied | Tax amount (mixed cur) | Notes |
+| --- | --- | --- | --- |
+| Standard Goods (default) | Per-jurisdiction full rate | $90,500 + £126,000 | majority |
+| Reduced-Rate Goods (UK children's) | UK 5% only; US treated as standard | £8,400 + (US standard) | 380 UK orders + the same product on US (no special handling there) |
+| Zero-Rated Goods (UK books) | Zero everywhere | £0 + $0 | 240 orders |
+| Tax-Exempt B2B (resale-cert holders) | All jurisdictions zero | $0 (across 80 B2B orders) | 80 US-side B2B orders skipped tax |
+
+**Insight pattern:**
+
+1. **UK Standard VAT dominates.** £126,000 across 1,820 orders. This figure goes to HMRC on the next VAT return. Reconcile: UK orders' subtotal = £630,000 (pre-VAT); £126,000 / £630,000 = exactly 20%, healthy.
+2. **UK Reduced VAT 5% on £8,400 across 380 orders.** Children's-clothing line correctly attracting reduced rate. Reconcile: implied subtotal = £168,000. If the merchant's children's-clothing revenue per [Revenue Breakdown](/nerve-centre/kpi-cards/adobe-commerce/revenue-breakdown) is also ~£168,000, the rate is consistently applied. If divergent, some children's products are mis-classified as Standard Goods (recoverable VAT).
+3. **US tax via Avalara.** $90,500 across 3,680 orders, average tax rate ~6.8% (varies by state). Avalara handles the per-county complexity; the card surfaces the per-state aggregate.
+4. **B2B tax-exempt orders.** 80 US B2B orders attracted $0 tax because the customer has a valid resale certificate uploaded to Avalara CertCapture. Audit: are there any B2B orders that *should* have been tax-exempt but weren't (cert expired, missing cert)? Cross-check with [`avalara.exemption_certificate_expiry`](/nerve-centre/avalara/exemption_certificate_expiry).
+5. **Reconciliation to AvaTax dashboard.** Avalara's "Liability Worksheet" for the same period should match this card's US-side total to the cent. If they diverge, either an order failed to call Avalara at checkout (`avatax_failed_call=1`) and Magento computed locally, or Avalara's commit step was skipped (`avatax_committed=0`). Check **System > Configuration > Sales > Tax > AvaTax > Logging** for failed calls.
+6. **Refunded tax not subtracted.** Refunded VAT on Credit Memos in the period totalled £7,650 (from [Refund Value](/nerve-centre/kpi-cards/adobe-commerce/refund-value) example). Net VAT remittance = £126,000 + £8,400 − £7,650 = £126,750. Always reconcile gross-tax (this card) to net-of-refund-tax (Finance) to net-on-VAT-return (HMRC submission).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Tax Analysis |
+| --- | --- |
+| [Total Tax](/nerve-centre/kpi-cards/adobe-commerce/total-tax-collected) | The aggregate. |
+| [Tax Over Time](/nerve-centre/kpi-cards/adobe-commerce/tax-collected-over-time) | Day-by-day shape. |
+| [Total Revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | The denominator (revenue is gross-of-VAT in `grand_total`). |
+| [Refund Value](/nerve-centre/kpi-cards/adobe-commerce/refund-value) | Refunded tax is on Credit Memos; subtract for net VAT. |
+| [Revenue Breakdown](/nerve-centre/kpi-cards/adobe-commerce/revenue-breakdown) | Useful for verifying per-tax-class subtotals. |
+| [`avalara.tax_liability_summary`](/nerve-centre/avalara/tax_liability_summary) | Avalara-side equivalent for US merchants. |
+| [`vertex.tax_summary`](/nerve-centre/vertex/tax_summary) | Vertex equivalent. |
+| [`shopify.tax_analysis`](/nerve-centre/shopify/tax_analysis) | Cross-platform reference (simpler tax model). |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Adobe Commerce Admin:**
+
+> **Reports > Sales > Tax** for the per-rule tax breakdown. Set the date range and Show By "Tax Rate" or "Tax Rule". The total at the bottom is the gross tax collected.
+
+For per-jurisdiction (US):
+
+> If using AvaTax, the AvaTax Admin section under **Stores > Configuration > Sales > Tax > AvaTax** has a "Sync to AvaTax" tool that pushes orders to Avalara's reconciliation report. The Avalara Liability Worksheet is the system of record for US tax filing.
+
+For per-rate (UK/EU):
+
+> **Reports > Sales > Tax** with "Show By" = "Tax Rate" gives the per-rate slice. UK Standard 20%, Reduced 5%, Zero 0% should each appear as a separate line.
+
+For tax-rule configuration:
+
+> **Stores > Configuration > Sales > Tax** > Tax Classes, Tax Rates, Tax Rules. The rules engine determines which rate applies to which (Customer Tax Class × Product Tax Class × Shipping Origin). Misconfigured rules are the most common source of tax discrepancies.
+
+**Why our number may legitimately differ from Adobe Commerce Admin:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Currency**. Reports > Sales > Tax defaults to base currency; this card defaults to mixed display. | Material for multi-currency stores |
+| **Reports indexer lag**. Tax reports use nightly aggregation. | Vortex IQ ahead by ~12-24h |
+| **AvaTax `commit` step**. Avalara orders that fail to commit (`avatax_committed=0`) appear in this card with the locally-computed tax (Magento fallback) but in AvaTax with the API-returned tax. The two can differ by cents per order if rates were updated between calls. | Small per-order divergence, can sum |
+| **Cancelled inclusion**. Card excludes cancelled. Admin reports vary by status filter. | Standard |
+| **`apply_tax_after_discount` toggle**. If the merchant changed this config mid-period, half the orders compute tax pre-discount and half post-discount. The card respects the order's stored value, no recomputation. | Historical-config-dependent |
+| **Time-zone, sync lag**. Standard. | Minor |
+
+**Cross-connector reconciliation (when these connectors are connected for this merchant):**
+
+| Card | Expected relationship | What divergence tells you |
+| --- | --- | --- |
+| [`avalara.tax_liability_summary`](/nerve-centre/avalara/tax_liability_summary) | Avalara's per-jurisdiction liability should match this card's US-side per-jurisdiction breakdown to the cent | Cent-level divergence: rounding or rate-change mid-period. Dollar-level divergence: failed commits or orders bypassing Avalara. |
+| [`vertex.tax_summary`](/nerve-centre/vertex/tax_summary) | Same as above for Vertex users | Same diagnostic logic. |
+| HMRC VAT Return | UK Standard 20% × subtotal subset should match Box 1 (output VAT) | Ensure refunds (Credit Memo tax) are subtracted before submitting. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+- [`shopify.tax_analysis`](/nerve-centre/shopify/tax_analysis)
+- [`bigcommerce.tax_analysis`](/nerve-centre/bigcommerce/tax_analysis)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is Adobe Commerce's tax engine harder to debug than Shopify's?**
+Magento's rules engine is more flexible: per-product tax class, per-customer tax class, per-Store-View rules, conditional rules (e.g. "tax 0% if customer has resale cert"). Power means complexity. The most common debugging gotcha: Customer Tax Class on the customer record (`customer.taxvat` and `customer.tax_class_id`) overrides what shows in the cart. If a customer is set to "Wholesale Tax-Exempt" Customer Group, no tax applies even on retail products.
+
+**Why is shipping tax separate?**
+Because in many jurisdictions shipping is taxable separately and at different rates from goods. UK shipping is taxable at 20% standard rate (with the goods); some US states tax shipping (CA, NY, TX) and others don't (FL doesn't on most categories). Magento's `shipping_tax_amount` field is the per-order shipping tax; the card breaks it out so Finance can reconcile per the jurisdiction's rules.
+
+**A B2B order has $0 tax but my Reports > Sales > Tax shows it as taxed, why?**
+Likely the Customer Group condition on the tax rule. If the customer is in a "B2B Tax-Exempt" group, the rule excludes them. Reports > Sales > Tax in 2.4.x sometimes shows the rate that *would* have applied, this card uses the actual stored `tax_amount` (which is $0 for the exempt order). Trust this card.
+
+**Avalara says I owe $X but this card says $Y, gap?**
+Likely failed commits. Avalara's "Liability Worksheet" reflects only orders that successfully called AvaTax and committed. If an order fails to call (network blip, AvaTax outage, bad shipping address), Magento computes locally; the order's tax appears here but not in Avalara. Re-commit failed orders via the AvaTax tools menu.
+
+**My multi-store has different tax rules per Store View, which one is the source of truth?**
+Each Store View is its own jurisdiction-of-sale (in Magento's accounting model). UK Store View → HMRC; US Store View → IRS. The card defaults to combined; slice per Store View for accurate per-jurisdiction reconciliation.
+
+**Why does post-discount tax differ from pre-discount tax?**
+A 20% VAT rate on a £100 product = £20 tax. Apply a £20 discount; net subtotal £80; recalculated VAT = £16. The customer pays £96 (£80 + £16). The £4 of "lost" VAT is the merchant's discount expense being effectively reduced by the VAT impact. Most merchants prefer post-discount (more accurate to what HMRC/IRS expects). Some (rare) prefer pre-discount. **Stores > Configuration > Sales > Tax > Calculation Settings > Apply Customer Tax** controls this.
+
+**Refunded VAT, where does it go?**
+On Credit Memos as `creditmemo.tax_amount`. When you submit your VAT return, you remit `(this card's UK Standard tax) − (refunded UK Standard VAT from Credit Memos in the same return period)`. The Vortex IQ workspace can pre-compute the net via a "Tax Filing" report that pairs both cards.
+
+**Per-county US tax with Avalara, how granular?**
+AvaTax handles state, county, city, and special-district tax. Adobe stores them all in `sales_order_tax_item` rows. The card aggregates to state by default; toggle to "city/county" for fine-grained reconciliation when you have a sales-tax nexus dispute.
+
+**Why is the per-rate breakdown sometimes off by pennies?**
+Floating-point rounding. Magento computes line-by-line tax, rounds per-line to 2 decimals, then sums. This card aggregates the stored values, which include the per-line rounding. The expected rate × subtotal computation is theoretical; the stored value is what the customer paid. Trust the stored value.
+
+**Can I see this for a quarterly tax filing window?**
+Yes. The card supports custom date ranges; set quarter boundaries (e.g. 1 Apr to 30 Jun for UK fiscal Q2). Most merchants run a "Tax Filing" snapshot card on a separate dashboard.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Tax Analysis* is one of hundreds of KPI pulses Vortex IQ tracks across Adobe Commerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

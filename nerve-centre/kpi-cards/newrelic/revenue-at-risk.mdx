@@ -1,0 +1,157 @@
+---
+title: "Revenue at Risk (live), New Relic"
+sidebarTitle: "Revenue at Risk (live)"
+description: "New Relic state x commerce-sibling baseline = $/hour at risk while the incident is open. The single most-valuable card in this manifest. How to read it, wh..."
+---
+
+**Card class:** Hero  •  **Category:** Monitoring
+
+> New Relic state x commerce-sibling baseline = $/hour at risk while the incident is open. The single most-valuable card in this manifest.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The single dollar number that translates technical incident state into a number the COO can read. Multiplies the merchant's current hourly revenue baseline (from connected commerce sibling, Shopify / BigCommerce / Adobe) by an impact factor derived from live New Relic operational state (Apdex degradation, error rate, active P1s).
+
+| | |
+| --- | --- |
+| **The formula** | `revenue_at_risk_per_hour = baseline_revenue_per_hour x impact_factor` where `impact_factor = clamp(0, 1, 0.5 x apdex_drop + 0.3 x error_rate_excess + 0.2 x p1_count_factor)`. The card is currency-tagged from the commerce sibling and updates every 30s. |
+| **NerdGraph endpoint** | Three NRQL queries via [NerdGraph](https://api.newrelic.com/graphql): (1) `SELECT apdex(duration, t: 0.5) FROM Transaction SINCE 5 MINUTES AGO` for current Apdex; (2) `SELECT percentage(count(*), WHERE error IS true) FROM Transaction SINCE 5 MINUTES AGO` for error rate; (3) `actor.account.aiIssues.issues(filter: {states: [ACTIVATED]})` for active incident count. Plus the commerce sibling endpoint for revenue baseline. |
+| **Metric basis** | Live composite. `apdex_drop = max(0, baseline_apdex - current_apdex)` where `baseline_apdex` is the rolling 7-day average for the same time-of-day. `error_rate_excess = max(0, current_error_rate - 1.0%)`. `p1_count_factor = min(1, p1_count / 5)`. |
+| **Browser vs APM scope** | APM-only for the impact factor; Browser RUM is excluded because customer-side latency doesn't map cleanly to revenue. The commerce-sibling baseline is from the merchant's actual sales/min, so the dollar number is real. |
+| **Aggregation window** | 5-minute rolling for the impact factor; 1-hour rolling for the baseline. The number flips up the moment an incident degrades operational state, flips down when state returns to baseline. |
+| **Severity threshold** | All severities contribute via the impact factor. P1s carry the strongest weight (5 P1s zero-out the operational health side); P2/P3 affect Apdex / error rate indirectly through their own conditions. |
+| **Sample basis** | Apdex and error-rate inputs are sample-corrected on high-cardinality accounts. P1 count is unsampled. Baseline revenue is unsampled (commerce platform Order data). |
+| **Filtered hosts / services** | APM scope follows the merchant's `appName IN (...)` config. Baseline scope is the merchant's primary commerce connector (Shopify, BigCommerce, or Adobe). |
+| **Time zone** | UTC for live evaluation; account timezone for chart display. |
+| **Time window** | `RT` |
+| **Alert trigger** | `>$0`. Any non-zero value triggers a notification because operational degradation that maps to revenue impact is always worth acknowledging. |
+| **Roles** | owner, finance, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your New Relic data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A Shopify Plus merchant with NR APM on the storefront. Baseline revenue at this hour-of-day is **£18,400/hour** (averaged over the last 28 days, same Tuesday 11:00, 12:00 hour). Live state at 11:14 on 02 May 26:
+
+| Input | Value |
+| --- | --- |
+| Current Apdex (5-min rolling) | 0.72 |
+| Baseline Apdex (7D same hour) | 0.91 |
+| Current error rate (5-min rolling) | 4.6% |
+| Active P1 incidents | 1 |
+
+**Impact factor calculation:**
+
+- `apdex_drop = 0.91 - 0.72 = 0.19`. Multiplier: `0.5 x 0.19 = 0.095` (Apdex contribution).
+- `error_rate_excess = 4.6% - 1.0% = 3.6%` (clamped to a 0, 1 normalised scale: 3.6/10 = 0.36). Multiplier: `0.3 x 0.36 = 0.108` (error-rate contribution).
+- `p1_count_factor = 1 / 5 = 0.2`. Multiplier: `0.2 x 0.2 = 0.04` (P1 contribution).
+- **`impact_factor = 0.095 + 0.108 + 0.04 = 0.243`**, ~24% of revenue at risk.
+
+**Revenue at risk = £18,400 x 0.243 = £4,470/hour.**
+
+Reading the breakdown: error rate is the biggest contributor (44% of the impact factor), then Apdex degradation (39%), then the single open P1 (16%). The COO sees a single number, **£4,470/hour**, and immediately understands two things: (a) this isn't a "look at this later" event, it's a "fix it now" event, and (b) the cost of one hour of inaction is roughly the equivalent of three engineer-days of salary. Justifying a deploy rollback or paging the CTO becomes trivial.
+
+**Conversion impact translation.** The £4,470/hour figure is *risk-adjusted* (it acknowledges that not 100% of customers are blocked). Real customer-side data over the next 30 minutes typically shows actual revenue running 70, 90% of baseline (so £14k, £16.5k actual vs £18.4k baseline = £2k, £4.4k actual lost / hour), which validates the model. The card is designed to be conservative on the high side; a £4,470 estimate that turns out to be £2,800 actual is a model that's calibrated to err toward action, which is correct for an alerting context.
+
+If error rate climbed to 8% and a second P1 fired, the impact factor would jump to ~0.40 and revenue-at-risk would scale to **£7,360/hour**. If the operational state recovered in 12 minutes (Apdex back to 0.88, error rate to 1.4%, P1 closed), the impact factor would drop to ~0.04 and the card to **£740/hour**, which represents the residual customer-experience drag during recovery.
+
+The card flips to £0 once `current_apdex >= baseline_apdex - 0.05` AND `current_error_rate < 1.0%` AND `active_P1_count = 0`.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Revenue at Risk |
+| --- | --- |
+| [Operational Health Score](/nerve-centre/kpi-cards/newrelic/operational-health-score) | Operational composite. The two cards co-move: score down = revenue at risk up. |
+| [Active Incidents](/nerve-centre/kpi-cards/newrelic/active-incidents) | One of the three impact-factor inputs. Each open P1 contributes ~£3,680 / hour at this baseline. |
+| [Error Rate](/nerve-centre/kpi-cards/newrelic/error-rate) | The 30%-weight component. Largest contributor when error rate climbs above 1%. |
+| [Apdex Score](/nerve-centre/kpi-cards/newrelic/apdex-score) | The 50%-weight component (largest weight). Apdex drops drive most of the visible movement. |
+| [Revenue Lost / Min (active incidents)](/nerve-centre/kpi-cards/newrelic/revenue-lost-min) | Cross-channel cousin. This card is potential risk; that one is hard-counted lost revenue. |
+| [Datadog Revenue at Risk](/nerve-centre/kpi-cards/datadog/revenue-at-risk) | Cross-connector peer with the same composite shape. |
+| [Shopify Sales / Min](/nerve-centre/shopify/sales_per_minute) | The baseline source. Watch sales/min co-move during incidents. |
+| [GA4 Conversion Rate](/nerve-centre/kpi-cards/google-analytics/conversion-rate) | Customer-side outcome. Conversion drop usually lags risk number by 5, 10 minutes. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in New Relic:**
+
+New Relic does not surface a revenue-at-risk number, this is a Vortex IQ composite that joins NR operational state with commerce-sibling baseline. The closest equivalent screens for the operational-state inputs:
+
+- [APM > Service > Summary](https://one.newrelic.com/nr1-core?filters=%28domain%3D%27APM%27%29) for Apdex and error rate.
+- [Alerts & AI > Issues & Activity](https://one.newrelic.com/alerts-ai) for P1 count.
+- [Dashboards](https://one.newrelic.com/dashboards) > "Service overview" pre-built.
+
+For the baseline revenue input compare against the merchant's connected commerce platform (Shopify Admin > Analytics > Live View, BigCommerce > Reports, etc.).
+
+**Why our number may legitimately differ from a manual estimate:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Baseline revenue staleness**. Baseline is rolling 28-day same-hour-of-day average; if the store had unusually low traffic in the baseline period (a demand-shifting event, a campaign down-day) the baseline reads low. | Risk number understates impact |
+| **Account timezone vs UTC**. Baseline scope follows the commerce platform's timezone; operational-state queries run in UTC. Boundary-hour rollups can show 5, 10% drift on the live number. | Either direction at hour boundaries |
+| **NRQL retention windows**. Apdex / error rate beyond 8 days aggregates to hourly resolution; the live card uses 5-minute windows so retention isn't a concern. | None for live card |
+| **Ingest sampling**. Apdex and error-rate inputs are sample-corrected on high-cardinality accounts; the impact factor stays accurate. | None |
+| **Conservative impact factor calibration**. The factor is intentionally tuned to err on the high side (alert-context bias), real revenue impact often lands at 60, 80% of the risk number. | Risk number > actual loss |
+
+**Cross-connector reconciliation:**
+
+The same composite shape is implemented on Datadog ([`dd_revenue_at_risk`](/nerve-centre/kpi-cards/datadog/revenue-at-risk)) using DD's APM, Monitors, and Synthetics inputs. With both connectors wired, the two risk numbers should agree within ~10% (the gap reflects probe-coverage differences and slightly different impact-factor weights). A 25%+ persistent gap indicates one platform is missing service coverage; audit which services each is instrumenting.
+
+The card is reconciled *forward* (against actual revenue loss) every 30 minutes after an incident closes: Vortex IQ Mind pulls the actual sales/min trace during the incident window and compares it to the baseline-projected revenue. If the actual loss tracks within 25% of the predicted loss, the model is calibrated; if it drifts persistently, the impact-factor weights are tuned. This back-test runs continuously.
+
+<details>
+<summary>Same-metric peers on other connectors</summary>
+
+| Connector | Card | Notes |
+| --- | --- | --- |
+| Datadog | [`dd_revenue_at_risk`](/nerve-centre/kpi-cards/datadog/revenue-at-risk) | Same composite shape using DD APM + Monitors + Synthetics. Should agree within ~10% when both connectors are wired. |
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**NR vs Datadog: should the two revenue-at-risk numbers match?**
+Within ~10%, yes. Both use the same baseline revenue source (the commerce sibling) and the same composite shape, but feed slightly different operational-state inputs (NR APM vs DD APM probes). A 10, 25% gap during an incident is normal and reflects each platform's coverage. A 25%+ persistent gap means one platform is missing instrumentation on a service that's contributing to the impact factor.
+
+**Apdex math: how does Apdex translate to revenue?**
+The card uses `apdex_drop = baseline_apdex - current_apdex` as a 0, 1 multiplier with 50% weight in the impact factor. So a 0.20 Apdex drop (e.g., 0.91 to 0.71) contributes `0.5 x 0.20 = 0.10` to the impact factor, or 10% of baseline revenue at risk. The 50% weight reflects that Apdex is the strongest single predictor of conversion drop; SOASTA / Akamai 2017 data shows roughly 7% conversion-rate drop per 100ms of additional p95 latency, and Apdex is a satisfaction-weighted view of latency.
+
+**NRQL retention: is this card affected by retention?**
+The live card reads 5-minute windows, well inside any retention window. The 28-day baseline is computed from rolled hourly aggregates and is not affected by raw-event retention. So the card works on standard NR plans (8-day raw retention) as well as on Data Plus (13-month).
+
+**NR and Datadog disagree by 30%, who's right?**
+Probably both, on different scopes. The two most common causes: (a) coverage difference, NR has the checkout service instrumented, DD has only the storefront, so NR sees more of the incident; (b) sampling difference, one platform's high-cardinality sampling is dropping events the other keeps. Audit instrumentation parity if a single-number reading across both matters.
+
+**Sampling: does sampling break the calculation?**
+No. Apdex and error-rate inputs are sample-corrected on high-cardinality accounts. P1 count is unsampled. Baseline revenue is unsampled (commerce platform Order data, not event-stream data). The whole composite stays accurate even on heavily-sampled NR accounts.
+
+**Multi-account: my US and EU revenue baselines are different, can the card handle both?**
+Yes. Connect each commerce sibling separately and pair each with the corresponding NR account integration. The Nerve Centre stack panel renders one risk number per regional pair. Combining into a single global number is also supported (sum of regional risk numbers), but most CFOs prefer the regional split for incident triage.
+
+**Ingest cost vs visibility tradeoff: can I reduce NR ingest without breaking this card?**
+Yes. Drop sample rate on non-checkout transactions to 25%, keep checkout at 100%, keep all error events at 100%. The Apdex / error-rate inputs stay sample-corrected, the P1 count is unsampled, baseline revenue is unaffected. The card stays accurate and ingest cost typically drops 40, 60%.
+
+**Alert tuning: my $0 trigger fires every 5 minutes for low-impact incidents, how do I quiet it?**
+Two options: (a) raise the floor to ">$100/hour" if you want to ignore residual customer-experience drag; (b) add a duration clause ("must be above $0 for 10 minutes") to suppress flutter. Most merchants prefer option (a) because the operational meaning of "$0 risk for 5 minutes then back to $50/hour" is rarely worth a notification.
+
+**The number jumps to £20k/hour for 30 seconds then back to £0, was that real?**
+Almost certainly an Applied Intelligence grouping artifact: when an issue family briefly contains 5+ incidents (before AI groups them into one) the P1 count factor can spike. AI typically resolves the grouping within 60, 90s and the number normalises. If the spike persists past 2 minutes it's a real escalation worth reading. Tune by adding a "must stay above £X for Y minutes" clause to the alert.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Revenue at Risk (live)* is one of hundreds of KPI pulses Vortex IQ tracks across New Relic and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

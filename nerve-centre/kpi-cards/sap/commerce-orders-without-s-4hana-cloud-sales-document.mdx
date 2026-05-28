@@ -1,0 +1,143 @@
+---
+title: "Commerce Orders Without S/4HANA Cloud Sales Document, SAP"
+sidebarTitle: "Commerce Orders Without S/4HANA Cloud Sales Document"
+description: "Commerce orders that never created a S/4HANA Cloud Sales Document. Each row is a revenue-leak investigation. How to read it, why it matters, and how to act..."
+---
+
+**Card class:** Cross-Channel  •  **Category:** Ecommerce Platform
+
+> Commerce orders that never created a S/4HANA Cloud Sales Document. Each row is a revenue-leak investigation.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Commerce orders (Shopify, BigCommerce, Adobe Commerce, SAP Commerce Cloud) that never created a corresponding S/4HANA Cloud Sales Document. Each row is a revenue-leak investigation: the customer paid, the commerce platform recorded the order, but SAP has no record. Untreated, these become permanent revenue gaps and audit findings.
+
+| | |
+| --- | --- |
+| **What it counts** | Commerce orders older than the connector's tolerance window (default 60 minutes) where no SAP Sales Document with the matching `BSTKD` (Customer Reference) exists. Excludes recently-placed orders inside the sync window. |
+| **Tax treatment** | n/a, this card is an existence check, not a value reconciliation. The row shows the order's gross value for triage. |
+| **Shipping** | Order gross includes shipping. |
+| **Discounts** | Order gross is post-discount. |
+| **Refunds** | Refunded orders excluded if the refund posted before the sync attempt. |
+| **Cancelled / voided orders** | Included if the commerce platform shows them as paid before cancellation. |
+| **Currency** | Order's transaction currency, displayed alongside Group Currency equivalent. |
+| **Channels / sources** | All connected commerce platforms. |
+| **Time window** | `RT` |
+| **Alert trigger** | `>0 unmapped orders` (any single failed mapping). |
+| **Roles** | owner, finance, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your SAP data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US enterprise B2B distributor on S/4HANA Cloud. Snapshot 03 May 26.
+
+**Headline:** 28 commerce orders unmapped, $214,000 of unbookable revenue at risk.
+
+| Commerce platform | Order ID | Order date | Order net (USD) | Customer reference (commerce-side) | Reason |
+| --- | --- | --- | --- | --- | --- |
+| Adobe Commerce | AC-12834 | 18 Apr 26 | $14,200 | ACME-EU-12 | Customer not in BP master |
+| Adobe Commerce | AC-12848 | 19 Apr 26 | $18,600 | ACME-EU-12 | Same customer |
+| Adobe Commerce | AC-12891 | 20 Apr 26 | $22,400 | BETA-NORTH-08 | Customer not in BP master |
+| BigCommerce B2B | BC-449634 | 21 Apr 26 | $42,000 | GAMMA-WEST-LLC | Tax classification rejected by SAP DRC |
+| BigCommerce B2B | BC-449721 | 23 Apr 26 | $38,400 | DELTA-INTL | Material code on line 3 not in SAP material master |
+| Shopify Plus | SP-92438 | 24 Apr 26 | $640 | (DTC, no customer ref) | Connector retry exhausted |
+| Adobe Commerce | AC-12942 | 28 Apr 26 | $4,200 | EPSILON-MX | Ship-to-country code MX not enabled in CC 1000 |
+| Adobe Commerce | AC-13002 | 02 May 26 | $73,560 | ACME-EU-12 | Same customer (now $108K total exposure) |
+
+**Investigation walkthrough:**
+
+1. **The dominant cluster: ACME-EU-12 with 3 orders totalling $108K.** Single root cause: customer was created in the commerce platform but the corresponding SAP Business Partner (transaction BP, role FLCU01 customer) was never set up. The Functional Analyst creates the BP, the integration retries (manual or automatic depending on middleware), and all 3 orders flow through.
+2. **GAMMA-WEST-LLC blocked by SAP DRC tax classification.** The commerce platform sent a tax code that does not match the destination jurisdiction's e-invoicing rules. SAP's Document and Reporting Compliance module rejects the Sales Document creation. The Functional Analyst either fixes the tax code mapping in the commerce-platform integration or amends the order tax-classification before retry.
+3. **DELTA-INTL: missing material in SAP master.** A material on the order does not exist in SAP. Likely a new product was added on commerce platform without being created in SAP. Master-data team adds the material (transaction MM01), retries.
+4. **EPSILON-MX: Company Code coverage gap.** The order's ship-to is Mexico but the integration was set up to flow into CC 1000 (US Inc) only. Either route MX orders to CC 3000 (MX SA) by configuration, or accept that MX-ship orders out of US Inc happen and configure cross-border tax handling.
+5. **Shopify SP-92438: retry exhausted.** Generic integration error, no clear cause. SAP Functional Analyst checks the integration logs (BTP Integration Suite). Often a transient timeout or rate-limit; manual retry usually clears.
+
+**Action playbook:**
+
+- **Daily** during high-volume periods: SAP Functional Analyst clears the queue. Goal: zero rows by EOB.
+- **Master-data fixes** (BP creation, MM01 material creation) clear most cases.
+- **DRC / e-invoicing rejections** require integration-side tax mapping fixes.
+- **Repeat offenders** (same customer / same material / same plant) suggest a configuration gap that needs structural fix, not just per-order patches.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Commerce Orders Without S/4HANA Cloud Sales Document |
+| --- | --- |
+| [Revenue Gap vs Commerce](/nerve-centre/kpi-cards/sap/revenue-gap-vs-commerce) | The headline; this card is the Unmapped Marketplace bucket. |
+| [Revenue Gap, Detailed Breakdown](/nerve-centre/kpi-cards/sap/revenue-gap-detailed-breakdown) | The full breakdown including this bucket. |
+| [Open Sales Document Value](/nerve-centre/kpi-cards/sap/sap-open-so-value) | The pipeline once mapping resolves. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in S/4HANA Cloud:**
+
+S/4HANA Cloud has no native unmapped-orders view; this card is unique to Vortex IQ. Closest manual approach: the integration middleware's error log (SAP Integration Suite, Cloud Platform Integration, MuleSoft, Boomi, etc) plus the commerce platform's order export. For drill-down once a row is being investigated:
+
+> **Manage Business Partner** transaction BP / Fiori app -> create or fix BP record
+> **Material Master** transaction MM01 / MM02 / MM03 -> create or display material
+> **Display Sales Document** transaction VA03 -> verify the Sales Document was created after retry
+> **DRC error log** Fiori app -> for tax-classification rejections
+
+**Why our list may legitimately differ from the integration log:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Tolerance window** | Card may exclude very recent orders | Default 60-minute grace period before flagging. Tunable. |
+| **Match logic** | Card may show false unmapped | If the integration writes the commerce order ID into a non-standard SAP field, the card cannot find the match. Configure the field via field map. |
+| **Multi-Company-Code routing** | Card may show as unmapped | If the order should route to CC 2000 but the integration tried CC 1000, the SAP-side document may exist under a different CC than the card searches. |
+
+**Cross-connector reconciliation:**
+
+| Source | Role |
+| --- | --- |
+| Commerce platforms (Shopify, BigCommerce, Adobe Commerce, SAP Commerce Cloud) | Source of unmapped orders |
+| S/4HANA Cloud Sales Documents (`I_SalesDocument` OData) | Match target |
+| SAP Integration Suite / BTP Integration Cockpit | Error log source |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My integration retries automatically, why does this card still show unmapped orders?**
+Auto-retries handle transient errors (network blips, rate limits). Master-data errors (missing BP, missing material, tax-classification rejections) require human intervention; auto-retry will exhaust without success. The card surfaces those.
+
+**What happens if I never fix an unmapped order?**
+It becomes a permanent revenue gap. The customer paid, the commerce platform shows the sale, but SAP has no record so the GL never books it. At year-end, this is an audit finding (cash on bank reconciliation that has no offsetting Sales Document) and likely a forced revenue adjustment.
+
+**Can I auto-create the Business Partner from the commerce-side data?**
+Some merchants do via SAP Cloud Platform Integration custom flows. It is opt-in and requires careful master-data governance (auto-creating BPs without proper credit limits and tax classifications creates downstream issues).
+
+**What is the typical resolution time?**
+Best-in-class merchants clear the queue within 4 hours. Most clear within 1 business day. Anything older than 5 days is a process gap.
+
+**Multi-Company-Code: how does the card route an order to the right CC?**
+The integration uses the order's ship-to country / region to determine the destination CC. If routing logic is wrong (or absent), orders land in the wrong CC or fail entirely.
+
+**SAP DRC e-invoicing rejections, are they fixable from the commerce platform?**
+Usually yes. The commerce-platform tax classification needs to align with the destination jurisdiction's e-invoicing rules. For UK MTD, German DSFinV-K, Indian e-invoicing IRP, Brazil NF-e, the rules differ; integration setup needs jurisdiction-aware tax mapping.
+
+**T-codes / Fiori apps to clear cases?**
+
+- BP: Business Partner (create / amend customer master).
+- MM01 / MM02: Material Master (create / amend material).
+- VA01: Create Sales Order (manual creation if integration cannot retry).
+- BTP Integration Cockpit: Integration error log.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Commerce Orders Without S/4HANA Cloud Sales Document* is one of hundreds of KPI pulses Vortex IQ tracks across SAP and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

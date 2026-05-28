@@ -1,0 +1,183 @@
+---
+title: "Revenue Drop Alert, Adobe Commerce"
+sidebarTitle: "Revenue Drop Alert"
+description: "Catches the canary before the merchant notices, broken checkout, expired payment cert, regional outage. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Ecommerce Platform
+
+> Catches the canary before the merchant notices, broken checkout, expired payment cert, regional outage.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A real-time canary alert. Compares this hour's `SUM(grand_total)` to the same hour on the prior 7-day same-day-of-week baseline. Fires when revenue is more than 25% below baseline, signalling a likely outage: broken checkout, expired payment certificate, regional CDN failure, or a Store View configuration change.
+
+| | |
+| --- | --- |
+| **What it counts** | Hour-by-hour `SUM(grand_total)` from the Adobe Commerce orders index, compared against the median of the four prior same-day-of-week hours (e.g. this Tuesday 14:00 vs the prior four Tuesday 14:00s). |
+| **API field** | `grand_total` and `created_at` from the orders index. Adobe Commerce REST endpoint `GET /rest/V1/orders`. |
+| **VAT / tax treatment** | **Tax-inclusive by definition.** `grand_total` already includes `tax_amount`. The alert ratio is dimensionless so tax inclusion doesn't bias it; it only matters that current and baseline use the same field. |
+| **Shipping inclusion** | **Included.** `grand_total` adds `shipping_amount` (post-discount). |
+| **Discounts** | Already deducted, this is the post-promotion customer-paid figure. A discount campaign that legitimately depresses revenue can trip this alert; pair with [Discount % of Revenue](/nerve-centre/kpi-cards/adobe-commerce/discount-of-revenue) when investigating. |
+| **Credit Memo refund treatment** | **NOT subtracted.** Credit Memos are separate documents; the original `grand_total` doesn't change after a refund. A refund-heavy hour does NOT trigger this alert via the refund itself; only the underlying inflow matters. |
+| **`state` machine inclusion** | **All states included** (matches [Total Revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue)): `new`, `processing`, `complete`, `closed`, `canceled`, `holded`, `pending_payment`, `payment_review`. The Adobe quirk: a stuck-`pending_payment` outage shows up as steady revenue here even though no cash is being collected; cross-check with payment-processor cards (Stripe/PayPal) to confirm a real outage vs a gateway-callback failure. |
+| **`pending_payment` quirk** | Included. This is intentional: if Adobe Commerce is creating order skeletons but the gateway never callbacks, `grand_total` looks normal here while Stripe falls off a cliff. The contrast pattern is itself a diagnostic, see the FAQs. |
+| **Multi-currency `grand_total` vs `base_grand_total`** | Uses `grand_total` (display currency, mixed without FX). Multi-store merchants with multiple base currencies should treat the alert as per-currency-stream; a 25% drop on the USD stream may not reflect anything happening on the GBP stream. The roadmap includes per-Store-View alert variants. |
+| **Store View scope (`store_id`)** | **All Store Views summed by default.** A US-only outage on a multi-Store-View store may dilute below the 25% threshold if the UK store is healthy. Set up per-Store-View alert variants for region-specific monitoring. |
+| **Time window** | `RT` (real-time, hour-by-hour). The card refreshes every 5-15 minutes as new orders index. |
+| **Alert trigger** | `drop >25% vs prior 7-day same-DOW window`, driven by `sentiment_key: revenue_trend`. The same-DOW comparison handles weekly patterns (Sunday-quiet, Monday-spike) without false positives. |
+| **Roles** | owner, finance, marketing |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+```
+SUM(grand_total)
+  WHERE date BETWEEN [period_start, period_end]
+```
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A multi-region fashion brand on Adobe Commerce 2.4.6 with US, UK, and B2B Store Views. Tuesday 14:00 GMT, the alert just fired.
+
+**Baseline** (median of the four prior Tuesdays at 14:00):
+
+| Tuesday | Hourly `SUM(grand_total)` |
+| --- | --- |
+| 22 Mar 26 | $4,810 + £1,420 |
+| 29 Mar 26 | $5,120 + £1,580 |
+| 5 Apr 26 | $4,640 + £1,510 |
+| 12 Apr 26 | $5,210 + £1,460 |
+| **Median baseline** | **$4,965 + £1,485** (≈ $6,820 at the indicative FX) |
+
+**Current** (this Tuesday 19 Apr 26 at 14:00):
+
+| Stream | Hourly revenue | vs median |
+| --- | --- | --- |
+| US (USD) | $1,840 | -63% |
+| UK (GBP) | £1,510 | +1.7% |
+| B2B (USD) | $0 | -100% (baseline ~$120/hr) |
+| **Combined (mixed currency)** | **$1,840 + £1,510** ≈ $3,640 | **-47%** |
+
+The alert fired because combined revenue is 47% below baseline, well past the 25% threshold. What investigation reveals:
+
+1. **The UK Store View is healthy at +1.7%.** Whatever broke is US-specific.
+2. **The B2B portal contributed zero in this hour vs a baseline of ~$120/hr.** Unusual but B2B order volume is too thin to be conclusive on a single hour.
+3. **Pair with [`stripe.stripe_total_revenue`](/nerve-centre/kpi-cards/stripe/total-charge-volume) for the same hour:** Stripe shows $0 captured charges on the US stream but the Adobe Commerce side shows $1,840 of `grand_total`. **That gap is the smoking gun**, orders are being created in `pending_payment` but the gateway callback isn't completing. The merchant's Stripe webhook endpoint is misconfigured or down.
+4. **The fix:** check Stripe Dashboard > Developers > Webhooks for failed delivery attempts to the merchant's Adobe Commerce endpoint. A 503 or 4xx burst within the last hour confirms it. Manually replay the failed webhooks and the `pending_payment` orders will transition to `processing`.
+5. **The order count looks normal** (this is the giveaway). [Total Orders](/nerve-centre/kpi-cards/adobe-commerce/total-orders) for the US stream is 12 in this hour vs a baseline of 14, only -14%. That's because Adobe Commerce is *creating* the orders fine; it's only the *capture-confirmation* that's failing. Without the cross-connector check this would look like a plain revenue dip.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+This alert is most useful when triangulated against payment-processor and operational cards. Pair with these:
+
+| Card | Why pair it with Revenue Drop Alert |
+| --- | --- |
+| [Total Revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | The underlying value. The alert is a derivative of this card's hourly slice. |
+| [Total Orders](/nerve-centre/kpi-cards/adobe-commerce/total-orders) | If revenue drops but order count is steady, the issue is basket-side (a popular high-AOV product went out of stock, or a discount code is auto-applying). If order count drops in lockstep, the issue is funnel-side. |
+| [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) | If `pending_payment` is spiking while revenue drops, the gateway callback is failing. This is the diagnostic that distinguishes "real" outage from "callback" outage. |
+| [Cancellation Rate](/nerve-centre/kpi-cards/adobe-commerce/cancellation-rate) | A creeping cancellation rate before the drop suggests upstream payment issues. |
+| [Revenue by Store View](/nerve-centre/adobe_commerce/revenue_by_store_id) | Localises the drop. A US-only outage may dilute below the 25% threshold on the combined view. |
+| [`stripe.stripe_total_revenue`](/nerve-centre/kpi-cards/stripe/total-charge-volume) | The Stripe canary. If Adobe Commerce revenue is flat but Stripe revenue cratered, the gateway-callback path is broken. |
+| [`paypal.pp_total_volume`](/nerve-centre/paypal/pp_total_volume) | Same as Stripe but for PayPal-routed orders. |
+| [`google_analytics.ga_revenue_trend`](/nerve-centre/kpi-cards/google-analytics/revenue-trend) | If GA4 revenue cratered too, the issue likely sits before checkout (broken product page, broken cart, redirect loop). |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Adobe Commerce Admin:**
+
+The closest Admin views for ground-truth comparison:
+
+> **Reports > Sales > Orders** (or **Reports > Sales** in 2.4.6+) with the time range set to "Today" and the "Apply" set to *Hourly*. This shows hourly revenue for today which is what the alert evaluates.
+
+For the live order grid:
+
+> **Sales > Orders** with the "Purchase Date" filter set to today and ordered by `created_at` descending. Count rows in the most recent hour against your normal hourly cadence.
+
+Other Adobe Commerce Admin views that *look* relevant but aren't:
+
+- **Dashboard > Last Orders**: only the last 5 orders, not aggregated by hour.
+- **Dashboard > Lifetime Sales**: all-time, not windowed.
+- **Reports > Sales > Invoiced**: invoiced amount, lags real-time order creation.
+- **Reports > Customers**: per-customer aggregation, no hourly breakdown.
+- **System > Notifications**: Adobe Commerce internal alerts (admin login, indexer status), not revenue.
+
+**Why our number may legitimately differ from Adobe Commerce Admin:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Time-zone**. Adobe Commerce Admin renders hourly reports in the Store View timezone (`Stores > Configuration > General > Locale Options`). Vortex IQ runs UTC by default. The "current hour" boundary will be shifted depending on the merchant's timezone, an alert that fires at 14:00 UTC may correspond to 09:00 EST or 16:00 CET in the merchant's admin. | ±N hours of timezone offset |
+| **Currency**. Adobe Commerce hourly reports aggregate in `base_currency` (FX-converted). This card sums `grand_total` without FX. Material for international merchants. | Material for multi-currency stores |
+| **Store View scope**. Admin reports default to a single Store View; this alert sums all Store Views. Set the admin scope to *All Store Views* for like-for-like. | Vortex IQ higher than per-view admin filter |
+| **`canceled` filter**. Admin reports with status filter "All Orders" include canceled; this alert also includes them. Match unless the merchant overrode the report filter. | Usually no divergence |
+| **Sync lag**. The alert evaluates on the OpenSearch index's most recent sync (typically 5-15 minutes behind real-time). The Admin order grid is live. | Vortex IQ slightly stale at the 5-15 min boundary |
+
+**Cross-connector reconciliation (when these connectors are connected for this merchant):**
+
+This is where Revenue Drop Alert earns its keep, the cross-connector contrast is itself the diagnostic.
+
+| Card | Expected relationship | What divergence tells you |
+| --- | --- | --- |
+| [`stripe.stripe_total_revenue`](/nerve-centre/kpi-cards/stripe/total-charge-volume) | Stripe ≤ Adobe Commerce, gap stable hour-on-hour | **If Adobe revenue is flat but Stripe revenue cratered, the gateway callback is failing** (orders sitting in `pending_payment`). **If both cratered together, the issue is upstream of payment** (checkout broken, CDN issue, regional outage). |
+| [`paypal.pp_total_volume`](/nerve-centre/paypal/pp_total_volume) | Subset of Adobe revenue (PayPal-checkout only) | If PayPal cratered while Stripe is steady, only the PayPal route is broken (PayPal SDK script blocked, PayPal API token expired). |
+| [`google_analytics.ga_revenue_trend`](/nerve-centre/kpi-cards/google-analytics/revenue-trend) | GA4 ≈ Adobe revenue × (1 − tracking gap) | If GA4 revenue cratered alongside Adobe revenue, the issue is before checkout. If GA4 sessions cratered (not just revenue), the issue is at the storefront level (broken homepage, redirect loop, CDN). |
+
+**Net contrast pattern:** if you can correlate the alert's exact start time with a Stripe webhook failure burst, an SSL certificate expiry, or a recent code deploy, you have your root cause. Vortex IQ Nerve Centre logs the alert timestamp to UTC second precision for exactly this purpose.
+
+---
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The same alert exists with platform-specific definitions on other commerce connectors. This is **not a reconciliation**; your Adobe Commerce store doesn't have a parallel Shopify or BigCommerce store. These cross-links exist so agencies running multi-platform client books can navigate between equivalent metrics across the docs.
+
+- [`shopify.shopify_alert_revenue_drop`](/nerve-centre/shopify/shopify_alert_revenue_drop)
+- [`bigcommerce.bc_alert_revenue_drop`](/nerve-centre/kpi-cards/bigcommerce/revenue-drop-alert)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The alert fired but my bank deposits look normal, why?**
+Three Adobe-specific reasons can cause this: (1) `pending_payment` orders inflate the baseline, so a hour where the gateway callbacks succeeded for once may look like a "drop" even though it's actually a return to normal cash flow; (2) the alert uses `grand_total` (gross of Credit Memos) so a refund-heavy hour doesn't trip the alert via refunds, only via genuine inflow loss; (3) the `pending_payment` quirk works the other way too, if Adobe Commerce keeps creating order skeletons but the gateway is silently failing, this card looks normal while the bank deposits drop. Always cross-check Stripe/PayPal cards alongside this one.
+
+**What's the difference between `state` and `status` and why does it matter for this alert?**
+`state` is the system-level lifecycle (8 fixed values). `status` is a configurable user-facing label. This alert uses `state`-agnostic logic, it sums `grand_total` regardless of state, including `pending_payment` and `canceled`. That's intentional: a sudden spike in `canceled` orders won't suppress the alert because the original `grand_total` is still summed. To detect a `canceled`-spike specifically, use [Cancellation Rate](/nerve-centre/kpi-cards/adobe-commerce/cancellation-rate) instead.
+
+**Why does the alert use `grand_total` rather than `base_grand_total`?**
+`grand_total` is what the customer paid in their display currency. `base_grand_total` is FX-converted to the store's base currency at order time. The alert uses `grand_total` because we want to detect drops in *what the customer pays*, not drops caused by FX-rate movement. A weakening pound that lowers `base_grand_total` but doesn't change `grand_total` shouldn't trigger a revenue-drop alert (it's not actually a revenue drop, it's an FX shift).
+
+**My multi-store Adobe Commerce, can I get a per-Store-View alert?**
+Not on this card by default; it sums all Store Views. A US-only outage may dilute below the 25% threshold if the UK is healthy. Configure per-Store-View alert variants by filtering `store_id` in the manifest, or use [Revenue by Store View](/nerve-centre/adobe_commerce/revenue_by_store_id) for a manual sanity check.
+
+**Why doesn't the alert fire when Adobe Commerce dashboard shows revenue is down?**
+Most commonly: (1) the dashboard is scoped to a single Store View while the alert sums all Store Views, the combined view may not be down 25%; (2) the dashboard is in Store View timezone, the alert is in UTC, so "today's revenue" boundaries differ; (3) the dashboard converts to base currency, the alert uses `grand_total`, FX swings can cause one to dip without the other.
+
+**The alert fired but Stripe/PayPal show normal volume, what's happening?**
+Counterintuitive but informative: this means orders are being created in Adobe Commerce *but never reaching the payment processor*. Likely causes: (1) `pending_payment` is being captured normally but the success-callback path from gateway to Adobe Commerce is failing, so `grand_total` looks low here even though Stripe captured the money; (2) a checkout-page bug is stopping orders from being created at all, so this card is correct and Stripe matches because nothing is reaching either system. Check Stripe Dashboard > Developers > Webhooks for failed deliveries.
+
+**Why doesn't Google Analytics agree?**
+GA4 typically misses 10, 25% of orders (ad blockers, consent, tag-fire failures). For an alert this is *useful*: if GA4 revenue cratered alongside Adobe revenue, the issue is upstream of checkout (broken homepage, broken cart, CDN). If only Adobe Commerce revenue dropped while GA4 sessions and revenue look normal, the issue is at the order-capture layer.
+
+**Why is today's number jumping all over the place between -40% and +20%?**
+Hourly numbers are noisy on low-volume stores. The 25% threshold can trip on a single low-traffic hour where one B2B order would have rescued it. The alert uses a 4-week median to smooth weekly seasonality but it can't smooth single-hour volatility on a thin baseline. If your store does &lt;100 orders/day, set the alert window to 6-hour rolling rather than hourly.
+
+**Why does the alert use same-DOW comparison (this Tuesday vs prior Tuesdays) rather than yesterday?**
+Ecommerce traffic is heavily day-of-week patterned. Sunday's revenue is naturally lower than Tuesday's; a "yesterday vs today" comparison would fire constantly on Mondays just because Sunday is quiet. Same-DOW vs same-hour neutralises that pattern and only fires on genuine deviation.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Revenue Drop Alert* is one of hundreds of KPI pulses Vortex IQ tracks across Adobe Commerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

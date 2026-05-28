@@ -1,0 +1,168 @@
+---
+title: "Synthetic Uptime, Datadog"
+sidebarTitle: "Synthetic Uptime"
+description: "Synthetic Uptime for Datadog stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Monitoring
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of synthetic-test runs that passed over the past 30 days. Datadog Synthetics runs scripted shopper journeys (login, browse, add to cart, checkout) from automated bots in different geographic regions, every 1-15 minutes. For a merchant, this is "if a robot pretending to be a customer tries to use my store, does it work?" Below 99.5% is the warning zone; below 99% means real shoppers in some regions cannot reliably complete the journey.
+
+| | |
+| --- | --- |
+| **API endpoint** | Datadog Synthetics API, `GET /api/v1/synthetics/tests` for the list, `GET /api/v1/synthetics/tests/{public_id}/results` for run history. |
+| **Metric basis** | Pass / total ratio across all configured synthetic tests in the connected account. Each test run produces a binary pass/fail; uptime is the aggregate pass percentage. |
+| **Aggregation window** | 5-minute rollup of pass/fail outcomes, aggregated to 30-day rolling window. |
+| **Severity threshold** | P1 = below 99% (multi-region or critical-path failure); P2 = below 99.5% (alert trigger); P3 = below 99.9% (worth investigating). |
+| **Alert pre-filtering** | (1) Tests tagged `purpose:experiment` or `[DRAFT]` excluded; (2) Tests muted or paused excluded; (3) Tests created in the last 24 hours flagged "new test, not yet stable" so a misconfigured selector does not pollute the headline. |
+| **Log Management gating** | Not used. Synthetic results are pulled from the Synthetics API, independent of Logs. |
+| **Test types counted** | Browser tests (full page-load with JS), API tests (HTTP request/response), multi-step journeys (login → browse → checkout). All weighted equally. The merchant-meaningful subset is browser tests on critical paths; pair this card with [Critical-Path Tests Status](/nerve-centre/kpi-cards/datadog/critical-path-tests-status) for that subset. |
+| **Filtered hosts / services** | All tests in the connected account. |
+| **Time zone** | Account timezone for chart axes; UTC for cross-connector arithmetic. |
+| **Why uptime and not just "is the site up"** | Shoppers experience the site as a journey, not a single endpoint. The homepage may load while checkout is broken; search may work while add-to-cart fails. Synthetic tests run the *journey* and answer "can a real shopper complete the action they came for". |
+| **Time window** | `30D vsP` (30 days vs prior 30 days) |
+| **Alert trigger** | `< 99.5%`, when uptime drops below 99.5% over the rolling 30 days, page on-call. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Datadog data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US homewares brand on BigCommerce running 12 Datadog synthetic tests: 3 browser tests (homepage load, product-detail render, checkout journey) and 9 API tests covering search, product API, cart API. Tests run every 5 minutes from 4 regions: AWS us-east-1, AWS us-west-2, AWS eu-west-1, AWS ap-southeast-2.
+
+| Test | Region | Total runs (30D) | Pass | Fail | Pass rate |
+| --- | --- | --- | --- | --- | --- |
+| Homepage load | All 4 | 34,560 | 34,488 | 72 | 99.79% |
+| Product-detail render | All 4 | 34,560 | 34,432 | 128 | 99.63% |
+| Checkout journey | All 4 | 34,560 | 34,011 | 549 | **98.41%** |
+| Search API | All 4 | 34,560 | 34,482 | 78 | 99.77% |
+| Product API | All 4 | 34,560 | 34,524 | 36 | 99.90% |
+| Cart API (other 8) | All 4 | 276,480 | 275,990 | 490 | 99.82% |
+| **Aggregate** | | **449,280** | **447,927** | **1,353** | **99.70%** |
+
+The headline reads **99.70%** which is above the 99.5% alert threshold, looks healthy, but the breakdown reveals the real story: **the checkout journey test is at 98.41%**, the lowest of all 12 tests and well below the rest of the fleet.
+
+Three observations the merchant should read:
+
+1. **Aggregate uptime hides per-test failure.** The aggregate is dragged down by checkout failures but the high-volume API tests (which mostly pass) buoy it. The headline 99.70% looks fine; the per-test view is where the problem lives. **Always pair this card with [Critical-Path Tests Status](/nerve-centre/kpi-cards/datadog/critical-path-tests-status)** for the checkout-specific view.
+2. **Checkout is failing 1.6% of runs over 30 days.** Translated: roughly 1 in every 60 shoppers attempting checkout sees an error or timeout. At this brand's typical 5,400 checkouts per month, that is ~86 shoppers per month who experienced a broken checkout. At AOV $74 with 50% recovery via retry, lost revenue is approximately $3,180/month. Material.
+3. **Region matters.** Drilling into the checkout failures: 87% of the 549 failures occurred from `ap-southeast-2`. The cause: this brand's CDN does not cache the checkout-validation JavaScript in Asia-Pacific regions because of a misconfigured cache rule. Shoppers in Australia / NZ experience slow JS load and the synthetic test times out. US and EU shoppers are fine. **Pair with [Uptime by Region](/nerve-centre/kpi-cards/datadog/uptime-by-region) to see the regional breakdown.**
+
+```text
+Action plan from this single card:
+  1. Open Critical-Path Tests Status to confirm which tests are failing
+  2. Open Uptime by Region to identify regional concentration
+  3. Open Browser Test Latency p95 to see whether failures are timeout-driven
+  4. Coordinate with engineering to fix the regional CDN config
+  5. Re-evaluate after fix; expect aggregate uptime to climb from 99.70% to 99.92%
+```
+
+Three takeaways merchants should remember:
+
+1. **Synthetic uptime is the merchant's north-star availability metric.** Server-side error rate and Apdex measure "did the request complete"; synthetic uptime measures "did a shopper-realistic journey complete from a real region". The latter is what matters for revenue.
+2. **The aggregate hides per-test problems.** A single critical-path test failing dramatically can be hidden by many high-volume passing tests. Read the headline and the per-test breakdown together.
+3. **Below 99.5% is real, not statistical noise.** At 30-day rolling windows of typical tests, 99.5% corresponds to roughly 7 minutes of failure per day. If a robot pretending to be a customer cannot complete the journey 7 minutes per day, real shoppers in those windows are also abandoning. The threshold is calibrated to material impact.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Synthetic Uptime | What the combination tells you |
+| --- | --- | --- |
+| [Critical-Path Tests Status](/nerve-centre/kpi-cards/datadog/critical-path-tests-status) | The merchant-meaningful subset of synthetic tests: login, browse, add to cart, checkout. | Aggregate uptime green plus critical-path red equals "the easy tests pass; the journey fails". |
+| [Uptime by Region](/nerve-centre/kpi-cards/datadog/uptime-by-region) | Per-region breakdown of the same data. | Regional concentration of failures equals CDN, DNS, or peering issues; uniform failures equals origin problem. |
+| [Browser Test Latency p95](/nerve-centre/kpi-cards/datadog/browser-test-latency-p95) | How long synthetic browser tests take to complete. | Latency above 5 seconds is often *why* tests fail (timeout); pair to diagnose. |
+| [API Monitor Failures (24h)](/nerve-centre/kpi-cards/datadog/api-monitor-failures) | The API-test subset; faster signal than browser tests. | Multiple API failures in 24h plus uptime drop equals coordinated upstream issue. |
+| [Operational Health Score](/nerve-centre/kpi-cards/datadog/operational-health-score) | The composite engineering view. | Composite green plus synthetic red equals "Datadog APM does not see what the customer sees". |
+| [Active Incidents](/nerve-centre/kpi-cards/datadog/active-incidents) | Independent confirmation. | Synthetic red plus zero incidents equals "engineering has not noticed the customer-facing problem yet". |
+| [Page Load p95 (RUM)](/nerve-centre/kpi-cards/datadog/page-load-p95) | Real-user version of the same metric. | Synthetic green plus RUM red equals "the bot path works but real shoppers' devices/networks fail"; usually third-party script issues. |
+| [Shopify / BC / Adobe Total Revenue](/nerve-centre/kpi-cards/shopify/total-revenue) | The downstream impact metric. | Sustained synthetic uptime drops below 99% usually correspond to measurable revenue dips. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Datadog:**
+
+> **[Synthetic Monitoring → Tests](https://app.datadoghq.com/synthetics/tests)** for the master list with per-test pass rates.
+> **[Synthetic Monitoring → Test Results](https://app.datadoghq.com/synthetics/results)** for individual run history.
+> **[Synthetic Monitoring → Settings → Locations](https://app.datadoghq.com/synthetics/settings/locations)** to see which regions are configured.
+
+**Why our number may legitimately differ from Datadog's UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Time zone** | Boundary days off | Datadog UI displays in account timezone; Vortex IQ rolls 30-day windows in UTC. |
+| **API rate limits** | Brief gaps | The Synthetics API is rate-limited; cached values may be 2-5 minutes stale. |
+| **Log indexing latency** | Not applicable | Synthetics is independent of Logs. |
+| **Test exclusion (draft, muted)** | Vortex IQ count higher | Vortex IQ excludes draft and muted tests by default; Datadog UI may include them in some views. |
+| **Multi-step journey weighting** | Either | A 5-step journey test counts as one test in the aggregate; in the per-step view (Datadog UI), each step's pass/fail is visible. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes the divergence |
+| --- | --- | --- |
+| [`google_analytics.ga_property_health`](/nerve-centre/kpi-cards/google-analytics/ga4-property-health) | Independent peer measuring browser-side health. RUM client-side vs APM server-side discrepancy is healthy and expected; synthetic sits between the two. | Synthetic green plus GA4 amber equals analytics-tag regression (RUM works, GA tag does not); synthetic red plus GA4 green equals server-path issue not affecting tag fire. |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) / [`adobe_commerce.total_revenue`](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | Inverse: synthetic uptime drops typically precede revenue dips by 5-15 minutes. | Synthetic green plus revenue dip equals demand-side problem (acquisition, marketing); synthetic red plus revenue stable equals the synthetic test is misconfigured (false negative). |
+| Datadog APM | APM measures server-side timing; synthetic measures journey completion. RUM client-side vs APM server-side discrepancy is healthy. | APM green plus synthetic red equals problem in code-path APM is not instrumenting (third-party widget, payment iframe). |
+
+<details>
+<summary><em>Documentation cross-reference (same-concept peer)</em></summary>
+
+Synthetic uptime is a standard concept on every monitoring platform. This is **not** a reconciliation; your Datadog account does not have a parallel New Relic Synthetics or Pingdom instance to compare against. These references exist purely so an agency running clients on multiple monitoring stacks can cross-link the same metric across docs.
+
+- New Relic Synthetics equivalent: SyntheticCheck pass rate.
+- Pingdom equivalent: uptime percentage.
+- AWS CloudWatch Synthetics equivalent: canary success rate.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My APM dashboard is green but synthetic uptime is amber. What is happening?**
+The classic Datadog "everything is fine but customers are complaining" pattern. Three causes: (1) The failure is in a third-party widget Datadog APM does not instrument (chat, reviews, payment iframe); (2) The CDN is serving cached errors to certain regions; (3) Synthetic tests run a full browser journey including JS execution, while APM measures server-side only. Browser-side regressions show in synthetic before APM. Open [Browser Test Latency p95](/nerve-centre/kpi-cards/datadog/browser-test-latency-p95) and the per-region [Uptime by Region](/nerve-centre/kpi-cards/datadog/uptime-by-region) to triage.
+
+**What is "synthetic" and how is it different from "real user monitoring (RUM)"?**
+Synthetic tests are scripted bots that pretend to be customers, running on a fixed schedule from fixed regions. RUM measures actual visitors as they use the site. Synthetic tests catch problems early (every 5 minutes whether or not anyone is shopping); RUM catches what real shoppers experience but only when shoppers are using the site. **Use both: synthetic for proactive detection, RUM for real impact.** Synthetic uptime is "could a robot do it"; RUM is "did real shoppers do it".
+
+**My uptime is 99.5% but I want it higher. How do I improve it?**
+99.5% over 30 days is roughly 3.6 hours of failure per month. To improve: (1) Identify which test is dragging the aggregate (per-test breakdown), (2) Identify whether failures are regional (per-region breakdown), (3) Look at failure root causes, are they timeouts (latency-driven) or assertion failures (logic-driven)? Most uptime improvements come from fixing the bottom 1-2 tests, not improving everything by a fraction.
+
+**Synthetic test costs are showing in our Datadog bill. Can we reduce frequency?**
+Yes, but be careful. Datadog charges per synthetic test run; the default 5-minute interval gives 8,640 runs per test per month. Reducing to 15-minute intervals cuts cost by 67% but also reduces detection speed (a 15-minute regression now takes up to 15 minutes to detect vs up to 5 minutes). For critical-path tests (checkout) keep 5-minute; for less-critical tests (search API, product listing) 15-minute is acceptable.
+
+**My Logs API returns 400 No valid indexes. Does this card still work?**
+Yes. Synthetic Uptime is independent of Logs. The Vortex IQ engine logs the gating event once at INFO and continues serving Synthetics-API-derived cards normally.
+
+**Why does the headline aggregate fail to surface critical-path issues?**
+Because aggregate is a weighted average of all tests, and high-volume API tests dominate the calculation. A single critical browser test failing can be hidden by thousands of passing API runs. **Always pair the aggregate with [Critical-Path Tests Status](/nerve-centre/kpi-cards/datadog/critical-path-tests-status)** to see the merchant-meaningful subset.
+
+**Datadog says everything is fine but customers in Asia are complaining about slow checkout.**
+This is the regional-CDN pattern. Synthetic uptime aggregate may be 99.7% globally but [Uptime by Region](/nerve-centre/kpi-cards/datadog/uptime-by-region) reveals the per-region breakdown: APAC may be 96% while US/EU are 99.95%. The cause is usually CDN cache configuration: certain assets are not cached in APAC PoPs, causing slow loads or timeouts. Fix by reviewing your CDN's per-region caching rules.
+
+**Can I add a synthetic test for a specific page or flow?**
+Yes, in the Datadog UI. Go to Synthetic Monitoring → New Test → choose Browser Test, API Test, or Multistep API Test. Tag it `purpose:critical-path` to include it in the [Critical-Path Tests Status](/nerve-centre/kpi-cards/datadog/critical-path-tests-status) card. Vortex IQ picks up the new test automatically within 1-2 polling cycles.
+
+**My synthetic test failed but I cannot reproduce the failure manually.**
+Common causes: (1) The test ran from a region where your CDN was briefly degraded; (2) A third-party script the test depends on (analytics, A/B SDK) was slow to load on the synthetic's network; (3) Your Datadog Synthetic IPs are being blocked by your WAF as bot traffic. Check Datadog's [public IP ranges](https://docs.datadoghq.com/synthetics/guide/identify_synthetics_bots/) and whitelist them in your WAF.
+
+**Why does my uptime drop briefly during deploys?**
+Most deploys cause 1-3 minutes of failed health checks while old containers shut down and new ones start. To exclude these, schedule a 5-minute mute around your deploy window in Datadog Synthetics, or tag deploy-driven failures and exclude them from the aggregate. Vortex IQ automatically detects sustained periods of synthetic failure aligned with deploy markers and flags them as "deploy-driven" in the change history.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Synthetic Uptime* is one of hundreds of KPI pulses Vortex IQ tracks across Datadog and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

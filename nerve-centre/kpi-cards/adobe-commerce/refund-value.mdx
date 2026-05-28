@@ -1,0 +1,180 @@
+---
+title: "Refund Value, Adobe Commerce"
+sidebarTitle: "Refund Value"
+description: "Refund Value for Adobe Commerce stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Ecommerce Platform
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The total monetary value refunded in the period. Aggregates Credit Memo `grand_total` across every Credit Memo created in the window. Magento and Adobe Commerce treat refunds as separate Credit Memo documents, the order's `total_refunded` field is the cumulative sum of all Credit Memos against that order, but this card sums the **memo** values directly so partial refunds and shipping-only refunds are all captured.
+
+| | |
+| --- | --- |
+| **What it counts** | `SUM(creditmemo.grand_total)` over Credit Memos where `created_at` falls inside the period. Each Credit Memo's `grand_total` includes its own `subtotal` (line value refunded) + `shipping_amount` (shipping refunded) + `tax_amount` (tax refunded) − `adjustment_negative` + `adjustment_positive`. |
+| **API field** | `grand_total` and `created_at` from the creditmemos index, also `base_grand_total`, `subtotal`, `shipping_amount`, `tax_amount` for the breakdown row. Adobe Commerce REST endpoint: `GET /rest/V1/creditmemos`. |
+| **Why this approach over `orders.total_refunded`** | The `total_refunded` field on an order is cumulative-to-date; if the order was refunded in three tranches over six months, `total_refunded` shows the running total. Using `SUM(orders.total_refunded WHERE status=refunded)` (the legacy stub query) captures only the orders that ever ended up fully refunded and double-counts the running totals if you slice by order date vs refund date. Summing Credit Memo `grand_total` by Credit Memo `created_at` is the only way to get a clean "refund value posted in this period" figure. |
+| **VAT / tax treatment** | **Tax-inclusive.** The Credit Memo `grand_total` mirrors the original order: it bundles refunded tax (`tax_amount` on the memo). For UK/EU merchants this is the customer-paid figure. Finance teams who book refunds net of VAT need to subtract `creditmemo.tax_amount`; that figure is exposed via the breakdown table on the card detail panel. |
+| **Shipping inclusion** | **Included.** A shipping-only Credit Memo (`subtotal=0`, `shipping_amount>0`) contributes its shipping value to this total. |
+| **Discounts** | Customer-paid net is what gets refunded. If the original order had a 20% discount, the refund typically refunds the post-discount line value (Adobe Commerce defaults to this). The `adjustment_positive` and `adjustment_negative` fields let merchants override on a per-memo basis (e.g. add a $5 goodwill credit to a return); those adjustments are included in `grand_total` and therefore in this card. |
+| **Adjustment fee** | Adobe Commerce supports a per-memo "Adjustment Fee" that can offset the refund (e.g. a restocking fee deducted from the customer's refund). It reduces `grand_total` and so reduces this card. Always reconcile to the customer's bank statement, not to `subtotal`. |
+| **Cancelled orders** | **Excluded.** Cancellations reverse authorisation pre-capture; no Credit Memo, no contribution here. |
+| **Currency** | Uses display currency `grand_total`. Multi-currency merchants get a mixed total which is fine for trend but not for booking. The breakdown row always shows `base_grand_total` for accounting reconciliation. |
+| **Multi-store scope** | Sums all Store Views by default. Configurable via `store_id` filter. |
+| **Time window** | `30D vsP`, the rolling 30-day refund value, compared to prior 30-day window. |
+| **Alert trigger** | None on this card directly. Use [Refund Rate](/nerve-centre/kpi-cards/adobe-commerce/refund-rate) for the normalised version with a threshold. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+```
+SUM(total_refunded) WHERE status=refunded
+  WHERE date BETWEEN [period_start, period_end]
+```
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A B2B+DTC apparel merchant on Adobe Commerce 2.4.7 with the B2B Companies module enabled. UK-based, GBP base currency, single Store View. Period: 14 Apr 26 to 13 May 26.
+
+**Credit Memo population for the window:** 188 Credit Memos.
+
+**Value breakdown (sum across all 188 Credit Memos in GBP):**
+
+| Component | Value | Notes |
+| --- | --- | --- |
+| `subtotal` (line items refunded) | £36,420 | the goods being refunded |
+| `shipping_amount` refunded | £1,830 | inc. 24 shipping-only Credit Memos for express upgrades not delivered |
+| `tax_amount` refunded | £7,650 | 20% VAT on the goods + shipping |
+| `adjustment_negative` (restocking fees) | -£420 | applied to 18 of the 188 memos |
+| `adjustment_positive` (goodwill credits) | +£740 | applied to 31 memos |
+| **`grand_total` sum** | **£46,220** | this card's headline number |
+
+**Comparison to prior period:**
+
+| Window | Refund value | Refunded order count | Average refund value |
+| --- | --- | --- | --- |
+| 14 Apr to 13 May 26 | £46,220 | 188 | £246 |
+| 15 Mar to 13 Apr 26 | £29,140 | 142 | £205 |
+| **Change** | **+59%** | **+32%** | **+20%** |
+
+The card's headline number is up 59% but the more telling slice is the 20% jump in average refund value. Operations should investigate whether high-AOV B2B orders are starting to come back. Drilling into the breakdown:
+
+1. **B2B refunds (Customers in any Adobe Commerce Company entity):** £21,400 of the £46,220, or 46% of refund value. B2B is typically &lt;10% of refund value because B2B orders rarely refund (they raise credit notes against future POs instead).
+2. **Cause:** the merchant launched a new wholesale uniform line on 1 Apr 26 with a sizing chart that turned out to be misaligned (suppliers ran 1 size small). 12 B2B accounts returned bulk shipments through April. The pattern is visible in [Top Refunded Products](/nerve-centre/kpi-cards/adobe-commerce/top-refunding-customers), where 6 of the top 10 refunded SKUs are uniform line items.
+3. **Action:** pause the uniform line on the Adobe catalogue, update the sizing chart, contact affected B2B accounts with replacement quotes. Forward to Procurement to chase the supplier on the sizing claim.
+4. **GL reconciliation note for Finance:** the Credit Memo `grand_total` includes £7,650 of refunded VAT. Net refund to book against revenue is £38,570; the £7,650 reverses the VAT liability (HMRC will see this on the next return). The card's headline £46,220 is the customer-side figure; Finance should use the breakdown row.
+5. **Cross-check Stripe:** [`stripe.stripe_refund_value`](/nerve-centre/kpi-cards/stripe/refund-value) for the same period shows £41,800. The £4,420 gap is PayPal-routed refunds (£3,210) plus 2 manual bank-transfer refunds (£1,210). Sums add up.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Refund Value |
+| --- | --- |
+| [Refund Count](/nerve-centre/kpi-cards/adobe-commerce/refunded-orders) | Volume vs value. Diverging signals (count up, value flat) point to lots of small partial refunds; (count flat, value up) points to a few whale refunds. |
+| [Refund Rate](/nerve-centre/kpi-cards/adobe-commerce/refund-rate) | The percentage of revenue refunded; volume-normalised so seasonality does not deceive. |
+| [Refunds Over Time](/nerve-centre/kpi-cards/adobe-commerce/refunds-over-time) | Day-by-day shape. Helps catch a one-day batch posting that distorts the 30-day total. |
+| [Top Refunded Products](/nerve-centre/kpi-cards/adobe-commerce/top-refunding-customers) | The SKU drivers. Concentrate Operations attention where it matters. |
+| [Total Revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | The denominator pair. Refund value as % of revenue is the canonical refund rate. |
+| [Return Status](/nerve-centre/kpi-cards/adobe-commerce/return-status) | Pipeline of in-process RMAs. Today's RMA approvals are tomorrow's Credit Memos. |
+| [`stripe.stripe_refund_value`](/nerve-centre/kpi-cards/stripe/refund-value) | Stripe-side gross refund value. Should match the Stripe-paid subset of this card. |
+| [`paypal.pp_refund_value`](/nerve-centre/kpi-cards/paypal/refund-value) | PayPal-side. Sum (Stripe + PayPal + manual) ≈ this card's value. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Adobe Commerce Admin:**
+
+> **Reports > Sales > Refunds** (Adobe Commerce 2.4.6+). Set the date range to the same period and the "Show By" to "Day" or "Month". The total at the bottom of the report is the figure to reconcile against. Note that this report uses `base_currency` (FX-converted) so it will not match this card's `grand_total` mixed-currency total for international merchants.
+
+For the document-level audit:
+
+> **Sales > Operations > Credit Memos**, sum the "Refunded" column. The grid total at the bottom matches `SUM(grand_total)` of every Credit Memo in the period.
+
+**Why our number may legitimately differ from Adobe Commerce Admin:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Currency**. Reports > Sales > Refunds aggregates in `base_grand_total` (FX-converted); this card uses `grand_total` (display currency). Multi-currency merchants should expect material differences. The breakdown row on the card detail panel shows `base_grand_total` for like-for-like reconciliation. | Material for multi-currency stores |
+| **Time-zone**. Admin reports run in the Store View locale; this card runs UTC by default. A Credit Memo created near midnight crosses different day boundaries. | ±1 day at edges |
+| **Reports indexer lag**. Reports > Sales > Refunds reads from `sales_refunded_aggregated`, a denormalised table refreshed nightly via the Magento reports indexer (`indexer:reindex sales_order_grid` and the reports cron). If the cron has not run today, the report may be 24 hours stale. This card refreshes every 5-15 minutes. | Vortex IQ ahead of stale Reports |
+| **Adjustment fee handling**. The Reports module sometimes excludes `adjustment_negative` from the displayed total depending on the Magento minor version. This card always includes `adjustment_negative` and `adjustment_positive` in `grand_total`. | Magento-version dependent |
+| **Off-platform refunds**. Refunds issued via gateway dashboards without back-filling a Credit Memo are invisible to both this card and the Admin Credit Memos grid. Bank statement is the only ground truth. | Both views under-count vs bank if process leaks |
+| **Sync lag**. 5-15 minutes behind the database. | Vortex IQ slightly lower than live Admin |
+
+**Cross-connector reconciliation (when both connectors are connected for this merchant):**
+
+| Pair | Expected relationship | What divergence tells you |
+| --- | --- | --- |
+| [`stripe.stripe_refund_value`](/nerve-centre/kpi-cards/stripe/refund-value) | Stripe ≈ Stripe-paid subset of this card | If Stripe is higher, refunds are being issued via Stripe Dashboard without Credit Memos in Adobe. The GL will not balance. |
+| [`paypal.pp_refund_value`](/nerve-centre/kpi-cards/paypal/refund-value) | PayPal-paid subset only | Same logic as Stripe scoped to PayPal. |
+| Sum of (Stripe + PayPal + manual transfer) | should equal this card's `base_grand_total` to within 1% | Larger gaps signal off-platform refunds slipping through process. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The same metric exists with platform-specific definitions on other commerce connectors. This is **not** a reconciliation, your Adobe Commerce store does not have a parallel store on those platforms.
+
+- [`shopify.refund_value`](/nerve-centre/kpi-cards/shopify/refund-value)
+- [`bigcommerce.refund_value`](/nerve-centre/kpi-cards/bigcommerce/refund-value)
+
+</details>
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+This metric exists with the same definition on other commerce platforms. This is **not** a reconciliation, your Adobe Commerce store doesn't have a parallel store on those platforms to compare against. These references exist purely so an agency running clients across multiple platforms can cross-link the same metric across docs.
+
+- [`shopify.refund_value`](/nerve-centre/kpi-cards/shopify/refund-value)
+- [`bigcommerce.refund_value`](/nerve-centre/kpi-cards/bigcommerce/refund-value)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does this card use Credit Memo `grand_total` instead of `orders.total_refunded`?**
+Because `total_refunded` on the order is a running cumulative; an order refunded in three tranches has a single `total_refunded` field that grows over time, with no record of the per-event amounts. To get a clean "refund value posted in this period" number, you must sum each Credit Memo's `grand_total` by the memo's own `created_at`. The legacy stub query `SUM(total_refunded) WHERE status=refunded` was incorrect for partial-refund cases and is replaced by Credit Memo-side aggregation.
+
+**The merchant says we refunded £50,000 but the card shows £46,220, gap?**
+The £3,780 gap is most often: refunded VAT booked separately by Finance, manual gateway-side refunds without Credit Memos, or a handful of `adjustment_negative` restocking fees the merchant treats as "refund-in-spirit" but which reduce the customer-paid figure. Walk through the breakdown row (`subtotal`, `shipping_amount`, `tax_amount`, `adjustment_negative`, `adjustment_positive`) and reconcile component by component.
+
+**Why is shipping refund value separated out?**
+Because shipping refunds are operationally different. A shipping refund usually means the carrier failed (express upgrade not delivered) which is a fulfilment problem, not a product problem. Knowing 4% of refund value is shipping vs 75% being product lets Operations route the issue correctly.
+
+**Multi-currency, can I see refund value in my base currency?**
+Yes. The card shows `grand_total` (mixed currency, useful for trend) by default. The breakdown row shows `base_grand_total` (FX-converted at order time) for accounting. Both are exposed via the API endpoint.
+
+**Does this include voucher / store credit refunds?**
+Yes if the Credit Memo records them as `adjustment_positive`. Adobe Commerce supports refunding to "Store Credit" instead of to the original payment method; the Credit Memo's `grand_total` includes the store-credit portion. If you only want cash refunds, filter on `creditmemo.refund_to_store_credit_amount=0` (configurable in the manifest).
+
+**Can a Credit Memo be issued on a `canceled` order?**
+No. Cancellation reverses authorisation pre-capture; nothing was paid, so nothing can be refunded. Adobe Commerce blocks Credit Memo creation on `canceled` orders. Cancellation value is captured separately on [Cancellation Rate](/nerve-centre/kpi-cards/adobe-commerce/cancellation-rate).
+
+**Why doesn't Stripe match this card exactly?**
+Three causes: (1) PayPal and Authorize.Net refunds are in this card but not in Stripe; (2) manual bank-transfer refunds posted as Credit Memos are in this card but not in Stripe; (3) Stripe-Dashboard-issued refunds without back-filling are in Stripe but not in this card. Sum (Stripe + PayPal + manual) should equal this card to within 1% if process is clean.
+
+**My 90-day refund value is £200k, my 30-day is £46k. Why isn't 30-day a clean third?**
+Because refunds are seasonal too. Returns spike after Black Friday, January, and post-Christmas. A 30-day window in mid-April is structurally lower than a 30-day in mid-January. Use day-of-week and month-on-month comparisons rather than expecting linear scaling.
+
+**A Finance audit shows the GL refund line is higher than this card. What's wrong?**
+Most likely Finance is including VAT in the GL refund line at full value (no VAT carve-out) while this card's GL-friendly view (`grand_total - tax_amount`) excludes refunded VAT. Or Finance is including unfunded "goodwill" credits that were issued as in-store credit rather than cash refunds. Walk the breakdown.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Refund Value* is one of hundreds of KPI pulses Vortex IQ tracks across Adobe Commerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

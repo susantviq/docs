@@ -1,0 +1,157 @@
+---
+title: "Late Shipments, APC Overnight"
+sidebarTitle: "Late Shipments"
+description: "Late Shipments for APC Overnight stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Shipping & Courier
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Count of shipments that missed their APC service-promise delivery time in the period. APC sells time-definite SLAs (NextDay by 9am, by 10:30, by 12:00, NextDay anytime, two-day Pallet), so "late" is judged against the *promised cutoff time on the promised day*, not just "delivered today vs tomorrow". Each shipment that overruns its specific cutoff scores 1.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(shipments WHERE actual_delivery_datetime > promised_delivery_datetime AND status IN ('DELIVERED','FAILED'))` over the rolling 7-day window. Still-in-transit parcels are not counted yet; they flip into the count only once a final scan lands. |
+| **Delivery success criterion** | APC POD (Proof of Delivery) scan or signature event. A consignment without a POD scan but with a `delivered` status set by the depot still counts as delivered. Carded / failed-attempt parcels do not satisfy the on-time test until rescheduled and successfully delivered. |
+| **On-time threshold** | Promised cutoff *time* on the promised *date*. APC NextDay by 9am missing 9:00 by even 5 minutes counts as late. NextDay by 12:00 counts late after 12:00. NextDay anytime uses end-of-business 17:30 as the cutoff. Pallet 2-Day uses 17:30 on day 2. No grace period is applied. |
+| **Returns / RTO** | Returns to sender are excluded from the late count (they are tracked on `apc_returned_to_sender`). Failed-and-redelivered parcels score against the *first* attempted delivery, so a parcel re-attempted on day 2 and successfully delivered is late. |
+| **Service level scope** | **All services pooled.** NextDay-9am, NextDay-10:30, NextDay-12, NextDay anytime, Pallet 24, Pallet 48, and any By-Hand or Saturday uplift are pooled. Service-level breakdown lives on `apc_shipments_by_service` and `apc_nextday_9am_sla`. |
+| **Failure-cause attribution** | Customer-caused exceptions (recipient absent, wrong address, refused, access denied) and weather / network events sit in the same count. APC publishes a `failure_reason` per failed POD; Vortex IQ pulls it through to `apc_exception_rate` but does not subtract those rows from this count. |
+| **Money-back-on-late eligibility** | APC offers service-failure refunds on *guaranteed* services (NextDay 9am, NextDay 10:30, NextDay 12) where APC is at fault. Each shipment in this count is a candidate, the merchant has to file via APC's claims portal within their contract window (typically 14 days). The card does not auto-flag eligibility; pair with `apc_open_claims`. |
+| **Time zone** | All scan timestamps are UK local time (GMT or BST). Vortex IQ pulls APC scans as-is. International export consignments via APC's Globe network are stored in UK time at handover; downstream international scans are in destination time and are not yet normalised. |
+| **B2B vs B2C** | Pooled. B2B accounts (auto-parts, medical, dental, replenishment) typically run 9am or 10:30 service; B2C uses NextDay anytime. The same parcel that is "5 minutes late at 9:05" is critical for a dental practice and immaterial for a consumer parcel; the count treats them identically. Filter by service via siblings to read the right number for each book of business. |
+| **Time window** | `7D` (rolling 7 days, period-over-period vs the prior 7 days). Tighter than the 30D OTD card on purpose, late spikes need to surface before they bleed into claims. |
+| **Alert trigger** | `>5% of total`, the count tripping more than 5 percent of total shipments in the same 7-day window flips the card amber. For premium UK express that target is roughly twice as strict as standard parcel networks would tolerate. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your APC Overnight data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK premium DTC brand selling £180 average-order-value precision watches. Customer base 70% London and Home Counties, 25% rest of UK mainland, 5% Highlands and Islands. APC Overnight is the primary carrier for orders over £100 because the merchant offers a "by 12pm next day" promise on the product page, and APC NextDay-12 is the only premium service the brand has negotiated rates for. Reading taken at 09:00 GMT on 13 Mar 26 for the trailing 7 days (06 Mar 26 to 12 Mar 26).
+
+| Service | Shipments (7D) | Late (missed promised cutoff) | Late % | Notes |
+| --- | --- | --- | --- | --- |
+| NextDay-12 (premium, money-back) | 412 | 19 | 4.6% | 14 missed the 12:00 cutoff but delivered same day; 5 delivered on day 2. |
+| NextDay anytime | 86 | 2 | 2.3% | Both day-2 deliveries to NW Scotland depot. |
+| Pallet 24 (B2B replenishment) | 12 | 1 | 8.3% | Wholesale order to a Birmingham retailer, day-2 delivery. |
+| **Total (this card)** | **510** | **22** | **4.3%** | |
+
+The card reads **22** as the headline; the alert at `>5% of total` is **not** tripped at the aggregate level (4.3%), but Pallet 24 is at 8.3% on small volume. Five things to notice:
+
+1. **Money-back-on-late candidates: the 14 NextDay-12 parcels that delivered same-day after 12:00.** Each is a candidate for an APC service-failure refund on the carriage charge (typically £8 to £14 per shipment for NextDay-12). At an estimated £11 average refund, that is **£154 of recoverable carriage** if the merchant files within APC's 14-day claim window. Pair with `apc_open_claims` to track filing rate.
+2. **The five day-2 NextDay-12 parcels are worse, not better.** Customer paid for "by 12pm tomorrow", got a parcel a day late. These are likely refund-and-discount events on the order itself (typical £15 to £25 goodwill voucher), not just carriage refunds. £100 to £125 of margin loss across five orders.
+3. **Pallet 24 8.3% is a depot-network signal, not a volume one.** 12 pallets is small; one bad pallet trips the percentage. But Birmingham depot has shown up on `apc_depot_otd` as a repeat offender three weeks running, the pattern is real even though the count is small.
+4. **The 4.3% headline does not fail the alert.** The merchant's promise to customers is "by 12pm next day"; the alert at 5 percent gives one percentage-point of headroom over the bare promise. If late percent climbs into the 4.5 to 5.0 zone for two weeks running, the next conversation is with APC's account team about depot routing.
+5. **Compare against the same week last year** in `apc_late_shipments_count` historical view. 13 Mar 25 reading was 1.8 percent, the doubling to 4.3 percent is the real story. Investigate `apc_route_otd` and `apc_depot_otd` to find which corner of the network slipped.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+Late shipments is a count, not a rate. It needs context to act on. Pair it with these:
+
+| Card | Why pair it with Late Shipments | What the combination tells you |
+| --- | --- | --- |
+| [On-Time Delivery Rate](/nerve-centre/kpi-cards/apc/on-time-delivery-rate) | The percent companion. Late count rising while OTD% stays flat means volume is up, not service. | If OTD% drops *and* late count rises, both proportional and absolute degradation, that is the real ops issue. |
+| [NextDay 9am Service Promise](/nerve-centre/kpi-cards/apc/nextday-9am-service-promise) | The premium-tier sub-slice. Late count is dominated by the 9am book if the merchant runs heavy B2B medical or auto-parts traffic. | A 9am SLA dip drives most of the late count even when other services hold up. Always check 9am first. |
+| [OTD by Origin Depot](/nerve-centre/kpi-cards/apc/otd-by-origin-depot) | Splits the count by APC's depot network. APC has 100+ local depots; one slipping depot can produce most of a late spike. | One-depot drops are an APC account-team conversation; network-wide drops are a peak-period or weather event. |
+| [Open Claims](/nerve-centre/kpi-cards/apc/open-claims) | Each late premium shipment is a service-failure-refund candidate. Filing rate vs late count tells you if you are recovering carriage you are entitled to. | If late count is 30 and open-claims is 4, the merchant is leaving £200 to £400 of carriage refunds per week unclaimed. |
+| [Failed Deliveries](/nerve-centre/kpi-cards/apc/failed-deliveries) | Sister metric. Some late shipments are also failed-first-attempt; some failed parcels are still on-time after rescheduling. | Late minus Failed roughly equals "would-be-on-time-if-rescheduled-faster" parcels, the controllable bucket. |
+| [APC OTD by Sales Channel](/nerve-centre/kpi-cards/apc/apc-otd-by-sales-channel) | Cross-channel. A late spike that is all Shopify retail and zero B2B-EDI tells you it is a consumer-experience problem first. | Channel mix in the late count matches the channel mix of customer-service tickets a day later. |
+| Cross-connector: [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Upstream. Shopify orders booked too late in the day cannot make APC's same-day collection cutoff. | A creep in late-day Shopify orders predicts a 1 to 3 day late-shipment rise on this card. |
+| Cross-connector: [`shipstation.shipments_late`](/nerve-centre/shipstation/shipments_late) | Same-shape metric on a multi-carrier shipping platform. Useful only if APC labels are also generated via ShipStation. | If ShipStation's late count and this card disagree, ShipStation's view includes carriers other than APC; use this card for APC-only truth. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in APC's own portal:**
+
+[APC Overnight Customer Portal](https://www.apc-overnight.com/) → log in to **Track & Trace** → **Reports → Service Performance**. Filter by *Date Range = Last 7 Days*, *Service = All*, *Status = Delivered + Failed*. The portal exposes a "Late deliveries" filter on the consignments table directly; each row shows promised cutoff vs actual POD timestamp. The aggregated count at the top of that filtered view is what should reconcile with this card.
+
+For account-managed customers, APC's quarterly business review (QBR) deck published by the account manager carries the same figure broken down by depot, by service, and by failure-cause code. Vortex IQ pulls the same underlying scan data through APC's API; the QBR adds APC's own commentary.
+
+**Why our number may legitimately differ from APC's portal:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Cutoff-time strictness** | Ours stricter | APC's portal sometimes counts a 9am shipment delivered by 09:30 as "marginal" and excludes it from late. Vortex IQ enforces the cutoff exactly: 09:00 is the line. Expect a small gap on 9am and 10:30 services where APC's internal grace is lenient. |
+| **In-transit treatment** | Ours lower for "today" | Vortex IQ excludes still-in-transit consignments from both numerator and denominator until a final scan lands. APC's same-day portal view sometimes pre-categorises in-transit-but-late-ETA as already late. T-2 days fully reconcile. |
+| **Failure-cause exclusions** | APC lower | APC's portal may quietly exclude "customer fault" failures (recipient absent, refused, wrong address) from the headline late number for QBR purposes. Vortex IQ counts every overrun regardless of cause, the merchant's customer experiences the lateness either way. Use `apc_exception_rate` to split. |
+| **Time-zone of the report** | Boundary days off | APC's portal uses UK local time (GMT or BST); Vortex IQ also uses UK local for the cutoff comparison. The 7-day window boundary may differ by one day depending on whether the portal's "Last 7 days" includes today. |
+| **POD-not-yet-uploaded shipments** | Ours lower | Driver POD scans can lag depot upload by 2 to 6 hours. The card excludes scan-pending parcels until POD lands. APC's portal sometimes shows these in a separate "pending" bucket; reconcile against the previous calendar day, not today. |
+| **Saturday and bank-holiday handling** | Either | NextDay services do not run on Sundays in the UK; APC's promise auto-bumps a Friday-shipped parcel to the following Monday. Vortex IQ honours this in `promised_delivery_datetime` calculation. Mismatched calendars between the merchant's checkout copy and APC's working-day calendar are the most common source of unexpected gaps. |
+
+**Internal identity (within APC):**
+
+`apc_late_shipments_count = apc_shipments_total - (apc_shipments_total × apc_otd_rate)`, ignoring rounding. The two cards are paired views of the same denominator; if they disagree by more than a unit or two, the gap is from in-transit treatment of the most recent two days.
+
+- [`apc.apc_otd_rate`](/nerve-centre/kpi-cards/apc/on-time-delivery-rate)
+- [`apc.apc_shipments_total`](/nerve-centre/kpi-cards/apc/shipments)
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Leading indicator. Shopify orders that flip from unfulfilled to fulfilled after 16:00 GMT typically miss APC's last collection of the day, surfacing here 1 to 2 days later. | Webhook lag, late afternoon promo spikes, manual fulfilment workflows. |
+| [`shipstation.shipments_late`](/nerve-centre/shipstation/shipments_late) | Same metric on a multi-carrier shipping platform. Should match exactly for APC-labelled consignments only. | ShipStation pools all carriers; this card is APC-only. |
+| Customer-service ticket volume (Zendesk, Gorgias, Intercom) | Downstream lag. Late count today predicts a +20 to +35% support-ticket spike at 24 to 48 hours lag. | Strong correlation; if ticket volume rises *without* a late spike here, the cause is elsewhere (e.g. product quality). |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple UK shippers)</em></summary>
+
+The "late shipments count" metric exists with conceptually similar definitions across other UK shipping connectors. These are not parallel measurements of the same parcels; they are independent metrics on independent carrier accounts. Use these cross-links only to navigate documentation.
+
+- [`parcelforce.par_late_shipments_count`](/nerve-centre/kpi-cards/parcelforce/late-shipments), Royal Mail's express arm.
+- [`interlink_express.int_late_shipments_count`](/nerve-centre/kpi-cards/interlink-express/late-shipments), DPD group's premium UK service.
+- [`dpd.dpd_late_shipments_count`](/nerve-centre/kpi-cards/dpd/late-shipments), parent network of Interlink.
+
+Multi-carrier brands typically run APC for time-definite high-AOV traffic and a cheaper carrier (Royal Mail Tracked 24, Evri) for low-AOV. The late counts are not comparable in absolute numbers because of mix; compare on percentage and on cost-per-late-shipment.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is APC late count rising on a service that has held up for months?**
+Three usual reasons, in order of likelihood. (1) **Volume mix shift.** A new product launch or wholesale account has pushed B2B replenishment volume to a depot that wasn't sized for it. Check `apc_depot_otd` and `apc_shipments_by_destination`. (2) **Booking-cutoff slippage.** Orders dispatched too late in the afternoon miss APC's last collection. Check whether dispatch-cutoff time has crept later in the day (warehouse floor problem, not APC). (3) **APC network event.** Most common in late autumn (industrial action risk, Q4 volume saturation, weather). APC publishes service alerts in the customer portal; check there before opening an account-team ticket.
+
+**Can I claim a refund for every late shipment in this count?**
+**No, only on guaranteed services.** APC offers money-back-on-late on its time-definite premium tiers (NextDay-9am, NextDay-10:30, NextDay-12) where the failure was APC's responsibility. You cannot claim on (a) NextDay anytime (no time guarantee), (b) Pallet services (different SLA structure), (c) failures caused by recipient absence, refusal, wrong address, or access issues, (d) declared force-majeure events. Filing window is typically 14 days from the failed POD; check your contract for exact terms.
+
+**Why does APC's portal show a different late count than this card?**
+Most often: APC's portal is silently excluding "customer fault" failures from the headline late number. Vortex IQ counts every overrun. Reconcile by toggling APC's portal filter to *include all failure causes*. The remaining gap is usually time-zone boundary or in-transit treatment, both detailed in the reconcile section above.
+
+**Should I switch my late shipments to a cheaper carrier?**
+Almost never. The reason a brand pays APC's premium is the time-definite promise; the customer expects "by 12pm tomorrow" because the merchant promised it. Switching to a cheaper carrier with no time guarantee solves the carrier problem by abandoning the customer promise, which kills repeat-rate. The right action is usually (a) file the refunds you are owed, (b) push APC's account team for depot fixes, and (c) re-look at the 5 to 10 percent of shipments that don't actually need premium service.
+
+**My late count is small in absolute terms, do I still need to act?**
+For premium UK express, yes. The cohort that buys high-AOV products at premium delivery promise has the highest expectation and the lowest tolerance. A single late £200 watch order with a "by 12pm" promise produces more cancellation, refund, and review-site damage than ten late £20 t-shirt orders on Royal Mail Tracked. Treat each late premium parcel as a margin-loss event, not a logistics statistic.
+
+**How do I split late shipments by B2B vs B2C?**
+APC's API does not expose a B2B flag directly, but the booking-account or consignor-reference can carry one. Vortex IQ doesn't auto-split today. Pragmatic proxies: filter `apc_shipments_by_service` (NextDay-9am and Pallet are heavily B2B; NextDay anytime is heavily B2C), or filter by destination postcode pattern (commercial vs residential). The roadmap includes a B2B/B2C tag input on the manifest.
+
+**APC missed the cutoff but the customer didn't complain, do I still record it?**
+Yes. The point of this card is to surface drift before customers notice. Most "missed by 5 minutes" 9am parcels never produce a complaint, but the cumulative pattern across a week predicts the customer-service ticket spike at 7 to 14 days lag. Treat the card as an early warning, not a complaint count.
+
+**How do I plan for Q4 / Black Friday peak on APC?**
+Three actions. (1) **Pre-book volume capacity** with APC's account team in September for November and December (premium UK express books capacity tighter than Royal Mail). (2) **Pull dispatch-cutoff forward** by 60 to 90 minutes during peak weeks; APC's depot saturation pushes routing decisions back, and the parcel that misses 16:00 collection becomes day-2. (3) **Soften the customer promise on the PDP** for peak weeks (move "by 12pm" to "next business day") so the late count, when it inevitably rises 3 to 8 percentage points, doesn't translate one-for-one into broken promises.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Late Shipments* is one of hundreds of KPI pulses Vortex IQ tracks across APC Overnight and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

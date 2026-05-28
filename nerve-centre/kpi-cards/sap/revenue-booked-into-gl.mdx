@@ -1,0 +1,176 @@
+---
+title: "Revenue Booked into GL, SAP"
+sidebarTitle: "Revenue Booked into GL"
+description: "Headline GL-booked revenue from S/4HANA Cloud. The single number the Finance Controller checks at 9am Monday. How to read it, why it matters, and how to ac..."
+---
+
+**Card class:** Hero  •  **Category:** Ecommerce Platform
+
+> Headline GL-booked revenue from S/4HANA Cloud. The single number the Finance Controller checks at 9am Monday.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Revenue formally booked into the S/4HANA Cloud General Ledger across the period. The arithmetic sum of revenue-account journal lines posted from Billing Documents (VBRK / VBRP), credit memos, and revenue-recognition postings against the selected Company Codes. This is the figure that flows through the Finance (FI) module into the P&L, survives ASC 606 / IFRS 15 audit, and is what the bank lender pulls when refinancing.
+
+| | |
+| --- | --- |
+| **What it counts** | `SUM(BSEG.WRBTR)` filtered to revenue-class GL accounts (typically the 4xxxxx range in the standard SAP chart of accounts, or the customer-defined revenue range in S/4 Universal Journal `ACDOCA`), with `BLART IN ('RV', 'DR', 'RE')` (billing documents, customer invoices, vendor invoices that hit revenue contra). The card sums the credit side of revenue postings, with reversals and credit memos netting through. This is the figure SAP Group Reporting consolidates and the figure the statutory auditor signs against. |
+| **Tax treatment** | **Net of tax.** SAP posts output VAT, GST, and US sales tax to dedicated tax payable accounts (configured per Tax Code in transaction OB40, typical SAP standard mapping is to GL accounts in the 175xxx / 176xxx range). The card sums revenue accounts only, so the figure is exclusive of tax across every Company Code regardless of jurisdiction or local tax engine (SAP S/4HANA Cloud's Document and Reporting Compliance handles country-specific tax). |
+| **Shipping** | **Configurable per pricing procedure.** If your SD pricing procedure books freight to a revenue account (condition type ZFR1 or KF00 mapped to a revenue GL via VKOA), it counts. If freight is booked to a freight-cost contra-account, it does not. Most enterprise SAP setups split freight to either revenue or a separate freight-recovery account; check your VKOA configuration. |
+| **Discounts** | Already deducted at the line level. Pricing-procedure discount conditions (K005, K007, RA00) reduce the net price before posting, so revenue is booked net of customer-specific and order-specific discounts. |
+| **Credit Memos** | **Deducted.** A Credit Memo (Billing Document type G2) posts a debit against revenue, so a returned $1,000 invoice nets the line down to $0 in the same period (or in the period the Credit Memo posts, whichever is later). The full Returns process (RE order type) flows through here. This is the key difference vs the commerce-platform Total Revenue headline, which is gross. |
+| **Cancelled / voided orders** | Excluded by definition. A reversed Billing Document (transaction VF11) creates an offsetting reversal posting; net GL impact is zero. Cancelled Sales Documents (VA02 with rejection reason) never become Billing Documents and so never post revenue at all. |
+| **Currency** | **Multi-Company-Code consolidation: rolled up in Group Currency (typically USD or EUR depending on the Group Reporting configuration).** S/4HANA Cloud's Universal Journal stores transaction currency, Company Code currency, and Group Currency on every line (`ACDOCA.WSL`, `HSL`, `KSL`), so the card translates without an extra revaluation step. Single-Company-Code accounts: Company Code currency natively, no translation. |
+| **Company Code scope** | Card respects the selected Company Code filter on the dashboard. By default rolls up every Company Code visible to the connected SAP business user / API role. Group-level eliminations on intercompany revenue are applied if the user picks the consolidated Group view; SAP Group Reporting (formerly SAP Financial Consolidation) handles the elimination logic. |
+| **Revenue recognition (ASC 606 / IFRS 15)** | If your tenant uses SAP Revenue Accounting and Reporting (RAR) or the newer Event-Based Revenue Recognition in S/4HANA Cloud, deferred revenue is excluded from this card; only recognised revenue counts. RAR contracts post recognised amounts to the GL via dedicated revenue-recognition runs, not at billing. |
+| **Time window** | `30D vsP` (default 30D vs the prior 30D) |
+| **Alert trigger** | `drop >15% vsP`, driven by `sentiment_key: revenue_trend` |
+| **Roles** | owner, finance, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your SAP data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK enterprise B2B distributor running SAP S/4HANA Cloud Public Edition with three Company Codes: 1000 UK Distribution Ltd (parent, GBP), 2000 US Distribution Inc (USD), and 3000 EU Distribution BV (EUR). Group reporting currency is GBP. The 30-day window covers 04 Apr 26 to 03 May 26.
+
+| Company Code | Local revenue | FX rate (group rate type M, period avg) | GBP equivalent |
+| --- | --- | --- | --- |
+| 1000 UK Distribution Ltd | £4,820,000 | 1.0000 | £4,820,000 |
+| 2000 US Distribution Inc | $3,140,000 | 0.7820 | £2,455,480 |
+| 3000 EU Distribution BV | €1,960,000 | 0.8540 | £1,673,840 |
+| Less: intercompany elimination (CC 1000 to CC 2000 wholesale) | (£284,000) | n/a | (£284,000) |
+| **Revenue Booked into GL (this card)** | | | **£8,665,320** |
+
+Five things to notice:
+
+1. **Intercompany elimination removed £284,000.** UK Distribution Ltd shipped wholesale stock to US Distribution Inc and posted an inter-company billing document (sales-org 1000 to ship-to party 2000-CUST-100). This is real revenue inside CC 1000's ledger but it nets to zero at the Group level (CC 2000 records it as inventory cost, the inter-co revenue and inter-co COGS eliminate). The card respects SAP Group Reporting's elimination convention as long as the user is viewing the Group consolidation; if they pivot to CC 1000 alone, the £284,000 reappears.
+2. **The GBP equivalent uses the rate type M (period-average) configured in the Group Reporting rate table (TCURR).** S/4HANA Cloud lets you store multiple FX rate types (M for monthly average, P for plan, B for buying, S for selling) and Group Reporting uses M by convention. If Finance flips between rate types in the dashboard filter, the card moves slightly even though the underlying Universal Journal lines did not.
+3. **Commerce platform Total Revenue for the same window was £9,420,000 across SAP Commerce Cloud B2B, a Shopify Plus DTC instance, and an Adobe Commerce wholesale portal.** The £755K gap is the killer finding. A breakdown lives on the [Revenue Gap vs Commerce](/nerve-centre/kpi-cards/sap/revenue-gap-vs-commerce) card and the [cross-connector card](/nerve-centre/kpi-cards/sap/revenue-gap-detailed-breakdown), but at a high level it splits as: £420K Sales Documents shipped but not yet billed (delivery created, billing due list pending), £165K credit memos and returns that hit GL but not the commerce headline, £108K unmapped marketplace orders not yet flowed through to S/4, £62K timing on the period boundary.
+4. **Last period was £8,910,000.** This period is down 2.7% vsP, well below the `drop >15% vsP` alert threshold. The Nerve Centre stays quiet, but the trendline still appears on the card.
+5. **Event-Based Revenue Recognition impact.** The merchant sells annual maintenance contracts on £640K of revenue this period. Under S/4HANA's Event-Based Revenue Recognition (EBRR), these contracts post a deferred-revenue balance at billing and recognise straight-line over 12 months. Only £53K hits this card; the remaining £587K sits in deferred-revenue balance-sheet account (typically 213xxx). Pre-EBRR (legacy ECC-style Result Analysis), the figure would be £587K higher and front-loaded, which IFRS 15 / ASC 606 auditors flag as a misstatement. SAP S/4HANA Cloud customers who migrated from ECC frequently see this number step-change down at go-live as deferred revenue moves to the balance sheet, which is policy-correct, not revenue loss.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+Revenue Booked into GL is the canonical revenue figure on S/4HANA Cloud but it lags real economic activity by the order-to-cash delay. Pair it with these to triangulate.
+
+| Card | Why pair it with Revenue Booked into GL |
+| --- | --- |
+| [Revenue Gap vs Commerce](/nerve-centre/kpi-cards/sap/revenue-gap-vs-commerce) | The killer finding for any commerce business running S/4HANA Cloud. Commerce Total Revenue minus this card, broken down by reason. Tells you whether the gap is timing (delivery-not-yet-billed), mapping (commerce customer not in business partner master), or accounting policy (EBRR deferred). |
+| [Invoiced Revenue](/nerve-centre/kpi-cards/sap/invoiced-revenue) | The Billing-Document-only slice of this card. Excludes revenue-recognition postings and direct journal entries. Useful when AR-driven analysis matters more than P&L roll-up. |
+| [Cash Collected](/nerve-centre/kpi-cards/sap/cash-collected) | Tells you what you actually banked, vs what you booked. The spread between this card and Cash Collected is your DSO problem on the FI-AR side. |
+| [Revenue by Company Code](/nerve-centre/sap/sap_revenue_by_company_code) | The same number sliced by Company Code. Essential when one Company Code is masking trends in another, especially during multi-jurisdiction quarter-end reviews. |
+| [Revenue by Segment](/nerve-centre/sap/sap_revenue_by_segment) | SAP's Profit Centre / Segment dimension typically splits revenue by business unit, brand, or region. The most actionable cut on consolidated revenue inside the Universal Journal. |
+| [Revenue by Currency](/nerve-centre/kpi-cards/sap/sap-revenue-by-currency) | Multi-Company-Code shops: shows currency mix and FX exposure on the booked total. |
+| [Open Sales Document Value](/nerve-centre/kpi-cards/sap/sap-open-so-value) | Forward-looking complement. Today's GL revenue is yesterday's open Sales Documents that converted; today's open Sales Documents are tomorrow's GL revenue. |
+| [shopify.total_revenue](/nerve-centre/kpi-cards/shopify/total-revenue) / [bigcommerce.total_revenue](/nerve-centre/kpi-cards/bigcommerce/total-revenue) / [adobe_commerce.total_revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | The commerce-platform headline for the same window. The gap between commerce gross and S/4HANA Cloud GL is the working-capital telemetry every Finance Manager wants. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in S/4HANA Cloud:**
+
+The closest native equivalents inside the SAP Fiori launchpad are:
+
+> **Manage Journal Entries** Fiori app (`F0717`) filtered to revenue accounts and the period
+> **Trial Balance** Fiori app (`F0996`) for the GL roll-up
+> **Display Financial Statement** Fiori app (`F0708`) for the P&L view
+> **Embedded Analytics**: query CDS view `I_GLAccountLineItem` filtered to revenue account hierarchy node
+
+Direct link template: `https://my{tenant}.s4hana.cloud.sap/sap/bc/ui2/flp#TrialBalance-display`
+
+The Display Financial Statement summary line "Revenue" should match this card to within a couple of pounds when you select the same period and the same Company Code(s). For an audit-grade match, run **Manage Journal Entries** filtered to GL Account hierarchy node "Revenue" (typically range 4000xx-4999xx) and Posting Date in the period, then sum `WRBTR` (transaction currency amount) translated to Group Currency. SAP Analytics Cloud's standard Finance content pack also exposes this as "Booked Revenue, Group Currency" in the Income Statement story.
+
+Common mistakes when comparing against SAP's own reports:
+
+- **Sales Information System (SIS) reports** (legacy transaction MCSI / MCTA) sum invoiced sales by sales-document hierarchy. They typically agree with this card but use the SD pricing-procedure net value, not the FI revenue posting; if your VKOA has any non-revenue mappings (e.g. revenue split into multiple GL accounts by sales organisation), SIS sums everything that flows through SD while this card sums only what landed in revenue accounts.
+- **Sales Document Register** (transaction VA05) lists Sales Documents, not booked revenue. Sales Documents in `Awaiting goods issue` or `Pending billing` state contribute to that report but are not yet GL revenue. Expect VA05 totals > this card.
+- **Customer Aging** (transaction FBL5N or Fiori app `F0708`) is AR-based, not revenue-based. It shows outstanding open items, not booked revenue.
+
+**Why our number may legitimately differ from SAP's reports:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Company Code currency vs Group Currency** | Either | If you compare the card (Group Currency) against a Trial Balance run at a single Company Code level (Company Code currency), the FX translation differs. Always run SAP reports at the same Company Code scope as the dashboard filter, or pivot the Trial Balance to Group Currency in the parameter selection. |
+| **FX rate type** | Small | S/4HANA Cloud lets Finance choose rate type M (period average), B (buying), S (selling), or P (plan). The card uses rate type M by default to align with Group Reporting; if your Income Statement is run at rate type B for a specific period-end revaluation, the values differ at the second-decimal level. |
+| **Credit Memo timing** | Either | A return invoice issued in Period 1 with a Credit Memo posting in Period 2 splits across two periods. SAP's Trial Balance applies the same convention, but a saved query filtered to a single Billing Document type misses one side of the pair. |
+| **Group Reporting eliminations** | Card lower | When the user filters to Group consolidation, eliminations apply via SAP Group Reporting tasks. Per-Company-Code Trial Balances do not eliminate inter-co lines, so the per-CC sum exceeds the consolidated sum. |
+| **Event-Based Revenue Recognition (EBRR) / RAR** | Card lower | Deferred revenue is excluded from this card. The unrecognised balance lives on the Balance Sheet under deferred revenue accounts, not Income Statement. |
+| **Non-revenue accounts wrongly mapped** | Either | If your VKOA configuration maps SD condition types to non-revenue accounts (e.g. freight booked to a freight-recovery account rather than revenue), they are missed. The card uses the GL account hierarchy node "Revenue" as configured in the chart of accounts; merchants with custom hierarchies should confirm the node range in the field map. |
+
+**Cross-connector reconciliation, the killer finding:**
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| [shopify.total_revenue](/nerve-centre/kpi-cards/shopify/total-revenue) | Commerce gross > S/4HANA Cloud GL booked | Sales Documents waiting for billing-due-list run, credit memos and returns (subtract from GL but not commerce headline), unmapped marketplace orders, period-boundary timing. |
+| [bigcommerce.total_revenue](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | Commerce gross > S/4HANA Cloud GL booked | As Shopify above. B2B BigCommerce orders running on Net-30 terms are particularly prone to long delivery-to-billing lag because billing-due-list runs are typically scheduled weekly or fortnightly. |
+| [adobe_commerce.total_revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | Commerce gross > S/4HANA Cloud GL booked | As above. Adobe Commerce B2B installations often have multi-step approval before Sales Documents flow into S/4. |
+| [stripe.stripe_total_revenue](/nerve-centre/kpi-cards/stripe/total-charge-volume) | Stripe ≤ S/4HANA Cloud GL | Stripe sees only card / wallet payments. Cash receipts via wire, ACH, SEPA Direct Debit, or B2B Net-30 invoices are missing from Stripe but in S/4HANA. |
+| [paypal.pp_total_volume](/nerve-centre/paypal/pp_total_volume) | PayPal ≤ S/4HANA Cloud GL | PayPal-only subset. |
+
+The detailed gap-breakdown lives on the [revenue-gap cross-connector card](/nerve-centre/kpi-cards/sap/revenue-gap-detailed-breakdown). The single most-asked finding from any SAP-running enterprise commerce shop using Vortex IQ is "where did the £755K go?", and that card answers it Sales Document by Sales Document.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is the GL booked figure lower than my SAP Commerce Cloud / Shopify / BigCommerce headline?**
+Three structural reasons, in order of typical contribution:
+
+1. **Delivery-to-billing lag.** Commerce orders post to Sales Documents in S/4HANA Cloud (transaction VA01 or auto-creation via API), then move through `Awaiting goods issue → Goods issue posted → Pending billing` before becoming a Billing Document (transaction VF01 or scheduled billing-due-list run VF04) that hits the GL. The lag is usually 1 to 3 days for DTC and 7 to 30 days for B2B Net-30 terms. Anything in the pre-billing pipeline is commerce revenue but not yet GL revenue.
+2. **Credit Memos.** A return on a $1,000 order posts a debit against revenue but the commerce platform usually shows it on the original gross headline. Over a year a 10% return rate becomes a 10% structural gap.
+3. **Cancellations.** A cancelled order (rejection reason on Sales Document) may still show in the commerce platform's lifetime totals but is rejected in SAP, so the GL net is zero.
+
+The full reconciliation lives on the [Revenue Gap vs Commerce](/nerve-centre/kpi-cards/sap/revenue-gap-vs-commerce) card.
+
+**Why is S/4HANA Cloud "the source of truth" for revenue if my commerce platform shows higher numbers?**
+S/4HANA Cloud is where the audit happens, where local tax authorities pull (UK HMRC Making Tax Digital, German tax office DSFinV-K, Indian e-invoicing IRP), and where the bank lender looks. The commerce platform is where the customer paid, but customer-paid is not the same as recognised revenue under accounting standards (ASC 606 in the US, IFRS 15 in the UK / EU). For boardroom and bank conversations, this card is what counts. For acquisition and conversion analysis, commerce headlines are what counts. Both are right, they just answer different questions.
+
+**Does this card include Cash Sales / DTC prepaid orders that bypass the Billing Document workflow?**
+Yes. SAP's BV (Cash Sale) order type and the equivalent retail POS integration book revenue at goods issue rather than via a separate Billing Document, but the FI posting still flows through the Universal Journal `ACDOCA` and the card includes it. So retail POS, prepaid web orders, and storefront-cash-and-carry transactions are all counted.
+
+**SAP S/4HANA Cloud vs SAP S/4HANA on-premise vs SAP ECC, does the card behave differently?**
+The card targets S/4HANA Cloud (Public Edition and Private Edition). The OData APIs and Universal Journal model are largely identical across S/4HANA Public, Private, and on-premise. If you are still on legacy ECC, the equivalent figure comes from BSEG / BKPF + the Special Ledger module (FI-SL); the card definition is portable but the connector path differs. Vortex IQ's connector targets the modern S/4HANA Cloud OData endpoints; ECC integrations are a roadmap item.
+
+**SAP Group Reporting consolidation, does the card respect it?**
+Yes. If your tenant has SAP Group Reporting (S/4HANA's built-in consolidation, which replaced the legacy SAP Financial Consolidation BPC product), eliminations on intercompany revenue, intercompany cost, and unrealised intercompany margin are applied at the Group Currency layer. The card supports both single-Company-Code views and Group consolidated views. Pivoting between them is a dashboard filter, not a re-query.
+
+**Multi-Company-Code with multi-currency, what does Group Currency mean here?**
+SAP S/4HANA Cloud's Universal Journal stores up to 10 currency views on every line, but the standard three are Transaction Currency (the customer's), Company Code Currency (the legal entity's local books), and Group Currency (the parent's reporting currency). The card defaults to Group Currency for consolidated views and Company Code Currency for single-CC views. FX revaluation runs (Fiori app `Run Foreign Currency Valuation`) update FX-translated balances on a period-close cadence; the card honours the latest revaluation snapshot.
+
+**OData API freshness, how stale is the card?**
+SAP S/4HANA Cloud OData APIs (`API_OPLACCTGDOCITEMCUBE_SRV` for journal-line-level revenue, `API_BILLING_DOCUMENT_SRV` for billing documents) are real-time queries against the live system; there is no analytical lag. Vortex IQ's connector polls every 15 minutes by default and caches at the period-aggregate level. For real-time intraday checks against a live close, the native SAP Embedded Analytics (CDS view) is always live; this card is at most 15 minutes behind.
+
+**My tenant uses SAP Revenue Accounting and Reporting (RAR), what does the card show?**
+Recognised revenue only. RAR contracts (multi-period contracts, subscription billings, software/maintenance bundles) sit in deferred-revenue balance-sheet accounts until RAR's recognition run releases the period's earned portion to revenue. Pre-RAR (Result Analysis or no rev-rec engine), the full Billing Document posts to revenue at billing, no deferral logic.
+
+**How does S/4HANA Cloud handle multi-currency vs NetSuite and Oracle ERP Cloud?**
+S/4HANA Cloud's Universal Journal stores every posting in up to 10 parallel currencies natively, with FX translation done by Group Reporting at consolidated level. NetSuite OneWorld translates at three configurable cadences via reporting-time FX. Oracle ERP Cloud's General Ledger handles multi-currency through Reporting Currencies and multi-rep-set ledger sets. SAP's depth (10 currencies, multiple FX rate types, real-time Group Currency) is overkill for most mid-market commerce but essential for genuinely global enterprises with treasury hedging, intra-group financing, and 5+ jurisdictions. Where SAP wins is on deeper local-tax compliance, manufacturing-cost integration, and multi-jurisdiction VAT/GST/sales tax handling. Where NetSuite/Oracle win is implementation cost and time-to-value for commerce-led mid-market.
+
+**T-codes vs Vortex IQ, do I still need to use VA03, VF03, FB03?**
+Yes for transaction-level investigation. SAP T-codes (VA03 for Sales Document display, VF03 for Billing Document display, FB03 for Journal Entry display, FBL5N for Customer Line Items) are the audit drill-down. Vortex IQ surfaces the headline + the gap; when Finance wants the per-document evidence, they pivot back into the Fiori launchpad or SAP GUI and use the T-code or Fiori app for that specific document. The card includes deep-link patterns to the Manage Journal Entries and Manage Sales Documents Fiori apps for one-click pivot.
+
+**Single-Company-Code vs multi-Company-Code on the card?**
+Same logic, simpler scope. Single-Company-Code skips the Group Reporting elimination and the Group Currency translation; the card simply shows the Company Code's revenue in Company Code Currency. Most fields are identical.
+
+**Refund vs Credit Memo, are they treated identically?**
+Both reduce revenue. In SAP terminology, a Credit Memo (Billing Document type G2) is the formal reduction document; a Refund is the cash side of a return. Returns flow: Returns Sales Document (RE) -> Credit Memo (G2) -> Returns Goods Receipt + Cash refund posting. The card sees the G2 Billing Document; the cash side is captured by the [Cash Collected](/nerve-centre/kpi-cards/sap/cash-collected) card.
+
+**B2B credit-hold mechanics, does this card show held revenue?**
+A Sales Document on credit hold (status block from SAP's credit management module FSCM-CR) is not yet a Billing Document, so it is not in this card. Once Finance releases the hold (transaction VKM3 or Fiori app `Manage Credit Cases`) and the document bills, it lands here. The lag is the killer working-capital signal; pair this card with [Sales Documents Blocked on Inventory or Credit](/nerve-centre/kpi-cards/sap/sales-documents-blocked-on-inventory-or-credit) to see what is stuck.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Revenue Booked into GL* is one of hundreds of KPI pulses Vortex IQ tracks across SAP and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

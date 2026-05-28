@@ -1,0 +1,164 @@
+---
+title: "Fulfillment Status, Adobe Commerce"
+sidebarTitle: "Fulfillment Status"
+description: "Fulfillment Status for Adobe Commerce stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Ecommerce Platform
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Distribution of orders by fulfillment state (new, processing, complete, closed, holded, etc.). The operational dashboard for warehouse managers and ops leads. Adobe Commerce's `state` machine is the canonical lifecycle; this card decomposes it. The B2B-mixed nature of typical Adobe Commerce stores means `pending_payment` is often a large bucket (net-30 PO pipeline) rather than a problem signal.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(orders) GROUP BY state` over the trailing 30 days, with `SUM(grand_total)` per state. Returns the state distribution. |
+| **API field** | `state` from `GET /rest/V1/orders`. |
+| **VAT / tax treatment** | n/a for the count; revenue uses `grand_total` (tax-inclusive on B2C). |
+| **Shipping inclusion** | Included via `grand_total`. |
+| **Discounts** | Deducted via `grand_total`. |
+| **Credit Memo refund treatment** | Refunded orders typically sit in `closed`; the card reflects the current state. |
+| **`state` machine inclusion** | All 8 canonical states. |
+| **`pending_payment` quirk** | Surfaced as its own bucket. Important to distinguish "healthy B2B net-30 pipeline" from "broken gateway callback" via cross-checks (does the count and value of `pending_payment` move in step with B2B order growth, or does it spike independently?). |
+| **Multi-currency `grand_total` vs `base_grand_total`** | Revenue uses `base_grand_total`. |
+| **Store View scope (`store_id`)** | All Store Views; per-Store-View overlays useful when warehouse ownership is split by region. |
+| **Time window** | `30D` |
+| **Alert trigger** | None by default. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+```
+GROUP BY state
+  WHERE date BETWEEN [period_start, period_end]
+```
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A B2B-heavy industrial supply distributor on Adobe Commerce 2.4.6. 30-day window ending Monday 4 May 26.
+
+**State distribution:**
+
+| State | Count | Revenue | % of revenue |
+| --- | --- | --- | --- |
+| new | 142 | $42,000 | 4.2% |
+| pending_payment | 240 | $310,000 | 31.0% |
+| processing | 412 | $186,000 | 18.6% |
+| complete | 1,820 | $282,000 | 28.2% |
+| closed | 246 | $42,000 | 4.2% |
+| canceled | 88 | $12,000 | 1.2% |
+| holded | 32 | $44,000 | 4.4% |
+| payment_review | 24 | $82,000 | 8.2% |
+| **Total** | **3,004** | **$1,000,000** | **100%** |
+
+What this is telling operations:
+
+1. **31% of revenue ($310k) sits in `pending_payment`.** On a B2B-heavy store this is normal: net-30 POs and B2B-sales-approved orders awaiting AP processing. Cross-check the running average; if it's stable at 28-32%, healthy.
+2. **18.6% in `processing`** is the warehouse pipeline (paid, not yet shipped).
+3. **8.2% in `payment_review`** ($82k of revenue value) is fraud-review queue. This is unusually high; typical baseline is 1-3%. Investigate: is the fraud-rule sensitivity tuned too tightly?
+4. **4.4% in `holded`** is operations-paused orders (credit checks, custom-make awaiting approval).
+5. **4.2% in `closed`** at $42k is post-RMA fully-refunded orders or specially-handled small orders.
+6. **1.2% in `canceled`** is in the healthy range.
+7. **The `payment_review` flag is the most actionable surprise.** A fraud rule pause-rate of 8% means the rule is rejecting ~7% more orders than benchmark. Either the rule is over-sensitive (reduce sensitivity to recover legitimate orders) or the merchant is genuinely seeing a fraud campaign (validate via per-IP and per-card-BIN review).
+8. **Cross-checking [Cancellation Rate](/nerve-centre/kpi-cards/adobe-commerce/cancellation-rate)**: 1.2% is fine. If the `payment_review` fraction was being auto-cancelled, cancellation rate would be 9%+. The merchant currently leaves them in review (manual ops review), which is conservative but adds operational load.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Fulfillment Breakdown |
+| --- | --- |
+| [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) | The same data, different visualisation. |
+| [Financial Status](/nerve-centre/kpi-cards/adobe-commerce/financial-status-breakdown) | The custom-status companion. |
+| [Unfulfilled Orders](/nerve-centre/kpi-cards/adobe-commerce/unfulfilled-orders) | The processing-and-pending pipeline subset. |
+| [Fulfilment Rate](/nerve-centre/kpi-cards/adobe-commerce/fulfillment-rate) | The trailing percentage view. |
+| [Fulfilment Over Time](/nerve-centre/kpi-cards/adobe-commerce/fulfillment-rate-over-time) | The trend view. |
+| [Cancellation Rate](/nerve-centre/kpi-cards/adobe-commerce/cancellation-rate) | Cancellation-state slice. |
+| [B2B Revenue Share](/nerve-centre/kpi-cards/adobe-commerce/b2b-revenue-share) | B2B mix drives `pending_payment` size. |
+| [`shopify.fulfillment_breakdown`](/nerve-centre/kpi-cards/shopify/fulfillment-status) | Cross-platform peer (Shopify uses fulfilled/partial/unfulfilled). |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Adobe Commerce Admin:**
+
+> **Sales > Orders** with the Status filter shows per-status counts; the State filter (Adobe Commerce 2.4.6+) shows canonical-state counts.
+
+> **Reports > Sales > Orders** with state grouping (newer Adobe versions).
+
+> **Stores > Order Status** to see the configured status-to-state mapping.
+
+For specific state subsets:
+
+> **Sales > Orders** with `state = pending_payment` filter for the AP/gateway pipeline.
+
+> **Sales > Orders** with `state = holded` for the credit-check queue.
+
+> **Sales > Orders** with `state = payment_review` for the fraud review queue.
+
+**Why our number may legitimately differ from Admin:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **State vs Status**. Card uses `state`; Admin grid filter is by `status`. Custom statuses mapping to the same state aggregate here. | Card buckets fewer than admin custom-status filter |
+| **Time-zone**. Admin in Store View timezone; card UTC. | Boundary effects |
+| **Currency**. Card uses `base_grand_total`. | Material on multi-currency |
+| **Sync lag**. Card uses OpenSearch sync (5-15 min); Admin live. | Negligible |
+
+**Cross-connector reconciliation (when these connectors are connected for this merchant):**
+
+| Pair | Expected relationship | What divergence tells you |
+| --- | --- | --- |
+| 3PL queue depth | `processing` count ≈ 3PL fulfilment queue | If 3PL queue is empty but `processing` is high, the integration is failing. |
+| [`stripe.stripe_charges`](/nerve-centre/stripe/stripe_charges) | Stripe-paid orders should sit in `processing` or later | If Stripe captured but Adobe shows `pending_payment`, webhook callback failure. |
+
+---
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+- [`shopify.fulfillment_breakdown`](/nerve-centre/kpi-cards/shopify/fulfillment-status)
+- [`bigcommerce.fulfillment_breakdown`](/nerve-centre/kpi-cards/bigcommerce/fulfillment-status)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is `pending_payment` so big on my store?**
+On B2B-heavy stores, net-30 POs sit in `pending_payment` until AP processes the invoice. 20-35% pending is typical. On consumer-only stores, `pending_payment` should be transient (gateway pre-authorisation lasting seconds-to-minutes); a high pending count there indicates webhook callback failures or net-30/wire-transfer routes the merchant should investigate.
+
+**Adobe Commerce vs Magento Open Source: difference?**
+None at the calculation. Both editions use the same 8-value `state` enum. Adobe Commerce paid edition's B2B Companies module adds approval-flow lifecycle on top, but the `state` field itself is identical.
+
+**What's the difference between this and Order State Breakdown?**
+Same underlying data. This card surfaces it primarily as count and revenue distribution; [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) often adds time-in-state analysis. Use the one that matches your question.
+
+**Why is `payment_review` separate from `processing`?**
+`payment_review` is Adobe's fraud-review state; orders sit there awaiting manual review or fraud-rule decision. `processing` is paid-and-greenlit. The distinction matters operationally: warehouse picks `processing` orders; fraud-team handles `payment_review`.
+
+**My multi-store, can I see per-Store-View distribution?**
+Yes, configure per-Store-View variants. Useful when one Store View has different fraud rules or B2B-routing.
+
+**Why does `closed` show meaningful revenue?**
+Closed orders include refunded orders, post-RMA orders, and orders the merchant manually closed (typically because of refund or special handling). 2-5% revenue share in `closed` is normal.
+
+**The `holded` state has $44k of revenue, is that money at risk?**
+Possibly. `holded` means operations paused the order. If the hold is for credit-check (B2B), the revenue typically converts after AP review (low risk). If for fraud or supplier-stall, the order may eventually cancel. Audit hold reasons by clicking into individual orders.
+
+**Why does this card include cancelled orders?**
+Because it's a workflow-distribution view. Other cards (Total Revenue, AOV) exclude cancellations because they're not real revenue, but the workflow card is auditing the lifecycle and cancelled orders are part of it.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Fulfillment Status* is one of hundreds of KPI pulses Vortex IQ tracks across Adobe Commerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

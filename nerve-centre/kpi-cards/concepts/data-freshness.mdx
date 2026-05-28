@@ -1,0 +1,187 @@
+---
+title: "Data Freshness, Vortex IQ Documentation"
+description: "Every Nerve Centre card declares where its data comes from and how fresh it is. The vocabulary: Native, API-derived, Derived, Real-time, Backdated, Hist, Cost. Refresh cadence and trade-offs."
+---
+
+A KPI is only as trustworthy as the data behind it. The [Nerve Centre](/nerve-centre/overview) is explicit about where every card's data comes from, how often it refreshes, and what known lags or quota constraints apply. The vocabulary is short and every card carries one of the terms in its `data_type` field. This page documents the seven types, the refresh cadence implied by each, and how the connector graph acts as the data substrate for everything Vortex IQ AI OS does.
+
+## Why this matters
+
+Two scenarios make data freshness a load-bearing concern:
+
+1. **The merchant is acting on the number.** A founder making a discount-day decision wants to know the data they are looking at is the same data the operations team has. If the dashboard says revenue is down 18 percent and they cancel a campaign on that basis, then the next morning learn the figure was a 24-hour-stale cache, the trust is broken.
+2. **The number disagrees with another tool.** Stripe Dashboard and the Nerve Centre's Stripe card may differ for legitimate reasons (timezone, in-flight refunds, refund window cutoffs) or for stale-data reasons. Distinguishing the two requires explicit metadata about how fresh the Vortex IQ value is.
+
+The `data_type` field on every card is the contract: this card's data comes from this source, refreshes on this cadence, with these known limitations.
+
+## The seven types
+
+| Type | What it means | Typical refresh | Example |
+| --- | --- | --- | --- |
+| `Native` | Direct read from the vendor's API. The value is what the vendor reports. | 5 to 15 minutes via poller, or webhook-driven where supported. | Shopify Total Revenue, Stripe Authorisation Rate, Klaviyo Active Subscribers. |
+| `API-derived` | Computed by Vortex IQ from one or more vendor API responses. The vendor does not publish this metric directly. | Same cadence as the underlying Native data. | Shopify AOV (computed from Total Revenue / Order Count), Google Ads Cost-per-Click (Spend / Clicks). |
+| `Derived` | Computed across multiple connectors. Cross-channel cards live here. | Refreshes on the slowest input's cadence. | *Stockout with Active Spend* (joins Google Ads + Shopify), *Refund Cliff vs Decline Spike*. |
+| `Real-time` | Recomputed on every render. There is no cached value; the connector is hit live. | On every dashboard render, throttled to a minimum interval (default 30s). | Live order count, active checkout sessions, open incidents. |
+| `Backdated` | Requires a historical seed at first load and is then maintained incrementally. The first day after connection shows partial coverage. | Daily batch after seeding. | Cohort retention curves, customer lifetime value, longitudinal churn. |
+| `Hist` | Vortex IQ maintains a long-running time series for this metric. Older points stay queryable for trend analysis. | Daily snapshot persisted to the historical store. | Revenue trend, AOV trend, refund rate trend. |
+| `Cost` | The metric consumes a meaningful slice of vendor API quota. Refresh is rate-limited to protect the quota budget. | Hourly or longer; surge-limited during high-traffic windows. | Some Google Analytics 4 deep aggregations, some Datadog log queries. |
+
+A card can carry more than one type when the boundaries blur (e.g. a `Derived` card whose primary input is `Real-time` and secondary input is `Hist` is documented as `Derived (RT/Hist)` in the recipe). The card UI displays the primary type only; the docs page explains the composition.
+
+## Native
+
+The simplest case. The card runs a query against the connector's API or webhook stream and returns whatever the vendor reports. The Vortex IQ ingest layer does not transform the value; it normalises units (milliseconds vs seconds, currency string vs decimal) and writes the value into the workspace's data store.
+
+Native is the right choice when the vendor publishes the metric in the shape the merchant wants. It is the highest-fidelity option; the vendor is the source of truth and any divergence between the Nerve Centre tile and the vendor admin is a tracking-gap or timezone issue, not a calculation issue.
+
+The trade-off is that Native cards are at the mercy of the vendor's own publish cadence. Shopify reports inventory in near-real-time on most order events, but stock-level corrections from POS systems can lag by minutes. Stripe publishes successful charges within seconds; failed charges can lag a few seconds longer when fraud-screening is in flight. The card's reconciliation table calls out these known vendor-side lags.
+
+## API-derived
+
+When the vendor does not publish the metric in the shape the merchant wants, Vortex IQ computes it from the data the vendor does publish. AOV is the canonical example: Shopify does not have an "AOV" endpoint; the card divides Total Revenue by Order Count.
+
+API-derived cards inherit the freshness of their inputs. An AOV card refreshes when Total Revenue or Order Count refreshes, whichever is sooner. The card's `data_type` is `API-derived` to flag that it is computed; the cadence is implicit from the inputs.
+
+The risk with API-derived cards is computation drift: if the vendor changes the underlying field (e.g. Shopify renames `totalPrice` or starts excluding tips), the API-derived card silently changes meaning. Vortex IQ's manifest layer fixes this by versioning the source field references; a vendor change triggers a manifest update and the card's documentation page logs the change.
+
+## Derived (cross-channel)
+
+Derived is the cross-connector case. The card joins data from two or more connectors and computes a value none of them could produce alone. The `derive_from` field on the card lists the source connectors; the Nerve Centre runtime joins their data at query time.
+
+Derived cards are the slowest to refresh because they wait on the slowest input. A *Stockout with Active Spend* card depends on:
+
+- Google Ads spend stream (refreshes every 5 to 15 minutes via the Google Ads API).
+- Shopify inventory stream (refreshes on every inventory event, typically within seconds).
+
+The card refreshes when the Ads stream refreshes, because that is the slower side. The Shopify side could be more recent, but the join only completes when both sides have current data.
+
+Derived cards are also the cards Vortex Mind reaches for during cross-channel diagnostics, because the cross-connector join is what makes a finding cross-functionally credible. See [cross-channel joins](/vortex-mind/concepts/cross-channel-joins).
+
+## Real-time
+
+Real-time means the card recomputes on every render. There is no cached value; a request from the dashboard hits the connector live.
+
+Real-time is the right choice when:
+
+- The merchant is in active incident response and needs the latest possible reading.
+- The metric changes faster than any reasonable poll cadence (active sessions, in-flight orders).
+- Caching would be misleading for the use case.
+
+The trade-off is cost: every render costs a connector API call. Vortex IQ throttles real-time refreshes to a minimum interval (default 30 seconds, configurable per workspace under [Settings, Data Refresh](/platform/settings/data-refresh)) so a merchant leaving a dashboard open does not burn quota.
+
+Real-time cards are flagged in the UI with an "RT" badge near the time-window code. The merchant knows the value is current to the second.
+
+## Backdated
+
+Some metrics require historical context to compute, even for a present-day reading. Customer lifetime value cannot be computed from this morning's order data alone; it needs the customer's full history. Cohort retention cannot be computed from a single day's data; it needs the cohort's order history over the cohort lifetime.
+
+Backdated cards solve this with a one-time historical seed at connector-connect time. The seed pulls the connector's history (typically 12 to 24 months) and writes it into the workspace's historical store. After the seed, the card maintains itself incrementally on the daily batch.
+
+Implications:
+
+- **The first day after connection shows partial coverage.** A merchant who connects Shopify on a Monday morning sees backdated cards loading through the day; they fill in over the next few hours as the seed completes.
+- **The seed is API-quota-intensive.** Some vendors throttle history endpoints aggressively. The seed runs in the background with retries and progress reporting; the merchant sees a "Seeding history" badge until complete.
+- **Re-seeding is supported but rare.** A connector reconnect or a configuration change that materially affects the back-history may trigger a re-seed. Vortex IQ surfaces a confirmation banner before re-seeding to set expectation.
+
+## Hist
+
+Hist (historical) cards are ones where Vortex IQ maintains a long-running time series past the vendor's own retention. Some vendors retain only 90 days of detail; some retain only the rollup. Hist cards solve this by snapshotting the metric daily into a Vortex IQ-owned store that retains as long as the workspace retention policy allows (default forever for paid plans).
+
+Hist cards are what enable:
+
+- Year-on-year trend reading even when the vendor only kept 13 months.
+- Cohort comparisons that span multiple vendor accounts (an old Stripe account and a new one).
+- Vortex Memory's longitudinal insight surface, which reads from Hist data archived alongside report runs.
+
+Hist is most common on revenue, AOV, refund rate, ad spend, and key marketing metrics where the merchant's analysis horizon is longer than the vendor's retention.
+
+## Cost
+
+Cost cards are ones whose refresh is rate-limited because the underlying API call is expensive in vendor quota terms. Examples:
+
+- Some Google Analytics 4 cohort and dimensional queries cost more quota than simple aggregations.
+- Some Datadog log-search queries cost more than metric queries.
+- Some Stripe report endpoints have stricter rate limits than the standard API.
+
+Cost-tier cards refresh on a slower cadence (typically hourly, sometimes once per day) and are explicitly flagged so the merchant does not expect minute-level freshness. The flag is also visible in the card's tile footer ("refreshed 47 minutes ago, refresh in 13 minutes").
+
+Cost cards are the right fit for vendor APIs where the quota cost is real and the metric does not change minute-to-minute. The rate limit is a Vortex IQ throttle, not a vendor block; the merchant can manually trigger a refresh on a cost-tier card from the tile menu, but the cadence default protects the quota budget.
+
+## The connector graph as data substrate
+
+Every connector publishes a graph: a JSON-on-disk document that captures the entities, relationships, and metrics the connector exposes. A workspace running ten connectors carries ten graphs in `auth/integration_graphs/`. The graphs are the substrate for:
+
+- **Nerve Centre cards.** Each card's query reads from one or more connector graphs.
+- **Vortex Mind diagnostics.** A diagnostic walk traverses the connector graphs to gather evidence. See [how diagnostics work](/vortex-mind/concepts/how-diagnostics-work).
+- **Ask Viq answers.** The query layer Ask Viq uses reads from the same graphs.
+- **Vortex Memory archive.** Daily snapshots of the graphs persist to Vortex Memory for longitudinal queries.
+
+The graph is the merchant's data substrate, not the vendor's API. The vendor API is the source; the graph is the structured, query-friendly representation. Vortex IQ owns the graph; the vendor owns the source. A vendor outage does not freeze the graph (the graph holds the most recent successful read with a staleness flag); a vendor change does not break the graph (the manifest layer normalises).
+
+For the deeper graph schema and how diagnostics walk it see [graph emissions](/vortex-mind/concepts/graph-emissions).
+
+## Refresh cadence at a glance
+
+| `data_type` | Default refresh | Configurable? |
+| --- | --- | --- |
+| Native | 5 to 15 minutes (poller) or webhook-driven | Yes, under [Settings, Data Refresh](/platform/settings/data-refresh) |
+| API-derived | Same as inputs | Inherited |
+| Derived | Slowest input's cadence | Inherited |
+| Real-time | Every render, min 30s throttle | Yes, throttle floor configurable |
+| Backdated | Daily batch after initial seed | No (batch is fixed) |
+| Hist | Daily snapshot | No |
+| Cost | Hourly or slower | Yes, can manually trigger |
+
+## How freshness surfaces in the UI
+
+- **Tile timestamp.** Every card's tile carries a "refreshed N minutes ago" timestamp in small font. Hover for a precise time.
+- **Stale badge.** When data has not refreshed within the expected window plus a tolerance, the card carries a "stale" badge and renders the value in grey rather than its sentiment colour.
+- **Seeding badge.** Backdated cards in their initial seed phase render a "Seeding history" badge with progress percent.
+- **Cost-tier badge.** Cost-tier cards carry a small clock icon indicating the slower cadence.
+- **Refresh control.** Manual refresh from the tile's three-dot menu, where applicable.
+
+## How it relates to other modules
+
+- **[Vortex Mind](/vortex-mind/concepts/how-diagnostics-work)** uses the card's `data_type` to set its evidence weighting. A Native vendor-side metric carries higher evidence weight than an inferred or stale metric. See the evidence weights table in [severity and evidence](/vortex-mind/concepts/severity-and-evidence-model).
+- **[Ask Viq](/ask-viq)** discloses freshness in answers. "Total revenue 30D vs prior 30D, data refreshed 4 minutes ago, source Shopify Native." The disclosure is the source-of-truth model.
+- **[Actions](/actions/kanban)** carries the freshness timestamp into the Kanban card so a responder knows whether they are acting on current or stale data.
+- **[Vortex Memory](/vortex-memory)** preserves freshness metadata in the archive. A query that asks "what was revenue on 14 Mar 26" returns the value with a "data was 7 minutes stale at the time of snapshot" annotation if relevant.
+
+## FAQ
+
+**How do I know if my card is showing fresh data?**
+Hover the tile timestamp for a precise refresh time. The stale badge fires automatically if the data is past its expected window. If you want to be sure, click the three-dot menu and "Refresh now" to force a re-pull.
+
+**My Shopify card is two hours stale; is the connector broken?**
+Two hours of staleness on a Native Shopify card is unusual. Check the connector status under [Settings, Sources](/platform/settings/sources). The most common cause is an expired OAuth token; the fix is a one-click reconnect.
+
+**Why is my GA4 card 24 hours behind?**
+Some GA4 reports have an inherent vendor-side delay (Google Analytics 4 finalises data overnight). Vortex IQ's GA4 cards reflect this delay; the timestamp and the documentation page note "data is T-1 by GA4 design".
+
+**Can I make a Cost card refresh more often?**
+The slower cadence is a quota protection. You can manually trigger a refresh from the tile menu when you specifically need fresh data. Persistently lowering the cadence floor risks burning quota and is configurable but not recommended.
+
+**What happens during a vendor outage?**
+The card holds the most recent successful read and renders a "stale since hh:mm" annotation. Sentiment is suppressed (grey rather than green/red/amber) so the merchant does not act on stale data. A data-gap alert routes to the workspace admin if the outage lasts past the tolerance.
+
+**What is the difference between Backdated and Hist?**
+Backdated requires a one-time historical seed to be useful (cohort retention, customer LTV). Hist is incremental from connection; we keep snapshotting it forward. A card can be both (e.g. revenue trend is Hist from connection date, but a Backdated full-history seed lets older trend lines render).
+
+**How does Real-time interact with the Nerve Centre dashboard?**
+Real-time cards refresh on render with a 30-second throttle. The dashboard does not auto-poll; the merchant initiates the render by opening the tab or hitting the refresh control. Briefings render once at briefing time and the value is the value at that moment.
+
+**Why do some cards have a manual refresh option and others do not?**
+Manual refresh is offered when the cadence default is slow (Cost-tier cards, daily Backdated cards). Native cards refresh frequently enough that a manual control would be misleading; the tile timestamp tells the merchant the data is current.
+
+## Cross-links
+
+- Concept: [the KPI model](/nerve-centre/kpi-cards/concepts/kpi-model)
+- Concept: [time windows](/nerve-centre/kpi-cards/concepts/time-windows)
+- Concept: [alert system](/nerve-centre/kpi-cards/concepts/alert-system)
+- Concept: [multi-property and multi-account](/nerve-centre/kpi-cards/concepts/multi-property-and-multi-account)
+- Platform: [Settings, Data Refresh](/platform/settings/data-refresh)
+- Platform: [Settings, Sources](/platform/settings/sources)
+- Module: [Vortex Mind, graph emissions](/vortex-mind/concepts/graph-emissions)
+- Module: [Vortex Mind, severity and evidence](/vortex-mind/concepts/severity-and-evidence-model)
+- Module: [Ask Viq](/ask-viq)
+- Module: [Vortex Memory](/vortex-memory)
