@@ -1,0 +1,191 @@
+---
+title: "B2B Accounts Gone Quiet, Adobe Commerce"
+sidebarTitle: "B2B Accounts Gone Quiet"
+description: "B2B buyers order on cadence (weekly/monthly POs). Silence = early churn signal worth a Sales call. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Ecommerce Platform
+
+> B2B buyers order on cadence (weekly/monthly POs). Silence = early churn signal worth a Sales call.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> List of B2B accounts (Adobe Commerce Company entities or B2B-tagged customers) whose most recent order is more than 2× their established ordering cadence. B2B buyers order on cadence (weekly/monthly POs); silence is an early churn signal worth a Sales call before the renewal review.
+
+| | |
+| --- | --- |
+| **What it counts** | For each B2B account: compute the median inter-order gap over the prior 12 months. Flag any account whose `now() − last_order_date > 2 × median_gap`, where `median_gap` is computed across at least 4 prior orders. Filter to accounts in the top 50% by 12-month `SUM(grand_total)` (high-LTV cohort only). |
+| **API field** | `customer_id`, `created_at`, `grand_total` from `GET /rest/V1/orders`. Company filter via `extension_attributes.company_attributes.company_id` (Adobe Commerce B2B module) or via Store View match for merchants using a dedicated B2B Store View. |
+| **VAT / tax treatment** | **Tax-inclusive on the LTV ranking.** `grand_total` includes `tax_amount`. UK B2B is typically tax-inclusive on display; US B2B is typically tax-exempt (resale certificates) so `grand_total` ≈ `subtotal + shipping`. The card uses `grand_total` either way for the LTV ranking; tax-treatment differences across accounts don't affect the silence detection (which is cadence-based, not value-based). |
+| **Shipping inclusion** | **Included.** `grand_total` adds `shipping_amount`. B2B shipping is often freight-charged separately so this matters; an account that switched to LTL freight outside the platform may show as "silent" here even though they're still buying via PO. |
+| **Discounts** | Already deducted. B2B accounts often have negotiated tier pricing applied as `special_price` or `customer_group_price`; `grand_total` is the post-tier figure. |
+| **Credit Memo refund treatment** | **NOT subtracted.** The cadence calculation is on order *placement*, refunds don't matter to silence detection. The LTV ranking is gross of refunds; a B2B account with a high refund rate may rank higher in the LTV cohort than its net contribution warrants. For top-N silence triage, that's usually fine. |
+| **`state` machine inclusion** | **All Adobe states included EXCEPT `pending_payment` and `canceled`.** This is one of the few cards that filters on state. Reasoning: a B2B account whose orders all sit in `pending_payment` (gateway never returned) isn't actually buying; counting them as "active" would mask a real silence problem. Similarly, all `canceled` orders are excluded from cadence calculation. |
+| **`pending_payment` quirk** | **Excluded by design** (see above). This is the right call for B2B silence detection but it differs from most other cards on this connector. If a B2B account is genuinely placing orders that all hit `pending_payment` (e.g. their net-30 PO routing is broken), that's a different problem worth flagging via [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown). |
+| **Multi-currency `grand_total` vs `base_grand_total`** | The LTV ranking uses `base_grand_total` (FX-converted to store base currency at order time) so accounts across regions are comparable. The cadence detection itself is currency-agnostic (it's date-based). |
+| **Store View scope (`store_id`)** | **Filters to B2B Store View only by default** (or to customers in any Adobe Commerce Company entity). DTC consumer accounts are excluded, otherwise the card would surface every dormant retail customer. Merchants without a dedicated B2B Store View should configure the Company-tag filter in the manifest. |
+| **Time window** | `90D` (rolling 90-day for the silence detection; LTV ranking uses 12-month). |
+| **Alert trigger** | `high-LTV B2B account no order >2× normal cadence`. Threshold is multiplicative of each account's own cadence, not a fixed day count, so a weekly-cadence account is flagged at >14 days silence while a quarterly-cadence account is flagged at >6 months. |
+| **Roles** | owner, marketing |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Adobe Commerce data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A janitorial-supply distributor on Adobe Commerce 2.4.6 with the B2B module enabled. The merchant has 312 active Company entities. Snapshot taken Tuesday 12 Apr 26.
+
+**Top-LTV B2B accounts (12-month `base_grand_total` top 50%):** 156 accounts.
+
+**Silence detection on the high-LTV cohort:**
+
+| Company | Cadence (median gap) | Last order | Days silent | Threshold (2× cadence) | Flagged? | 12-month LTV |
+| --- | --- | --- | --- | --- | --- | --- |
+| Riverside Hospital Group | 7 days (weekly PO) | 24 Mar 26 | 19 days | 14 days | **Yes** | $284,000 |
+| Westfield School District | 30 days (monthly PO) | 14 Feb 26 | 57 days | 60 days | No (just under) | $156,000 |
+| HotelChain UK | 14 days | 1 Mar 26 | 42 days | 28 days | **Yes** | $112,000 |
+| MegaCorp Office Cleaners | 4 days | 8 Apr 26 | 4 days | 8 days | No | $96,000 |
+| StateGov Procurement | 90 days (quarterly) | 12 Jan 26 | 90 days | 180 days | No (mid-cycle) | $87,000 |
+| LeisureGroup Plc | 21 days | 5 Feb 26 | 66 days | 42 days | **Yes** | $74,000 |
+| **This card** | | | | | **3 accounts flagged** | **$470,000 LTV at risk** |
+
+What this is telling Sales:
+
+1. **Riverside Hospital Group is the top priority.** A weekly-cadence $284k/year account hasn't ordered in 19 days. That's 5 missed PO cycles. Either they switched supplier, the procurement contact left, or they're running down old stock before placing a fresh PO. A Sales call tomorrow morning, before they normalise to a new supplier, is worth ~$5,400/week of recurring revenue.
+2. **Westfield School District just missed the threshold (57 vs 60 days).** Not flagged but worth watching, the schools' fiscal year ends 30 Jun and procurement decisions are being made now. A proactive nudge before the threshold trips converts 2-3× better than a reactive rescue.
+3. **HotelChain UK at 42 days silent on a 14-day cadence is the canary for the hospitality category.** If two more hospitality accounts go silent in the next 14 days, there's a sector-wide cause (hotel occupancy dropped, a category-wide supplier-switch, a competitor running aggressive pricing).
+4. **The flagged accounts together represent $470k of 12-month LTV.** Each Sales rescue call that retains the account is worth (12-month LTV × probability_of_save). Industry norms suggest 50-70% save-rate at 2× cadence, dropping to &lt;20% at 4× cadence. **Move fast.**
+5. **`pending_payment` orders are excluded from cadence detection.** Riverside Hospital's procurement may have submitted a PO that's stuck in `pending_payment` (their AP system hasn't approved). That order isn't counted as "placed" here. Operations should also check [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) filtered to B2B for stuck POs that masquerade as silence.
+6. **StateGov is a 90-day cadence account, mid-cycle silence isn't flagged.** Quarterly POs are normal in public sector; the 2× threshold (180 days) gives them headroom. Good design.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+This is a Sales-action card. Pair with these to triage and follow up:
+
+| Card | Why pair it with B2B Accounts Gone Quiet |
+| --- | --- |
+| [B2B Revenue Share](/nerve-centre/kpi-cards/adobe-commerce/b2b-revenue-share) | The denominator-of-context. If B2B is 60% of revenue, silence is existential; if B2B is 5%, it's a routine retention exercise. |
+| [B2B AOV Delta](/nerve-centre/kpi-cards/adobe-commerce/b2b-aov-vs-b2c-aov) | Sister card. A silenced account might be one whose AOV dropped first (they're shifting to a different supplier on partial categories before going fully silent). |
+| [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) | Filter to B2B Store View. A silenced account may actually be placing POs that are stuck in `pending_payment`, that's a different problem (AP routing failure) but masquerades as silence. |
+| [Total Revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | Watch for the secondary effect, when silenced accounts churn, total revenue drops 2-6 weeks later. |
+| [Customer Count](/nerve-centre/kpi-cards/adobe-commerce/unique-customers) | The denominator. Silence count as % of total B2B accounts is the "leak rate". |
+| [Repeat Customer Rate](/nerve-centre/kpi-cards/adobe-commerce/repeat-customer-rate) | B2B repeat rate should be near 100%; if it's dropping, silence is increasing. Leading indicator. |
+| [Churn Risk](/nerve-centre/kpi-cards/adobe-commerce/customer-churn-risk) | Broader churn-risk model includes consumer accounts; this card is the B2B-specific high-LTV version. |
+| [`stripe.stripe_subscription_churn`](/nerve-centre/stripe/stripe_subscription_churn) | If the account uses Stripe Subscriptions for recurring POs, a Stripe-side cancellation is the smoking gun. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Adobe Commerce Admin:**
+
+For Adobe Commerce B2B (the Companies module is part of Adobe Commerce, not Magento Open Source):
+
+> **Customers > Companies** in Admin shows the full Company list with their assigned Sales rep. Click a Company to see its order history (Orders tab on the Company detail page).
+
+For per-account silence-checking:
+
+> **Customers > Companies > [Company Name] > Orders** lists every order with `created_at`. Compare the most recent date to today; if the gap is unusually long for that account, silence is real.
+
+For merchants who use Customer Group tagging instead of the B2B Companies module:
+
+> **Customers > Customer Groups** to define your B2B group, then **Customers > All Customers** filtered to that group, sorted by Last Login or last order date.
+
+Other Adobe Commerce Admin views that *look* relevant but aren't:
+
+- **Customers > Now Online**: real-time login state, not order silence.
+- **Marketing > Newsletter Subscribers**: email list, not purchase activity.
+- **Reports > Customers > Customers by Orders Total**: lifetime totals, not silence detection.
+- **Reports > Customers > Customers by Number of Orders**: total order count, not recency.
+- **Reports > Sales > Coupons**: irrelevant to silence detection.
+
+**Why our number may legitimately differ from a manual Admin check:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Time-zone**. Adobe Commerce stores `created_at` in server local time. Cadence calculation uses UTC by default. Day-boundary effects on the most recent order can shift "days silent" by ±1. | ±1 day on silence count |
+| **`pending_payment` and `canceled` exclusion**. The card excludes these from cadence calculation; the Admin view shows them. An account whose last order is `canceled` will show as more silent in the card than in Admin. | Vortex IQ flags accounts the Admin's "last order" view doesn't |
+| **B2B Company filter**. The card filters to Adobe Commerce Company entities (or B2B Customer Group). Merchants without the B2B module who tag B2B-ness via custom attributes need a manifest tweak. | Excludes wrongly-tagged accounts |
+| **High-LTV cohort**. The card filters to top 50% by 12-month LTV; small accounts (single $50 order in the last year) don't appear. The Admin doesn't filter, so it shows more accounts as "silent". | Vortex IQ shows fewer flags than full-account scan |
+| **Cadence calculation needs ≥4 orders**. Brand-new accounts (first order in the last 90 days) don't have enough history for a cadence median. They're not flagged here, even if they bought once and went silent. Add a separate "new B2B not returning" card for that cohort. | Excludes new accounts |
+| **API rate-limit gaps during sync**. Adobe REST has request quotas; if the indexer throttled, the latest few hours of orders may be missing, falsely inflating silence. | Self-resolves at next sync |
+
+**Cross-connector reconciliation (when these connectors are connected for this merchant):**
+
+This is a B2B operational card; few connectors reconcile directly.
+
+| Pair | Expected relationship | What divergence tells you |
+| --- | --- | --- |
+| [`stripe.stripe_subscription_churn`](/nerve-centre/stripe/stripe_subscription_churn) for B2B subscriptions | Stripe cancellations should appear as silenced accounts within 2× cadence | If Stripe shows the account as active but this card flags silence, the Stripe subscription may be paused or the next billing date is far out, but no PO has come in. Sales call still warranted. |
+| [`google_analytics.ga_b2b_session_trend`](/nerve-centre/google_analytics/ga_b2b_session_trend) on the B2B Store View | Silence + dropped sessions = the buyer stopped logging in | Strong churn signal. Silence + steady sessions = the buyer is still browsing but not converting; pricing or product issue. |
+| [`klaviyo.b2b_email_engagement`](/nerve-centre/klaviyo/b2b_email_engagement) | Silenced + still-engaging = email-active but procurement-paused | Often signals an internal change (new procurement contact, budget freeze). Sales call to the right person fixes it. |
+
+---
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The same B2B silence-detection concept exists with platform-specific definitions on other commerce connectors that support B2B (Shopify Plus B2B, BigCommerce B2B Edition). This is **not a reconciliation**; your Adobe Commerce store doesn't have a parallel store on those platforms.
+
+- [`shopify.shopify_b2b_account_silence`](/nerve-centre/shopify/shopify_b2b_account_silence)
+- [`bigcommerce.bc_b2b_account_silence`](/nerve-centre/bigcommerce/bc_b2b_account_silence)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**A flagged account ordered yesterday but it's still on the list, why?**
+Sync lag. The card uses the most recent OpenSearch index sync (5-15 min behind real-time). If the order landed within the last sync interval, the card hasn't seen it yet. Refresh in 15 minutes and the account should drop off the list.
+
+**My Sales rep says the account placed an order via phone/email, why isn't it counted?**
+The card only counts orders placed through Adobe Commerce. Off-platform orders (phone-in POs, EDI orders, manual orders entered into the ERP but not Adobe) don't appear. If your B2B routinely takes off-platform orders, this card will over-flag those accounts. Either: (a) push all orders through Adobe (manual entry via Sales > Orders > Create New Order), or (b) tag those accounts with a custom attribute and exclude them from this card's manifest.
+
+**What's the difference between `state` and `status` and does it affect silence detection?**
+`state` is the system lifecycle (8 fixed values). `status` is configurable label. This card uses `state`-based filtering: it excludes `pending_payment` and `canceled` from cadence calculation, includes everything else. If you've renamed your `processing` status to "PO Received" or similar, the card still works (the underlying `state = processing` is what matters).
+
+**Why are `pending_payment` and `canceled` orders excluded from cadence?**
+B2B silence detection asks "is this customer still buying?". A `pending_payment` PO that the gateway never resolved isn't a buy, the customer placed an order intent but no commitment was confirmed. A `canceled` order is a withdrawn intent. Counting either as a "real" order would mask genuine silence. The exclusion is opinionated; it differs from most cards on this connector which include all states. If your B2B has high `pending_payment` rates due to net-30 PO routing (the order intentionally sits unconfirmed for AP processing), the card may over-flag, in that case, configure the manifest to include `pending_payment` for B2B accounts only.
+
+**My multi-currency Adobe Commerce, can the card compare cadence across regions?**
+Yes. Cadence detection is date-based, currency-agnostic. The LTV ranking uses `base_grand_total` (FX-converted) so accounts across regions are comparable on the LTV-cohort filter.
+
+**Why doesn't Adobe Commerce dashboard have an equivalent?**
+Adobe Commerce B2B module shows per-Company order history but doesn't compute median cadence or flag silence relative to cadence. The closest native view is the Sales rep's account-by-account drill-down. The card is the synthesis layer that flags silence at scale.
+
+**My Stripe revenue and B2B silence don't reconcile, expected?**
+Yes. Stripe sees Stripe-paid orders only; many B2B accounts pay via net-30 invoice (manual payment, recorded in Adobe but never touching Stripe). Stripe's view of the B2B world is a subset, not a reflection. Don't try to reconcile directly.
+
+**Why doesn't Google Analytics flag the silenced accounts?**
+GA4 attributes by session, not by account. A B2B procurement contact who logs in less often shows up as fewer sessions, but GA4 doesn't tie back to a Company entity. The card uses Adobe-side `customer_id` which has the Company link.
+
+**`grand_total` vs `base_grand_total`, which does this card use?**
+LTV ranking uses `base_grand_total` so multi-currency accounts are comparable. Cadence detection is date-based, neither field matters. Most cards in the Nerve Centre use `grand_total`; this one uses `base_grand_total` deliberately for the cross-region LTV cohort.
+
+**My multi-store Adobe Commerce, can the card scope per Store View?**
+Yes. By default it filters to the B2B Store View. For multi-region B2B (UK B2B portal, US B2B portal), the card flags silence per portal. Configure per-Store-View routing in the manifest if you want a unified per-account view that spans portals (rare, most B2B accounts shop on one portal).
+
+**Why does the threshold use 2× cadence rather than a fixed 30/60/90 days?**
+B2B cadences vary wildly: a daily-PO janitorial account vs a quarterly-PO public-sector account. A fixed 30-day threshold would over-flag the public sector and under-flag the janitorial. Multiplicative threshold (2× the account's own cadence) normalises across cadence types.
+
+**Why does today's number swing so much?**
+Daily resolution can flip an account in or out of the flagged list as their "days silent" crosses the 2× threshold. If you do a Sales-call workflow on the list, snapshot it once daily (e.g. each morning) and work that snapshot rather than chasing the live list. The flag-state of a specific account is more meaningful than the aggregate count.
+
+**An account on the list said they're on holiday, should I dismiss them?**
+Yes, mark the account as "on hold" in the Vortex IQ workspace (a per-account snooze feature). Otherwise it will re-flag every refresh. Snoozing also feeds back into the cadence median, so when they return to ordering it doesn't artificially shorten their established cadence.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*B2B Accounts Gone Quiet* is one of hundreds of KPI pulses Vortex IQ tracks across Adobe Commerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

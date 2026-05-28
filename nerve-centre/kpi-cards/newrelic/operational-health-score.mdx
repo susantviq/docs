@@ -1,0 +1,151 @@
+---
+title: "Operational Health Score, New Relic"
+sidebarTitle: "Operational Health Score"
+description: "Composite, apdex x inverse error-rate x inverse incident-count x SLO compliance. The CXO single-number. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Monitoring
+
+> Composite, apdex x inverse error-rate x inverse incident-count x SLO compliance. The CXO single-number.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A 0, 100 composite that compresses four New Relic operational signals (Apdex, error rate, active incident count, SLO compliance) into one number a non-engineering founder can read at a glance. Designed for the question *"is my store backend doing what it should be doing right now, yes or no?"*
+
+| | |
+| --- | --- |
+| **The formula** | `0.30 x Apdex_pct + 0.25 x (100 - 10 x error_rate_pct) + 0.20 x (100 - 20 x active_P1_count) + 0.25 x slo_compliance_pct`. Components clamp at 0 and 100. The four weights were chosen because Apdex is the day-to-day customer-experience signal, error rate is the leading edge of revenue loss, active P1 incidents are the "right now" signal, and SLO compliance is the rolling-window credibility signal. |
+| **NerdGraph endpoint** | All four inputs are sourced from one [NerdGraph](https://api.newrelic.com/graphql) GraphQL query. Apdex and error rate via NRQL embedded inside `actor.account.nrql.results`; incident count via `actor.account.aiIssues.issues`; SLO compliance via `actor.entitySearch` over service-level entities. |
+| **Apdex component (30% weight)** | NRQL: `SELECT apdex(duration, t: 0.5) FROM Transaction WHERE appName IN (...) SINCE 5 MINUTES AGO`. Apdex is already a 0, 1 score so we multiply by 100. Healthy = 0.85, 0.95. Below 0.5 means most users are frustrated. The 4 x threshold (`F`) for "frustrated" is calibrated automatically. |
+| **Error rate amplifier (25% weight)** | `100 - 10 x error_rate_pct` where `error_rate_pct = errorCount / totalCount x 100` from `Transaction` events. The x10 amplifier means a 1% absolute jump in error rate drops the composite by 2.5 points. A 5% error rate alone takes this component to 50. |
+| **Active incident component (20% weight)** | `100 - 20 x P1_count` where `P1_count` is the number of currently triggered conditions at priority CRITICAL in New Relic Alerts. Five concurrent P1s zero out the component. |
+| **SLO compliance (25% weight)** | Rolling SLO target attainment percentage from New Relic's Service Level entities (`ServiceLevel.indicator.objective.target`). 99.9% target with 99.85% compliance contributes 99.85 to this slot. |
+| **Browser vs APM scope** | Inputs are APM-scoped (server-side Transaction events). Browser RUM and Mobile data are deliberately excluded so the score reflects backend health only. See [`nr_rum_page_load_p95`](/nerve-centre/kpi-cards/newrelic/page-load-p95) for the customer-side counterpart. |
+| **Sample basis** | NRQL on `Transaction` runs against the full event set on most plans; high-volume accounts may see [event sampling](https://docs.newrelic.com/docs/data-apis/manage-data/high-cardinality/) where a representative sample stands in for the full population. The sampled count is back-calculated for rates so the percentage stays correct, the absolute count may be lower than what the merchant counted client-side. |
+| **Time window** | `RT/7D` (real-time, rolling 7-day baseline for SLO compliance). Apdex, error rate, and incidents are computed on a 5-minute rolling window. |
+| **Alert trigger** | `<70`, when the composite drops below 70 the merchant gets pinged. The 70 threshold corresponds roughly to "Apdex &lt; 0.75 OR error rate > 4% OR 2+ active P1s". |
+| **Sentiment key** | `operational_health_score` |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your New Relic data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A multi-region Shopify Plus brand running a Node.js storefront on Cloud Run, instrumented with the New Relic APM agent. The 5-minute window covers 12:35 to 12:40 on 02 May 26.
+
+| Component | Raw value | Score |
+| --- | --- | --- |
+| Apdex (`SELECT apdex(duration, t: 0.5) FROM Transaction`) | 0.86 | 86 |
+| Error rate (`errorCount / count(*) FROM Transaction`) | 3.2% | 100 - 10 x 3.2 = **68** |
+| Active P1 incidents | 1 (a memory pressure alert on the catalogue service) | 100 - 20 x 1 = **80** |
+| SLO compliance (rolling 7D) | 99.74% (target 99.9%) | 99.74 |
+
+**Composite** = 0.30 x 86 + 0.25 x 68 + 0.20 x 80 + 0.25 x 99.74 = 25.8 + 17.0 + 16.0 + 24.94 = **83.7**
+
+Score 84 is healthy (above the 70 alert threshold). Reading the breakdown:
+
+1. **Error rate is the laggard.** At 3.2% it cost 8 composite points (vs an ideal score of 100). With Apdex at 0.86 the user-facing latency feels acceptable but a meaningful slice of requests are failing outright. Open [Errors by Transaction](/nerve-centre/kpi-cards/newrelic/errors-by-transaction) and the Apdex calibration: with `t: 0.5` the "frustrated" threshold is 4 x 0.5 = 2.0 seconds, so users hitting errors that take >2s to surface are doubly punished in Apdex too.
+2. **One open P1.** Memory pressure on catalogue. Worth checking whether it correlates with the error rate spike via [Deploy Markers vs Latency](/nerve-centre/kpi-cards/newrelic/deploy-markers-vs-latency).
+3. **SLO compliance is comfortable.** 99.74% over 7 days, only 0.16% under the 99.9% target. Plenty of error-budget headroom.
+
+**Conversion impact translation.** Industry data (SOASTA / Akamai 2017, Deloitte 2020) shows roughly a 7% conversion drop per additional 100ms of page latency on commerce checkouts. A drop of Apdex from 0.86 to 0.65 (caused by the same backend slowdown that drove this card from 84 to 65) typically maps to a 200, 400ms p95 increase, which on a £2M/month checkout flow translates to roughly £14k, £28k of monthly conversion loss. The composite drops first; the revenue impact follows with a 24, 48 hour lag as customers churn.
+
+If next 5-minute window's error rate slipped to 5.5% (still common during a deploy gone wrong), the composite drops to about 76. If a second P1 also fired, it drops to about 72, still above the 70 trigger but a clear "look at this" signal.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Operational Health Score |
+| --- | --- |
+| [Apdex Score](/nerve-centre/kpi-cards/newrelic/apdex-score) | The 30%-weight component. The first card to open when the composite drops because it's the customer-experience signal. |
+| [Error Rate](/nerve-centre/kpi-cards/newrelic/error-rate) | The 25%-weight component (amplified x10). Error movements drive most score swings during deploys. |
+| [Active Incidents](/nerve-centre/kpi-cards/newrelic/active-incidents) | The 20%-weight component. Each open P1 deducts 20 points directly. |
+| [SLO Burn Rate (1h)](/nerve-centre/kpi-cards/newrelic/slo-burn-rate) | Pair to see whether you're spending error budget faster than you can rebuild it. Burn rate >2x means SLO compliance will degrade rapidly. |
+| [p95 Response Time](/nerve-centre/kpi-cards/newrelic/p95-response-time) | Apdex is satisfaction-weighted; p95 is raw tail latency. When the score drops but Apdex looks fine, p95 usually shows the cause. |
+| [Datadog Operational Health Score](/nerve-centre/kpi-cards/datadog/operational-health-score) | Cross-connector peer. If both connectors are wired the two scores should agree within ~5 points; a 15+ point gap is itself a signal (probe coverage difference). |
+| [Shopify Sales / Min](/nerve-centre/shopify/sales_per_minute) | Reads the revenue-side consequence of the operational signal. When the health score drops to 65 and sales/min holds, the drop is internal-only; if both drop together, customers are feeling it. |
+| [GA4 Web Vitals](/nerve-centre/google_analytics/ga_web_vitals) | Customer-side counterpart from real-user telemetry. APM Apdex going green while GA4 LCP stays red means the issue is browser/CDN, not backend. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in New Relic:**
+
+New Relic does not surface a single "Operational Health" composite, this card synthesises one from four New Relic-native signals. The closest equivalent screens in [one.newrelic.com](https://one.newrelic.com):
+
+- [APM & Services](https://one.newrelic.com/nr1-core?filters=%28domain%3D%27APM%27%20AND%20type%3D%27APPLICATION%27%29) for Apdex and error-rate context.
+- [Alerts & AI > Issues & Activity](https://one.newrelic.com/alerts-ai) for active incident count.
+- [Service Levels](https://one.newrelic.com/service-levels) for SLO compliance.
+- [Dashboards](https://one.newrelic.com/dashboards) > pre-built "Application performance" dashboard for combined view.
+
+Compare each component independently if you want to verify, the composite has no single New Relic counterpart.
+
+**Why our number may legitimately differ from New Relic's own screens:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Account timezone vs UTC**. New Relic dashboards default to the account's configured timezone; Vortex IQ runs on UTC. Boundary-day rollups can show 1, 3% drift on the most recent 24h slice. | Either direction at midnight |
+| **NRQL retention windows**. NRQL `Transaction` data is retained at full resolution for 8 days on standard plans, then aggregated. Rolling 7D SLO compliance still works inside the full-resolution window; queries reaching beyond day 8 fall back to aggregated data and may differ slightly from real-time. | Vortex IQ may show fresher numbers near the 7D boundary |
+| **Ingest sampling on high-cardinality accounts**. New Relic samples [`Transaction` events](https://docs.newrelic.com/docs/data-apis/manage-data/high-cardinality/) when an account exceeds its event-per-minute quota. Rates (Apdex, error rate) are sample-corrected; counts are not. | Counts in Vortex IQ may be lower than what app logs show |
+| **NerdGraph rate limits**. Default 3,000 points / minute per account. During heavy investigation periods Vortex IQ may show stale data for 30, 60s. | Stale, not wrong |
+| **Service-level entity scope**. SLO compliance reads only entities with a configured Service Level. If a critical service has no SLO defined, it contributes 0 to that component. | Composite biased low for under-instrumented accounts |
+
+**Cross-connector reconciliation:**
+
+NR APM and Datadog APM are the two leading commercial APM platforms. Probes are different (NR APM agent vs Datadog APM trace agent), so latency numbers can differ by 5, 15ms even on the same service, both are legitimate and the gap itself is sometimes diagnostic (a probe overhead difference, not a real customer-facing change). Browser-side telemetry (NR Browser RUM, GA4 Web Vitals) sample differently again, NR Browser instruments every page load, GA4 samples by session.
+
+<details>
+<summary>Same-metric peers on other connectors</summary>
+
+| Connector | Card | Notes |
+| --- | --- | --- |
+| Datadog | [`dd_health_score`](/nerve-centre/kpi-cards/datadog/operational-health-score) | Same composite shape (Apdex / error / incident / SLO) but sourced from Datadog APM, Monitors, and SLO products. |
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**We have both New Relic and Datadog connected, which Operational Health Score should I trust?**
+Both are legitimate. Practically, pick one as your "system of record" based on which platform owns more of your services. Brands that started on New Relic and added Datadog for infrastructure usually trust the NR composite for backend health and the DD composite for infrastructure health. The two scores should agree within ~5 points; a 15+ point gap is a signal worth investigating (probe coverage difference, agent version drift, or one platform missing a service).
+
+**My Apdex is 0.92 but the score is only 78, what's pulling it down?**
+Apdex is only 30% of the formula. With a healthy Apdex but, say, a 4% error rate (the x10 amplifier takes that component to 60), one active P1 (component = 80), and 99.5% SLO compliance (under target so contributes 99.5), the composite lands at 0.30 x 92 + 0.25 x 60 + 0.20 x 80 + 0.25 x 99.5 = 27.6 + 15 + 16 + 24.9 = 83.5. Open [Error Rate](/nerve-centre/kpi-cards/newrelic/error-rate) and [Active Incidents](/nerve-centre/kpi-cards/newrelic/active-incidents) to see the actual culprits.
+
+**How is Apdex calibrated, and why is 0.5 the danger line?**
+Apdex requires a "tolerance threshold" `t`. Requests below `t` are *satisfied*, between `t` and `4 x t` are *tolerated*, above `4 x t` are *frustrated*. The score = (satisfied + 0.5 x tolerated) / total. So a score of 0.5 means most users are either tolerated or frustrated, the satisfied bucket is below half. In commerce contexts we standardise `t = 0.5s` for browse pages and `t = 1.0s` for checkout (longer-tolerance because customers expect a "processing" feel). [New Relic's Apdex documentation](https://docs.newrelic.com/docs/apm/new-relic-apm/apdex/apdex-measure-user-satisfaction/) covers the math in detail.
+
+**Datadog and New Relic disagree on p95 latency by 12ms, who's right?**
+Both probes are sampling different segments of the same request. NR's APM agent instruments at the entry-point (typically the framework middleware), Datadog's trace agent often instruments slightly earlier or later depending on the integration. A 5, 15ms difference is normal. The 12ms gap itself is not a problem; the *trend* matching across both platforms is what matters. If NR shows a 50ms increase and DD shows the same 50ms increase, the increase is real regardless of which absolute baseline you trust.
+
+**NRQL retention is 8 days, can I still see compliance over a 30-day SLO window?**
+Yes. SLO compliance is computed on New Relic's Service Level entity, which maintains rolling SLI/SLO state at the entity layer (separate from raw event retention). The 30-day SLO works even though raw `Transaction` events past day 8 are aggregated. What you lose at >8 days is the ability to *re-query* a specific minute of historical data, but the rolled SLI numbers stay accurate.
+
+**Do high-cardinality sampling rates affect my score?**
+Rates yes (sample-corrected automatically), counts no. If your account is in a sampled state during peak traffic, the *Apdex score* and *error rate percentage* remain accurate (NR back-calculates from the sample). The active P1 incident count is unaffected (incidents are not sampled). SLO compliance is unaffected (computed on the SLI ratio at ingest time). So the composite stays valid even during sampled periods.
+
+**My account aggregates two sub-accounts (production, staging), is the score across both?**
+Vortex IQ reads the New Relic account configured in your integration. If you've connected only the production account, the composite covers production only, which is what most merchants want. To monitor staging separately, connect a second integration (the [clone integration](/../05-vortex-mind-runtime) flow handles this).
+
+**Ingest cost has gotten high, can I drop visibility to save money?**
+Yes, but tradeoffs apply. Common levers: (a) drop Browser agent on low-traffic pages (saves event ingest), (b) sample `Transaction` events to 50% on non-checkout endpoints (Apdex stays accurate via sample-correction; raw counts halve), (c) reduce `Log` ingest by filtering INFO-level entries server-side. The composite stays accurate under all three; what degrades is your ability to drill into individual requests when something goes wrong. We recommend keeping checkout-path instrumentation at 100%, sampling everything else.
+
+**The score is at 70 exactly and my pager went off, was the alert noise?**
+No. The trigger is `< 70` (strict less than), so 70.00 should not fire. If you saw an alert at exactly 70 it likely fluttered: a previous reading of 69.x triggered, then the score recovered to 70.x by the next sample. See [Recently Flapped Conditions (24h)](/nerve-centre/kpi-cards/newrelic/recently-flapped-conditions) to confirm. Tune the alert by adding a 5-minute "must stay below 70" window to suppress flutter without losing the real signal.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Operational Health Score* is one of hundreds of KPI pulses Vortex IQ tracks across New Relic and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

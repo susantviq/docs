@@ -1,0 +1,190 @@
+---
+title: "Decline Rate Spike Alert, PayPal"
+sidebarTitle: "Decline Rate Spike Alert"
+description: "Decline Rate Spike Alert for PayPal stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Payment Gateway
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Operational alert that fires when the PayPal decline rate jumps **more than 2 standard deviations above the preceding 1-hour baseline**. Built for the operations team, distinct from the executive [PP Decline Rate](/nerve-centre/kpi-cards/paypal/decline-failure-rate) gauge: this card is binary (firing or not), real-time, and explicitly statistical (handles both small-store noise and high-volume spikes). The trigger card behind [PP Revenue at Risk (live)](/nerve-centre/kpi-cards/paypal/revenue-at-risk).
+
+| | |
+| --- | --- |
+| **The formula** | `current_1h_decline_rate > baseline_mean + (2 × baseline_stddev)`. The baseline is computed over the *preceding* 1 hour (rolling, so noise gets smoothed). The 2σ threshold catches statistically meaningful jumps regardless of absolute level. |
+| **Event code filter** | T00xx only (payment events). Same denominator as PP Decline Rate, only attempts (S + D + F + P + V + T) count. |
+| **Numerator (declines)** | `transaction_status IN [D, F]`. PayPal-side denials, bank-side issuer declines on bridged card payments, network failures, 3DS abandons, all included equally. |
+| **What "spike" means here** | Statistical, not absolute. A baseline of 4% with current rate 8% is a spike; a baseline of 12% with current rate 13% is *not* (it's already volatile so 1 percentage point is within noise). The 2σ threshold normalises for the store's own variability. |
+| **Pending status (P) handling** | In denominator, not in spike numerator. If pending payments resolve to D in the next hour, that hour's rate climbs and may trigger a spike alert then; the original pending hour does not. |
+| **Refunds (T11) and disputes (T19)** | NOT counted. This card watches payment-stage declines only. |
+| **Currency** | **n/a (rate, currency-neutral).** Multi-currency PayPal accounts get a single, valid spike alert across all currencies. |
+| **Seller Protection** | Not a factor; declines never reach the protection-eligibility stage. |
+| **Why 2σ, not absolute threshold** | A small store with 50 attempts/hour has higher natural variability than a large store with 500/hour. An absolute "alert at >8%" threshold would either over-fire on small stores (every quiet hour with 1 decline lights up) or miss genuine issues on large stores (a 1-point absolute jump is meaningful at scale). The σ-based approach adapts to each store's own noise floor. |
+| **Page cap** | 10,000 transactions per call. Live windows are 1 hour so unlikely to hit cap. |
+| **Time window** | `RT` (real-time, refreshes every sync, typically every 5-15 minutes). |
+| **Alert trigger** | `> 2σ vs 1h baseline`. The card's headline state is binary: firing or quiet. |
+| **Roles** | owner, finance, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your PayPal data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US-based subscription beauty brand running PayPal Express alongside Stripe. The 24 hours leading up to 14:00 UTC on 12 Apr 26 give us the baseline distribution.
+
+Hourly decline-rate baseline (preceding 24 hours):
+
+| Hour | Decline rate |
+| --- | --- |
+| Hour-1 | 5.0% |
+| Hour-2 | 4.6% |
+| Hour-3 | 5.2% |
+| Hour-4 | 4.8% |
+| ...up to Hour-24 | average 4.9%, stddev 0.7% |
+
+```text
+Baseline mean (μ)   = 4.9%
+Baseline stddev (σ) = 0.7%
+2σ threshold        = μ + 2σ
+                    = 4.9% + 1.4%
+                    = 6.3%
+```
+
+Now the current 1-hour window (13:00-14:00 UTC):
+
+| Metric | Value |
+| --- | --- |
+| T00 attempts | 240 |
+| T00 declined (D + F) | 33 |
+| Current decline rate | 13.75% |
+
+```text
+Spike check
+  current_rate    = 13.75%
+  threshold       = 6.3%
+  13.75% > 6.3%   → ALERT FIRES
+  spike magnitude = (13.75% − 4.9%) ÷ 0.7%
+                  = 12.6σ
+```
+
+Five things worth noticing:
+
+1. **The spike is 12.6 standard deviations above baseline.** That's an extraordinarily strong signal, statistically near-impossible by chance. Something concrete changed: a Risk rule misfire, a 3DS provider outage, a checkout deploy break, or a coordinated card-testing attack. The card fires hard. The operator's first move is opening [PP Decline Event Codes](/nerve-centre/kpi-cards/paypal/top-decline-event-codes) for the dominant subject.
+2. **Compare with absolute-threshold alerting.** A simple "alert at >8%" trigger would have caught this too (13.75% >> 8%), but on a *different* store with baseline 7% and natural stddev 1.5%, the same logic would over-fire every other quiet hour. The 2σ framing adapts to each store automatically.
+3. **What if the same 13.75% rate had appeared on a high-volatility store?** A store with baseline mean 9% and stddev 3% has 2σ threshold = 15%. The 13.75% rate would NOT trigger the alert because it's within that store's normal noise. That's correct: such a store is already in trouble, but this hour wasn't unusual *for them*. They need [PP Decline Rate](/nerve-centre/kpi-cards/paypal/decline-failure-rate) (absolute level) not this card (anomaly detection).
+4. **What does the operator do?** The Vortex IQ playbook: (a) open [PP Decline Event Codes](/nerve-centre/kpi-cards/paypal/top-decline-event-codes), find the dominant `transaction_subject`; (b) if `denied_by_risk`, log into PayPal Business → Risk Settings and check for recent rule changes; (c) if `payer_authentication_required`, the 3DS provider has an outage, suggest Apple Pay / Google Pay as workaround; (d) if `network_error` or `instrument_declined` mass, check your own checkout for a recent deploy; (e) if `denied_by_risk` clustered to one IP / email pattern, you're under a card-testing attack, see [PP Fraud Velocity](/nerve-centre/kpi-cards/paypal/fraud-velocity).
+5. **The spike will self-cancel if it persists.** Sustained elevation raises the next hour's baseline; by hour-3 of a sustained issue the spike alert has gone quiet (the new "normal" is the elevated rate). That's by design: this card is for *change* detection. Sustained issues need [PP Decline Rate](/nerve-centre/kpi-cards/paypal/decline-failure-rate) which compares to a 7-day baseline.
+
+If the next hour's window shows the rate back at 4.8%, the spike was a transient (likely 3DS provider blip). If it stays at 13%, the operator has a real problem and the rate-card alert (at >8% absolute) will fire next.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with PP Decline Rate Spike Alert |
+| --- | --- |
+| [PP Decline Rate](/nerve-centre/kpi-cards/paypal/decline-failure-rate) | The absolute-level view. This card catches *change*; that one catches *steady state*. Both fire on a sustained problem after the first hour. |
+| [PP Revenue at Risk (live)](/nerve-centre/kpi-cards/paypal/revenue-at-risk) | The dollar-weighted twin. Spike alert says "something's wrong"; revenue-at-risk says "and this is how much it's costing per hour". |
+| [PP Decline Event Codes](/nerve-centre/kpi-cards/paypal/top-decline-event-codes) | First card to open when this fires. Tells you WHY declines spiked. |
+| [PP Fraud Velocity](/nerve-centre/kpi-cards/paypal/fraud-velocity) | If the spike is `denied_by_risk` driven, this card surfaces the attack signature (clustered IPs, email patterns). |
+| [PP Recoverable Declines](/nerve-centre/kpi-cards/paypal/recoverable-declines) | Of the spike, which dollars are recoverable via dunning vs hard-loss. |
+| [PP XC Decline vs Funnel](/nerve-centre/kpi-cards/paypal/decline-spike-vs-checkout-funnel-drop) | Cross-channel: confirms the spike is hitting real customers (funnel drops) not just blocked attempts. |
+| [PP Alert Fraud Velocity](/nerve-centre/kpi-cards/paypal/fraud-velocity-alert) | The fraud-specific spike alert. Pair when the dominant subject is `denied_by_risk`. |
+| [PP Alert Dispute Velocity](/nerve-centre/kpi-cards/paypal/dispute-velocity-alert) | Disputes-spike alert. A decline spike that follows a dispute spike usually points to PayPal Risk tightening rules in response. |
+| [Stripe Decline Rate Spike Alert](/nerve-centre/kpi-cards/stripe/decline-rate-spike-alert) | The Stripe twin. Simultaneous fire = upstream issue (3DS network, your checkout); PayPal-only fire = PayPal-side. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PayPal Business:**
+
+PayPal Business does NOT offer a built-in σ-based decline-spike alert; this card is a Vortex IQ-derived signal. The closest PayPal-native screens for cross-checking:
+
+- [Activity → All Transactions](https://www.paypal.com/businessmanage/activities), filter Status = "Denied" + "Failed" for the last hour and previous hour, hand-compute the rate to verify our numbers.
+- [PayPal Business → Notifications](https://www.paypal.com/businessprofile/settings/notifications) for individual decline emails (per-transaction, not aggregate).
+- [PayPal Business → Risk Settings](https://www.paypal.com/businessprofile/settings/risk) to see whether a Risk rule changed recently that might explain a `denied_by_risk` spike.
+- [PayPal Business → Reports → Activity download](https://business.paypal.com/merchantdata/reportHome) for the row-level CSV.
+
+Other views that look like this but aren't:
+
+- "Live transactions" tile shows count but no rate calculation.
+- The Risk dashboard's "blocked transactions" counter does NOT distinguish baseline-vs-spike.
+- "Real-time alerts" in PayPal Notifications is per-transaction, not aggregated.
+
+**Why our alert may legitimately differ from a hand-calculation:**
+
+| Reason | Direction of divergence | What to do |
+| --- | --- | --- |
+| **Baseline window length**. We use the immediately preceding 1 hour. A user comparing against "yesterday at this time" would see different math. | Either direction | Use Vortex IQ's framing for live response; use day-over-day comparisons for trending. |
+| **Sample size**. With &lt; 30 attempts in either window, the σ calculation is unstable. Small stores may see false-positive fires on individual unlucky declines. | Vortex IQ may **over-fire on small stores** | Layer with [PP Revenue at Risk (live)](/nerve-centre/kpi-cards/paypal/revenue-at-risk) which dollar-weights the signal; small-dollar fires are usually harmless. |
+| **Refresh lag**. Card refreshes every 5-15 minutes; a spike that started 4 minutes ago may not yet be reflected. | Vortex IQ may be **lagged** | Wait one refresh cycle. |
+| **Pending-resolution timing**. Pending payments resolving to D bump the rate retroactively. | Vortex IQ may **shift** between refreshes | Normal; pending is rarely > 5% of attempts. |
+| **Time zone**. Hourly windows are UTC-anchored; PayPal Business uses your account timezone. The "current hour" boundary may differ. | Boundary effects | Compare by hour-of-day, not hour-name. |
+
+**Cross-connector reconciliation:**
+
+| Comparison | Expected relationship | When divergence is legitimate |
+| --- | --- | --- |
+| `pp_alert_decline_spike` ↔ [`stripe.stripe_alert_decline_spike`](/nerve-centre/kpi-cards/stripe/decline-rate-spike-alert) | Two independent processors. PayPal-only fire is most common; simultaneous fire is rare. | A simultaneous fire usually means upstream: 3DS network outage, your own checkout deploy, an ad-platform bot wave hitting both checkout paths. |
+| `pp_alert_decline_spike` + `pp_alert_fraud_velocity` together | Both firing simultaneously = card-testing attack (denied_by_risk dominant). | Decline spike alone, no fraud velocity = legitimate-customer issue (3DS, deploy break). |
+| `pp_alert_decline_spike` ↔ [`pp_xc_decline_vs_funnel`](/nerve-centre/kpi-cards/paypal/decline-spike-vs-checkout-funnel-drop) | Should correlate when the spike is hitting real customers. | Decline spike WITHOUT funnel drop = blocked fraud, no real revenue at risk. Decline spike WITH funnel drop = real customers being blocked. |
+
+This card is a *Vortex IQ-derived* operational alert, not a PayPal-native metric. PayPal Business does not offer σ-based anomaly detection on the decline rate; if you want this signal you need either Vortex IQ or a custom-built monitoring layer on top of `/v1/reporting/transactions`.
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The Stripe twin is [`stripe.stripe_alert_decline_spike`](/nerve-centre/kpi-cards/stripe/decline-rate-spike-alert). Same shape (σ-based anomaly detection on hourly decline rate), different processor. Operations dashboards typically run both side-by-side to distinguish processor-specific from upstream issues.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is the alert σ-based instead of an absolute % threshold?**
+Because each store has different natural variability. A small store with 50 attempts/hour fluctuates 4-9% naturally; an absolute "alert at >8%" trigger over-fires every quiet hour. A high-volume store with 1,000 attempts/hour fluctuates 4.5-5.2%; the same trigger ignores meaningful 1-percentage-point deteriorations. The 2σ threshold normalises to each store's own noise floor, alerts when something *different* is happening, regardless of absolute level.
+
+**The alert fires every Monday at 02:00 UTC, why?**
+Two common reasons: (1) eCheque batch clearance, banks process eCheque overnight Sunday and PayPal flips a chunk from `P` to `S` or `D` in the early Monday hours, the morning hour's "current" rate spikes; (2) an automated weekly drop email or recurring promo brings a sudden mostly-guest-checkout traffic burst. The first is structural and ignorable; the second is real and worth optimising. If the spike is recurring and the funnel doesn't drop, suppress the alert window for that hour.
+
+**What's the difference between this and PP Decline Rate?**
+Different jobs. PP Decline Rate is the absolute % gauge (alert fires at >8% sustained). This card is the *anomaly detector* (alert fires when the rate jumps statistically meaningfully vs the prior hour). On a sustained issue, this card fires once at the spike onset, then goes quiet as baseline catches up; PP Decline Rate fires when the elevated rate persists past the steady-state threshold. They complement each other.
+
+**Will this card miss a sustained slow-rise issue?**
+Yes, by design. A slowly-rising decline rate (each hour 0.2 percentage points worse than the last) never generates a 2σ jump because the baseline keeps catching up. Slow-rise issues need the absolute-level [PP Decline Rate](/nerve-centre/kpi-cards/paypal/decline-failure-rate) card. Operations teams run both.
+
+**Why is the baseline only 1 hour?**
+For responsiveness. A 24-hour or 7-day baseline would smooth out so much that hourly spikes get diluted. The 1-hour rolling baseline catches the *moment* something changed, which is what operations teams need. Trade-off: a sustained issue stops looking spiky after one hour. That's why you pair this with the steady-state card.
+
+**Small stores get false positives, anything I can do?**
+Yes, two options: (1) suppress the alert below a minimum-attempts floor (e.g. only fire when current hour has ≥ 30 attempts), this requires a manifest tweak; (2) layer with [PP Revenue at Risk (live)](/nerve-centre/kpi-cards/paypal/revenue-at-risk) which dollar-weights the signal, a $20 at-risk signal on a small store usually means one unlucky decline, not a real issue. Most operational teams use the dollar-weighted view as the primary trigger and this card as a debug tool.
+
+**The card fires but the funnel didn't drop, what's happening?**
+Most likely you're blocking real fraud and the spike isn't real customer-loss, it's blocked fraud-attempts. Open [PP Decline Event Codes](/nerve-centre/kpi-cards/paypal/top-decline-event-codes): if `denied_by_risk` dominates AND the email/IP cluster looks suspicious (multiple failed attempts from same IP), it's a card-testing attack and PayPal Risk did its job. Cross-check with [PP Fraud Velocity](/nerve-centre/kpi-cards/paypal/fraud-velocity). No customer impact, no operational action beyond watching.
+
+**Stripe's twin didn't fire but PayPal's did, why?**
+PayPal-only spikes are common because PayPal carries different traffic (younger, international, mobile, bank-funded) and is subject to PayPal Risk decisions Stripe never sees. PayPal-only fires usually point to: (1) a PayPal Risk rule change you can check in Risk Settings, (2) an eCheque clearance hiccup, or (3) a campaign disproportionately routed through PayPal Express. If both fire, the issue is upstream of either processor.
+
+**Does this card use the same baseline as PP Revenue at Risk (live)?**
+Yes, same 1-hour-preceding window. If both cards fire together (and they usually do), you have a high-confidence signal: statistical anomaly + dollar exposure. If the spike alert fires but at-risk is $0, the spike is in low-volume hours (overnight UTC) and probably not worth chasing.
+
+**Multi-currency PayPal account, does the alert work?**
+Yes, count-based. The σ calculation works on rate not value, so currency mix doesn't affect the spike trigger. The dollar-weighted [PP Revenue at Risk (live)](/nerve-centre/kpi-cards/paypal/revenue-at-risk) shows the multi-currency exposure once the alert fires.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Decline Rate Spike Alert* is one of hundreds of KPI pulses Vortex IQ tracks across PayPal and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

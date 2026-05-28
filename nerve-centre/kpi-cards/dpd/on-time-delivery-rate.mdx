@@ -1,0 +1,149 @@
+---
+title: "On-Time Delivery Rate, DPD"
+sidebarTitle: "On-Time Delivery Rate"
+description: "On-Time Delivery Rate for DPD stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Shipping & Courier
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Share of DPD parcels that arrived at the customer on or before DPD's promised delivery date. The merchant-facing "did the parcel turn up when DPD said it would" number, computed across every DPD shipment in the window. DPD UK quotes a contract SLA of ~98% on Next Day services for premium DTC accounts; this card tracks the lived reality.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(parcels WHERE actual_delivery_at <= estimated_delivery_at) / COUNT(parcels WHERE actual_delivery_at IS NOT NULL)`, every delivered parcel scores 0 or 1 against its own promise. |
+| **Delivery success criterion** | DPD `parcelStatus = DELIVERED` AND a valid Proof-of-Delivery (POD) scan with timestamp. PUDO drop-offs at DPD Pickup shops count as delivered the moment the parcel scans into the shop, not when the customer collects. |
+| **On-time threshold** | DPD's `estimatedDeliveryDate` field on the parcel object, no grace window. Predict-slot parcels (the 1-hour window) use the slot end-time as the cutoff; see `dpd_predict_slot_accuracy` for the in-slot variant. |
+| **Service-level scope** | All DPD services pooled: Next Day, Next Day by 12:00, Next Day by 10:30, Saturday, Sunday, EU Classic, EU Express. Filter by `productCode` in OTD by Route to isolate. DPDLocal is a separate connector card. |
+| **Predict-slot quirk** | A parcel can be "on time" by date (delivered same day) and "out of slot" (arrived 13:45 when the customer chose 10:00 to 11:00). This card scores the date; the slot is scored on `dpd_predict_slot_accuracy`. Treat the two as paired metrics. |
+| **Tracking event semantics** | DPD pushes status webhooks on every scan (collection, depot in, on van, attempted, delivered). The card uses the first `DELIVERED` event timestamp; subsequent corrections (e.g. carded then redelivered) do not retroactively change the score. |
+| **Returns / RTO** | Excluded. Returned-to-sender parcels (`parcelStatus = RTO` or refused) are removed from both numerator and denominator. They surface on `dpd_returned_to_sender`. |
+| **Geographic scope** | UK domestic + DPD UK outbound to EU and rest-of-world. Inbound EU origins served by DPD Group sister carriers (DPD France, DPD Germany) report through their own connectors and are not blended here. |
+| **Peak-period degradation** | Q4 (Black Friday through Christmas Eve) typically drops UK OTD by 3 to 8 percentage points; not as severe as Royal Mail or Evri because DPD's network is purpose-built for parcel volume, but still meaningful. Read November and December numbers in seasonal context. |
+| **Time window** | `30D vsP` (rolling 30 days vs prior 30 days) |
+| **Alert trigger** | `<95%` warns, `<90%` is critical, driven by `sentiment_key` gauge thresholds. Adjustable per workspace. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your DPD data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK premium-DTC menswear brand (AOV £180, ~3,000 orders / week) ships everything via DPD UK Next Day with predict-slot enabled at checkout as a paid £4.95 upgrade. Reading taken at 09:00 GMT on 12 Mar 26 for the trailing 30 days (10 Feb 26 to 11 Mar 26).
+
+| Service tier | Parcels | Delivered on date | OTD rate | In-slot rate (paired card) |
+| --- | --- | --- | --- | --- |
+| Next Day (standard) | 8,420 | 8,150 | 96.8% | n/a |
+| Next Day by 12:00 | 1,640 | 1,584 | 96.6% | n/a |
+| Next Day with Predict | 2,340 | 2,278 | 97.4% | 94.1% |
+| EU Classic (FR / DE / NL / IE) | 580 | 524 | 90.3% | n/a |
+| **All DPD (this card)** | **12,980** | **12,536** | **96.6%** | (slot card) |
+
+The card reads **96.6%** on the dial; the `<95%` warn threshold is **not** tripped. Five things to notice:
+
+1. **DPD's premium-tier number is meaningfully higher than mass-market UK couriers.** Industry-comparable Royal Mail Tracked 24 typically runs 91 to 94% on the same DTC-fashion lane; Evri runs 85 to 90%. This brand is paying ~£6.20 per parcel with DPD vs ~£4.10 for Royal Mail Tracked 24, a 50% premium for ~5 percentage-point OTD lift. Whether that maths works depends on AOV and refund-cost economics, see Premium-Service Uplift on DPDLocal for the same calculation in the cheaper-tier connector.
+2. **The in-slot 94.1% is the bigger story.** Customers paid £4.95 for the predict slot. 5.9% of them got the parcel on the right day but outside the chosen 1-hour window. They will not chargeback (parcel arrived) but they *will* file a refund-the-shipping-fee CS ticket; track Open Claims for the volume.
+3. **EU Classic 90.3% is the actionable signal.** The aggregate masks a Brexit-customs-lane problem; see UK to EU Cross-Border Exception Rate. Either the merchant accepts the EU lane is structurally slower or they switch EU outbound to DPD Express (premium DPD EU service, ~£12 per parcel).
+4. **Lost-parcel rate sits inside the 3.4% miss.** Of the 444 misses, ~70% were 1-day-late carded redeliveries (recovered next attempt), ~25% PUDO collection delay, ~5% genuinely lost. DPD's lost-parcel rate runs ~0.05% of total, an order of magnitude below Evri's ~0.4%; this is why premium-DTC accounts pay the premium.
+5. **3 to 5 percentage-point drop in OTD typically precedes a 0.5 to 1.5 percentage-point rise in refund rate at 7 to 14 days lag.** Pair with the merchant's Shopify or BigCommerce refund-rate card to confirm.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+On-time delivery is the customer-facing outcome metric. Pair it with these to diagnose root cause and see the downstream business impact.
+
+| Card | Why pair it with OTD | What the combination tells you |
+| --- | --- | --- |
+| [Predict Slot Accuracy](/nerve-centre/kpi-cards/dpd/predict-slot-accuracy) | DPD's flagship paid premium. OTD covers the *date*, slot accuracy covers the *hour*. | High OTD + low slot = the customer received the parcel but not when promised; refund-the-shipping-fee tickets follow within 24 hours. |
+| [Late Shipments](/nerve-centre/kpi-cards/dpd/late-shipments) | The numerator behind the miss. OTD is the rate, this is the absolute count. | Useful for ops triage, OTD says "how bad", late count says "how many tickets we are about to get". |
+| [Exception Rate](/nerve-centre/kpi-cards/dpd/exception-rate) | Catches refused, damaged, or held-at-customs parcels that never reached the customer. | Rising exceptions while OTD holds = network is delivering, but a slice is being lost; check claims. |
+| [OTD by Route](/nerve-centre/kpi-cards/dpd/otd-by-route) | Splits aggregate by destination postcode area. | One-region drops are local-depot or driver issues; network-wide drops are weather or peak-period structural. |
+| [UK to EU Cross-Border Exception Rate](/nerve-centre/kpi-cards/dpd/uk-eu-cross-border-exception-rate) | Isolates EU outbound from UK domestic. | EU lanes typically run 5 to 10 percentage points worse on OTD post-Brexit; pull these out of the headline. |
+| [DPD OTD by Sales Channel](/nerve-centre/kpi-cards/dpd/dpd-otd-by-sales-channel) | Joins shipments to commerce-sibling orders. | Reveals if Amazon-channel orders (often expedited) are over-served vs Shopify direct, or vice-versa. |
+| Cross-connector: [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Upstream cause. Orders waiting unfulfilled cannot meet OTD. | Climbing unfulfilled count predicts an OTD dip 1 to 2 days later. |
+| Cross-connector: [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream impact. Late deliveries drive refund and chargeback. | A 3 to 5 pp OTD drop precedes a 0.5 to 1.5 pp refund rise at 7 to 14 days lag. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in DPD's own dashboard:**
+
+[MyDPD Business portal](https://mydpd.co.uk/) -> **Reports -> Service Performance -> On-Time Delivery**. The portal shows the same metric with toggles for date range, service tier, and originating depot. The closest like-for-like view is *All Services, Last 30 Days, Aggregate*.
+
+For per-parcel audit, [MyDPD -> Track -> Filter "Late deliveries"](https://mydpd.co.uk/) shows individual parcels with the gap between estimated and actual delivery; useful when the headline number disagrees and you need to see which parcels missed.
+
+**Why our number may legitimately differ from MyDPD's portal:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Time zone** | Boundary days off | MyDPD defaults to Europe/London local time (BST in summer, GMT in winter). The card defaults to UTC. For a 30-day window the gap averages out; for "today" or "yesterday" it can shift the count by a few percent. |
+| **Tracking-feed lag** | Ours lower for last 4 to 6 hours | DPD pushes status webhooks within 5 to 30 seconds of each scan, but POD scans from rural rounds may not be uploaded until the driver returns to depot at end of shift. Most-recent-day numbers fully reconcile by T+1. |
+| **Peak-period throttling** | Ours lower during BFCM | DPD's webhook queue can throttle during BFCM peak; deliveries may post 2 to 6 hours late into the index. T-2 days fully reconcile. |
+| **Predict-slot vs date timestamp** | Either, depending on view | MyDPD's "On-Time Performance" tile uses the *date* as the SLA; their separate "Predict In-Slot" tile uses the *hour*. The card here uses date. Compare against the right MyDPD tile. |
+| **Service-tier scope** | Either | MyDPD defaults to the depot or account context the user is logged into. The card pools every service. Use the MyDPD service-filter dropdown to align. |
+
+**Cross-connector reconciliation against commerce platform unfulfilled:**
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Upstream input. Orders flow Shopify -> warehouse / 3PL -> DPD label print -> handoff. Persistent unfulfilled in Shopify implies orders DPD has not yet collected. | Webhook delivery failures, B2B / pre-order flows that bypass DPD, manual-fulfilment SKUs. |
+| [`bigcommerce.unfulfilled_orders`](/nerve-centre/kpi-cards/bigcommerce/unfulfilled-orders) | Same as Shopify upstream. | Same caveat. |
+| [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream impact. Late deliveries drive refunds. | 3 to 5 pp OTD drop -> 0.5 to 1.5 pp refund rise at 7 to 14 days lag. |
+| Cross-3PL: [`shipbob.sb_otd_rate`](/nerve-centre/kpi-cards/shipbob/on-time-delivery-rate) | Peer outcome metric for merchants split across UK-DPD and US-ShipBob. | Different parcel populations entirely, do not arithmetically reconcile. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for merchants comparing UK couriers)</em></summary>
+
+DPD operates in the same UK parcel network as Royal Mail and Evri but at a different price-and-service tier. Premium-DTC merchants typically use DPD as their "fast lane" and Royal Mail or Evri as a "slow lane" for low-AOV or non-urgent shipments. These cross-links are for navigation only; they are not arithmetic reconciliations.
+
+- Royal Mail Tracked 24 / 48 (mass-market UK)
+- Evri (lower-tier UK, ex-Hermes)
+- DPDLocal (DPD's lower-cost service line, separate connector)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**DPD vs DPDLocal, which one should I use?**
+DPD is the premium tier (full network, paid service uplifts, contracted SLAs around 98% on Next Day, predict-slot, Saturday and Sunday options). DPDLocal is the same network but a lower-cost product line aimed at smaller merchants, lower-volume shippers, and price-sensitive customers; SLAs are still strong but service tiers are fewer and predict-slot coverage is narrower. Most merchants either pick one based on AOV (DPD for £80+ AOV where margin can absorb the premium; DPDLocal for £20 to £60 AOV where £1 to £2 per parcel matters) or run both and tier by SKU. Read the two connectors side by side. The same OTD card on each will show whether the cheaper tier is actually compromising service or whether the network parity holds in practice.
+
+**How is in-slot delivery measured, and why does it differ from the OTD shown here?**
+In-slot is on the paired card, [Predict Slot Accuracy](/nerve-centre/kpi-cards/dpd/predict-slot-accuracy). The two metrics measure different windows. OTD asks "did it arrive on the promised *date*" (cutoff is end-of-day on the estimated delivery date); in-slot asks "did it arrive in the customer-chosen 1-hour window". A parcel can be on-time-by-date but out-of-slot, which is the most common DPD quality complaint and drives a specific kind of refund-the-shipping-fee CS ticket rather than a chargeback. Use OTD for the headline, in-slot for the predict-paid sub-population.
+
+**How does DPD's predict-app integration affect the metric?**
+Recipients who install the DPD mobile app see live driver-tracking and a 15-minute refined window on delivery day; they can change instructions in-app (deliver to neighbour, leave with shop, divert to PUDO). App users have higher first-attempt success because they can confirm in-home availability or redirect on the fly. The card includes app-driven redirections as on-time provided the parcel reached the *redirect destination* by the original promised date. This is by design (the customer chose the new destination) but it does inflate the metric vs a strict "delivered to original address" interpretation.
+
+**Why does DPD hold up during peak when Royal Mail and Evri collapse?**
+Three structural reasons. (1) **Network purpose-built for parcels**, not letters. DPD's depots, sortation, and final-mile fleet are sized for parcel volume year-round, not for a Christmas-card surge that displaces parcels. (2) **Tighter capacity contracts** with DTC accounts. Premium-DTC merchants pay roughly 30 to 60% above mass-market rates partly to lock in capacity through Q4. (3) **Predict-slot routing** spreads delivery load across the day rather than the typical morning-bottleneck pattern. Expect a 3 to 8 pp Q4 dip on this card vs 8 to 15 pp for Royal Mail Tracked and 12 to 20 pp for Evri on comparable lanes.
+
+**The customer says "not delivered" but DPD shows DELIVERED. What is happening?**
+Three usual edge cases. (1) **Left with neighbour**. DPD drivers can leave with a neighbour at customer permission (in-app or on the day-before notification); the parcel scans DELIVERED at the neighbour, not the customer's door. The customer collects later, or sometimes does not realise. (2) **PUDO drop**. If the customer was out and a Pickup shop is enrolled, DPD drops there and the parcel scans DELIVERED at the shop; the customer has 7 days to collect. The card counts this as on-time on the shop-scan date, not the customer-collection date. (3) **Wrong-address delivery**. Driver mis-scanned at the wrong door; rare but happens around 0.05% of parcels. Pull the POD photo from MyDPD; if the door does not match, file a claim. None of these change the OTD count, but they all generate CS tickets which is why this card pairs with Open Claims.
+
+**What is the returns flow and does it affect this card?**
+DPD returns ride either DPD's "Inbound Consumer Returns" service (label sent to customer, customer drops at PUDO or hands to driver on next collection) or a manual courier return (rarer). Returned parcels are excluded from the OTD denominator, they appear on [Returned to Sender](/nerve-centre/kpi-cards/dpd/returned-to-sender). A late outbound that the customer then returned still counts as late on this card; the return flow is downstream.
+
+**Why is today's number jumping around?**
+Small numbers are noisy. If you ship under ~200 parcels per day, a single bad route (driver out sick, depot truck breakdown) can move the daily OTD by several percentage points. **Look at the rolling 7-day or 30-day, not the daily figure**, that is why we default the alert window to 30D vsP. The Nerve Centre [OTD Today](/nerve-centre/kpi-cards/dpdlocal/otd-today) (DPDLocal) and the today-toggle on this card are for live ops triage, not for trending.
+
+**Should I use DPD as my only carrier, or run multi-shipper?**
+Most premium-DTC brands above ~5,000 parcels per week run two carriers: a fast lane (DPD or DPDLocal) for AOV >£60 or expedited orders, and a slow lane (Royal Mail Tracked 48 or Evri) for AOV &lt;£40 or non-urgent. The Cross-Channel cards in DPDLocal and Adobe Commerce can break revenue-at-risk by carrier so you can see whether the cost premium is justified. As a rough guide: if your average refund-from-late-delivery cost is ~3% of late-parcel revenue, DPD's ~5 pp OTD lift over Evri pays for the ~£2 per-parcel premium at any AOV above ~£40.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*On-Time Delivery Rate* is one of hundreds of KPI pulses Vortex IQ tracks across DPD and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

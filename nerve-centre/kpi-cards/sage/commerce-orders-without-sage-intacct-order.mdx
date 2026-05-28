@@ -1,0 +1,161 @@
+---
+title: "Commerce Orders Without Sage Intacct Order, Sage"
+sidebarTitle: "Commerce Orders Without Sage Intacct Order"
+description: "Commerce orders that never created a Sage Intacct Order. Each row is a revenue-leak investigation. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Cross-Channel  •  **Category:** Ecommerce Platform
+
+> Commerce orders that never created a Sage Intacct Order. Each row is a revenue-leak investigation.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Real-time alert table of commerce orders (BigCommerce, Shopify, Adobe Commerce) that never produced a Sage Intacct Order in the Order Entry module, and therefore never reached the Intacct GL. Each row is one order, with its commerce-side detail, presumed cause, and the Intacct dimension (Customer, Item, Class, Location) that owns the fix. This is the largest single gap-cause on most US mid-market Intacct merchants: typically 60 to 80% of total commerce-vs-Intacct revenue gap traces here.
+
+| | |
+| --- | --- |
+| **What it counts** | Commerce-platform orders (Shopify Order, BigCommerce Order, Adobe Commerce Order) created in the period whose order ID does not appear as a `CUSTOMERID + ORDERSOURCEKEY` link on any Intacct Order, Invoice, or Cash Receipt with revenue offset. Lists each unmapped order with: order date, order value, Customer email, presumed cause, owning Intacct dimension, and recovery action. |
+| **Tax treatment** | Order value shown as commerce-side gross (tax-inclusive on UK / EU, tax-exclusive on US) since the Intacct-side has no equivalent line. The mapping fix converts to the Intacct tax convention on Order creation. |
+| **Shipping** | Included (commerce gross). |
+| **Discounts** | Already applied (commerce post-discount). |
+| **Refunds** | Excluded; refunded orders are not "unmapped revenue", they are zero-net economically. |
+| **Cancelled / voided orders** | Excluded by default. Cancelled orders have their own card ([Cancellation Mismatch](/nerve-centre/sage/sage_xc_cancellation_mismatch)). |
+| **Currency** | Order shown in commerce currency; recovery action posts to the appropriate Intacct entity (US entity = USD, Canadian entity = CAD, etc) per the Location dimension routing. |
+| **Channels / sources** | Web (Shopify / BigCommerce / Adobe Commerce) by default. B2B portals, EDI flows, and POS can be added via manifest. |
+| **Owning Intacct dimension** | Each row is tagged with the dimension whose mapping is broken: Customer (most common), Item (second most common), Location (Multi-Entity routing), Class (Wholesale-vs-Retail), Project (project-tagged orders), or "config" (a webhook / credential / workflow problem with no dimensional cause). |
+| **Time window** | `RT` (real-time, refreshes on dashboard load and on webhook events) |
+| **Alert trigger** | `>0 unmapped orders`. Healthy stores run zero unmapped orders most of the time; spikes correlate with credential rotations, Implementation Partner Chart of Accounts changes, or new product / new Customer launches. |
+| **Roles** | owner, finance, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Sage data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US digital agency on Sage Intacct, project-based revenue recognition under Intacct Contracts and Revenue Management, with a Shopify Plus side channel for branded merchandise and templates the agency sells D2C. Annual revenue ~$28M. Period: real-time read on 02 May 26.
+
+**Headline:** 23 unmapped Shopify orders sitting outside Intacct, total commerce value $14,820. Median order value $384 (consistent with the agency's branded D2C book). Oldest unmapped order: 04 Apr 26 (28 days old).
+
+**Top 8 unmapped orders, with dimensional diagnosis:**
+
+| Order # | Date | Value | Customer | Owning Intacct dimension | Presumed cause |
+| --- | --- | --- | --- | --- | --- |
+| #SH-12047 | 04 Apr 26 | $1,840 | Acme Corp | Customer | Customer dimension link missing (B2B Shopify customer never linked to Intacct Customer record) |
+| #SH-12081 | 09 Apr 26 | $1,420 | Beta Industries | Customer | Same Customer-dimension issue, different B2B account |
+| #SH-12134 | 14 Apr 26 | $1,180 | Charlie Studios | Customer | Same |
+| #SH-12198 | 18 Apr 26 | $920 | (D2C consumer) | Item | New SKU `KIT-VEGA-2026` launched on Shopify before the Item record was created in Intacct |
+| #SH-12224 | 22 Apr 26 | $720 | (D2C consumer) | Item | Same new SKU |
+| #SH-12251 | 24 Apr 26 | $640 | (D2C consumer) | config | Webhook failure (HTTP 504 on the Intacct REST endpoint, no automatic retry configured) |
+| #SH-12289 | 28 Apr 26 | $580 | Delta Partners | Project | Order tagged to a Project that was archived in Intacct; the new Project code was not propagated to the Shopify product feed |
+| #SH-12302 | 30 Apr 26 | $480 | (D2C consumer) | Class | Order routed to Wholesale Class but the Class record had been renamed in Intacct |
+
+Five things to notice:
+
+1. **Three Customer-dimension issues account for $4,440 (30%) of the unmapped value.** Three B2B Customer accounts (Acme Corp, Beta Industries, Charlie Studios) placed orders through the Shopify B2B portal during the period. Their Shopify customer records exist; their Intacct Customer dimension records exist; the link between them is broken (the field-map's `customer_external_id` mapping was not run after the last Intacct Implementation Partner pushed a CRM cleanup). Recovery: re-run the Customer dimension link via the Vortex IQ field map admin, retroactively post the three Orders against the linked Customers, let them auto-Invoice on the standard Order-to-Invoice workflow. Recovers $4,440 within 15 minutes.
+2. **Two Item-dimension issues account for $1,640 (11%) of the unmapped value, and they share a root cause: a new SKU launched on Shopify before its Item record was created in Intacct.** This is the classic "merchandiser launches faster than finance" failure mode. The fix is to create `KIT-VEGA-2026` in Intacct (with the correct Department, Class, and Project tagging), then retroactively post the two Orders. Recovers $1,640. The systemic fix is a launch-gate: no SKU goes live on Shopify until the Item record exists in Intacct. Most agencies and SaaS-adjacent merchants land this lesson once, then never repeat it.
+3. **The Project-dimension issue ($580) is the killer Sage Intacct finding that no other ERP would surface this cleanly.** Order `#SH-12289` was tagged to Project `PRJ-DELTA-Q1`, which had been archived in Intacct after the project closed. When Delta Partners placed a new order, the Shopify product feed's Project tag still referenced the archived code; Intacct rejected the Order create call. The Project dimension is unique to Sage Intacct (NetSuite has Projects but they are subrecords, not first-class dimensions; SAP S/4HANA uses WBS Elements with a different structure). For project-based services agencies and consultancies, this kind of Project-dimension mapping issue is recurring; this card surfaces it inside a single dashboard read, where in NetSuite or SAP it would require a custom saved search per archived project.
+4. **The Class-dimension issue ($480) is rare but high-impact when it happens.** Class is the Intacct dimension typically used to separate Wholesale from Retail D2C, or brand units, or business segments. When a Class is renamed (the merchant's Implementation Partner reorganised the Wholesale Class into Wholesale-Domestic and Wholesale-International), the legacy Class code in the Shopify integration config breaks. The fix is to update the field map to point at the new Class code; until then, every order tagged to the old Class falls through. Recovery: $480, plus a one-time cleanup of any other order types still referencing the old Class.
+5. **The webhook config failure ($640) has no dimensional cause, just an infrastructure cause.** A single Shopify-to-Intacct webhook returned HTTP 504 and the integration had no automatic retry configured. The payload sat in the dead-letter queue. Vortex IQ's drift detector caught it because the Intacct record never appeared. Recovery: replay the webhook from the dead-letter queue, post the Order. Systemic fix: enable webhook retry-with-back-off in the integration config (most BigCommerce, Shopify, and Adobe Commerce integrations support this; defaults vary).
+
+**Total recovery value:** $14,820 of revenue moves from "unmapped Shopify orders" into the Sage Intacct GL within 30 minutes of fixing the three dimension links and replaying the one webhook. Without this card, all 23 orders would have aged into the next month-end before the Implementation Partner caught the gap, and three of them (the older Customer-dimension orders from early April) would have been booked late, probably with a one-line GL adjustment that the auditor flags. With this card, the recovery is same-day and dimensionally precise.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Commerce Orders Without Sage Intacct Order |
+| --- | --- |
+| [Revenue Gap, Detailed Breakdown](/nerve-centre/kpi-cards/sage/revenue-gap-detailed-breakdown) | The master cross-channel card. This card drills into the unmapped-orders bucket, which typically dominates the gap. |
+| [Revenue Gap vs Commerce](/nerve-centre/kpi-cards/sage/revenue-gap-vs-commerce) | Headline gap dollar; this card is the row-level worklist behind it. |
+| [Inventory Sync Drift](/nerve-centre/kpi-cards/sage/inventory-sync-drift) | The mirror gap on the Item dimension: this card tracks order leakage, that one tracks on-hand drift. |
+| [Revenue Gap Spike](/nerve-centre/kpi-cards/sage/revenue-gap-spike) | Fires when the gap (and therefore typically this card) suddenly widens. |
+| [Revenue by Entity](/nerve-centre/kpi-cards/sage/sage-revenue-by-subsidiary) | Multi-Entity Console: confirms the recovered revenue lands in the right entity. |
+| [Open Order Value](/nerve-centre/kpi-cards/sage/sage-open-so-value) | The healthy-state denominator: orders that did make it into Intacct. |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) | Commerce-side numerator for Shopify-fronted stores. |
+| [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | Same for BigCommerce-fronted stores. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Sage Intacct:**
+
+Sage Intacct cannot show this card on its own. The card is a join across Intacct (which has no concept of "missing orders that should exist") and the commerce platform (which has no concept of "did Intacct receive this?"). The closest manual approaches are:
+
+> **Reports → Order Entry → Sales Order Register** for the period (the Intacct-side existence list)
+> **BigCommerce Admin** or **Shopify Admin** Orders Report (the commerce-side ground truth)
+> Manual diff via spreadsheet on order ID
+
+The Implementation Partner pattern: most Partners run this comparison once at month-end as part of the close pack, sample-check 20 to 50 orders, and flag any obvious mismatches. They rarely catch every unmapped order because the volume is too high to inspect by hand. Vortex IQ runs the diff continuously, real-time, with dimensional tagging, which is the value beyond the Partner relationship.
+
+To approximate manually with sufficient rigour for audit:
+
+> **Interactive Custom Report (ICR)** against the Intacct Order Entry data source filtered to `RECORDTYPE = 'Sales Order' OR RECORDTYPE = 'Sales Invoice'` for the period, exported with `CUSTOMER.NAME, ITEM.NAME, ORDERSOURCEKEY` columns
+> Commerce-platform export of the same period's orders with their order IDs
+> Anti-join on `ORDERSOURCEKEY` vs commerce order ID; the unmatched commerce-side rows are the unmapped orders
+
+This takes a Controller (or the Implementation Partner) 60 to 120 minutes per period. The card does it continuously in real time.
+
+**Why our list may legitimately differ from a manual cross-check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Period boundary** | Either | Card uses commerce order date for inclusion; an Intacct ICR uses the Order or Invoice posting date. The boundary days move. |
+| **Order ID linkage field** | Material | Card uses the `ORDERSOURCEKEY` field on the Intacct Order to match the commerce order ID. If the field map points at a different custom field (some Implementation Partners use a renamed field), the matching breaks and produces false unmapped rows. Confirm the field-map link during onboarding. |
+| **Channel scope** | Either | Default is Web; merchants with B2B portals, EDI flows, or POS need to configure scope explicitly or those orders show as unmapped when they actually flow through a different integration path. |
+| **Cancellation timing** | Either | A commerce order that was placed and immediately cancelled (within 30 seconds, before the Intacct sync ran) may show as unmapped. Configure a min-age filter (default 5 minutes) to exclude these. |
+| **Multi-Entity entity routing** | Either | An order routed to the wrong entity (US instead of Canadian) shows as unmapped against the expected entity but mapped against the actual entity. The card surfaces both dimensions; the recovery action moves the Order. |
+
+**Cross-connector reconciliation:**
+
+This card IS the cross-connector revenue-leak detector. It is the row-level decomposition behind the headline [Revenue Gap, Detailed Breakdown](/nerve-centre/kpi-cards/sage/revenue-gap-detailed-breakdown) card. The dimensional tagging (Customer, Item, Class, Project, Location) makes it uniquely Sage Intacct-shaped: each unmapped row carries the dimension whose mapping is broken, so the recovery action is one click rather than a manual investigation. NetSuite's equivalent card lists unmapped orders by reason; Sage Intacct's lists them by reason AND dimension. For services-heavy or project-based merchants, the Project-dimension column is often the killer find.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Some orders show up as unmapped for hours, then disappear. Are they real?**
+Probably sync-lag. The card's default min-age filter is 5 minutes; orders younger than that are excluded. If an order shows for 30 to 60 minutes and then vanishes, the integration eventually succeeded (likely a webhook retry on a transient failure). Configure a longer min-age (15 to 30 minutes) if your sync cadence is slow and you want to suppress transient noise.
+
+**A new Customer just placed their first order and it shows as unmapped. Is the integration broken?**
+Usually not, it is a Customer-dimension creation race condition. New Shopify or BigCommerce customers do not have an Intacct Customer dimension record on day one; the integration creates the Customer record and the Order in a single workflow, but if the Customer-create step fails (for example, the Customer email already exists in Intacct under a slightly different format), the Order-create step never runs. Recovery: link the Shopify customer to the existing Intacct Customer dimension record manually, then replay the Order. Systemic fix: configure a Customer-matching rule on email or external ID, and ensure the Intacct Customer dimension record-creation flow is idempotent.
+
+**Why does my B2B portal contribute disproportionately to unmapped orders?**
+Two reasons. First, B2B orders typically have higher values, so each one is more visible in the dollar count. Second, B2B portals (Shopify Plus B2B, BigCommerce B2B Edition, Adobe Commerce B2B) use different webhook surfaces than the standard storefront, and many integrations only cover the storefront flow. Configure the B2B-channel webhook explicitly and the Customer dimension link from the B2B portal to the Intacct Customer record.
+
+**Sage Intacct Implementation Partner just pushed a Chart of Accounts change. Why am I seeing 200+ unmapped orders?**
+Almost certainly a Class, Department, or Item dimension code change. When the Partner renames or restructures dimensions, the integration's mapping config breaks until the field map is refreshed. Open the field map admin, refresh the dimension lookups, and replay the failed orders. The Implementation Partner's change advisory should always include a "refresh integration mappings" step; if it does not, push back.
+
+**Multi-Entity Console: an order shows as unmapped against the US entity but I think it should be Canadian. How do I tell?**
+The card's "Owning Intacct dimension" column will show "Location" for entity-routing issues. The Customer dimension on the unmapped order tells you the right entity (the Customer record is tagged to one entity). Cross-reference the Customer dimension's entity tag against the entity the integration tried to post to; mismatch = entity-routing fix. Update the field map's entity-routing logic and replay.
+
+**Can I auto-replay unmapped orders from this card?**
+Yes via Ask Viq. Vortex IQ supports a "replay unmapped orders" action that re-fires the integration's order-create call after the dimensional fix is applied. Requires merchant authorisation and the relevant integration permissions. The replay is idempotent: if the order has already been created in Intacct in the meantime (because the original webhook retried), the replay no-ops cleanly.
+
+**Sage Intacct Contracts and Revenue Management: do unmapped Contract-bundled orders behave differently?**
+Yes. An order that is part of a Contract (a SaaS subscription, an annual replenishment, a services retainer with deferred recognition) needs the Contract record to exist before the Order can post. If the Contract is not created in Intacct (because the Contracts admin has not yet processed the new subscription), the Order falls through and shows here. The fix is to create the Contract first, then replay the Order. Most agencies and SaaS-adjacent merchants set up a Contracts-admin workflow that runs daily before Order replay, to avoid the race condition.
+
+**REST vs XML API freshness, does it affect this card?**
+Marginally. The card joins commerce-side webhook events (real-time) with Intacct REST API reads (refreshed on the workspace's cadence, typically 5 to 15 minutes). The XML API is used for bulk back-fills if a long sync outage occurred; for normal operation, REST is sufficient. Lag is rarely material on this card because the alert fires when an order is missing, not when it is just slow.
+
+**The card shows 0 unmapped orders for weeks, then 50 overnight. What happened?**
+A credential rotation, a Chart of Accounts change, a webhook config change, or an Intacct API outage. Open the Vortex IQ event log around the time the count spiked; one of those four causes will be evident. Most spikes resolve within hours once the root cause is identified.
+
+**Sage Intacct vs NetSuite: is the unmapped-orders pattern different?**
+Same shape, slightly different dimensionality. NetSuite's unmapped-orders card tags by Customer and Item; Sage Intacct's adds Class, Department, Project, and Location as first-class tag candidates. For project-based services merchants on Intacct, the Project tag is often the killer; for B2B distribution merchants on NetSuite, the Customer tag dominates. Both are valid mid-market fits; the dimensional richness on Intacct is the structural advantage when the merchant has any project-based, multi-class, or multi-location complexity.
+
+**My account is single-entity Intacct, no Multi-Entity Console. Does this card still work?**
+Yes, identical formula. The Location dimension column will be empty (no entity-routing issues are possible) and the recovery action posts to the single entity. Most single-entity Intacct accounts run fewer Customer and Item dimension issues because the integration scope is simpler; expect lower baseline counts on this card.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Commerce Orders Without Sage Intacct Order* is one of hundreds of KPI pulses Vortex IQ tracks across Sage and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

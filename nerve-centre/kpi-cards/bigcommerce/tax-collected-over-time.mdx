@@ -1,0 +1,181 @@
+---
+title: "Tax Collected Over Time, BigCommerce"
+sidebarTitle: "Tax Collected Over Time"
+description: "Tax Collected Over Time for BigCommerce stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Ecommerce Platform
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Daily time-series of total tax collected over the rolling 90-day window. The chart finance teams use to verify tax collection is keeping pace with sales (and to catch tax-engine misconfigurations early). BigCommerce supports three distinct tax handling modes: native BC tax (manual rate tables), Avalara AvaTax integration (real-time API rates), and TaxJar integration (similar). **Each tax engine produces slightly different numbers**, and a sudden movement on this card frequently signals a tax-engine issue (failover from Avalara to native, expired Avalara credentials, TaxJar nexus changes) rather than a sales movement. Reconciliation between this card and the tax-engine dashboard is essential for stores in multi-jurisdiction territories.
+
+| | |
+| --- | --- |
+| **What it counts** | `SUM(total_tax) GROUP BY DATE(date_created)`. Daily buckets; `total_tax` is the BigCommerce-recorded customer-paid tax across all order line items. Includes VAT (UK / EU), state sales tax (US), GST (Australia / New Zealand / Canada), and any custom tax types configured. |
+| **VAT / tax treatment** | This card *is* the tax view. Distinct from [BC Total Revenue](/nerve-centre/kpi-cards/bigcommerce/total-revenue) which is tax-inclusive; this card isolates the tax portion. |
+| **Shipping** | Tax on shipping is included in `total_tax` if the merchant configured shipping as taxable (typical for UK / EU; varies by US state). |
+| **Discounts** | Tax is calculated on the post-discount subtotal in BC's default mode. So a £100 order with £20 discount sees tax computed on £80, not £100. |
+| **Refunds** | Tax on refunded orders is included in this card by default (gross tax view). For net-tax (deducted refunds), use the BC tax export with the refund-aware view. |
+| **Cancelled orders** | Excluded; cancelled orders generate no tax record. |
+| **`Incomplete` orders** | Excluded. |
+| **Currency** | Multi-currency without FX. Each currency aggregates separately; the headline shows the dominant currency or display currency. |
+| **Channels / sources** | All channels aggregate. Marketplace tax handling differs: Amazon, eBay, and Walmart Channel Manager orders typically have **marketplace-collected tax** (the marketplace remits tax directly), so the BC `total_tax` field on those orders may be 0 even though tax was collected. **This is a major reconciliation gap**, BC's tax over time only reflects merchant-collected tax. |
+| **Tax-engine caveat** | Stores using Avalara AvaTax or TaxJar see tax calculated by the engine and *recorded* in BC's `total_tax`. If the engine fails (timeout, expired creds), BC falls back to native tax tables, which usually compute differently. Sudden steps in this card commonly signal engine failover rather than sales change. |
+| **B2B Edition behaviour** | B2B orders frequently use tax-exempt customer groups (resale certificates, wholesale exemptions). Tax on B2B can be near-zero even on substantial revenue; this is structural and not a problem. |
+| **Time window** | `90D` (rolling 90 days). |
+| **Alert trigger** | None directly; an anomaly fires if daily tax / daily revenue ratio shifts by more than 2pp (suggesting tax-engine issue). |
+| **Roles** | owner |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your BigCommerce data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US apparel brand on BigCommerce, 90-day window 14 Feb 26 to 14 May 26. Multi-state nexus: ships to all 50 states, registered in 7 (CA, NY, TX, FL, IL, WA, MA). Avalara AvaTax integrated for tax calc.
+
+| Period | Avg daily revenue ($) | Avg daily tax ($) | Effective tax rate | Notes |
+| --- | --- | --- | --- | --- |
+| 14 Feb 26 to 28 Feb 26 | $14,800 | $920 | 6.2% | Baseline, blended state rate |
+| 1 Mar 26 to 14 Mar 26 | $15,200 | $945 | 6.2% | Stable |
+| 15 Mar 26 to 28 Mar 26 | $15,800 | $620 | **3.9%** | **Step-down anomaly** |
+| 29 Mar 26 to 11 Apr 26 | $15,200 | $945 | 6.2% | Returned to baseline |
+| 12 Apr 26 to 30 Apr 26 | $16,400 | $1,015 | 6.2% | Stable |
+| 1 May 26 to 14 May 26 | $17,200 | $1,070 | 6.2% | Stable |
+
+What's interesting:
+
+1. **The Mar 15-28 step-down is the diagnostic gold.** Tax dropped from $920/day to $620/day while revenue rose. **This is the signature of an Avalara outage**: the tax engine timed out, BC fell back to native tax tables, native tax tables don't have the multi-state matrix configured properly, so tax under-collected by ~37% for two weeks. **The merchant collected ~$4,200 less tax than they owed**. They'll either eat that liability themselves or face penalty interest.
+2. **Detection took two weeks.** Without this chart, the merchant noticed only when their accountant did the monthly reconciliation. **A daily-trending tax card with a 2pp ratio-shift alert would have flagged this on day 1.**
+3. **Effective tax rate of 6.2% is the read.** US national average for retail varies 5-9%; 6.2% is consistent with apparel (often clothing-tax-exempt in some states like NY and PA, which lowers blended). The rate should be *stable* over time; movement is the signal.
+4. **Multi-state nexus is the complexity.** Each state has its own rate; some states tax apparel, some don't; some tax shipping, some don't. Avalara abstracts this away; native BC tax tables do not. **Stores with nexus in 5+ states should use Avalara or TaxJar**; native tables become unmaintainable.
+5. **Reconciling against Avalara dashboard** would have caught the outage immediately. The Avalara console shows API call success rate; a drop to 60% on Mar 15 would have been visible there. Pair this card with Avalara monitoring.
+
+Action playbook this card surfaces:
+
+1. **Track effective tax rate (tax / revenue)** as a stability KPI. Movement is the signal; absolute level is set by the rate-table jurisdiction mix.
+2. **Set up an alert on 2pp ratio drift.** Most tax-engine failures show as a 1-3pp drop in effective rate over a few days; the alert catches them before reconciliation.
+3. **Reconcile monthly against the tax-engine dashboard** (Avalara, TaxJar). The engine knows what should have been collected; BC knows what was collected. Gaps mean engine failover or misconfig.
+4. **Audit marketplace-collected tax separately.** Amazon, eBay, Walmart often collect and remit tax directly; BC `total_tax` may understate the truth. Use marketplace tax reports for the full picture.
+5. **Document tax-rate movements with explanations.** Quarterly state rate changes, new nexus registrations, exemption certificate processing, all drive expected movements; track them in a change log so unexplained moves stand out.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Tax Over Time |
+| --- | --- |
+| [BC Total Tax](/nerve-centre/kpi-cards/bigcommerce/total-tax-collected) | The single-number aggregate. This card is the time series; that one is the magnitude. |
+| [Total Revenue](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | Denominator for effective tax rate. |
+| [Revenue Over Time](/nerve-centre/kpi-cards/bigcommerce/revenue-over-time) | Read alongside to confirm tax movements track sales movements. |
+| [BC Channel Revenue Mix](/nerve-centre/kpi-cards/bigcommerce/revenue-mix-by-channel) | Marketplace-collected tax can hide here; channel mix shifts change the effective rate. |
+| [BC Customer Countries](/nerve-centre/kpi-cards/bigcommerce/orders-by-country) | Tax rates differ by destination country / state; geographic mix shifts move this card. |
+| [BC Top Cities](/nerve-centre/kpi-cards/bigcommerce/top-cities-by-orders) | Sub-jurisdiction tax (city, county) shows here in aggregate; geographic detail is on top cities. |
+| [BC Customer Segments](/nerve-centre/kpi-cards/bigcommerce/customer-spend-segments) | B2B / wholesale customer segments often tax-exempt; segment mix shifts move this card. |
+| [Refunds Over Time](/nerve-centre/kpi-cards/bigcommerce/refunds-over-time) | Refund-related tax adjustments correlate with refund spikes. |
+| [Discount Over Time](/nerve-centre/kpi-cards/bigcommerce/discounts-given-over-time) | Discount handling changes tax basis; promotional periods show different effective rates. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in BigCommerce's own dashboard:**
+
+The native view is **BC Control Panel → Reports → Tax Reports**. Filter by the same date range; the Total Tax column should match this card's sum directly.
+
+For tax-engine integrations, the authoritative tax view is the engine's dashboard:
+
+- **Avalara AvaTax:** Avalara console → Reports → Tax Liability Report. This is the source of truth for what tax *should* have been collected based on transaction data.
+- **TaxJar:** TaxJar dashboard → Reports → Tax Liability. Same idea.
+
+For multi-channel stores: Channel Manager → (channel) → Tax Reports for marketplace-specific tax (often the marketplace collects and remits directly).
+
+**Why our number may legitimately differ from the vendor's:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Marketplace-collected tax** | Ours lower | Amazon, eBay, Walmart often collect and remit tax directly; BC `total_tax` may show 0 or a marketplace facilitator amount. The marketplace dashboard has the truth. |
+| **Tax engine failover** | Either | If Avalara/TaxJar timed out and BC fell back to native rates, recorded tax differs from what the engine would have computed. |
+| **Time zone** | Boundary days off | UTC vs store time zone. |
+| **Refund tax adjustments** | Either | We show gross tax; BC tax reports may show net (refund-adjusted). |
+| **Tax-exempt customer groups** | Either | B2B / wholesale exemptions may apply differently in our index versus BC's tax report depending on configuration. |
+| **Multi-currency** | Trivial | Per-currency aggregation; no FX. |
+| **Shipping tax** | Either | Whether shipping is taxable varies by jurisdiction; configuration changes mid-period show as movements. |
+
+**Cross-connector reconciliation (when both connectors are connected for this merchant):**
+
+| Card | Expected relationship | Notes |
+| --- | --- | --- |
+| [`avalara.avalara_tax_liability`](/nerve-centre/avalara/avalara_tax_liability) | Should match BC `total_tax` within ±1% on engine-managed orders | Persistent gaps >2% mean Avalara failover or sync issue; investigate. |
+| [`taxjar.taxjar_tax_collected`](/nerve-centre/taxjar/taxjar_tax_collected) | Same idea | TaxJar's view should mirror BC for engine-managed orders. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+Tax over time exists on Shopify and Adobe Commerce with similar definition. Shopify's tax engine is increasingly Shopify Tax (native); Adobe uses Magento native tax classes or third-party engines.
+
+- [`shopify.tax_over_time`](/nerve-centre/kpi-cards/shopify/tax-collected-over-time)
+- [`adobe_commerce.tax_over_time`](/nerve-centre/kpi-cards/adobe-commerce/tax-collected-over-time)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My effective tax rate dropped 3pp last month, what does that mean?**
+Almost certainly a tax-engine issue or a customer-base shift toward tax-exempt categories. Check Avalara / TaxJar dashboards first; if engine is healthy, audit recent customer-group changes (more B2B exempt, more wholesale orders).
+
+**Why does my Amazon channel show $0 tax in BC but Amazon collected tax?**
+Amazon is a "marketplace facilitator" in most US states; they collect and remit tax directly. BC records the order without tax because the merchant didn't collect it. **Use Amazon's tax report for marketplace-collected tax**; this card only shows merchant-collected.
+
+**Should I trust this number for my tax filings?**
+Treat the engine (Avalara / TaxJar) as authoritative for filings, this card as authoritative for cash-collection reconciliation. The two should agree; if they don't, investigate the gap.
+
+**Why does my B2B Edition show near-zero tax?**
+B2B customer groups are typically tax-exempt (resale certificates on file, wholesale buyers). Structurally normal; not a problem.
+
+**My tax rate spiked from 6% to 9% over a week, is that a problem?**
+Could be: (1) a state rate change taking effect, (2) a new nexus registration adding additional state collection, (3) channel mix shifting to higher-tax-rate channels. Check engine config; tax engines update rates automatically but only if the integration is healthy.
+
+**Does this card include Avalara fees?**
+No, Avalara fees are a service charge from Avalara to the merchant; they don't appear in BC's `total_tax` field. Track them separately in finance.
+
+**Can I see tax by state?**
+Yes via Ask Viq: "tax collected by state for last 90 days". Useful for nexus monitoring (your collection by state determines your nexus filing obligations).
+
+**Why is my UK tax (VAT) at 20% but the chart shows 16%?**
+Effective rate, not the marginal rate. UK VAT is 20% on standard goods, 5% on some categories (children's clothing, books, most food), 0% on others (newspapers, public transport). The blended effective rate depends on your category mix.
+
+**My tax-engine integration shows healthy but BC tax dropped, why?**
+Possible reasons: (1) the engine was healthy on average but had per-transaction failures (some orders fell back to native), (2) customers in newly-added jurisdictions where the engine doesn't have rates configured, (3) bulk orders with manual price adjustments that bypass the engine.
+
+**Can I export this for accounting?**
+Yes via Ask Viq or Settings → Data Solutions → Export → Orders (with tax columns). Most accountants use the BC Tax Report directly; our card is for trend monitoring.
+
+**Why does this not match my sales tax filing report?**
+Sales tax filings use the *destination* tax (where the customer is); BC's `total_tax` is *as collected* (which may differ if shipping address changes after order). Avalara's filing report is authoritative; this card is for daily trending.
+
+**Should I worry about tax on refunded orders?**
+Yes. Refund tax adjustments are reportable in most jurisdictions; if you refund a $100 order, you also "refund" the tax to the customer and reduce your liability accordingly. BC handles this if you use the refund flow correctly; gateway-side refunds can leave tax-adjustment gaps.
+
+**My multi-currency store shows tax for each currency separately, is that right?**
+Yes. Each currency's tax is calculated and reported in that currency. For consolidated reporting, FX-convert at filing time using the period's average rate (or daily rates for accrual accounting).
+
+**Why is the daily tax line bumpy compared to the smooth revenue line?**
+Tax cohorts in jagged bursts because high-tax states (CA, NY) cluster orders in waves; mid-tax states (FL, TX) average out; tax-exempt states (NH, DE) drag down. Day-to-day mix shifts move the daily tax more than the daily revenue.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Tax Collected Over Time* is one of hundreds of KPI pulses Vortex IQ tracks across BigCommerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

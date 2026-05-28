@@ -1,0 +1,157 @@
+---
+title: "Error Rate, Datadog"
+sidebarTitle: "Error Rate"
+description: "Error Rate for Datadog stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Monitoring
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of requests served by your instrumented services that returned an error response (HTTP 5xx, RPC error, span status `error`). For a merchant, this is "of every 100 shoppers who tried to do something on my site in the last hour, how many hit a broken page?" Above 1% means real customers are seeing real errors; above 5% means revenue is leaking right now.
+
+| | |
+| --- | --- |
+| **API endpoint** | Datadog Metrics API, `GET /api/v1/query` with `sum:trace.servlet.request.errors{*} / sum:trace.servlet.request.hits{*} * 100` (or the equivalent for your runtime: `trace.aspnet_core.request`, `trace.express.request`, `trace.flask.request`, etc). |
+| **Metric basis** | APM span counts, NOT raw HTTP access-log counts. Spans tagged `error:true` divided by all spans for the same service. |
+| **Aggregation window** | 1-minute rollup at source; the card averages across the rolling 7-day comparison window. |
+| **Severity threshold** | All errors counted equally at the metric level; tiered analysis happens downstream. P1 in this context means error rate > 5%, P2 means > 2%, P3 means > 1%. |
+| **Alert pre-filtering** | Datadog internal traffic (synthetic tests, `@user_agent:Datadog/Synthetic`) is excluded by default. Health-check endpoints (`/health`, `/ping`, `/metrics`) are excluded if your service catalog tags them as such. |
+| **Log Management gating** | Not used for this card. Error rate is computed entirely from APM metric data, so the card returns valid values even if Log Management is disabled (Logs API would otherwise return 400 No valid indexes). |
+| **Filtered hosts / services** | All instrumented services by default; per-service breakdown lives on [Error Rate by Service](/nerve-centre/kpi-cards/datadog/error-rate-by-service). |
+| **Time zone** | Datadog account timezone for chart axes; UTC for cross-connector correlation with commerce-platform order events. |
+| **Time window** | `T/7D vsP` (today vs the prior 7-day average) |
+| **Alert trigger** | `> 2%`, an error rate above 2% sustained for 5 minutes pages the on-call. |
+| **Sentiment key** | `error_rate` |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Datadog data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US apparel brand on BigCommerce with Datadog APM instrumented across web, checkout, search, and an inventory worker. The error rate sat at 0.4% steady-state through 03 Apr 26 then jumped during a deploy at 14:00 GMT.
+
+| Hour (UTC) | Total spans | Error spans | Error rate | What happened |
+| --- | --- | --- | --- | --- |
+| 13:00 | 184,200 | 700 | 0.38% | Baseline |
+| 14:00 | 192,400 | 920 | 0.48% | Deploy at 14:02; brief 1-minute blip |
+| 15:00 | 188,600 | 4,920 | 2.61% | Deploy regression: a new payment-retry loop on the checkout service |
+| 16:00 | 167,300 | 8,810 | 5.27% | Shoppers retrying checkout amplified the error stream |
+| 17:00 | 155,800 | 1,860 | 1.19% | Rollback at 16:45 |
+| 18:00 | 178,400 | 540 | 0.30% | Recovered |
+
+**Apdex dropped from 0.92 to 0.87 during this 6-hour window. Conversion rate dropped 18% in the same window.** The 18:00 recovery in error rate matched a recovery in BigCommerce orders/min from 12 to 41 within 25 minutes.
+
+```text
+Revenue impact (estimated):
+  - 3 hours of degradation, 14:30 to 17:30
+  - Baseline orders/min during peak: 38
+  - Observed orders/min during incident: 21
+  - Lost orders ≈ (38 − 21) × 60 × 3 = 3,060 orders
+  - At AOV of $94: lost revenue ≈ $287,640
+  - Datadog incident cost vs deploy savings: catastrophic mismatch
+```
+
+Three takeaways merchants should remember:
+
+1. **Error rate above 2% sustained for more than 5 minutes is *always* a paging event.** No matter how confident the engineering team is in the deploy, the cost of a false positive (an unnecessary page) is dwarfed by the cost of letting a real regression run another 30 minutes.
+2. **The error-rate curve and the orders/min curve are correlated but lagged.** Shoppers do not abandon instantly; they retry, refresh, and try a different browser. The lag is typically 5-15 minutes for desktop and 2-8 minutes for mobile (mobile shoppers abandon faster). When you see error rate spike, expect the orders/min curve to dip 10 minutes later.
+3. **Rollback is faster than fix-forward.** The team rolled back at 16:45 and the error rate normalised by 17:00. If they had tried to debug-and-patch in production, the incident would likely have run another 90 minutes. Internalise this: at error rates above 2%, rollback first, debug after.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Error Rate | What the combination tells you |
+| --- | --- | --- |
+| [Error Rate by Service](/nerve-centre/kpi-cards/datadog/error-rate-by-service) | The breakdown view. When the headline rate spikes, this card tells you which service is responsible. | Checkout error rate jumping while web stays healthy equals revenue-impacting regression; web spiking while checkout stays healthy equals less urgent (search/browse degradation). |
+| [5xx Response Rate](/nerve-centre/kpi-cards/datadog/5xx-response-rate) | The HTTP-status-only subset of error rate. Sometimes useful when teams instrument 4xx as errors and you want only 5xx. | If 5xx rate is low but error rate is high, you have lots of 4xxs being marked `error:true`, often a misconfigured instrumentation. |
+| [p95 Response Time](/nerve-centre/kpi-cards/datadog/p95-response-time) | Latency and error rate co-move during cascade failures. | Both spiking together equals dependency exhaustion (DB pool, API rate limit). Latency only equals slowness without breakage. |
+| [Apdex Score](/nerve-centre/kpi-cards/datadog/apdex-score) | The shopper-perception view; Apdex penalises both errors and slow requests. | When Apdex drops more than error rate predicts, the gap is latency-driven; when error rate drops more than Apdex, the gap is `error:true` instrumentation. |
+| [Top Error Messages](/nerve-centre/kpi-cards/datadog/top-error-messages) | The triage card. When error rate is up, this surfaces the top 5 messages so engineering can focus. | Same message dominating equals single root cause; many messages equals broader infrastructure issue. |
+| [Deploy Markers vs Latency](/nerve-centre/kpi-cards/datadog/deploy-markers-vs-latency) | Overlay deploys on the error-rate timeline. | Almost every error-rate jump aligns with a recent deploy; this card surfaces the link visually. |
+| [Shopify / BC / Adobe Total Revenue](/nerve-centre/kpi-cards/shopify/total-revenue) | The merchant-impact card. | When error rate is up but revenue is stable, the errors hit non-revenue paths (workers, admin); when revenue follows error rate down, the errors hit the storefront. |
+| [GA4 Property Health](/nerve-centre/kpi-cards/google-analytics/ga4-property-health) | Browser-side error peer. | Datadog error rate measures server-side; GA4 measures whether tags fired. Both red equals real outage; either red alone equals investigate one side. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Datadog:**
+
+> **[APM → Service List](https://app.datadoghq.com/apm/services)** for per-service error-rate breakdown.
+> **[APM → Traces](https://app.datadoghq.com/apm/traces?query=status%3Aerror)** to drill into individual error spans for a specific time window.
+> **[Dashboards → APM Overview](https://app.datadoghq.com/dashboard/lists)** for the time-series chart showing the rolling error rate.
+> **[Monitors → Manage Monitors](https://app.datadoghq.com/monitors/manage?q=metric%3Aerror_rate)** to see which alert is wired to this metric and what threshold is active.
+
+**Why our number may legitimately differ from Datadog's UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Time zone** | Boundary days off | Datadog UI displays in account timezone; Vortex IQ rolls windows in UTC. For "today" the gap can be a full day if you are in UTC+10 or beyond. |
+| **API rate limits** | Brief gaps | The Metrics query API is rate-limited; on burst minutes a polled value may use the cached prior result. |
+| **Log indexing latency** | Not applicable | Error rate is APM-derived, not log-derived; the typical 30-90 second log indexing lag does not affect this card. |
+| **Monitor state cache** | Up to 60 seconds | Monitor state is refreshed once per minute; a freshly triggered monitor may take up to 60 seconds to appear. |
+| **Span sampling** | Both directions | If your APM ingestion uses head-based sampling at &lt;100%, the absolute error count is sampled but the *rate* is unbiased. Tail-based sampling that prefers errors will inflate Datadog's error rate vs raw. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes the divergence |
+| --- | --- | --- |
+| [`google_analytics.ga_property_health`](/nerve-centre/kpi-cards/google-analytics/ga4-property-health) | Independent peer measuring browser-side health. RUM client-side vs APM server-side discrepancy is healthy and expected. | A 0.5% server-side error rate (Datadog) and a 1.2% browser-side JS error rate (GA4 / RUM) are both correct; they measure different layers. The shopper experiences the union, not the intersection. |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) / [`adobe_commerce.total_revenue`](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | Inverse relationship: when error rate spikes above 2% sustained, revenue/min should drop within 5-15 minutes. | If error rate spikes but revenue stays stable, the errors hit non-storefront paths (admin, workers, internal APIs). If revenue drops without an error-rate spike, the issue is latency or RUM-side, not server errors. |
+| Datadog logs | Subset relationship: error-level logs are a subset of error spans (a span can produce zero or one error log). | Error log rate &lt; error span rate is normal; if log rate > span rate, you have non-traced services emitting error logs (workers without APM coverage). |
+
+<details>
+<summary><em>Documentation cross-reference (same-metric peer)</em></summary>
+
+The error-rate metric exists with the same definition on other observability platforms. This is **not** a reconciliation, your Datadog account does not have a parallel New Relic instance to compare against. These references exist purely so an agency running clients on multiple monitoring stacks can cross-link the same metric across docs.
+
+- New Relic equivalent: `NrdGraph` query against `Span` events `WHERE error IS true`, returning the same shape.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My error rate is 0.4% and the alert says >2%. Why is the card amber?**
+The card alerts on the rolling 5-minute average versus the 7-day baseline. If your steady-state is 0.05% and you have just risen to 0.4%, that is an 8x baseline jump even though the absolute rate is still low. The amber state catches *changes*, not just absolute thresholds. Open the [Error Spike Detection](/nerve-centre/kpi-cards/datadog/error-spike-detection) card to see whether the jump is statistically significant.
+
+**Datadog says everything is fine but customers are complaining about errors.**
+This is the most common Datadog blind spot for ecommerce, and it is real. Three places to check, in order: (1) [JS Errors / Session](/nerve-centre/kpi-cards/datadog/js-errors-session), browser-side errors do not appear in server-side APM; (2) [Critical-Path Tests Status](/nerve-centre/kpi-cards/datadog/critical-path-tests-status), if a synthetic checkout test is failing while APM looks fine, the regression is in a code path Datadog is not instrumenting (third-party script, payment iframe); (3) [GA4 Property Health](/nerve-centre/kpi-cards/google-analytics/ga4-property-health), browser-side measurement gaps. The classic cause: a third-party script (chat widget, review widget, paid-social pixel) starts throwing errors and Datadog APM has no visibility. Add Datadog RUM to catch this class of issue.
+
+**What is the difference between an alert and an incident in this context?**
+An *alert* (or "monitor triggered") is a single threshold breach: a metric crossed a number for a period. An *incident* is a coordinated response: someone has acknowledged the alert and is actively investigating. Datadog uses both terms; Vortex IQ surfaces alerts on [Alerts Summary](/nerve-centre/kpi-cards/datadog/alerts-summary) and incidents on [Active Incidents](/nerve-centre/kpi-cards/datadog/active-incidents). The error rate metric drives alerts; humans declare incidents.
+
+**Why does my error rate include 4xx errors? My team only considers 5xx errors as real.**
+That depends on your APM instrumentation. By default, most Datadog tracers mark 5xx HTTP responses as `error:true` but leave 4xx as `error:false`. If your team has overridden this (some teams mark 401/403 as errors to track auth issues), the rate will look higher than your "5xx only" mental model. Use [5xx Response Rate](/nerve-centre/kpi-cards/datadog/5xx-response-rate) for the strict 5xx-only view.
+
+**My Logs API returns 400 No valid indexes. Does this card still work?**
+Yes. The error rate card is APM-derived, not log-derived. Vortex IQ logs the Log Management gating event once at INFO level and skips log-only cards (like [Top Error Log Patterns](/nerve-centre/kpi-cards/datadog/top-error-log-patterns) and [Error-level Log Rate](/nerve-centre/kpi-cards/datadog/error-level-log-rate)), but the headline error rate, Apdex, latency, and incident cards continue to function normally.
+
+**Datadog has a 15-month retention; Vortex IQ shows me 7 days. Why?**
+Vortex IQ's default rolling-window comparison is `T/7D vsP` because most actionable error-rate movements resolve in hours, not months. To see the longer view, use [Apdex Trend](/nerve-centre/kpi-cards/datadog/apdex-trend) for a 90-day picture, or query the underlying metric directly in Datadog with the date range you want. Vortex IQ stores its own historical snapshots for trend cards but does not duplicate Datadog's 15-month metric store.
+
+**My account has multiple Datadog organizations (multi-account aggregation). How is the error rate computed?**
+Each Datadog organization is a separate Vortex IQ connector instance and produces its own error-rate card. The headline does not blend organizations; the [Stacked Panel](https://docs.vortexiq.ai/nerve-centre/stacked-panels) feature on the Nerve Centre lets you display three or more side-by-side. This is correct for most merchants because each organization typically corresponds to a different store, brand, or environment.
+
+**RUM error rate is much higher than APM error rate. Which one do I trust?**
+Both, and they measure different things. APM error rate is "of all traced requests, how many returned an error". RUM error rate is "of all browser sessions, how many threw a JavaScript error". RUM will always be higher because it includes third-party script failures, ad-blocker interference, and browser quirks that the server never sees. **APM is the right metric for "is my code broken"; RUM is the right metric for "is the shopper experience broken".** They are complementary; merchant dashboards should show both.
+
+**Why does the error rate look fine during overnight hours when I know we had an incident?**
+At low-volume hours (under 1,000 spans/min) absolute error counts can stay in single digits even during a real degradation, which keeps the rate technically below the threshold. Vortex IQ flags these windows as "low-confidence" and uses absolute counts (>10 errors in any 5-minute window) as a secondary trigger. This catches overnight regressions that the rate alone would miss.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Error Rate* is one of hundreds of KPI pulses Vortex IQ tracks across Datadog and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

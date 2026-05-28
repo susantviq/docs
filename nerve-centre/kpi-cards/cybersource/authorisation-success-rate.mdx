@@ -1,0 +1,178 @@
+---
+title: "Authorisation Success Rate, CyberSource"
+sidebarTitle: "Authorisation Success Rate"
+description: "Authorisation Success Rate for CyberSource stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Payment Gateway
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Percentage of CyberSource transaction attempts that ended in `AUTHORIZED`. The cleanest single signal of "is the gateway doing its job today, yes or no" for enterprise merchants. The 35%-weight component of [Payment Health Score](/nerve-centre/kpi-cards/cybersource/payment-health-score). Healthy CyberSource merchants run 92, 96%; below 90% is unusual and almost always points to a Decision Manager rule-pack misfire, an issuer-side outage on a major BIN, or a 3DS 2.0 challenge-rate spike.
+
+| | |
+| --- | --- |
+| **The formula** | `COUNT(status='AUTHORIZED') ÷ COUNT(status IN ('AUTHORIZED','DECLINED','REVIEW','INVALID_REQUEST')) × 100` from `/tss/v2/searches`. `PARTIAL_AUTHORIZED` excluded from both (gift-card-split flows that re-submit). |
+| **`REVIEW` treatment** | DM `REVIEW` outcomes are in the denominator (they were a transaction attempt) but NOT the numerator (didn't authorise on first pass). If ops manually approves and the merchant re-submits, the second auth call counts separately. High `REVIEW` rates drag this metric directly. |
+| **`INVALID_REQUEST` treatment** | Counted in denominator. Most are merchant-side (malformed CVV, bad expiry, unsupported card-type for the MID config) and merchant-fixable. |
+| **Decline taxonomy** | `DECLINED` can be (a) AVS mismatch, (b) CVV mismatch, (c) Decision Manager `REJECT`, (d) issuer decline (`reasonCode` 201, 203, 204, 205, 231, 254). Each has a different fix; see [Top Decline Reasons](/nerve-centre/kpi-cards/cybersource/top-decline-reasons). |
+| **3DS 2.0 frictionless vs challenge** | Frictionless 3DS flows straight to `AUTHORIZED` (looks identical to non-3DS auths from this card's perspective). Challenges customers abandon end as `DECLINED`; challenges they pass count as `AUTHORIZED`. See [3DS Frictionless Volume](/nerve-centre/kpi-cards/cybersource/3ds-frictionless-volume). |
+| **Tokenized vs fresh-card** | Network tokens (Visa VTS / Mastercard MDES) typically run 4, 8pp higher auth rate than fresh cards on the same merchant. PAN tokens via TMS run 1, 3pp higher. Blended rate reflects whatever mix the merchant has. |
+| **Recurring vs one-time** | Both included. Tokenized recurring usually highest (95, 98%); fresh-card recurring runs lowest because of `do_not_honor` on suspected-recurring transactions. |
+| **Multi-acquirer routing** | If the merchant uses CyberSource as one of several acquirers (with intelligent routing), this card shows only the slice routed to CS. Merchants with smart-routing typically see CS auth rate higher than the unrouted average because the router sends the easy traffic to the highest-priority acquirer. |
+| **Currency** | **n/a (rate, currency-neutral).** Multi-currency global enterprises get a single, valid auth rate. |
+| **Time window** | `T / 7D vsP` (default 7D vs prior 7D). |
+| **Reporting API extraction lag** | Real-time via `/tss/v2/searches` for the most recent 7 days. Historical via `/reporting/v3/conversion-details` (overnight batch); 2, 6 hours stale on the most recent day. |
+| **Alert trigger** | `< 92%`. Below 92% almost always indicates an active issue, not normal variation. |
+| **Sentiment key** | `decline_rate` (inverse) |
+| **Roles** | owner, finance, operations, fraud-ops |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your CyberSource data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US-based subscription telecommunications merchant running CyberSource for monthly bill-pay across 8.4M active accounts. The 7-day window covers 06 Apr 26 to 12 Apr 26. Heavy tokenized-recurring book (94% of attempts are TMS-tokenized stored cards on file).
+
+The transaction outcome mix from `/tss/v2/searches`:
+
+| Status | Count | Notes |
+| --- | --- | --- |
+| `AUTHORIZED` | 1,485,200 | The numerator |
+| `DECLINED` | 86,400 | In denominator, breakdown below |
+| `REVIEW` | 12,800 | Decision Manager queue (ops will manually clear most) |
+| `INVALID_REQUEST` | 3,100 | Merchant-side bad data (mostly bad-format expiries from one self-service portal) |
+| `PARTIAL_AUTHORIZED` | 1,890 | Excluded from this card |
+
+Drilling into the 86,400 DECLINED:
+
+| Decline reason | Count | Share | Recovery option |
+| --- | --- | --- | --- |
+| `do_not_honor` (issuer, 203) | 35,400 | 41.0% | Retry rarely succeeds; some recovery via dunning at +24h |
+| `insufficient_funds` (204) | 23,300 | 27.0% | Retry on payday-aligned schedule; ~32% recovery rate |
+| AVS mismatch (no funds reason) | 11,200 | 13.0% | Re-prompt for billing address; some recovery |
+| `expired_card` | 7,800 | 9.0% | Account-update / network-token refresh recovers most |
+| Decision Manager `REJECT` | 5,500 | 6.4% | Rule-tuning required; manual review where ambiguous |
+| Other (CVV mismatch, format errors) | 3,200 | 3.6% | Mostly merchant-fixable |
+
+```text
+Auth Rate
+  numerator   = 1,485,200 AUTHORIZED
+  denominator = 1,485,200 + 86,400 + 12,800 + 3,100 = 1,587,500
+  rate        = 1,485,200 ÷ 1,587,500 × 100
+              = 93.56%
+```
+
+Composite contribution under the 35% weight:
+
+```text
+Component score = 93.56 (no amplifier; clamped at 100)
+Weighted contribution = 0.35 × 93.56
+                      = 32.75 (out of 35.00 possible)
+```
+
+Five things worth noticing:
+
+1. **93.56% is healthy enterprise band.** Comfortably above the 92% alert threshold. The carrier's heavy TMS-tokenized recurring book is doing its work; if this were a fresh-card-heavy mix the auth rate would likely sit 87, 91% with the same issuer base.
+2. **`do_not_honor` is the largest decline bucket at 41%.** This is typical for recurring-billing books: issuers respond `do_not_honor` (reason 203) when their internal risk models flag a recurring-MID transaction even though there's nothing wrong. Recovery via single retry rarely works (the issuer's risk position doesn't change); recovery via [Dunning Recovery Rate](/nerve-centre/kpi-cards/cybersource/dunning-recovery-rate) at +24h with messaging to the customer is more effective.
+3. **`insufficient_funds` is the second-largest at 27%.** Higher than typical for a non-subscription merchant. This is an artifact of bill-pay timing: the merchant runs all monthly bills on the same day for some account cohorts, hitting customers who hadn't yet been paid that month. Retry-on-payday-aligned schedules (typical `+5 days`, `+10 days`, `+15 days` for a SSI / pension cohort that paydays mid-month) recover ~32% of these.
+4. **AVS mismatch at 13% is meaningful.** Fresh-card billing-address re-prompts in the customer self-service portal recover some of these (the customer typed the wrong zip; the actual zip on the bank record is different). For a recurring book, AVS mismatch on a previously-successful tokenized card usually means the customer moved house and the billing zip is now stale; account-update services from the card networks refresh this.
+5. **Decision Manager `REJECT` at 6.4%, with REVIEW at ~0.8% of total.** A relatively healthy DM tuning. If REJECT climbed above 8%, ops should run a Decision Manager Replay against historical rule packs to confirm whether a recent rule change is responsible. See [Decision Manager Score Mix](/nerve-centre/kpi-cards/cybersource/decision-manager-score-mix).
+
+If next week's auth rate slipped to 91.2% (below the 92% alert), the composite drops by ~0.8 points and the alert fires. The first three places to look: [Top Decline Reasons](/nerve-centre/kpi-cards/cybersource/top-decline-reasons) (which bucket grew?), [Top Declining Issuers](/nerve-centre/kpi-cards/cybersource/top-declining-issuers) (is one specific issuer suddenly declining more?), and [Decision Manager Score Mix](/nerve-centre/kpi-cards/cybersource/decision-manager-score-mix) (did a recent rule pack ship?).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Auth Rate |
+| --- | --- |
+| [Decline Rate](/nerve-centre/kpi-cards/cybersource/decline-rate) | The complement (`100% − auth_rate − review_rate`). Together they show the full first-pass outcome split. |
+| [Top Decline Reasons](/nerve-centre/kpi-cards/cybersource/top-decline-reasons) | The "why" behind any auth-rate dip. AVS / CVV / DM / issuer breakdown. |
+| [Top Declining Issuers](/nerve-centre/kpi-cards/cybersource/top-declining-issuers) | When auth rate drops, this card answers "is one issuer responsible?" |
+| [Under-Review Rate](/nerve-centre/kpi-cards/cybersource/under-review-rate) | DM `REVIEW` outcomes, the in-between state that drags this rate. |
+| [Decision Manager Score Mix](/nerve-centre/kpi-cards/cybersource/decision-manager-score-mix) | Was a fraud rule pack the cause? |
+| [3DS Success Rate](/nerve-centre/kpi-cards/cybersource/3ds-success-rate) | If 3DS challenges are failing more, auth rate falls. |
+| [Stored-Token Health](/nerve-centre/kpi-cards/cybersource/stored-token-health) | TMS-tokenized auth rate runs higher than fresh-card. Token expiry cliffs visibly drop this card. |
+| [Payment Health Score](/nerve-centre/kpi-cards/cybersource/payment-health-score) | This card is the 35%-weight component. |
+| [Stripe Auth Rate (peer)](/nerve-centre/kpi-cards/stripe/success-rate) | Cross-processor peer for multi-acquirer enterprises. CyberSource enterprise-tier typically runs 2, 4pp lower than Stripe SMB-tier on the same merchant due to harder issuer mix. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in CyberSource Business Center (EBC2):**
+
+Closest views in [ebc2.cybersource.com](https://ebc2.cybersource.com/):
+
+- [Transactions → Search](https://ebc2.cybersource.com/ebc2/app/Transactions/transactions), filter by `Status = AUTHORIZED` for numerator, all statuses for denominator.
+- [Reports → Standard Reports → Conversion Detail Report](https://ebc2.cybersource.com/ebc2/app/Reports/StandardReports), the daily transaction-level dump. Authoritative source for "what authorised yesterday".
+- [Decisions → Decision Manager → Performance Reports](https://ebc2.cybersource.com/ebc2/app/RiskManagement/DecisionManager) for the DM `ACCEPT` / `REVIEW` / `REJECT` distribution.
+
+**Why our number may legitimately differ from EBC2:**
+
+| Reason | Direction | What to do |
+| --- | --- | --- |
+| **`REVIEW` treatment**. We exclude REVIEW from numerator; EBC2 may include in some performance views as "approved with conditions" depending on filter. | Ours **lower**. | This is intentional; see [Under-Review Rate](/nerve-centre/kpi-cards/cybersource/under-review-rate). |
+| **Reporting API extraction lag**. Reporting v3 conversion-detail runs overnight. Our historical view (>7d back) lags real-time EBC2 by 2-6 hours. | Vortex IQ may lag on most recent day. | Use 7D windows for fresh data via `/tss/v2/searches` (real-time). |
+| **Time zone**. EBC2 uses merchant-account tz; we use UTC. | Boundary-day drift. | Largest impact on "today"; 7D averages out. |
+| **`PARTIAL_AUTHORIZED` exclusion**. We exclude from both numerator and denominator. EBC2 may include it in some views. | Tiny drift (typically &lt;0.2pp). | Intentional; partial-auth re-submissions flow through as separate AUTHORIZED. |
+| **DM rule-version drift**. Historical reports re-evaluate against live rule version, not the rule active at transaction time. | Tiny drift on long historical windows. | Hold DM-driven analyses to ≤ 30D. |
+
+**Cross-connector reconciliation:**
+
+| Comparison | Expected relationship | When divergence is legitimate |
+| --- | --- | --- |
+| `cs_auth_rate` ↔ [`stripe.str_success_rate`](/nerve-centre/kpi-cards/stripe/success-rate) | CyberSource enterprise typically 2, 4pp **lower** than Stripe SMB on same merchant. | Harder issuer mix on CS (more international, corporate, recurring). A 5pp+ gap usually means a Decision Manager rule mis-tune on CS side. |
+| `cs_auth_rate` ↔ commerce platform checkout-completion | They co-move within 24, 72 hours. A drop in CS auth rate typically precedes a drop in commerce checkout completion. | See [Decline Spike vs Checkout Funnel Drop](/nerve-centre/kpi-cards/cybersource/decline-spike-vs-checkout-funnel-drop) for the live cross-platform pulse. |
+| `cs_auth_rate` ↔ [`cs_payment_health_score`](/nerve-centre/kpi-cards/cybersource/payment-health-score) | Internal identity. The 35%-weight component must move together. | n/a (mathematical relationship). |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for multi-acquirer enterprise merchants)</em></summary>
+
+The Stripe peer is [`stripe.str_success_rate`](/nerve-centre/kpi-cards/stripe/success-rate). Same definition (succeeded ÷ attempted) but typically 2, 4pp higher on Stripe due to softer SMB issuer mix vs CyberSource enterprise. Multi-acquirer enterprises should track both side-by-side; routing logic that sends harder traffic to CS will widen the gap by design.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is CyberSource's auth rate lower than Stripe's for the same brand?**
+Three structural reasons. (1) CS is positioned for enterprise and carries harder traffic mix: more international, corporate, recurring, all of which run lower issuer-side approval rates. (2) Multi-acquirer routing typically sends harder traffic to CS by design (Stripe handles the easy domestic-consumer flow). (3) CS's Decision Manager rule packs are usually tuned more conservatively than Stripe's Radar defaults, especially on enterprise merchants with chargeback monitoring exposure. A 2, 4pp gap is normal.
+
+**My auth rate dropped 3pp overnight, where do I look first?**
+In order: [Top Decline Reasons](/nerve-centre/kpi-cards/cybersource/top-decline-reasons) (which bucket grew?), [Top Declining Issuers](/nerve-centre/kpi-cards/cybersource/top-declining-issuers) (single-issuer outage?), [Decision Manager Score Mix](/nerve-centre/kpi-cards/cybersource/decision-manager-score-mix) (recent DM rule-pack ship?), then [3DS Success Rate](/nerve-centre/kpi-cards/cybersource/3ds-success-rate) (challenge-rate spike from the issuer side?). 80% of overnight drops are either a single-issuer outage (Capital One, Chase, BoA) or a DM rule-pack rollout.
+
+**My DM REVIEW rate climbed; should I expect this auth rate to fall?**
+Yes, by definition. REVIEW outcomes are in the denominator but not the numerator. A 1pp climb in REVIEW rate without a compensating climb in ops manual-approval pulls auth rate down 1pp. The fix is either: tighten DM rules (so fewer transactions go to REVIEW), or speed up ops manual-clear so customers don't abandon during the queue.
+
+**How does 3DS 2.0 affect this card?**
+3DS 2.0 frictionless flow has minimal impact, frictionless authentications complete server-to-server and the auth proceeds normally. Challenge flow is the impact: customers seeing the issuer's challenge screen and abandoning end as `DECLINED` (the auth never completes), which lowers this rate. EU PSD2 / SCA-mandated challenges add 5, 12% friction depending on customer device and issuer. See [3DS Challenge Abandon Rate](/nerve-centre/kpi-cards/cybersource/3ds-challenge-abandon-rate).
+
+**Why is my recurring-billing auth rate lower than my one-time auth rate?**
+Two reasons. First, recurring transactions trigger issuer risk models more aggressively (they look like card-on-file fraud patterns to a naive risk engine). Second, recurring books accumulate stale tokens (cards that have expired since the last successful charge); the network's Account Updater service refreshes some, but not all. Tokenized recurring on network tokens (VTS / MDES) is the highest-auth-rate slice of any enterprise book.
+
+**What's the auth-rate uplift from network tokens specifically?**
+Materially significant. On the same merchant comparing fresh-card vs network-token (Visa VTS / Mastercard MDES) for the same customer cohort, expect 4, 8pp uplift. PAN-token via TMS gives less (1, 3pp). Network tokens carry stronger metadata to the issuer and trigger fewer risk-model false-positives.
+
+**Does multi-acquirer routing affect this card?**
+Yes. If the merchant uses an external router (Spreedly, Cashflow, internal logic) to distribute auth requests across multiple acquirers, this card shows only the slice routed to CyberSource. Healthy multi-acquirer setups send harder traffic to the lowest-cost acquirer; if CS is the failover, expect this card to read materially lower than a single-acquirer-CS setup would.
+
+**How fast does this card refresh?**
+Real-time via `/tss/v2/searches` for the most recent 7 days, with sync-cycle freshness (typically every 5, 15 minutes). Historical (>7 days back) uses Reporting v3 which runs overnight. Check `last_synced_at` in the card metadata for exact freshness.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Authorisation Success Rate* is one of hundreds of KPI pulses Vortex IQ tracks across CyberSource and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

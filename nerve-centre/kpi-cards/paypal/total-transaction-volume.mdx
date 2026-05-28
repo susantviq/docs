@@ -1,0 +1,180 @@
+---
+title: "Total Transaction Volume, PayPal"
+sidebarTitle: "Total Transaction Volume"
+description: "Total Transaction Volume for PayPal stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Payment Gateway
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Total amount that successfully **flowed through PayPal** in the period, gross of refunds, gross of fees, gross of disputes. Money that touched the processor, not money you kept. The PayPal twin of [Stripe Total Charge Volume](/nerve-centre/kpi-cards/stripe/total-charge-volume).
+
+| | |
+| --- | --- |
+| **What it counts** | `SUM(transaction_amount.value)` for every row where `transaction_event_code` starts with **T00** (payment) AND `transaction_status = S` (success). One feed, four prefixes; T00 = payment, T03 = payout, T11 = refund, T19 = dispute. Only T00 successes contribute to this card. |
+| **Event code filter** | T00xx only. Refunds (T11) and disputes (T19) live in the same `/v1/reporting/transactions` feed but do not contribute. T03 payouts (PayPal disbursing to your bank) are also excluded; they're internal money movement, not customer revenue. |
+| **Transaction status filter** | `S` only. `P` (pending eCheque / SEPA clearance, hold-for-review) is transitional and excluded; it counts when it later flips to S. `D` (denied) and `F` (failed) are excluded. `V` (reversed) and `T` (in-transit) also excluded. |
+| **Currency** | **Multi-currency without FX.** Each transaction is summed in its own `transaction_amount.currency_code`. A GBP store taking GBP + EUR + USD payments will see arithmetic GBP + EUR + USD with no conversion. Use [PP Revenue by Currency](/nerve-centre/kpi-cards/paypal/revenue-by-currency) for the per-currency breakdown. |
+| **Fees / processing cost** | **Gross.** PayPal fees (`fee_amount.value`, stored as negative per transaction) are NOT deducted. See [PP Net Revenue](/nerve-centre/kpi-cards/paypal/net-revenue) for the post-fee + post-refund figure. PayPal fees are exact (unlike Stripe estimates) because they come from the API directly. |
+| **Refunds** | **NOT deducted.** A fully refunded $100 payment contributes $100 to this card. T11 refund events are not subtracted. See [PP Refund Value](/nerve-centre/kpi-cards/paypal/refund-value) or PP Net Revenue. |
+| **Disputes / chargebacks** | **NOT deducted.** A successful payment later disputed (T19) still counts here. See [PP Dispute Value](/nerve-centre/kpi-cards/paypal/dispute-value) for the at-risk amount. |
+| **Failed / declined payments** | **Excluded** (status D / F). [PP Decline Rate](/nerve-centre/kpi-cards/paypal/decline-failure-rate) tracks the rest. PayPal's "decline" includes both PayPal-side denials AND bank-side issuer declines for card payments routed through PayPal. |
+| **Pending status (P) handling** | Excluded. PayPal's `P` status covers eCheque clearance, SEPA debits (~3 days), and risk-review holds. When the hold resolves to S, the transaction starts contributing on the next refresh; if it resolves to D, it never contributes. |
+| **Seller Protection** | Coverage tracked separately (see [PP Seller Protection Coverage](/nerve-centre/kpi-cards/paypal/seller-protection-coverage-rate)). Eligibility does not change whether revenue counts here, only whether you're protected against future chargeback losses on it. |
+| **Page cap** | 10,000 transactions per `/v1/reporting/transactions` call; 31-day window cap per call (engine pages across longer windows). Merchants doing > 10k transactions in a single 31-day page will see truncated data. |
+| **Time window** | `T/7D/30D vsP` (default 30D vs prior 30D). |
+| **Alert trigger** | `drop > 15% vsP`, sentiment key `revenue_trend`. |
+| **Roles** | owner, finance |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your PayPal data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US-based fashion brand running PayPal alongside Stripe. PayPal carries the higher-risk traffic (younger demographics, international guests, customers without credit cards). The 7-day window covers 06 Apr 26 to 12 Apr 26.
+
+The transactions feed returns 1,420 rows for that window:
+
+| Event code prefix | Status | Count | Sum (USD subset) | Notes |
+| --- | --- | --- | --- | --- |
+| T00 (payment) | S (success) | 1,140 | $98,420.50 | Counts here |
+| T00 (payment) | D (denied) | 78 | $0 | Excluded, see PP Decline Rate |
+| T00 (payment) | F (failed) | 14 | $0 | Excluded, network errors / 3DS abandon |
+| T00 (payment) | P (pending) | 22 | $0 | eCheque clearing + 8 risk-holds; will count later if S |
+| T11 (refund) | S | 47 | -$3,810.00 | Excluded, see PP Refund Value |
+| T19 (dispute) | various | 4 | -$520.00 | Excluded, see PP Dispute Value |
+| T03 (payout) | S | 7 | -$94,000.00 | Excluded, internal money movement |
+
+```text
+PayPal API returns rows tagged by event_code:
+  T00xx + S      → 1,140 rows, $98,420.50 USD + €4,210.00 EUR + £880.00 GBP
+  T00xx + D/F    → excluded (declines)
+  T00xx + P      → excluded (pending; counts later if S)
+  T11xx          → excluded (refunds NOT deducted)
+  T19xx          → excluded (disputes NOT deducted)
+  T03xx          → excluded (payouts to bank, not customer revenue)
+
+Total Transaction Volume = $98,420.50 + €4,210.00 + £880.00
+                          (NOT $103k-equivalent; three currencies, no FX)
+```
+
+Three things worth noticing for a PayPal-heavy merchant:
+
+1. **The decline + failed bucket (92 rows, ~7.6% of T00 attempts) is meaningfully higher than a card-only Stripe store would see.** PayPal carries international shoppers and bank-funded payers; both groups skew higher decline. The headline volume looks fine but the *yield* (success ÷ attempts) is the better north-star here. Compare against [PP Success Rate](/nerve-centre/kpi-cards/paypal/transaction-success-rate).
+2. **22 pending payments worth ~$1,900 are sitting in `P`.** Most are SEPA / eCheque clearing on a 3-business-day cycle; a handful (8 rows) are risk-review holds on suspicious-looking high-value orders. They'll either resolve to S (and start counting) or D (and never count). Don't include them in revenue forecasts; track them via [PP Pending Rate](/nerve-centre/kpi-cards/paypal/on-hold-pending-rate).
+3. **The 4 dispute events (T19) are NOT deducted from this card** but they represent real exposure ($520). PayPal disputes include both PayPal-buyer-protection cases and bank-initiated chargebacks routed through PayPal. The dispute rate of 0.35% (4 ÷ 1,140) is healthy but worth watching, [PP Dispute Rate](/nerve-centre/kpi-cards/paypal/dispute-rate) alerts at 0.9% (90% of the Visa/Mastercard 1.0% cap).
+
+The headline number is "money in", not "money kept". For the kept-money view use PP Net Revenue (gross minus refunds minus PayPal fees).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with PP Total Transaction Volume |
+| --- | --- |
+| [PP Net Revenue](/nerve-centre/kpi-cards/paypal/net-revenue) | Same metric minus refunds and minus exact PayPal fees, the closest to a P&L view PayPal can give you. |
+| [PP Revenue by Currency](/nerve-centre/kpi-cards/paypal/revenue-by-currency) | The unambiguous per-currency breakdown when this card sums multiple currencies. |
+| [PP Refund Value](/nerve-centre/kpi-cards/paypal/refund-value) | The amount to subtract for a net-of-refunds figure. |
+| [PP Dispute Value](/nerve-centre/kpi-cards/paypal/dispute-value) | The amount tied up in chargebacks (not deducted here). |
+| [PP Avg Transaction](/nerve-centre/kpi-cards/paypal/average-transaction-value) | The denominator-aware view (`total ÷ successful_payments`). |
+| [PP Revenue Trend](/nerve-centre/kpi-cards/paypal/revenue-over-time) | Same metric trended daily for visual anomaly spotting. |
+| [PP Revenue by Country](/nerve-centre/kpi-cards/paypal/revenue-by-payer-country) | Geographic breakdown using `payer_info.country_code`. |
+| [Stripe Total Charge Volume](/nerve-centre/kpi-cards/stripe/total-charge-volume) | The Stripe twin (same metric on a different processor). Multi-processor merchants run both side-by-side. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PayPal Business:**
+
+Closest comparable is **[PayPal Business → Reports → Financial summary](https://business.paypal.com/merchantdata/reportHome)** for the same date range. The "Gross sales" line on that report maps to this card. Other useful screens:
+
+- [Activity → All Transactions](https://www.paypal.com/businessmanage/activities), the row-level view filtered to "Payments received".
+- [Reports → Activity download](https://business.paypal.com/merchantdata/reportHome) for a CSV export to reconcile row-by-row.
+- [Reports → Sales transactions](https://business.paypal.com/merchantdata/reportHome) groups by item and excludes refunds/disputes the way this card does.
+
+Other views that look like this but aren't:
+
+- "Net amount received" on the Financial summary already nets fees and refunds; that maps to PP Net Revenue, not this card.
+- "Money in" on the Activity summary tile includes received-friend-payments and personal transfers if your account has both personal and business activity blended.
+- "Settled to bank" is a payout view (T03), not a payment-received view.
+
+**Why our number may legitimately differ from PayPal Business:**
+
+| Reason | Direction of divergence | What to do |
+| --- | --- | --- |
+| **Page cap** (10,000 transactions per `/v1/reporting/transactions` call). High-volume PayPal merchants doing > 10k transactions in a 31-day window see truncated single-page totals. | Vortex IQ may be **lower** | Use shorter windows (7D / 1D) where each page stays inside 10k, or wait for the warehouse-backed view (rolling out separately). |
+| **Time zone**. PayPal Business uses your account-configured timezone (Settings → Business profile → Time zone). Vortex IQ runs on UTC by default. | Boundary days **differ** | Largest impact on "today" / "yesterday"; for 7D / 30D the drift averages out. |
+| **Event-code interpretation drift**. PayPal's `T00xx` sub-codes have evolved over time (older transactions may use codes since deprecated). Most engines, including ours, treat any T00 prefix as "payment" but PayPal Business has finer granularity. | Tiny drift on long historical windows | Compare equal short windows; differences usually &lt; 0.1%. |
+| **Pending refresh lag**. Transactions in `P` (eCheque, SEPA, risk-review) flip to `S` only after PayPal clears them; Vortex IQ reflects the state at last sync. | Vortex IQ **lower** for the most recent 1-3 days | Wait for next refresh; SEPA debits typically clear in 3 business days. |
+| **Multi-currency presentation**. PayPal Business converts to your account's primary currency at the day's FX rate; Vortex IQ sums each transaction in its own currency without FX. | Ours is **arithmetically wrong as a single number, accurate per-currency** | Use [PP Revenue by Currency](/nerve-centre/kpi-cards/paypal/revenue-by-currency) for the unambiguous view. |
+
+**Cross-connector reconciliation:**
+
+| Comparison | Expected relationship | When divergence is legitimate |
+| --- | --- | --- |
+| `pp_total_revenue` ↔ [`stripe.stripe_total_revenue`](/nerve-centre/kpi-cards/stripe/total-charge-volume) | Two independent processors, no equality expected. PayPal share is typically 15-30% of Stripe + PayPal combined for stores running both. | The split shifts with traffic mix (international, mobile, younger demographics push toward PayPal). |
+| `pp_total_revenue` + Stripe charge volume | `≈ commerce_total_revenue` | The two payment volumes summed (in matching currency) should approach the commerce platform's total minus other gateway revenue (Klarna direct, Apple Pay direct, manual bank transfer, gift cards, COD). |
+| `pp_total_revenue` ↔ [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) | `pp ≤ shopify` | Shopify total revenue includes orders paid via Stripe, Klarna, Apple Pay, gift cards, manual transfer, and any other gateway. PayPal is a *subset* of Shopify total. |
+| `pp_total_revenue` ↔ [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | `pp ≤ bigcommerce` | Same logic. BC supports many non-PayPal gateways (Stripe, Braintree, Authorize.net, Square, Cybersource), each one displaces PayPal revenue. |
+| `pp_total_revenue` ↔ [`adobe_commerce.total_revenue`](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | `pp ≤ adobe_commerce` | Same logic. Adobe Commerce stores frequently use Cybersource, Braintree, or Worldpay alongside PayPal. |
+
+**Quick rule for support tickets:** if a merchant says *"PayPal Business shows $100k, your dashboard shows $80k"* in the same period, walk through the divergence table in order. Page cap is the most common cause for high-volume merchants; FX is the most common for multi-currency stores; refresh lag for "today" complaints; and timezone for "yesterday" complaints.
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+This metric exists with the same definition on other payment processors. The closest direct twin is [`stripe.stripe_total_revenue`](/nerve-centre/kpi-cards/stripe/total-charge-volume), which uses the same shape (gross successful charges, no refunds deducted, no fees deducted, multi-currency without FX). For agencies running multi-processor merchants, both cards run side-by-side and "PayPal Total + Stripe Total" sums to roughly the commerce platform's total (minus other gateway revenue). Direct cross-linking:
+
+- [`stripe.stripe_total_revenue`](/nerve-centre/kpi-cards/stripe/total-charge-volume)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+> Reconciliation questions ("why doesn't this match PayPal Business / my bank?") are answered in the **Reconciling against the vendor's own dashboard** section above. Below are the merchant questions that aren't reconciliation.
+
+**Why is my PayPal total a fraction of my Stripe total?**
+PayPal typically carries 15-30% of combined PayPal + Stripe revenue for multi-processor merchants. Buyers default to whichever option they trust; younger US shoppers, international guests, and mobile-heavy traffic skew toward PayPal, while desktop card-on-file shoppers skew toward Stripe. The split is a strategic input for which option to feature in checkout, not a bug.
+
+**Why is this higher than what arrived in my bank?**
+Total Transaction Volume is **gross of fees, refunds, and disputes**. Bank deposits reflect [PP Net Revenue](/nerve-centre/kpi-cards/paypal/net-revenue) (PayPal fees and refunds netted) minus disputes lost minus rolling reserves. Use [PP Pending Balance](/nerve-centre/kpi-cards/paypal/pending-balance) and [PP Avg Settlement Time](/nerve-centre/kpi-cards/paypal/avg-settlement-time) to see what's in flight on its way to settlement.
+
+**What does "denied" actually mean for PayPal?**
+PayPal's `D` (denied) status covers *both* PayPal-side denials AND bank-side issuer declines for card payments routed through PayPal. PayPal acts as a payment intermediary; from the merchant view the distinction is irrelevant (the customer didn't pay). For finer breakdown see [PP Decline Event Codes](/nerve-centre/kpi-cards/paypal/top-decline-event-codes). The card excludes both equally.
+
+**Are eCheque payments counted while they're clearing?**
+No. eCheque clearance puts the transaction in `P` (pending) for ~3-5 business days. While `P` it's excluded; when it flips to `S` it starts contributing on the next refresh. Same for SEPA debit (~3 business days) and any payment held for risk review. Track the pending pool via [PP Pending Rate](/nerve-centre/kpi-cards/paypal/on-hold-pending-rate).
+
+**Are disputes counted as revenue?**
+Yes, until and unless they're resolved against you. A successful payment later disputed *still counts* in this card. PayPal's dispute lifecycle (T19) is tracked separately on [PP Dispute Value](/nerve-centre/kpi-cards/paypal/dispute-value), [PP Dispute Rate](/nerve-centre/kpi-cards/paypal/dispute-rate), and [PP Buyer Protection Win Rate](/nerve-centre/kpi-cards/paypal/buyer-protection-win-rate). PayPal aligns with Visa/Mastercard at the 1.0% chargeback monitoring threshold; we alert at 0.9%.
+
+**My multi-currency PayPal account, why does the headline number look weird?**
+Because we sum each transaction in its own currency without FX conversion. A store taking USD + EUR + GBP gets a sum like "$50k + €12k + £8k", arithmetically meaningless as a single number but correct per-currency. Use [PP Revenue by Currency](/nerve-centre/kpi-cards/paypal/revenue-by-currency) for the breakdown, or wait for the FX-normalised version on the roadmap.
+
+**Why doesn't my PayPal total match my commerce platform's "PayPal" filter?**
+Three usual reasons: (1) the commerce platform's "paid via PayPal" tag includes PayPal Express, PayPal Credit, Pay Later, and Venmo (all of which sum here too) but excludes any PayPal-bridged-card flows where the gateway recorded "card" instead of "PayPal"; (2) timezone differences move boundary-day orders; (3) refunds processed in PayPal but not yet synced back to Shopify (or vice versa) cause short-term drift. After 24-48 hours the two numbers converge.
+
+**Are Late Capture or Hold transactions counted?**
+No. PayPal's `P` (pending) covers eCheque clearance, SEPA, risk holds, and authorisation-without-capture states. None contribute. When the hold resolves to `S` they count then.
+
+**The PayPal share of my revenue is shrinking, should I worry?**
+Not by itself. Successful migrations to Stripe (or Apple Pay direct) often shrink PayPal share without shrinking PayPal absolute volume. Watch *absolute* PP Total Transaction Volume against the previous 30 days, not the share-of-total. If the absolute number drops > 15% vs prior period the alert will fire.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Total Transaction Volume* is one of hundreds of KPI pulses Vortex IQ tracks across PayPal and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

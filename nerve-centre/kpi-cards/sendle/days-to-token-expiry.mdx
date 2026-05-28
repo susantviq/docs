@@ -1,0 +1,141 @@
+---
+title: "Days to Token Expiry, Sendle"
+sidebarTitle: "Days to Token Expiry"
+description: "Days to Token Expiry for Sendle stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Shipping & Courier
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Days until your Sendle **API key** expires (or, where keys are non-expiring, days until the calendared rotation date set by the merchant). Sendle's primary auth model is a long-lived API key tied to the workspace; some enterprise accounts schedule rotations on quarterly or annual cadences for security hygiene. When the key invalidates, label-print and tracking calls fail, **breaking despatch end-to-end**.
+
+| | |
+| --- | --- |
+| **What it counts** | `(key_rotation_date - now) in calendar days`, read from the merchant's calendared rotation policy (defaults to 365 days from issue if no policy set). For accounts with truly non-expiring keys, the card displays a placeholder 365 from issue date and the alert can be suppressed. |
+| **API endpoint** | `GET /api/me` (Sendle account info endpoint) confirms the key is still valid and exposes the workspace ID. The expiry date itself is stored in Vortex IQ's connector configuration, not in Sendle (Sendle's API model does not natively expire keys). |
+| **Delivery success criterion** | Not applicable, this is connector health, not delivery. |
+| **On-time threshold** | Not applicable. |
+| **Returns / RTO** | Not applicable. |
+| **Service level scope** | Single key covers all Sendle services and zones in the workspace. |
+| **What "expired" actually breaks** | Every Sendle API call: label generation, tracking polls, claims filing. In-flight parcels continue tracking via Sendle's webhook stream (carrier-direct), but new orders cannot be processed. |
+| **Currency** | Not applicable. |
+| **Time window** | `RT` (real-time, refreshed on connector poll cycle every 5 to 15 minutes) |
+| **Alert trigger** | `<14 days`. Tripped at 14 days remaining against the calendared rotation date. The 14-day cushion gives change-management time. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Sendle data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+The Australian DTC home-goods brand. Reading taken at 09:00 AEDT on 12 Mar 26.
+
+| Workspace | Key issued | Calendared rotation | Days remaining | Alert state |
+| --- | --- | --- | --- | --- |
+| sendle-au | 28 Mar 25 | 28 Mar 26 | **16** | Healthy (close to alert) |
+
+The card reads **16** days. The alert at `<14 days` is **not yet firing** but will trigger in 2 days. Five things to notice:
+
+1. **The 16-day reading is the right time to schedule rotation.** It is calendar-warning land: the operator has time to plan a rotation window during business hours next week. Sendle's API does not auto-expire, so the merchant is rotating purely for security hygiene; missing the calendared date does not break despatch immediately.
+2. **Sendle keys are functionally non-expiring.** Unlike ShippyPro's OAuth bearer model, Sendle's API key remains valid indefinitely until the merchant manually revokes. The "expiry" the card tracks is a self-imposed rotation discipline, not a Sendle constraint. Some merchants set this to "never" and suppress the alert; the discipline is recommended for SOC 2 / ISO 27001 alignment.
+3. **Rotation is fast.** Generate new key in [Sendle Dashboard → Settings → Account & Plans → API](https://www.sendle.com/dashboard/api), copy, paste into the Vortex IQ connector settings, save. Total time &lt;5 minutes if access is pre-authorised. The old key remains valid until manually revoked, so there is a grace overlap.
+4. **For multi-region merchants, each region has its own key.** AU and US Sendle accounts are separate; rotate independently and stagger the rotation calendar so they never expire in the same week.
+5. **The card resets to the new rotation cadence after rotation.** Update the calendared next-rotation in the connector config; the card re-reads on the next poll. If you forget to update the calendar, the card will show 0 or negative days while the actual key continues working; Sendle's API will not error.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+Token-expiry is binary at the day level (alert fires or not), and a leading indicator for connector failure when the merchant treats it as a real expiry not a calendared discipline.
+
+| Card | Why pair it with Days to Token Expiry | What the combination tells you |
+| --- | --- | --- |
+| [API Error Rate](/nerve-centre/kpi-cards/sendle/api-error-rate) | Lagging confirmation. Invalidated key produces 401 errors. | Error rate climbing while expiry days drop = rotation deadline missed and key already invalid. |
+| [Label Generation Success](/nerve-centre/kpi-cards/sendle/label-generation-success) | Direct downstream effect. | Drops to 0% the moment the key invalidates. |
+| [Shipments](/nerve-centre/kpi-cards/sendle/shipments) | Volume processed. | Drops to 0 the moment label-gen hits 0; useful for confirming despatch is fully blocked vs partially degraded. |
+| Cross-connector: any other connector's token-expiry card | Workspace-wide rotation hygiene. | Multiple connectors with simultaneous low expiry = the merchant's rotation calendar is overdue stack-wide. |
+| Cross-connector: alerting / on-call rota | Ensures the alert wakes someone. | If the alert fires unattended, the silent-failure mode returns. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Sendle's own dashboard:**
+
+[Sendle Dashboard → Settings → API Keys](https://www.sendle.com/dashboard/api). The page lists active keys with creation date and last-used timestamp. There is no expiry column because Sendle keys do not natively expire; the rotation calendar is merchant-owned. The card and the portal will not match exactly because the rotation date is held in Vortex IQ's connector config, not in Sendle.
+
+**Why our number may legitimately differ from Sendle's portal:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sendle has no native expiry** | Always | The card displays a calendared rotation date set in the connector; Sendle does not store this. The two are independent fields by design. |
+| **Calendared rotation outdated** | Card may show 0 or negative | If the rotation date passes and the merchant did not update the connector, card shows expired while the actual key is still valid. Update the rotation date to resolve. |
+| **Multi-key accounts** | Either | Some merchants run multiple keys (one per integration). The card reads only the connected key. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| Other shipping connectors' token-expiry cards | Independent, except for shared rotation calendar policy. | Merchants on quarterly stack-wide rotation will see synchronised counts. |
+| Webhook-health monitors | Key-invalidation breaks API but not webhooks (Sendle posts to your endpoint). | In-flight tracking continues until next outbound API call from the connector. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multi-platform stacks)</em></summary>
+
+Token-expiry signals exist across all connectors with conceptually similar definitions, but the underlying auth model differs significantly.
+
+- [ShippyPro Days to Token Expiry](/nerve-centre/kpi-cards/shippy-pro/days-to-token-expiry) (OAuth bearer with native 365-day expiry; the card tracks a real Sendle-side clock)
+- [ShipTheory Days to Token Expiry](/nerve-centre/kpi-cards/ship-theory/days-to-token-expiry) (similar OAuth bearer)
+- Most VortexIQ connectors expose this card; rotation hygiene is workspace-wide, not per-connector.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Sendle keys do not expire, why is this card hero-tier?**
+Because the rotation discipline is part of operational hygiene even when the key itself is non-expiring. Long-lived API credentials are a known leak risk; quarterly or annual rotation reduces blast radius if a key is exposed. The card surfaces the calendared rotation; the merchant decides the cadence.
+
+**Can I disable this card if I do not rotate?**
+Yes. Set the rotation cadence to "never" in the connector configuration; the card displays "no rotation policy" and the alert is suppressed. Some merchants take this stance, accepting the static-key risk for simplicity.
+
+**My calendared rotation date passed but despatch is still working. What now?**
+Because Sendle does not auto-revoke, the actual key remains valid past your calendared rotation. The card alert means "you said you would rotate by X and X passed". Either: (a) rotate now and update the calendar, (b) extend the calendar if you intentionally deferred. Do not ignore; the alert is hygiene.
+
+**How long does Sendle key rotation actually take?**
+Mechanical: 5 minutes. Generate new key in Sendle dashboard, copy to Vortex IQ connector settings, save. The new key starts working on the next API call. Old key continues working until you manually revoke it in Sendle's dashboard, so there is a grace period of however long you choose. Typical rotation: generate new key Monday, switch connector Tuesday, revoke old key Friday once new key is confirmed working.
+
+**Multi-region (AU + US) Sendle accounts, separate keys?**
+Yes, each region issues its own key. Connect each separately in Vortex IQ; the card surfaces each as a separate workspace. Stagger the rotation calendar so they never expire in the same week.
+
+**What happens if despatch is mid-batch when I rotate?**
+Nothing. New API calls from the connector will use the new key; in-flight calls complete with the old. Sendle accepts both for as long as both are valid. There is no grace gap unless you revoke the old key before the connector reconnects.
+
+**Why does the alert fire at 14 days specifically?**
+Industry-standard for credential rotation. Two business weeks is enough cushion for change-management approval and rollback. Below 7 days is P2 escalation; below 2 days P1.
+
+**Can the connector auto-rotate?**
+Not yet for Sendle. Sendle's API does not currently support programmatic key issuance for the merchant's own account; rotation requires a human in the dashboard. Some other connectors support automated rotation; this is a Sendle-specific limitation.
+
+**The card showed expired then went green, what happened?**
+Likely the merchant updated the calendared rotation date in the connector after the card's read cycle, or rotated the key and updated the date. Both reset the count. Audit log in the connector shows the change.
+
+**Should I rotate annually or quarterly?**
+Trade-off. Annual is lower operational overhead; quarterly is better security hygiene. Most ecommerce merchants accept annual for shipping connectors (low-data-sensitivity vs payments connectors). High-compliance accounts (PCI, SOC 2, ISO 27001) typically rotate quarterly or per their policy.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Days to Token Expiry* is one of hundreds of KPI pulses Vortex IQ tracks across Sendle and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

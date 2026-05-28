@@ -1,0 +1,173 @@
+---
+title: "The Sentiment Model, Vortex IQ Documentation"
+description: "Every card on the Nerve Centre carries a sentiment colour: green good, red bad, amber warning. Decided per metric by sentiment_key. Dual-axis sentiment for bidirectional risks."
+---
+
+Numbers on their own do not tell the merchant what to do. The same revenue figure is good news on Tuesday and bad news on Black Friday. The same checkout latency is acceptable on a B2B catalogue page and intolerable on a high-velocity DTC checkout. The Nerve Centre solves this with **sentiment**: every card carries a colour rule that interprets the value in context. This page documents how sentiment is computed, how the colours map, where dual-axis sentiment applies, and when sentiment is intentionally absent.
+
+## What sentiment is
+
+Sentiment is a colour assigned to a card's current value by the renderer at refresh time. The colour is one of:
+
+- **Green.** Good direction. The metric is in its target band or moving toward it.
+- **Red.** Bad direction. The metric is outside its band or moving away from it.
+- **Amber (orange).** Warning. The metric is approaching its threshold from the inside, or sitting just outside the threshold but not yet at the alert-fire bar.
+- **Grey (neutral).** No sentiment. Either the card has no sentiment rule (informational metric) or the data is too sparse to assign a colour.
+
+The sentiment colour is not a separate visual element. It is the colour of the card's primary value, the card border, the trend arrow, and (for chart-type cards) the chart strokes and bars. A green Total Revenue tile renders the £165,890 figure in green and the trend line in green. A red Refund Rate tile renders the 4.4 percent figure and the trend bar in red.
+
+Sentiment is also the input to the dashboard's at-a-glance scan. A merchant who opens the Nerve Centre at 9am wants to see green, green, green and move on. A wall of green is a healthy morning. Red or amber tiles are the things that need a closer look. Sentiment is what makes that scan possible.
+
+## How sentiment is computed
+
+Each card carries a `sentiment_key` field that names the rule used to colour it. The rule is a registered function in the sentiment library that takes the card's current value, its baseline, its threshold, and any per-metric configuration, and returns a colour.
+
+A simplified view of the most common rule shapes:
+
+| Rule shape | When to use | Example |
+| --- | --- | --- |
+| `higher_is_better` | The metric should grow. Below threshold is red, above is green, near is amber. | Total Revenue, Order Count, Conversion Rate. |
+| `lower_is_better` | The metric should shrink. Below threshold is green, above is red. | Refund Rate, Cart Abandonment, Decline Rate, Latency. |
+| `target_band` | A specific range is healthy. Above OR below the band is bad. | Inventory cover days, AOV (too low = discount problem; too high = exclusive product problem). |
+| `dual_axis` | Both extremes are risky for different reasons. | Branded ad share, discount depth, customer concentration. See [dual-axis sentiment](#dual-axis-sentiment). |
+| `directional_change` | Absolute value matters less than the move. | Trend metrics that ought to move in one direction; a flat or reverse move is the sentiment signal. |
+| `state_categorical` | The value is categorical (active, syncing, errored). | Connector health, agent deployment status. |
+
+The colour bands per rule are configurable per workspace under [Dashboard Settings, Sensitivity](/platform/settings/alerts). The defaults are recipe-driven and informed by industry benchmarks; the workspace admin can tighten or loosen.
+
+## The default colour bands
+
+For `higher_is_better` and `lower_is_better` cards, the default bands are expressed as percent-of-threshold:
+
+| Distance from threshold | Colour |
+| --- | --- |
+| At or beyond the green target | Green |
+| Inside the green target by 0 to 10 percent | Green |
+| Inside the threshold by 10 to 30 percent (warning zone) | Amber |
+| Beyond the threshold (alert zone) | Red |
+
+For `target_band` cards, the bands are symmetric around the band's midpoint:
+
+| Position | Colour |
+| --- | --- |
+| Inside the band | Green |
+| Outside the band by 0 to 25 percent of band width | Amber |
+| Outside the band by more than 25 percent | Red |
+
+The bands map onto alert thresholds: red is the alert-fire band; amber is the watch band. The merchant who sees an amber tile knows the metric is approaching trouble before it crosses.
+
+## Dual-axis sentiment
+
+Some metrics are bad in both directions. Setting a single threshold and colouring above versus below is misleading. The classic example is **branded search ad share**:
+
+- Too low (e.g. less than 50 percent of branded SERP impressions captured by your own ad) and competitors are arbitraging your brand traffic. Your CPA on branded looks great because you are paying nothing for what they are skimming.
+- Too high (e.g. more than 95 percent of branded SERP) and you are over-spending on a click that would have come organically. The brand was always going to convert; the ad spend is a tax.
+
+Dual-axis sentiment handles this by attaching two thresholds and two colour rules to the same card:
+
+- A **lower threshold**, below which the card is red (under-defending).
+- An **upper threshold**, above which the card is red (over-spending).
+- A green band between them.
+- Amber bands on either side just inside the red bands.
+
+The card UI shows two trend arrows (one each side) and a band visualisation that makes the healthy zone obvious. Other dual-axis cards include:
+
+- **Discount depth.** Too low = no acquisition lever; too high = margin destruction.
+- **Customer concentration (revenue from top-1-percent customers).** Too low = no whales; too high = single-customer risk.
+- **Inventory cover days.** Too low = stockouts; too high = working-capital lockup.
+- **New-versus-returning revenue mix.** Too low = no acquisition; too high = no retention.
+- **Refund rate** can be dual-axis on category (a near-zero refund rate on a clothing store with 30 percent industry refund norms is actually a tracking gap, not a triumph).
+
+Dual-axis cards always carry the `sentiment_key` value with a `_dual` suffix in the registry (e.g. `branded_share_dual`, `discount_depth_dual`).
+
+## When sentiment is null
+
+Not every card has a meaningful sentiment. The following cases render in neutral grey:
+
+- **Pure informational metrics.** Order count by hour over the last 24 hours, distribution histograms, traffic source breakdowns. The values are useful context; the rule "more is better" or "less is better" does not apply universally.
+- **Categorical state cards.** Connector status, deployment state, currency code. These render in their own colour palette (green active, blue syncing, red errored) but the palette is not the sentiment library.
+- **Sparse data.** A card with fewer than the recipe's minimum sample size suppresses sentiment until the sample fills out. The merchant sees the value with a "(small sample)" annotation.
+- **Stale data.** When a connector is in a data-gap state, the most recent value renders in grey with a "stale since hh:mm" annotation. The sentiment rule does not run on stale data because the comparison would be meaningless.
+
+Suppressing sentiment when it would mislead is as important as showing it when it is meaningful. A card that confidently renders red on a 7-data-point sample is worse than no sentiment at all.
+
+## Sentiment versus alert
+
+Sentiment and alerts share thresholds but they are not the same.
+
+| Question | Sentiment | Alert |
+| --- | --- | --- |
+| What does it do? | Colours the card | Fires an event into the routing layer |
+| When does it run? | Every render | Every refresh |
+| What is its visible surface? | The card colour | A Kanban entry, an email, a Slack ping |
+| Can it be disabled? | Per card, per profile | Per card, per channel |
+
+A card can be amber (sentiment) without firing an alert (the merchant has muted the channel; the alert floor is `high` only; the card is in the watch band but not the breach band). A card can fire an alert without changing colour (an anomaly alert on a metric still inside its hard threshold band). The two systems share the underlying threshold object but render at different layers.
+
+For the alert system itself see [alerts](/nerve-centre/kpi-cards/concepts/alert-system).
+
+## How sentiment surfaces in the UI
+
+- **Card tile.** The current value is rendered in the sentiment colour. The trend arrow is the same colour. The card border carries an accent line in the sentiment colour for hero cards.
+- **Connector tab badge.** When any card on a connector tab is red, the tab title carries a small red dot. The merchant sees at a glance which connectors have something wrong.
+- **Dashboard banner.** When more than three cards are red across the workspace, a banner appears at the top of the Nerve Centre summarising the failure modes.
+- **Activity feed (right rail).** Sentiment changes are streamed as events. A card flipping from green to red appears in the feed with a timestamp and a click-through.
+- **Briefings.** The daily morning briefing opens with the sentiment summary: "X cards green, Y amber, Z red, of which N are critical".
+
+## Customising sentiment
+
+The Dashboard Settings page (gear icon, Sensitivity tab) is the surface for sentiment customisation. The screenshots show the layout: a per-metric row with a green target value, a red threshold value, a sensitivity slider (very high / high / medium / low), and a "Reset to Defaults" button per category.
+
+Common customisation patterns:
+
+- **Tighten the green band on a high-margin business.** A 1 percent refund rate is acceptable on commodity retail; a 0.4 percent rate is the floor on a luxury brand. Tighten the rule.
+- **Widen the green band during a known seasonal swing.** Black Friday week revenue does not need a "drop > 15 percent vsP" alert if the merchant has already planned the dip; widen for the week.
+- **Profile-scoped overrides.** A finance profile might want stricter cash-flow thresholds; a marketing profile might want stricter acquisition-cost thresholds. Sentiment overrides bind to the profile.
+
+Customisations are versioned and audit-trailed. A workspace admin can see "the refund rate threshold was changed from 4 percent to 5 percent on 12 Mar 26 by sarah@example.com" and revert if needed.
+
+## How sentiment relates to other modules
+
+- **[Alerts](/nerve-centre/kpi-cards/concepts/alert-system)** share the threshold object with sentiment. Tightening the sentiment rule tightens the alert rule unless the two are decoupled (an advanced setting).
+- **[Vortex Mind](/vortex-mind/concepts/severity-and-evidence-model)** uses sentiment as one input into the severity score. A red sentiment with a confirmed evidence bundle is more confidently `high` severity than a green or grey sentiment.
+- **[Ask Viq](/ask-viq)** narrates sentiment in answers. "Total Revenue is currently green, sitting 4 percent above last period's comparable window." The colour vocabulary travels into chat.
+- **[Actions](/actions/kanban)** carries the alert sentiment colour into the Kanban card's status badge.
+- **[Vortex Memory](/vortex-memory)** archives sentiment transitions. "This is the fourth time the refund rate card flipped to red in the last 90 days" is a Vortex Memory query that depends on the archive.
+
+## FAQ
+
+**Why amber and not yellow?**
+Yellow is too close to white in the V2 dark theme; it does not read as a warning at a glance. Amber (or orange) carries the warning semantic at the right contrast. The internal name in the codebase is `amber`; some legacy strings use `orange` and they are equivalent.
+
+**Can I change the colours themselves?**
+Not at the colour-value level (the green / red / amber palette is fixed for accessibility and consistency). What is configurable is the threshold values that decide which colour is shown. A workspace can decide that "5 percent refund rate is the green ceiling" rather than the default 4 percent; the colour rule is unchanged.
+
+**What happens when the metric is exactly at the threshold?**
+The bands are inclusive on the green side and exclusive on the red side by default. A refund rate of exactly 4 percent renders green; 4.001 percent renders red. The band edges are configurable; some workspaces prefer a 0.1 percentage point hysteresis to prevent flapping.
+
+**Are colour-blind users accommodated?**
+Yes. The sentiment colours each carry a secondary visual cue: green has a check icon, amber has a warning icon, red has a stop icon. The icons render alongside the value so the colour is not the sole signal. A high-contrast theme also remaps the palette for users who configure it under their account preferences.
+
+**Does sentiment work on cross-channel cards?**
+Yes. Cross-channel cards have their own sentiment rules informed by the join logic. A *Stockout with Active Spend* card is red whenever the spend stream is non-zero on a SKU whose inventory stream shows zero. The sentiment runs the same way as for single-connector cards; the rule is more interesting because the inputs are joined.
+
+**Can I see why a card is amber rather than green?**
+Hover the card to see the threshold tooltip: current value, green target, amber band, red band, time to next refresh. Click into the card's documentation page (or its [Vortex Mind diagnostic](/vortex-mind/concepts/how-diagnostics-work) when one has run) for the deeper why.
+
+**What is the difference between dual-axis sentiment and target-band sentiment?**
+Both are "U-shaped" rules with a healthy zone in the middle. The difference is in the framing. Target-band cards have a single conceptual reason for the band ("inventory cover days should be between 21 and 60"). Dual-axis cards have two distinct failure modes on each side, often relevant to different stakeholders ("branded share too low matters to growth; too high matters to finance"). The card UI for dual-axis carries the two-arrow visualisation; target-band uses a single band visualisation.
+
+**Why are some cards always grey?**
+Informational distribution metrics (e.g. order count by hour, traffic source breakdown, currency mix) do not have a "good or bad" reading. Their job is to give the merchant context for interpreting the cards that DO carry sentiment. They render grey by design.
+
+## Cross-links
+
+- Concept: [the KPI model](/nerve-centre/kpi-cards/concepts/kpi-model)
+- Concept: [alert system](/nerve-centre/kpi-cards/concepts/alert-system)
+- Concept: [hero, cross-channel, tiers](/nerve-centre/kpi-cards/concepts/hero-cross-channel-tiers)
+- Concept: [time windows](/nerve-centre/kpi-cards/concepts/time-windows)
+- Concept: [data freshness](/nerve-centre/kpi-cards/concepts/data-freshness)
+- Module: [Vortex Mind, severity and evidence](/vortex-mind/concepts/severity-and-evidence-model)
+- Module: [Actions, Kanban](/actions/kanban)
+- Module: [Ask Viq](/ask-viq)
+- Module: [Vortex Memory](/vortex-memory)

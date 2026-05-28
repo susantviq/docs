@@ -1,0 +1,156 @@
+---
+title: "Decline Rate Spike Alert, CyberSource"
+sidebarTitle: "Decline Rate Spike Alert"
+description: "Decline Rate Spike Alert for CyberSource stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Payment Gateway
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Real-time anomaly-detection alert that fires when CyberSource decline rate exceeds 2 standard deviations above the rolling 1-hour baseline. The Nerve Centre's first-line incident detector for payment-side problems: a single Decision Manager rule pack misfire, an issuer outage, or a checkout-script bug can show up here within 60-90 seconds of the cause. The alert that triggers operator response on every other CyberSource card (Revenue at Risk, Decline Spike vs Funnel Drop, etc).
+
+| | |
+| --- | --- |
+| **The formula** | `current_decline_rate(15min) > baseline_decline_rate(1h) + 2 × σ(baseline)`. The baseline is computed over the prior 60 minutes excluding the current 15-minute window; 2σ is the statistical threshold for "this is unusual, not noise". |
+| **Why 2σ vs 1h baseline?** | 2σ captures ~95% of normal variation, so spikes above 2σ have ~5% probability of being noise. 1-hour baseline is short enough to react quickly to incidents but long enough that single-customer-cohort effects (a fraud-screening rule re-running on a batch of new customers) don't trigger false positives. |
+| **Spike-detection cadence** | Runs every 60 seconds. Recomputes both the current 15-min rate and the trailing 1-hour baseline + σ. Alert fires within 60-120 seconds of a real spike. |
+| **What triggers a fire** | Most common causes (in observed frequency): (1) Decision Manager rule pack deployed too aggressively (~40% of fires); (2) Issuer outage (e.g. Capital One or Chase risk-system slowdown) (~25%); (3) Storefront / checkout-script bug pushing malformed auth requests (~15%); (4) 3DS challenge-rate spike from issuer side (~10%); (5) Genuine fraud incident (e.g. card-testing attack) (~10%). |
+| **Suppression rules** | (1) Volume floor: alert won't fire if current 15-min has &lt; 100 attempts (avoids false positives during low-volume hours). (2) Anti-flap: once fired, the alert stays "armed" for 30 minutes; it doesn't re-fire on the same incident. (3) Resolution detection: alert auto-resolves when current rate returns to within +1σ of baseline for 2 consecutive 15-min windows. |
+| **Currency** | n/a (the alert watches a rate, not a value). |
+| **Refunds / disputes** | Excluded. The alert is about authorisation outcomes only. |
+| **Failed / declined payments** | These ARE the signal. The alert watches the decline-rate movement. |
+| **Time window** | `RT` (60-second cadence; 15-min current window vs 1h baseline). |
+| **Alert trigger** | `> 2σ above 1h baseline`. Approximately corresponds to "decline rate jumped 2-3pp absolute over baseline" for a typical enterprise merchant; the absolute jump varies with baseline σ. |
+| **Roles** | owner, finance, operations, on-call |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your CyberSource data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A North American electronics retailer running CyberSource. On 09 Apr 26 at 09:42 UTC, a Decision Manager rule pack deployed by fraud-ops at 09:35 UTC begins driving decline rate up. The alert fires.
+
+State at 09:42 UTC:
+
+| Metric | Value | Source |
+| --- | --- | --- |
+| Trailing 1h baseline decline rate | 5.10% | mean of 4 prior 15-min windows |
+| Trailing 1h baseline σ | 0.34pp | std-dev of those windows |
+| 2σ threshold | 5.78% (5.10 + 2 × 0.34) | computed |
+| Current 15-min decline rate | 8.74% | last 15 min from `/tss/v2/searches` |
+| Volume in current window | 1,420 attempts (well above 100 floor) | computed |
+| Alert state | **FIRED** | 8.74% > 5.78% threshold |
+
+The alert sends pages / Slack / email per the merchant's notification config and lights up [Decline Spike vs Checkout Funnel Drop](/nerve-centre/kpi-cards/cybersource/decline-spike-vs-checkout-funnel-drop) and [Revenue at Risk (live)](/nerve-centre/kpi-cards/cybersource/revenue-at-risk).
+
+Five things worth noticing during the incident:
+
+1. **Detection latency is 60-120 seconds.** The cause kicked in at 09:35 UTC; the alert fired at 09:42 UTC. The 7-minute lag is the time for the spike to actually start, accumulate enough volume in the 15-min window to register against baseline, and complete the 60-second detection cadence. For most enterprise incidents this is fast enough; for very fast-moving incidents (DDoS-driven decline spikes, multi-million-attempt-per-minute fraud incidents) the lag can feel slow.
+2. **Anti-flap logic prevents alarm fatigue.** Once the alert fires, it stays "armed" for 30 minutes. If the operator rolls back the cause at 10:38 UTC and the rate returns to baseline, the alert resolves automatically. If the rate dips and re-spikes within the 30-minute window (e.g. partial rollback), the alert doesn't re-page; it surfaces the re-spike on the existing incident timeline.
+3. **The 2σ statistical threshold matters.** A naive "decline rate > 6%" alert would fire on every busy Friday afternoon when normal variation pushes the rate above 6%. The 2σ-vs-baseline threshold adapts: at 9am on a typical Tuesday, baseline σ might be 0.3pp so the alert fires at 5.8% absolute; on Black Friday with high traffic σ might be 0.6pp so the alert needs 6.2% absolute. This is what makes the alert actionable across all conditions.
+4. **Volume floor prevents low-traffic false positives.** During quiet hours (3-5am UTC for a North American merchant), the 15-min window might have only 80 attempts; even small absolute changes look statistically significant. The 100-attempt floor suppresses these. Most enterprise merchants doing high-volume processing rarely hit the floor; mid-market merchants on quiet hours might.
+5. **Pairs with the cross-channel diagnostic.** The alert fires; the operator opens [Decline Spike vs Checkout Funnel Drop](/nerve-centre/kpi-cards/cybersource/decline-spike-vs-checkout-funnel-drop) to confirm whether storefront completion is also dropping (real revenue loss) or stable (alternate-tender absorption). If storefront completion drops, this is a real incident; if it doesn't, the alert is signaling a CS-side technical issue that customers are absorbing with workarounds. Different remediation paths.
+
+For this incident the operator confirmed via [Top Decline Reasons](/nerve-centre/kpi-cards/cybersource/top-decline-reasons) that AVS-mismatch declines were the spike driver, traced to the 09:35 UTC DM rule pack deploy, rolled back at 10:38 UTC, and the alert auto-resolved at 10:42 UTC. Total incident duration: 60 minutes. Total revenue loss (per [Revenue at Risk live](/nerve-centre/kpi-cards/cybersource/revenue-at-risk)): ~$54,000.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Decline Rate Spike Alert |
+| --- | --- |
+| [Decline Rate](/nerve-centre/kpi-cards/cybersource/decline-rate) | The base metric the alert watches. |
+| [Top Decline Reasons](/nerve-centre/kpi-cards/cybersource/top-decline-reasons) | First diagnostic during an active fire: which reason bucket spiked? |
+| [Top Declining Issuers](/nerve-centre/kpi-cards/cybersource/top-declining-issuers) | Single-issuer-outage diagnostic. |
+| [Decision Manager Score Mix](/nerve-centre/kpi-cards/cybersource/decision-manager-score-mix) | Was a recent fraud rule-pack deploy the cause? |
+| [Decline Spike vs Checkout Funnel Drop](/nerve-centre/kpi-cards/cybersource/decline-spike-vs-checkout-funnel-drop) | Cross-channel: is the spike costing revenue or being absorbed? |
+| [Revenue at Risk (live)](/nerve-centre/kpi-cards/cybersource/revenue-at-risk) | Dollar quantification while the alert is active. |
+| [Recoverable Revenue (decline-driven)](/nerve-centre/kpi-cards/cybersource/recoverable-revenue) | Post-incident: how much can be won back? |
+| [Fraud Velocity Alert](/nerve-centre/kpi-cards/cybersource/fraud-velocity-alert) | Sibling alert for fraud-side spikes. |
+| [3DS Failure Alert](/nerve-centre/kpi-cards/cybersource/3ds-failure-alert) | Sibling alert for 3DS-side problems. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in CyberSource Business Center (EBC2):**
+
+CyberSource Business Center does not have a parallel anomaly-detection alert; this is a Vortex IQ-derived signal. The closest equivalent EBC2 views during an active alert:
+
+- [EBC2 → Transactions → Search](https://ebc2.cybersource.com/ebc2/app/Transactions/transactions), filter to last 15 minutes for current decline-rate confirmation.
+- [EBC2 → Decisions → Decision Manager → Performance](https://ebc2.cybersource.com/ebc2/app/RiskManagement/DecisionManager) for the DM-rule-pack diagnostic.
+- [EBC2 → Reports → Conversion Detail Report](https://ebc2.cybersource.com/ebc2/app/Reports/StandardReports) for transaction-level dump (post-incident analysis).
+
+**Why our alert may legitimately fire when EBC2 looks fine (or vice versa):**
+
+| Reason | Direction | What to do |
+| --- | --- | --- |
+| **Anomaly threshold**. Our 2σ vs 1h baseline alert can fire when absolute decline rate is still moderate (5.8%) but unusual for that time-of-day. EBC2 doesn't have a comparable anomaly view. | Vortex IQ alert may fire while EBC2 looks "normal". | This is intentional; the alert is a leading signal. |
+| **Volume floor**. We suppress alerts on &lt; 100 attempts per 15 min. EBC2 shows all data regardless of volume. | Mid-market merchants on quiet hours: alert may not fire. | Adjust the floor in the manifest if the merchant operates 24x7. |
+| **Refresh cadence**. We run anomaly detection every 60 seconds. EBC2 transaction search is real-time on demand. | Vortex IQ alert may lag real-state by up to 60 seconds. | Negligible for incident response. |
+| **Anti-flap window**. After firing, our alert stays armed 30 min. EBC2 has no equivalent state. | Vortex IQ may not re-fire on a re-spike within 30 min. | Use the incident timeline view for re-spike events. |
+
+**Cross-connector reconciliation:**
+
+| Comparison | Expected relationship | When divergence is legitimate |
+| --- | --- | --- |
+| `cs_alert_decline_spike` ↔ [`cs_xc_decline_vs_funnel`](/nerve-centre/kpi-cards/cybersource/decline-spike-vs-checkout-funnel-drop) | When this alert fires, the cross-channel card lights up within the same 60-90 second cycle. | n/a (causal). |
+| `cs_alert_decline_spike` ↔ [`cs_revenue_at_risk_live`](/nerve-centre/kpi-cards/cybersource/revenue-at-risk) | When this alert fires, the revenue-at-risk card transitions from $0 to live. | n/a (causal). |
+| `cs_alert_decline_spike` ↔ Stripe / PayPal equivalent alerts | Independent processors. Multi-acquirer enterprises should track all simultaneously; an issue affecting one processor (e.g. an issuer outage that's actually CS-routing-specific) won't show on others. | n/a. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for on-call payments teams)</em></summary>
+
+This alert is the Nerve Centre's first-line incident detector for CS-side payment problems. The peer alerts on Stripe / PayPal use similar 2σ-vs-baseline detection logic but with processor-specific tuning. For multi-acquirer enterprises, configure all three (CS, Stripe, PayPal) into the same on-call routing so the on-call sees the first-fired alert regardless of processor.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The alert fired but I think it's a false positive. How do I check?**
+Three diagnostic checks: (1) Is current 15-min decline rate truly elevated vs baseline, or just slightly above? Open [Decline Rate](/nerve-centre/kpi-cards/cybersource/decline-rate) and look at the current value vs the 1-hour history. (2) Is one specific decline reason driving it? Open [Top Decline Reasons](/nerve-centre/kpi-cards/cybersource/top-decline-reasons); real spikes always have a single dominant reason. (3) Is one specific issuer driving it? Open [Top Declining Issuers](/nerve-centre/kpi-cards/cybersource/top-declining-issuers); real issuer outages are concentrated. If all three look "spread out and small", it's likely a noise alert.
+
+**What's a typical alert frequency for an enterprise merchant?**
+Most enterprise merchants see 2-6 fires per month. Higher than 8-10/month suggests either (a) the merchant has genuine ops issues that need addressing, or (b) the threshold needs re-tuning (the merchant is naturally noisier than the 2σ default expects). Below 1/month suggests the threshold is too loose (real incidents are being missed); recalibrate to 1.5σ.
+
+**Can I tune the alert threshold?**
+Yes, in the manifest. The default `2σ vs 1h baseline` is calibrated for enterprise stability. For high-volume merchants doing >100k transactions/hour, the default might be too sensitive (every issuer hiccup fires); tune to 2.5σ. For low-volume merchants doing &lt;10k transactions/hour, the default might be too loose; tune to 1.5σ.
+
+**Why 1-hour baseline and not longer?**
+Trade-off between adaptiveness and stability. 1 hour reacts quickly to evolving conditions (a Decision Manager rule deploy that's been running for 30 minutes is "the new normal" and shouldn't keep firing). Longer baselines (4h, 24h) take longer to adapt and would keep firing on the same incident. Shorter baselines (15-30 min) are too noisy.
+
+**What if my decline rate is naturally elevated for the time-of-day?**
+The 1-hour baseline adapts. At 3pm with normal-time-of-day decline rate of 6%, the alert wouldn't fire on 6.5% (within +1σ). At 3am with normal decline rate of 4.2%, the alert WOULD fire on 5.5% (well above +2σ for that hour's lower variance). This adaptiveness is the point.
+
+**Does the alert distinguish "real spike" from "fraud incident"?**
+Not directly. The alert just says "decline rate is unusually high right now"; the operator has to diagnose whether it's a fraud incident, an issuer outage, a DM rule misfire, or a checkout-script bug. The companion alerts ([Fraud Velocity Alert](/nerve-centre/kpi-cards/cybersource/fraud-velocity-alert) for fraud, [3DS Failure Alert](/nerve-centre/kpi-cards/cybersource/3ds-failure-alert) for 3DS) help disambiguate when they fire alongside.
+
+**My team is getting alert fatigue. What can I do?**
+First check if it's true alert fatigue (too many fires) or perceived fatigue (alerts firing on real incidents but the team ignoring them). For true: tune threshold up (2.5σ instead of 2σ) or extend the baseline window. For perceived: review the response process, ensure the team has clear playbooks for the top 5 alert causes (DM rule deploy, issuer outage, etc).
+
+**Does the alert fire during planned maintenance?**
+Yes, by default. If ops knows a Decision Manager rule pack deploy is planned (with expected decline-rate impact), suppress the alert manually for the deploy window. Vortex IQ supports a "scheduled maintenance" suppression option in the alert config.
+
+**My multi-currency global merchant, does the alert work across currencies?**
+Yes, the alert watches the rate (currency-neutral). Spikes in one currency / region will show up in the global rate. For per-region alerting (e.g. EU-only spike), configure region-specific alert variants.
+
+**What's the relationship to other CyberSource alerts?**
+This is the core decline-rate anomaly alert. The siblings: [Fraud Velocity Alert](/nerve-centre/kpi-cards/cybersource/fraud-velocity-alert) watches DM-score patterns specifically, [3DS Failure Alert](/nerve-centre/kpi-cards/cybersource/3ds-failure-alert) watches 3DS challenge-success-rate, [Settlement Stuck](/nerve-centre/kpi-cards/cybersource/settlement-stuck) watches payouts, [Dispute Threshold Watch](/nerve-centre/kpi-cards/cybersource/dispute-threshold-watch) watches the regulatory dispute-rate ceiling. The decline-spike alert is the most-frequently-fired of these by a meaningful margin because decline incidents happen more often than the others.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Decline Rate Spike Alert* is one of hundreds of KPI pulses Vortex IQ tracks across CyberSource and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

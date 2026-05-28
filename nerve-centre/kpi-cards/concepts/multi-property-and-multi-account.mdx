@@ -1,0 +1,139 @@
+---
+title: "Multi-Property and Multi-Account, Vortex IQ Documentation"
+description: "Inside the Nerve Centre, GA4 and Google Ads share OAuth tokens via the parent_integration_id pattern. One token, many properties or campaigns, all rendered as separate cards."
+---
+
+Many merchants run more than one Google Analytics 4 property or more than one Google Ads campaign / account. An agency typically runs dozens. The connector model in the [Nerve Centre](/nerve-centre/overview) is designed for this: one OAuth authorisation, many properties or campaigns, each rendered as its own integration with its own card surface but sharing the upstream credential. This page explains the `parent_integration_id` pattern, the clone integration concept, how cards iterate per-property and per-campaign, and where this surfaces in the UI.
+
+## The challenge
+
+A typical merchant who connects Google Analytics 4 grants Vortex IQ access to a single property at first connect. They run Brand A on the property `properties/123456789`. Six weeks later they launch Brand B on a sibling property `properties/987654321` under the same Google account. They want both to surface in Vortex IQ without re-doing the OAuth dance.
+
+A typical agency who connects Google Ads grants Vortex IQ access to an MCC (My Client Center) manager account. Inside the MCC are 30 client accounts and 200 campaigns. The agency wants per-client and per-campaign reporting without 30 separate OAuth flows.
+
+The naive solution is one integration per property or per campaign with its own OAuth grant. That works for one or two but breaks for thirty: token refresh failures multiply, the OAuth UI gets cluttered, and the merchant loses track of which integration corresponds to which property.
+
+The Vortex IQ solution is OAuth-token sharing via the `parent_integration_id` pattern.
+
+## The parent_integration_id pattern
+
+When a merchant first connects GA4 or Google Ads, Vortex IQ creates a **parent integration** with the OAuth token, refresh token, and account-level metadata (the merchant's Google account email, the available property list or accessible accounts list).
+
+When the merchant adds a second property (or campaign), Vortex IQ creates a **child integration** that:
+
+- Stores its own property ID or campaign ID and any per-property settings.
+- Does **not** store its own OAuth token.
+- Carries a `parent_integration_id` field pointing to the parent integration.
+- Reads OAuth credentials at query time by following the parent reference.
+
+The result: one OAuth grant, many property-or-campaign-scoped integrations. Each child renders as a fully independent integration in the UI (its own card grid, its own alerts, its own sentiment) but they share the underlying credential. When the parent's token refresh succeeds, every child sees fresh access; when the parent's token expires, every child surfaces the same "reconnect required" state.
+
+The pattern is generalised to any vendor where one credential governs multiple resource scopes. Today it is wired for GA4 (one Google account, many properties) and Google Ads (one Google account, many client accounts and many campaigns). Future connectors that fit the model (Microsoft Ads, Amazon Ads' multi-account view) will follow the same pattern.
+
+## The clone integration concept
+
+In the UI, adding a second property or campaign is called **cloning**. The flow:
+
+1. Open the connector drawer for an already-connected GA4 (or Google Ads) integration.
+2. Click "View Details" on the existing integration.
+3. Click "Add more property" (GA4) or "Add more campaign" (Google Ads).
+4. The drawer fetches the parent's available property or campaign list (filtered to those not already cloned).
+5. Pick a property or campaign; the integration name auto-populates.
+6. Submit. A new child integration is created with `parent_integration_id` pointing to the source.
+
+The clone is **not** a copy of the parent's data. It is a new integration with its own card states, its own alert configuration, and its own KPI history. What it inherits is the OAuth credential, not the data.
+
+The flow is documented per connector under [Settings, Sources, Multi-property Clones](/platform/settings/sources/multi-property-clones). The mechanics are the same; the connector-specific labels differ ("property" for GA4, "campaign" for Google Ads).
+
+## How cards iterate per-property and per-campaign
+
+Every card in the GA4 catalogue (100 cards on the connector) and the Google Ads catalogue (75 cards) renders once per integration. A workspace running:
+
+- Parent GA4 integration with two cloned children (three properties total)
+- Parent Google Ads integration with five cloned children (six campaigns total)
+
+renders 100 GA4 cards × 3 properties = 300 GA4 card instances, and 75 Google Ads cards × 6 campaigns = 450 Google Ads card instances. Each instance is independent: its own current value, its own alert state, its own sentiment colour.
+
+In the Nerve Centre UI, each property or campaign is a tab within the connector tab. The merchant sees:
+
+- Top-level connector tab: "Google Analytics".
+- Within it, sub-tabs: "Brand A (123456789)", "Brand B (987654321)", "Brand C (456789012)".
+- Each sub-tab carries the full card grid scoped to that property.
+
+For a workspace with many cloned integrations, the connector tab becomes a multi-tab view; the executive summary view (see [hero, cross-channel, tiers](/nerve-centre/kpi-cards/concepts/hero-cross-channel-tiers)) collapses the per-property hero cards into a stacked layout for quick scanning.
+
+## Caching and quota implications
+
+Cloned integrations share their parent's OAuth quota with the vendor. Google Ads has API quota per developer token plus per customer account. GA4 has quota per property per day. Cloning amplifies the quota draw because each child runs its own queries.
+
+Vortex IQ's runtime handles this with:
+
+- **Per-card cache keys that include the property or campaign ID.** Two property's Total Sessions cards do not share a cache; each is keyed independently.
+- **Vendor-quota-aware throttling.** When the workspace approaches a vendor quota ceiling, the runtime stretches refresh cadence on lower-priority cards (standard tier first, hero tier preserved).
+- **Per-property refresh budgets.** Each property gets a fair share of the workspace's quota allocation; one runaway property's queries do not starve another's.
+
+The merchant rarely needs to think about quota until they are running 20+ cloned integrations on a single connector. At that scale, the workspace admin sees a quota-usage dashboard under [Settings, Data Refresh](/platform/settings/data-refresh) with per-connector and per-property breakdowns.
+
+## Naming and labels
+
+The integration name on a clone defaults to the property name or the campaign name as reported by the vendor. So a GA4 clone for property "Brand B Web" renders as "Brand B Web" in the connector tab. The merchant can rename the integration under the connector drawer's "View Details" view; the rename is workspace-scoped and persists across re-authentications.
+
+For agencies, the rename matters: clients usually have descriptive client-side labels (Acme Corp - Production, Acme Corp - Staging) that differ from the GA4 property's internal name. The rename surface lets the agency present the data with their preferred labels without touching the vendor.
+
+## Where this surfaces in the UI
+
+- **Connector tab.** GA4 and Google Ads connector tabs render sub-tabs per cloned integration.
+- **Connector drawer.** "View Details" shows the parent and its children, with "Add more property / campaign" and "Disconnect this property" actions.
+- **Settings, Sources.** The integrations list shows the parent and the children grouped under it. The parent_integration_id relationship is visible in the integration detail view.
+- **Alerts.** Alerts from cloned integrations carry the property or campaign label so the merchant knows which one fired.
+- **Briefings.** Daily morning briefings call out each cloned integration's hero metrics separately ("Brand A Total Sessions, 14,200; Brand B Total Sessions, 9,400").
+
+## How it relates to other modules
+
+- **[Vortex Mind](/vortex-mind/concepts/how-diagnostics-work)** runs diagnostics on a per-clone basis. A revenue alert on Brand A's GA4 produces a Brand A-scoped diagnostic; Brand B is not implicated unless the cross-channel join surfaces a relationship.
+- **[Ask Viq](/ask-viq)** routes property-or-campaign questions through the active profile (see [profile dropdown](/ask-viq/concepts/profiles)). "What was the revenue on Brand A this month" resolves to the Brand A clone's data; "all properties" resolves to the union.
+- **[Actions](/actions/kanban)** scopes Kanban cards to the clone that fired the alert. An owner working on Brand A does not see Brand B noise on their board.
+- **[Vortex Memory](/vortex-memory)** archives per-clone snapshots. A longitudinal query "Brand A revenue over the last six months" reads from the Brand A clone's archive.
+
+The profile system is the cross-cutting glue: a profile binds a set of clones (and other connectors) into a coherent workspace, so a marketer working on Brand A sees only Brand A data without the Brand B clutter, and an executive comparing Brand A to Brand B switches to a "All Brands" profile that includes both.
+
+## FAQ
+
+**Why is the OAuth token shared rather than per-clone?**
+Google issues one OAuth token per Google account per scope set. Granting the token once and routing reads through the property ID or customer ID is the canonical pattern Google itself uses internally (the GA4 web UI does the same when a user has access to multiple properties). It minimises consent prompts and avoids the multiplied refresh-failure surface.
+
+**What happens if I disconnect the parent integration?**
+The parent disconnect cascades to the clones because they depend on the parent's token. Vortex IQ surfaces a confirmation banner ("disconnecting this integration will also disconnect 3 cloned properties") and the merchant has to confirm. The clones are paused (their cards render stale) but their configuration is preserved; reconnecting the parent reactivates the clones automatically.
+
+**Can I disconnect just one clone?**
+Yes. A clone can be disconnected independently without affecting the parent or other clones. The clone's configuration is preserved (in case the merchant wants to reconnect it later) but its cards stop refreshing. Disconnect is reversible; the merchant re-clones from the parent's available property or campaign list.
+
+**How do I see which property a card is showing?**
+Each card's title shows the integration name (which defaults to the property or campaign name). The connector sub-tab also shows the active property in the breadcrumb. Hovering the card timestamp reveals the property ID for unambiguous identification.
+
+**Can I have a parent in one workspace and clones in another?**
+No. The parent and its clones are workspace-scoped. An agency with multiple workspaces (one per client) connects GA4 separately in each workspace if the agency holds the credential. If the client holds the credential, each workspace runs its own integration owned by the client.
+
+**What about manager accounts in Google Ads?**
+Google Ads MCC accounts are handled the same way as direct accounts. The OAuth token is granted at the MCC level; cloned integrations are created per client account or per campaign within a client account. The campaign-id-scoped clones are the most granular surface; the agency can also keep the client-account-scoped clone for the rolled-up view of that client.
+
+**Does this work for GA4 dimensional cuts (e.g. by audience or by traffic source)?**
+Today it works at the property level. Dimensional cuts within a property are filters on cards within the property's tab, not new clones. A merchant who wants per-traffic-source cards as separate tiles uses the dashboard's filter controls; they do not clone a property to achieve it.
+
+**How does cloning interact with quota?**
+Each clone consumes its share of the parent's vendor API quota. Vortex IQ's runtime watches the quota and throttles lower-priority cards on the most quota-hungry clones first. For workspaces approaching quota limits, the [Settings, Data Refresh](/platform/settings/data-refresh) view shows where the budget is going.
+
+## Cross-links
+
+- Concept: [the KPI model](/nerve-centre/kpi-cards/concepts/kpi-model)
+- Concept: [data freshness](/nerve-centre/kpi-cards/concepts/data-freshness)
+- Concept: [alert system](/nerve-centre/kpi-cards/concepts/alert-system)
+- Concept: [time windows](/nerve-centre/kpi-cards/concepts/time-windows)
+- Concept: [hero, cross-channel, tiers](/nerve-centre/kpi-cards/concepts/hero-cross-channel-tiers)
+- Concept: [multi-currency](/nerve-centre/kpi-cards/concepts/multi-currency)
+- Platform: [Settings, Sources, Multi-property Clones](/platform/settings/sources/multi-property-clones)
+- Platform: [Settings, Data Refresh](/platform/settings/data-refresh)
+- Module: [Vortex Mind, how diagnostics work](/vortex-mind/concepts/how-diagnostics-work)
+- Module: [Ask Viq](/ask-viq)
+- Module: [Actions](/actions)
+- Module: [Vortex Memory](/vortex-memory)

@@ -1,0 +1,146 @@
+---
+title: "Label-Generation Success Rate, ShipTheory"
+sidebarTitle: "Label-Generation Success Rate"
+description: "ShipTheory's core SLA - did label generation succeed? Below 98% directly blocks order despatch and is the most actionable signal. How to read it, why it ma..."
+---
+
+**Card class:** Hero  •  **Category:** Shipping & Courier
+
+> ShipTheory's core SLA - did label generation succeed? Below 98% directly blocks order despatch and is the most actionable signal.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Share of label-creation API calls in the last 24 hours that returned a valid printable shipping label. **The single most-actionable connector-health number for ShipTheory**: when this drops below 98%, orders cannot be despatched, regardless of how healthy the underlying carriers, the warehouse, or the rate-shop ruleset are. The card surfaces problems at the boundary between Vortex IQ, ShipTheory, and the underlying UK sub-carriers.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(label_create_calls WHERE status = 'success') / COUNT(label_create_calls)` over trailing 24 hours. Each call is one label attempt; retries count as separate calls. |
+| **API endpoint** | `POST /shipments` (ShipTheory's create-shipment endpoint with `print_label: true`). The card reads HTTP response code and parsed `success` flag. |
+| **Failure modes counted** | (1) Sub-carrier downtime: underlying UK carrier's API rejected the booking (Royal Mail OBA, DPD, Evri, Parcelforce, Yodel each have their own uptime). (2) ShipTheory-internal 5xx errors. (3) Validation: missing house number, invalid UK postcode, invalid weight/dimensions, missing customs declaration on EU exports post-Brexit. (4) Auth: 401 from expired token (links to [Days to Token Expiry](/nerve-centre/kpi-cards/ship-theory/days-to-token-expiry)). |
+| **Sub-carrier-mix sensitivity** | Failures not uniformly distributed. Royal Mail OBA can have transient 503 spells during high-volume Monday morning windows. Evri's API has been historically the least stable of UK mass-market carriers. DPD and Parcelforce typically run 99.5%+. A 95% reading on an Evri-heavy account often resolves to 99% if Evri is excluded. |
+| **Returns / RTO** | Includes Returns Easy Print labels; treats them identically to outbound. |
+| **Currency** | Not applicable. |
+| **Time window** | `24H` (rolling 24-hour window) |
+| **Alert trigger** | `<98%`. Tripped when success rate drops below 98 percent. ShipTheory's published SLA target for label-creation excluding sub-carrier failures is 99.9%; the 2-percent buffer covers expected sub-carrier noise. |
+| **Sentiment key** | `label_generation_success` |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your ShipTheory data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+The UK home & garden merchant. Reading taken at 09:00 GMT on 12 Mar 26 for the trailing 24 hours.
+
+| Sub-carrier | Label calls (24h) | Successful | Failures | Success rate | Most common failure |
+| --- | --- | --- | --- | --- | --- |
+| Royal Mail | 1,580 | 1,576 | 4 | 99.7% | Address validation |
+| DPD | 480 | 480 | 0 | 100.0% | (none) |
+| Evri | 620 | 564 | 56 | 91.0% | Carrier 503 (downtime) |
+| Parcelforce | 180 | 179 | 1 | 99.4% | Validation |
+| Yodel | 110 | 102 | 8 | 92.7% | Carrier 5xx |
+| **All sub-carriers (this card)** | **2,970** | **2,901** | **69** | **97.7%** | |
+
+The card reads **97.7%**; the alert at `<98%` is **firing**, dragged by Evri (91.0%) and Yodel (92.7%). Five things to notice:
+
+1. **Evri's 91% drags the aggregate by 1.9 points.** 56 of 69 failures are Evri. If Evri volume rises, the aggregate drops further. Per-sub-carrier sub-tile is mandatory reading.
+2. **56 Evri failures over 24 hours = 56 orders waiting.** They sit in the warehouse queue. Operational fix during Evri downtime is to override rate-shop temporarily to Royal Mail Tracked 48 (slightly higher cost) and despatch. The card is the trigger for the override.
+3. **DPD and Parcelforce at near-100% are the carrier-network benchmark.** If they ever drop below 99%, issue is almost certainly ShipTheory-side or your-account-side, not carrier.
+4. **The 4 Royal Mail failures are noise-floor.** Address-validation rejections (postcode-vs-address mismatch, common in UK with people typing post town as address line 1). They retry successfully on next attempt.
+5. **97.7% aggregate is the intervention threshold.** At 97% exact, queue stall visible to despatch staff (~10 to 30 orders waiting); at 95% full operations escalation; at 90% P1. The alert at 98% is calibrated for first-detection signal, before user-visible pain.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+Label-generation success is the gate; many other cards depend on it being green.
+
+| Card | Why pair it with Label Generation Success | What the combination tells you |
+| --- | --- | --- |
+| [Days to Token Expiry](/nerve-centre/kpi-cards/ship-theory/days-to-token-expiry) | Token expiry produces 100% failure with 401s. | Both red simultaneously = expired token, rotate immediately. |
+| [API Error Rate](/nerve-centre/kpi-cards/ship-theory/api-error-rate) | Same underlying signal, different angle. | Error rate climbing while label-success drops = carrier or ShipTheory issue. |
+| [Shipments](/nerve-centre/kpi-cards/ship-theory/shipments) | Volume processed; reflects label-success in absolute. | Volume drop without label-success drop = upstream order-flow drop. |
+| [Sub-Carrier Volume Mix](/nerve-centre/kpi-cards/ship-theory/sub-carrier-volume-mix) | Per-sub-carrier breakdown. | If a sub-carrier's label success degrades, watch its OTD; carrier API instability often correlates with carrier physical-network issues. |
+| [Labels Printed Not Collected](/nerve-centre/kpi-cards/ship-theory/labels-printed-not-collected) | Adjacent operational signal. | Labels generated successfully but never collected = warehouse cutoff issue, not API issue. |
+| Cross-connector: [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Downstream impact. | Failed labels = unfulfilled Shopify orders. |
+| Cross-connector: 3PL warehouse-management system queue | Direct operational view of orders waiting. | Queue stalling without label-success drop = warehouse-side. Queue stalling with label-success drop = ShipTheory-side. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ShipTheory's own dashboard:**
+
+[ShipTheory Account → Logs → API Calls](https://app.shiptheory.com/account/logs). The page lists every API call with status, response code, error message, and sub-carrier. The closest like-for-like view is *Last 24h, Type: shipment.create*. ShipTheory's [status page](https://status.shiptheory.com) posts platform-side outages and underlying carrier issues.
+
+**Why our number may legitimately differ from ShipTheory's portal:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Retry counting** | Ours sometimes lower | Card counts each retry as separate; portal sometimes collapses to per-shipment outcome. |
+| **Internal-error attribution** | Either | ShipTheory classifies some 5xx as carrier-side, others as platform-side; card pools them. |
+| **Validation pre-check** | Ours sometimes higher | If client-side rejects label before submitting (e.g. weight=0), the card never sees it; portal may show as "rejected". |
+| **Timezone** | Boundary hour | Card UTC; portal GMT/BST. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Downstream effect; label-failure raises unfulfilled count. | Manual fulfilment, B2B flows, retry behaviour. |
+| Sub-carrier status pages (Royal Mail Service Updates, DPD service alerts) | Upstream truth on carrier downtime. | Correlate timestamped failures in audit log to carrier announcements. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multi-platform stacks)</em></summary>
+
+Label-generation success is the universal hero card across shipping connectors with conceptually identical semantics; the carrier mix and failure-mode distribution differ.
+
+- [ShippyPro Label Generation Success](/nerve-centre/kpi-cards/shippy-pro/label-generation-success-rate) (multi-carrier EU)
+- [Sendle Label Generation Success](/nerve-centre/kpi-cards/sendle/label-generation-success) (single-courier, simpler failure-mode profile)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is Evri structurally less reliable than DPD?**
+Capacity model. Evri runs on distributed self-employed-courier network with smaller sortation hubs; their API takes occasional 503 spells during high-volume Monday and pre-peak windows. DPD runs centralised in-house network with multi-region failover. Cost-vs-reliability trade is intentional in your rate-shop ruleset.
+
+**The card shows 95% but our orders are still going out. Why?**
+Retry behaviour. ShipTheory's connector retries failed labels up to 3 times with backoff. 95% first-attempt success often resolves to 99%+ post-retry on shipment level. Operations only sees queue stall when retries also fail (5%-of-5%, 0.25% of shipments).
+
+**My account is mostly Royal Mail and we still see 97%. Why?**
+UK address validation rejections. Royal Mail OBA is strict about postcode-vs-address-line alignment; if your customer-data quality is uneven, OBA rejects. Fix is upstream address validation, not carrier change.
+
+**Why 24h window and not 1h?**
+Smoothing. Carrier APIs have transient 5xx spells (Evri mid-day, Royal Mail OBA Monday morning). 1h window alerts on noise; 24h gives enough samples.
+
+**Label success rate dropped sharply, diagnosis flow?**
+Five steps. (1) Check [Days to Token Expiry](/nerve-centre/kpi-cards/ship-theory/days-to-token-expiry). (2) Check sub-carrier sub-tile, is one carrier failing or all? (3) Check failing carrier's status page. (4) Check audit log for failure-message distribution. (5) If unclear, contact ShipTheory support with timestamped samples.
+
+**What is "ShipTheory's core SLA"?**
+Label-creation API is the highest-criticality endpoint; ShipTheory's internal SLA targets 99.9% availability excluding sub-carrier-side failures. Most enterprise contracts include credits for breach. The card's 98% threshold is the merchant-facing operational threshold.
+
+**EU exports post-Brexit, failure profile?**
+Stricter. Customs declaration data must be present; missing fields produce validation failures. EU-export lanes typically show 60 to 80% success until merchant's order-data pipeline includes the customs fields. Read this card alongside [Shipments by Destination](/nerve-centre/kpi-cards/ship-theory/shipments-by-destination).
+
+**Royal Mail strikes, how does the card behave?**
+Royal Mail OBA stays available even during postal strikes (the API processes label creation; couriers do not collect during strike). Card shows healthy success rate; the operational issue is downstream (manifest gap, not label gap). Watch [Labels Printed Not Collected](/nerve-centre/kpi-cards/ship-theory/labels-printed-not-collected) during strikes.
+
+**Can I use this card to negotiate carrier contracts?**
+Yes, indirectly. Pair with sub-carrier-specific reliability extracts; sub-carriers running materially below 99% on healthy windows lose volume in the rate-shop. Present 90-day rolling reliability per carrier from the trend view in QBR.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Label-Generation Success Rate* is one of hundreds of KPI pulses Vortex IQ tracks across ShipTheory and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

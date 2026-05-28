@@ -1,0 +1,154 @@
+---
+title: "Late Dispatch Queue, OnBuy"
+sidebarTitle: "Late Dispatch Queue"
+description: "Late Dispatch Queue for OnBuy stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Marketplace
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Real-time queue of OnBuy orders that have already passed their `dispatch_due_by` deadline without being dispatched. The actionable to-do list version of [`onbuy_sla_compliance`](/nerve-centre/kpi-cards/onbuy/dispatch-sla-compliance), this is the screen the warehouse should keep open during shift.
+
+| | |
+| --- | --- |
+| **What it counts** | `LIST(orders WHERE dispatch_due_by < now() AND dispatched_at IS NULL AND status NOT IN ('cancelled', 'returned'))`, sorted by hours-overdue descending. |
+| **API endpoint** | `GET https://api.onbuy.com/v2/orders?status=paid` filtered client-side by `dispatch_due_by`. |
+| **Currency** | n/a (count of orders). Per-order revenue shown in the drilldown. |
+| **Tax / fees** | n/a. |
+| **Refunds** | Excluded (refunded orders no longer need dispatch). |
+| **Cancellations** | Excluded (cancelled orders fall out of the SLA calculation). |
+| **Channel scope** | OnBuy only. |
+| **Time window** | `RT` (real-time). Polled every 15 minutes. |
+| **Alert trigger** | `any order past dispatch_due_by`. |
+| **Sentiment key** | none (binary actionable threshold). |
+| **OnBuy SLA tie-in** | Each entry will impact [`onbuy_sla_compliance`](/nerve-centre/kpi-cards/onbuy/dispatch-sla-compliance) at the next 30D recomputation. |
+| **Roles** | owner, operations. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your OnBuy data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+**A small UK gardening-supplies seller, 27 Apr 26 11:00 BST.**
+
+The dashboard shows 3 orders in the late-dispatch queue:
+
+| Order | Paid at | Due by | Hours overdue | Order value | SKU |
+| --- | --- | --- | --- | --- | --- |
+| ON-2238104 | 25 Apr 26 16:33 | 26 Apr 26 16:33 | 18.5h | £42 | seed-tray-x12 |
+| ON-2238291 | 26 Apr 26 09:14 | 27 Apr 26 09:14 | 1.8h | £28 | compost-bin-25l |
+| ON-2238347 | 26 Apr 26 11:08 | 27 Apr 26 11:08 | 0.0h (just now) | £35 | shears-pruning |
+
+```text
+Total late orders                3
+Total at-risk revenue            £105 (already realised, will land as fulfilled-late)
+SLA impact (over rolling 30D)    -2.1 percentage points
+Time to triage in-house          15 minutes
+Time to dispatch all 3           1 hour
+```
+
+**What it means for this seller.** Three lates is one of those mornings, manageable but not free. ON-2238104 at 18.5h overdue is the priority; the buyer is now eligible for an "On-Time Dispatch" claim if the order eventually arrives late, which can lead to a refund cost AND an SLA hit. Dispatch this one in the next pick run with a courier upgrade (e.g. Royal Mail Tracked 24 instead of 48) so it lands within the original delivery promise. The other two are easily salvageable; ON-2238347 is at the deadline, dispatching it within the next hour means the buyer never knows.
+
+**Why this matters more than the SLA % card alone.** The 30D SLA compliance card averages out lates over a month, so 3 lates in a 130-order month barely moves the headline (97.7% -> 95.4%, still above the 95% threshold). But the buyers of those 3 orders are a different story: each gets a personal late-delivery experience and may leave negative seller feedback that takes weeks to fix. This card prioritises buyer experience, not just account standing.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why it matters next to Late Dispatch Queue | What the combination tells you |
+| --- | --- | --- |
+| [Dispatch SLA Compliance](/nerve-centre/kpi-cards/onbuy/dispatch-sla-compliance) | The aggregate %. | Queue is "right now"; SLA % is "this rolling 30D". |
+| [Pending Dispatch](/nerve-centre/kpi-cards/onbuy/pending-dispatch) | Orders not yet late but close. | Pending >2x daily average + non-empty late queue = ops capacity issue, not bad luck. |
+| [Avg Time to Dispatch (hrs)](/nerve-centre/kpi-cards/onbuy/avg-time-to-dispatch) | Trend in dispatch speed. | Rising avg + lates appearing means the warehouse is slowing structurally. |
+| [Dispatch Time by Region](/nerve-centre/kpi-cards/onbuy/dispatch-time-by-region) | Regional breakdown. | If lates concentrate in Scotland or NI, courier is the lever. |
+| [Late Dispatch Count (30d)](/nerve-centre/kpi-cards/onbuy/late-dispatch-count) | Standing total over 30D. | Confirms whether today's lates fit the recent pattern or are a break. |
+| [Total Revenue](/nerve-centre/kpi-cards/onbuy/total-revenue) | Downstream impact. | Sustained lates correlate with 5 to 10% revenue drop within 30 days. |
+| [Shopify Unfulfilled Orders](/nerve-centre/shopify/unfulfilled) | DTC peer for ops capacity. | If both DTC and OnBuy queues are deep, the warehouse is the bottleneck, not OnBuy-specific. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in OnBuy's own dashboard:**
+
+> **OnBuy Seller Console (`https://seller.onbuy.com`) -> Orders -> Filter: dispatch_status = pending, due_by &lt; today**
+
+The Console shows the same set of orders but as a flat list. It does not surface "hours overdue" prominently, which is the field we lead with.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sync lag** | Ours lower for new orders | Our 15-minute poll may miss orders just-paid in the last few minutes; they show in Console first. |
+| **Time zone** | Boundary-of-day off | OnBuy's `dispatch_due_by` is in Europe/London; we display in the user's selected timezone but compute "overdue" from UTC. Edge cases at midnight BST. |
+| **Status taxonomy** | Either | We exclude orders in any cancelled / returned status; Console keeps them visible until manually filtered. |
+| **Bank holidays** | Same | OnBuy auto-extends `dispatch_due_by` on UK bank holidays; we honour the field, so it should always match. Edge cases on Scottish-only bank holidays. |
+
+**Internal identity (within OnBuy):**
+
+`onbuy_alert_late_dispatch (count) <= onbuy_pending_dispatch (count)`
+
+Late queue is a subset of pending; if late > pending, raise a sync issue.
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The "late dispatch queue" exists on every commerce platform with an SLA contract:
+
+- [`shopify.unfulfilled`](/nerve-centre/shopify/unfulfilled)
+- [`bigcommerce.bigcommerce_unfulfilled_orders`](/nerve-centre/bigcommerce/bigcommerce_unfulfilled_orders)
+- [`ebay.ebay_late_dispatch_queue`](/nerve-centre/ebay/ebay_late_dispatch_queue)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**An order showed in the queue but it was already dispatched. Why?**
+Sync lag. After you mark the order dispatched in OnBuy Seller Console, our next 15-minute poll picks it up and removes it from the queue. If the order persists for >30 minutes after dispatch, the most likely cause is that the dispatch confirmation pushed to OnBuy without a tracking number; OnBuy then rejects it as incomplete and the order remains "pending dispatch" on their side. Add the tracking number and re-confirm.
+
+**The order is showing 0 hours overdue but it is on the list. Why?**
+The list captures orders that crossed the deadline within the last polling cycle. An order at exactly the deadline appears with 0.0h overdue and increments minute by minute until dispatched. It is the moment-of-truth window: dispatching within the next pick run keeps the buyer experience neutral.
+
+**Why does this card show fewer orders than the OnBuy Seller Console "pending dispatch" filter?**
+The Console filter shows everything pending, including orders not yet past their deadline. This card shows only the subset that is overdue. Use [`onbuy_pending_dispatch`](/nerve-centre/kpi-cards/onbuy/pending-dispatch) for the full pending list.
+
+**Will dispatching late actually hurt my SLA?**
+Yes. Each entry on this list will count as a "late" in the next 30D rolling SLA recomputation. Three lates in a 100-order month is a 3 percentage point hit, enough to pull SLA below the 95% threshold if your baseline is 97 to 98%. The faster you clear the queue, the less damage; an order dispatched 30 minutes after the deadline still counts as late, but the buyer experience is salvageable.
+
+**Can I dispute a late dispatch?**
+Only if OnBuy mis-set the deadline (rare; usually a bank-holiday calendar bug for Scottish-only holidays). Open a Seller Console -> Help -> Order Issue ticket with the order ID and proposed correct deadline; OnBuy will adjust within 48 hours if confirmed. Otherwise the late stands.
+
+**My buyer asked when their order will arrive. What do I tell them?**
+Be honest: tell them the order is on its way today and offer a courier upgrade (Royal Mail Tracked 24 instead of 48 if you originally promised 48). Many buyers will accept the slight delay with no negative-feedback fallout if you proactively communicate; silence is what triggers the bad reviews.
+
+**Action playbook when the queue is non-empty:**
+
+1. **Sort by hours overdue, descending.** Address the most overdue first; their buyer experience is most at risk.
+2. **Sort secondary by order value.** A £200 order overdue by 4 hours is higher priority than a £15 order overdue by 6 hours.
+3. **Use a courier upgrade.** Even if you would normally use Tracked 48, switch the late ones to Tracked 24 to compress the gap. The £1.50 extra cost is much cheaper than a refund.
+4. **Email the buyer proactively** with the tracking number once dispatched. Apologise briefly, offer a 5 to 10% discount code if the order value is significant.
+5. **Add a Saturday-half-day shift** for the next bank-holiday weekend if lates cluster around bank holidays.
+
+**How does OnBuy's late-dispatch penalty compare to Amazon and eBay?**
+Amazon is most punitive: late shipment rate >4% (96% on-time floor) leads to selling-privilege suspension. eBay is most lenient: lates above 5 to 10% only affect Top Rated Seller status. OnBuy sits in between, lates above 5% pull SLA below 95% and trigger Boost de-listing, but the account remains active.
+
+**Is this card worth checking outside business hours?**
+For most small sellers, no. OnBuy's `dispatch_due_by` runs in 24h or 48h windows, so an order paid at 22:00 on Saturday has until at least Monday 22:00. The exception is high-volume periods (Black Friday, Christmas) when carrier collection cut-offs matter; during those windows, a Sunday-evening check pays for itself.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Late Dispatch Queue* is one of hundreds of KPI pulses Vortex IQ tracks across OnBuy and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,158 @@
+---
+title: "Top Declining Issuers, CyberSource"
+sidebarTitle: "Top Declining Issuers"
+description: "Issuer-bank decline rates ('Capital One declines 18% of yours'). Leads to recoverable revenue via dunning / token retry. How to read it, why it matters, an..."
+---
+
+**Card class:** Hero  •  **Category:** Payment Gateway
+
+> Issuer-bank decline rates ('Capital One declines 18% of yours'). Leads to recoverable revenue via dunning / token retry.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Per-issuer decline rates ranked descending. Surfaces statements like "Capital One declines 18% of your transactions" or "Chase Sapphire BIN 414720 declines 22% on recurring billing". The diagnostic card ops opens when [Decline Rate](/nerve-centre/kpi-cards/cybersource/decline-rate) spikes, tells the team whether a single issuer is responsible (often is) or whether the issue is systemic. Direct lever for recoverable revenue via issuer-aware retry timing, BIN-level rule tuning, and account-update enrolment.
+
+| | |
+| --- | --- |
+| **What it counts** | For each issuer (identified by BIN, first 6 digits of card number), `COUNT(DECLINED) ÷ COUNT(attempts) × 100` ranked descending. Defaults to top 20 issuers by attempt volume to avoid surfacing low-volume noise. |
+| **Issuer identification** | Uses the BIN database to resolve BIN → issuer-bank name (e.g. `414720 → Chase Sapphire`). For sub-BIN-level analysis (different products from the same issuer with different decline patterns) the card supports drilldown to 8-digit BIN where the BIN database has the data. |
+| **Volume floor** | Issuers with &lt; 100 attempts in the period are excluded from the ranking (noise floor). Configurable via the manifest. |
+| **Decline reason breakdown per issuer** | Each row in the ranking expands to show the issuer's specific decline-reason mix: `do_not_honor` vs `insufficient_funds` vs `expired_card` vs Decision Manager `REJECT`. This is critical because the remediation differs per reason. |
+| **Cross-border vs domestic split** | Each issuer row shows domestic vs cross-border attempts and decline rates separately. Cross-border decline rates are typically 1.5-2.5x domestic for the same issuer; this is normal and shouldn't drive panic. |
+| **AVS-mismatch authorization differences** | For US issuers, AVS data is robust and AVS-mismatch declines are meaningful signals. For non-US issuers (most EU, JP, BR, IN, MX), AVS data is unreliable and merchants who auto-decline on AVS-mismatch over-block these issuers; this card surfaces the over-blocked issuers explicitly. |
+| **Tokenization adjustment** | Tokenized recurring (network token via Visa VTS / Mastercard MDES) typically runs 4, 8pp lower decline rate per issuer. The card surfaces the tokenized vs non-tokenized split per issuer when the merchant has both. |
+| **Currency** | n/a (count-based ratios per issuer). |
+| **Refunds / disputes** | Excluded. This card is about authorisation outcomes, not post-auth events. |
+| **Time window** | `30D`. |
+| **Reporting API extraction lag** | Real-time via `/tss/v2/searches` for the most recent 7 days; historical via Reporting v3 (overnight batch). |
+| **Alert trigger** | Any issuer with > 15% decline rate AND ≥ 1,000 attempts. The volume floor on the alert prevents noise from one-off issuer outages on small BINs. |
+| **Roles** | owner, finance, operations, fraud-ops |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your CyberSource data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US-based enterprise online travel booking merchant running CyberSource for hotel + flight + car-rental payments. The 30-day window covers 14 Mar 26 to 12 Apr 26. The merchant processes ~55,000 transactions per day with high cross-border share (32% of attempts).
+
+The top 8 issuers by attempt volume:
+
+| Rank | Issuer (BIN) | Attempts | Decline rate | Domestic-only rate | Top reason |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Chase Sapphire (414720) | 168,400 | 4.2% | 3.1% | `do_not_honor` (38%) |
+| 2 | Capital One (517805) | 142,300 | **18.4%** | 14.1% | `do_not_honor` (52%) |
+| 3 | American Express (372411) | 121,600 | 5.8% | 4.9% | `insufficient_funds` (31%) |
+| 4 | Bank of America (414709) | 98,200 | 6.7% | 5.4% | AVS mismatch (28%) |
+| 5 | Citi (548116) | 84,500 | 8.2% | 6.1% | `do_not_honor` (44%) |
+| 6 | Wells Fargo (446542) | 71,200 | 7.4% | 6.0% | `do_not_honor` (40%) |
+| 7 | Barclaycard UK (478173) | 52,400 | **22.1%** | n/a (UK BIN) | AVS mismatch (61%) |
+| 8 | HSBC global (520858) | 48,900 | 11.2% | 8.7% | `insufficient_funds` (35%) |
+
+Five things worth noticing for an enterprise travel ops lead:
+
+1. **Capital One at 18.4% is the #1 outlier and triggers the alert.** A 18.4% decline rate on 142k attempts is ~26,200 declined transactions in 30 days. Drilling in: the high `do_not_honor` share (52%) suggests Capital One's risk model is over-flagging this merchant's transactions specifically. Common cause for travel merchants: Capital One's risk model is sensitive to high-AOV cross-border bookings (typical of travel) and conservatively declines unless additional auth signal is present. The fix: enrol the merchant's recurring repeat-customer book on Capital One's tokenization (Visa VTS), which signals "trusted relationship" to Capital One's risk model and typically drops decline rate 5, 8pp.
+2. **Barclaycard UK at 22.1% is a different problem.** AVS-mismatch is 61% of declines, that's not Barclays declining; that's the merchant's Decision Manager rule auto-declining on AVS-mismatch. Barclaycard UK doesn't fully participate in AVS in the same way US issuers do, so AVS-mismatch on Barclaycard means almost nothing. Tuning the DM rule to NOT auto-decline AVS-mismatch on UK BINs would recover ~7,200 attempts per period. At typical travel AOV $340, that's $2.4M of recoverable revenue per period.
+3. **Cross-border decline rates are uniformly higher than domestic.** Capital One: 14.1% domestic vs 18.4% blended. Citi: 6.1% domestic vs 8.2% blended. This is normal (issuer risk models are more conservative on cross-border) and not directly fixable on the merchant side. The lever is shifting cross-border AVS rules and pursuing 3DS on cross-border to invoke liability shift.
+4. **`do_not_honor` is the dominant reason on most major US issuers.** This is the issuer's polite "no", an issuer-side risk decision the merchant can't change in real-time. Recovery comes via: (a) network tokenization to signal "trusted relationship"; (b) dunning at +24h with a customer-side prompt to update payment method; (c) Account Updater service for stored-card recurring customers. None of these recover most `do_not_honor` declines instantly.
+5. **The merchant's Decision Manager false-positive cost is hidden in the AVS column.** Across the top 8 issuers, AVS-mismatch contributes 4-28% of declines depending on issuer geography. Tuning DM rules to be issuer-country-aware (loose on non-US, tight on US) would recover an estimated 3-5% of total declines, ~16,000 attempts per period at $340 AOV ≈ $5.4M recoverable revenue.
+
+If next period the merchant ships (a) network token enrolment for Capital One, (b) issuer-country-aware AVS rules, (c) dunning-at-+24h for `do_not_honor` declines on top 4 issuers, expect total decline rate to drop ~1.5pp and the composite [Payment Health Score](/nerve-centre/kpi-cards/cybersource/payment-health-score) to gain ~3 points. The cross-channel impact via [Recoverable Revenue](/nerve-centre/kpi-cards/cybersource/recoverable-revenue) is typically $2-5M monthly for an enterprise travel merchant of this scale.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Top Declining Issuers |
+| --- | --- |
+| [Decline Rate](/nerve-centre/kpi-cards/cybersource/decline-rate) | The aggregate. This card is the per-issuer drilldown when the aggregate looks bad. |
+| [Top Decline Reasons](/nerve-centre/kpi-cards/cybersource/top-decline-reasons) | The reason-code companion. Issuer + reason together identify the specific remediation. |
+| [Decline Rate by Card-Country](/nerve-centre/kpi-cards/cybersource/decline-rate-by-card-country) | Geographic split (issuer country) when issuer-specific data is too granular. |
+| [Card Brand Performance](/nerve-centre/kpi-cards/cybersource/card-brand-performance) | Visa / MC / Amex / Discover-level view, less granular than this card. |
+| [Recoverable Declines (soft)](/nerve-centre/kpi-cards/cybersource/recoverable-declines) | The "money you could win back" view. |
+| [Decline Retry Success Rate](/nerve-centre/kpi-cards/cybersource/decline-retry-success-rate) | Issuer-specific retry success rates differ; this card identifies which issuers are worth retrying. |
+| [Stored-Token Health](/nerve-centre/kpi-cards/cybersource/stored-token-health) | Tokenization is the most effective issuer-decline remediation. |
+| [Authorisation Success Rate](/nerve-centre/kpi-cards/cybersource/authorisation-success-rate) | The aggregate auth rate. |
+| [Recoverable Revenue (decline-driven)](/nerve-centre/kpi-cards/cybersource/recoverable-revenue) | The cross-channel dollar value of issuer-driven recoverable revenue. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in CyberSource Business Center (EBC2):**
+
+- [Reports → BIN Analysis Report](https://ebc2.cybersource.com/ebc2/app/Reports/StandardReports), the canonical issuer-level decline-rate dump. Group by 6-digit BIN.
+- [Transactions → Search](https://ebc2.cybersource.com/ebc2/app/Transactions/transactions), filter by BIN prefix for ad-hoc per-issuer drilldowns.
+- [Reports → Issuer Performance Dashboard](https://ebc2.cybersource.com/ebc2/app/Reports/StandardReports) (where enabled), pre-built issuer-ranking view.
+
+**Why our number may legitimately differ from EBC2:**
+
+| Reason | Direction | What to do |
+| --- | --- | --- |
+| **BIN database freshness**. We use a regularly-updated BIN database to resolve BIN → issuer name. When a BIN is reassigned (e.g. issuer acquisition), the old BIN database can mislabel for 30-60 days. EBC2 uses CyberSource's own internal BIN database. | Issuer-name labels may differ; rates per BIN match. | Compare on BIN, not name. |
+| **Volume floor**. We exclude BINs with &lt; 100 attempts in the period; EBC2 surfaces all BINs. | Tail-rank discrepancy. | Adjust the volume floor in the manifest if needed. |
+| **Reporting API extraction lag**. Reporting v3 overnight batch. | Vortex IQ may lag EBC2 2-6 hours on most-recent day. | Use 30D windows. |
+| **Sub-BIN granularity**. We support 8-digit BIN drilldown when BIN database has data; EBC2 supports it natively. | Can match if both at same granularity. | n/a. |
+
+**Cross-connector reconciliation:**
+
+| Comparison | Expected relationship | When divergence is legitimate |
+| --- | --- | --- |
+| `cs_top_declining_issuers` ↔ aggregate [`cs_decline_rate`](/nerve-centre/kpi-cards/cybersource/decline-rate) | The weighted-average issuer decline rate equals the aggregate. | n/a (mathematical identity). |
+| `cs_top_declining_issuers` ↔ Stripe issuer breakdown | Stripe's data is not directly comparable (different BIN coverage). For multi-acquirer enterprises, the same issuer might have very different decline rates on Stripe vs CS due to routing differences. | A 5pp+ gap between CS and Stripe for the same issuer usually signals routing logic favouring one acquirer for that issuer's traffic. |
+| `cs_top_declining_issuers` ↔ Visa / Mastercard issuer-performance reports | Card-network reports are at quarterly cadence vs our 30D rolling. | Use for long-term issuer-relationship management, not for incident response. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for ops teams managing issuer relationships)</em></summary>
+
+This card is intentionally CyberSource-specific because BIN-level data quality and decline-reason granularity is best on CyberSource's transaction-search API. For multi-acquirer enterprises this is the canonical issuer-decline view; the same issuer's behaviour on Stripe / PayPal won't match exactly because of routing.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Capital One declines 18% of my transactions. Can I do anything about it?**
+Yes, several things, in order of impact: (1) **Tokenization**, enrol your repeat-customer book on Visa Token Service (VTS) for Capital One BINs; this signals "established relationship" to Capital One's risk model and typically drops decline rate 5-8pp. (2) **Network token uplift**, push Apple Pay / Google Pay flows where the underlying card auths via VTS at provisioning time. (3) **Dunning at +24h with customer prompt**, recovers ~12% of `do_not_honor` declines. (4) **Direct issuer outreach**, for very large merchants, CyberSource account-management can sometimes facilitate direct conversations with the issuer's risk team about specific patterns being over-flagged.
+
+**My ops team says "issuer decline" is unfixable. Are they right?**
+Partly. The merchant cannot directly change an issuer's auth decision. But the merchant CAN: (a) reduce risk-model triggers by sending richer auth signal (3DS, network tokens, fraud-screening attributes); (b) shift volume away from problem issuers via promotional offers favouring other tender (e.g. promote "5% off with Apple Pay"); (c) recover declined volume via dunning / retry / token refresh. "Unfixable in real-time" doesn't mean "unrecoverable".
+
+**Why is Barclaycard UK showing 22% decline rate when other UK issuers are normal?**
+Almost always an AVS-rule misfire. Barclaycard UK doesn't fully participate in AVS in the way US issuers do; AVS-mismatch on Barclaycard means the data wasn't there to compare, not that the address was wrong. Decision Manager rules that auto-decline on AVS-mismatch over-block UK issuers. The fix: scope the AVS-decline rule to US/CA/AU issuer countries only. Recovery is typically 10, 15pp on UK-specific decline rate.
+
+**One issuer's decline rate jumped 8pp overnight. Is that an outage?**
+Probably yes. Issuer outages happen, risk-system updates, batch-clearing failures, network connectivity issues. Visa publishes Operations Bulletins (OPS) for known issuer outages on the Visa Online portal. Cross-reference with [Decline Rate Spike Alert](/nerve-centre/kpi-cards/cybersource/decline-rate-spike-alert) timing. If the spike correlates with a Visa OPS bulletin, no merchant-side action needed (resolves typically within 4-24 hours). If not, escalate to CyberSource account-management for issuer-side investigation.
+
+**Should I stop accepting cards from a specific issuer that declines too much?**
+Almost never. Even a 25% decline-rate issuer is still authorising 75% of attempts; refusing the issuer entirely costs you the 75% to save the 25%. Better strategies: tighten DM rules for that issuer's BIN range, push customers from that issuer toward saved-token / Apple Pay / Google Pay flows, or accept the issuer with reduced retry attempts so you don't waste retry quota on a low-recovery issuer.
+
+**My recurring book has different issuer decline patterns than my one-time book. Why?**
+Yes, materially different. Issuers' risk models flag recurring transactions more aggressively (legitimate concern about card-on-file fraud). Some issuers are particularly conservative on recurring. Capital One, Citi, and several smaller mid-tier US issuers. The fix is the same as for one-time: tokenization signals "trusted relationship" and substantially reduces issuer-side conservatism.
+
+**How does Account Updater service interact with this card?**
+Account Updater is a card-network service (Visa Account Updater, Mastercard Automatic Billing Updater) that automatically refreshes stored cards when the underlying card is reissued, replaced, or upgraded. For merchants with significant tokenized recurring books, Account Updater enrolment recovers most `expired_card` declines without customer touch. It doesn't help with `do_not_honor` (issuer-side risk) but does help with `invalid_account` (231) and `expired_card` declines.
+
+**Why is my biggest issuer (highest volume) usually NOT the highest decline rate?**
+Because the biggest issuers (Chase, Amex, Citi) have the most sophisticated risk models AND the most robust AVS / 3DS / fraud-screening infrastructure. Their decline rates are typically lowest. The high-decline-rate issuers tend to be mid-tier US banks, smaller foreign issuers, or BINs heavily issued to higher-risk customer segments (subprime card products, prepaid programmes). This is why the alert volume floor is important, without it, the card surfaces noise from low-volume problem BINs that don't warrant ops attention.
+
+**Does this card include corporate vs consumer card breakdown?**
+The drilldown supports it. Corporate / commercial card BINs typically run higher decline rates than consumer BINs because corporate cards have stricter spending controls (per-transaction limits, MCC restrictions). For B2B merchants with heavy corporate-card volume, this is a real lever, corporate-card decline rates 8-15% are normal, consumer 3-6% are normal. See [Corporate vs Consumer Cards](/nerve-centre/kpi-cards/cybersource/corporate-vs-consumer-cards).
+
+**My multi-currency global merchant, does this card aggregate across currencies?**
+Yes, the issuer ranking is currency-neutral (count-based). A French issuer's decline rate is the same regardless of whether the customer paid in EUR, USD, or GBP, the ranking shows the issuer's global behaviour against this merchant's traffic.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Top Declining Issuers* is one of hundreds of KPI pulses Vortex IQ tracks across CyberSource and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,163 @@
+---
+title: "Payment Health Score, CyberSource"
+sidebarTitle: "Payment Health Score"
+description: "Composite, auth-rate × inverse decline × inverse dispute × settlement-on-time. The CFO single-number. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Payment Gateway
+
+> Composite, auth-rate × inverse decline × inverse dispute × settlement-on-time. The CFO single-number.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A 0, 100 composite that compresses four enterprise payment-health signals (authorisation rate, decline rate, dispute rate, settlement-on-time) into one number a Fortune-500 CFO or VP of Payments can read at a glance. CyberSource is Visa's enterprise gateway used by airlines, hotels, automotive, and large retailers; this card is calibrated for that volume profile (50k+ transactions per period is normal) and that risk posture (Visa Dispute Monitoring Program 1.0% ceiling sits very close to "merchant account terminated"). The number a board pack opens with.
+
+| | |
+| --- | --- |
+| **The formula** | `0.35 × auth_rate + 0.25 × (100 − 5 × decline_rate) + 0.20 × (100 − 50 × dispute_rate) + 0.20 × settlement_on_time_pct`. Four components, each clamped to 0, 100. Auth-rate carries the most weight because it is the day-to-day operating signal; dispute amplifier is harshest because crossing 1.0% triggers Visa VDMP enrolment. |
+| **Auth-rate component (35% weight)** | `AUTHORIZED ÷ (AUTHORIZED + DECLINED + REVIEW + INVALID_REQUEST) × 100` from `/tss/v2/searches`. Healthy enterprise band sits 92, 96%. Below 90% on a CyberSource merchant is unusual and usually points to a Decision Manager rule firing too aggressively or a 3DS 2.0 challenge-rate spike. |
+| **Decline-rate amplifier (25% weight)** | `100 − 5 × decline_rate`. The ×5 amplifier is intentional: at enterprise volume, a 1pp absolute jump in decline rate (4% to 5%) on 50k transactions per day equates to 500 lost authorisations daily. The composite drops 1.25 points for that movement, enough to trigger a "look at this" pulse. |
+| **Dispute-rate amplifier (20% weight)** | `100 − 50 × dispute_rate` from `/reporting/v3/chargebacks`. The ×50 amplifier is calibrated to the **Visa Dispute Monitoring Program (VDMP) 0.9% warning + 1.0% breach** thresholds. At 1.0% the component scores 50; at 2.0% it scores 0 (an unrecoverable position that could mean merchant-account termination within 90 days). |
+| **Settlement-on-time (20% weight)** | Percentage of payment-batch summaries from `/reporting/v3/payment-batch-summaries` arriving within the merchant's expected window (T+1 for most enterprise contracts, T+2 cross-border). Late settlement is an acquirer-side / banking-side signal but still hits the composite because cash-flow forecasting at enterprise scale depends on predictable batches. |
+| **Decline taxonomy feeding it** | AVS mismatch (codes A, N, Z), CVV mismatch, Decision Manager `REJECT`, `REVIEW` (counted as half-decline), issuer decline (`reasonCode` 201, 203, 204, 205, 231). Each treated equally in the rate; the breakdown lives in [Top Decline Reasons](/nerve-centre/kpi-cards/cybersource/top-decline-reasons). |
+| **Tokenization adjustment** | Tokenized recurring transactions (Token Management Service "TMS") run materially better auth rates than fresh-card transactions, typically 96, 98% vs 89, 93%. The composite reads the blended rate; merchants with recurring-billing books should also watch [Stored-Token Health](/nerve-centre/kpi-cards/cybersource/stored-token-health). |
+| **Currency** | **n/a (composite 0, 100).** All components are rates, not amounts, so multi-currency enterprise merchants get a single, valid health score across USD, EUR, GBP, AUD, JPY, etc. No FX conversion required. |
+| **Fraud-rule outcomes** | Decision Manager `ACCEPT` flows through to `AUTHORIZED`; `REVIEW` is half-counted as decline (operationally these need manual ops review and most never convert); `REJECT` counts as full decline. Rule-version drift (when fraud-ops ships a rule pack) shows up here within 24, 48 hours. |
+| **Time window** | `RT / 7D` rolling. Updates every sync cycle. |
+| **Alert trigger** | `< 70`. Crossing 70 fires a Nerve Centre incident. The 70 threshold corresponds to "auth rate &lt; 88% OR decline rate > 6% OR dispute rate > 0.4% OR settlement on-time &lt; 90%". |
+| **Reporting API extraction lag** | CyberSource Reporting API runs an overnight batch by default; transaction-level Reporting v3 reports for "yesterday" land between 02:00 and 06:00 merchant-account local time. Expect 2-6 hours of staleness on the most recent component values. |
+| **Roles** | owner, finance, operations, compliance, fraud-ops |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your CyberSource data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A North American mid-market airline running CyberSource for ticket payments and Magento (Adobe Commerce) for the storefront. The 7-day window covers 06 Apr 26 to 12 Apr 26. Roughly 1.2M passengers booking, mix of one-time tickets and recurring corporate-account billing.
+
+| Component | Value | Score |
+| --- | --- | --- |
+| Auth rate | 1,134,800 AUTHORIZED ÷ 1,200,400 total = **94.5%** | 94.5 |
+| Decline rate | 58,200 DECLINED ÷ 1,200,400 = **4.85%** | 100 − 5 × 4.85 = **75.75** |
+| Dispute rate | 7,322 chargebacks ÷ 1,134,800 AUTHORIZED = **0.645%** | 100 − 50 × 0.645 = **67.75** |
+| Settlement-on-time | 38 of 41 daily batches landed by T+1 = **92.7%** | 92.7 |
+
+**Composite** = 0.35 × 94.5 + 0.25 × 75.75 + 0.20 × 67.75 + 0.20 × 92.7 = 33.08 + 18.94 + 13.55 + 18.54 = **84.1**
+
+A score of 84 is healthy for an enterprise carrier (above the 70 alert threshold, below the rare 90+ band). What's worth noticing:
+
+1. **Dispute rate is the largest drag.** At 0.645% the composite component scored only 67.75. The carrier is comfortably under the Visa VDMP 0.9% warning, but a doubling to 1.3% would drop the dispute component to 35 and pull the composite to ~76, AND would land the merchant in VDMP enrolment within 60 days. Open [Chargeback Reason Codes](/nerve-centre/kpi-cards/cybersource/chargeback-reason-codes) to see if reason 4853 (cardholder dispute / fraud) or 4855 (goods/services not received, common on cancelled-flight refund disputes) is driving the mix. Airlines historically over-index on 4855 because of cancellation-policy disputes.
+2. **Decline-rate amplifier is doing its job.** A 4.85% decline rate cost 24.25 component points (vs perfect 100). Drilling into [Top Decline Reasons](/nerve-centre/kpi-cards/cybersource/top-decline-reasons): 41% are issuer `do_not_honor` (reason 203, low value to fix, retry rarely succeeds), 22% AVS mismatch (corporate cards from outside the US billing-zip system), 18% Decision Manager REVIEW (potentially false-positive, see below), 12% insufficient_funds, 7% expired_card. The Decision Manager REVIEW slice is the actionable one; if fraud-ops can tighten rules without raising chargeback risk, the composite climbs roughly 1.5 points per 1pp of REVIEW reduction.
+3. **Decision Manager false-positive rate is suspect.** REVIEW outcomes that ops manually approves and ship without a chargeback are by definition false-positives. If the carrier's ops team manually reviews these and approves >85% (typical when DM rules are over-tuned), tightening the rules is the highest-leverage action. The composite would respond within one full sync cycle.
+4. **Three settlement batches missed T+1.** Two were Easter weekend (banking-holiday-driven, expected), one was a routine acquirer-side delay on EUR-denominated batches. Cross-border settlement to non-USD currencies takes T+2 contractually, so the on-time threshold should arguably be applied per-currency, not globally; that's a manifest tweak, not a CFO concern. See [Avg Settlement Time](/nerve-centre/kpi-cards/cybersource/avg-settlement-time).
+5. **Token Management Service auth uplift is hidden in the blend.** This carrier's TMS-tokenized corporate-account recurring book runs at 97.8% auth rate; fresh-card one-time tickets run at 92.1%. The blended 94.5% includes both. If the recurring book grew (B2B corporate adoption), the composite would climb without any operational change. Watch [Stored-Token Health](/nerve-centre/kpi-cards/cybersource/stored-token-health) and [Recurring Charge Failure Rate](/nerve-centre/kpi-cards/cybersource/recurring-charge-failure-rate).
+
+If next week's auth rate slipped to 91.5% (still common but unhealthy for enterprise), the composite drops to about 79. If decline rate ALSO went to 6.5%, it drops to about 73, very close to the 70 trigger. A simultaneous dispute-rate creep above 0.9% would punch the composite through the floor due to the ×50 amplifier, expect Nerve Centre to fire well before VDMP letters arrive.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Payment Health Score |
+| --- | --- |
+| [Authorisation Success Rate](/nerve-centre/kpi-cards/cybersource/authorisation-success-rate) | The 35%-weight component. First card to open when the composite drops; tells you whether the issue is acquirer-side, issuer-side, or rule-side. |
+| [Decline Rate](/nerve-centre/kpi-cards/cybersource/decline-rate) | The 25%-weight component (amplified ×5). Most decline-rate movements drive composite swings. |
+| [Top Decline Reasons](/nerve-centre/kpi-cards/cybersource/top-decline-reasons) | When decline rate is the cause, this card splits the rate by reason: AVS mismatch, CVV mismatch, Decision Manager REJECT, issuer `do_not_honor`. Each has a different remediation. |
+| [Dispute Rate](/nerve-centre/kpi-cards/cybersource/dispute-rate) | The 20%-weight component (amplified ×50). The most punishing input. Calibrated to Visa VDMP 1.0%. |
+| [Avg Settlement Time](/nerve-centre/kpi-cards/cybersource/avg-settlement-time) | Settlement-on-time component (20% weight). Late batches hit cash-flow forecasting at enterprise scale. |
+| [Decision Manager Score Mix](/nerve-centre/kpi-cards/cybersource/decision-manager-score-mix) | The fraud-rule lens. When the score drops without an obvious cause, a recent DM rule pack is often responsible. |
+| [Recoverable Declines (soft)](/nerve-centre/kpi-cards/cybersource/recoverable-declines) | The "money you could win back" view. Soft declines (insufficient_funds, do_not_honor, expired_card) are recoverable via retry / dunning, hard declines are not. |
+| [Stripe Payment Health Score](/nerve-centre/kpi-cards/stripe/payment-health-score) | Cross-processor peer for merchants running multi-acquirer routing. CyberSource enterprise-tier scores typically run 2-4 points lower than Stripe SMB-tier scores due to harder-mix issuer bases. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in CyberSource Business Center (EBC2):**
+
+CyberSource Business Center does NOT have a single "Payment Health" composite, this card synthesises one from four CyberSource-native metrics. The closest equivalent screens in [ebc2.cybersource.com](https://ebc2.cybersource.com/):
+
+- [Transactions → Search](https://ebc2.cybersource.com/ebc2/app/Transactions/transactions) for auth-rate context (filter on Status = `AUTHORIZED` vs total).
+- [Decisions → Decision Manager → Case Management](https://ebc2.cybersource.com/ebc2/app/RiskManagement/DecisionManager) for fraud-rule outcome mix (`ACCEPT` / `REVIEW` / `REJECT`).
+- [Reports → Standard Reports → Conversion Detail Report](https://ebc2.cybersource.com/ebc2/app/Reports/StandardReports) for decline-reason breakdown.
+- [Reports → Chargeback Summary Report](https://ebc2.cybersource.com/ebc2/app/Reports/StandardReports) for dispute-rate context.
+- [Reports → Payment Batch Detail Report](https://ebc2.cybersource.com/ebc2/app/Reports/StandardReports) for settlement-on-time context (batch arrival vs expected window).
+
+Compare each component independently if you want to verify; the composite has no single CyberSource-side counterpart.
+
+**Why our component values may legitimately differ from EBC2:**
+
+| Reason | Direction of divergence | What to do |
+| --- | --- | --- |
+| **Reporting API extraction lag**. CyberSource Reporting v3 runs an overnight batch by default. Yesterday's full conversion-detail report typically lands between 02:00 and 06:00 merchant-account-tz. EBC2 transaction search shows real-time data; Vortex IQ pulls Reporting API. | Vortex IQ may lag EBC2 by 2-6 hours on the most recent day. | Compare equal date ranges using `submitTimeUtc` boundaries, not local-day boundaries. |
+| **Time zone**. EBC2 uses the merchant-account-configured time zone. Vortex IQ uses UTC. | Boundary-day drift. | Largest impact on "today" / "yesterday" component values; 7D rolling averages out the drift. |
+| **Decision Manager rule-version drift**. When fraud-ops ships a DM rule pack, the new rule logic applies to transactions submitted after the change. Historical reports re-evaluate against the live rule version, not the rule version that was in effect at the time. | Tiny drift on long historical windows. | Hold DM-driven analyses to ≤ 30D windows. |
+| **`REVIEW` outcome treatment**. Vortex IQ counts `REVIEW` as half-decline (operationally, most never convert). EBC2 reports `REVIEW` as a separate bucket. | Vortex IQ decline rate is **slightly higher** than EBC2 "Declined" count alone. | This is intentional; see [Under-Review Rate](/nerve-centre/kpi-cards/cybersource/under-review-rate) for the standalone view. |
+| **Multi-currency reporting**. EBC2 by default presents transaction amounts in the merchant's settlement currency at fixed FX. The composite uses count-based rates, currency-neutral. | n/a for this card (rates not amounts). | Use the standalone amount-based cards (Total Revenue, Net Revenue) if amount reconciliation is needed. |
+
+**Cross-connector reconciliation, what should match what:**
+
+| Comparison | Expected relationship | When divergence is legitimate |
+| --- | --- | --- |
+| `cs_payment_health_score` ↔ [`stripe.stripe_payment_health_score`](/nerve-centre/kpi-cards/stripe/payment-health-score) | Both use the same composite shape (auth × decline × dispute × settlement). CyberSource enterprise typically runs 2-4 points **lower** because the issuer-base mix is harder (more international corporate cards, more cross-border, more recurring) than typical Stripe SMB. | A CyberSource-Stripe gap of 2, 4 points is normal. Larger gap usually means a Decision Manager rule pack misfire on the CS side. |
+| `cs_payment_health_score` ↔ commerce platform `total_revenue` | The composite has no amount-based counterpart on the commerce side, but a rapidly dropping CS health score usually precedes a commerce revenue dip by 24, 72 hours. | Use [Decline Spike vs Checkout Funnel Drop](/nerve-centre/kpi-cards/cybersource/decline-spike-vs-checkout-funnel-drop) for the live cross-platform pulse. |
+
+**Quick rule for support tickets:** if a payments-ops lead says *"EBC2 shows 95% auth rate, your dashboard shows 93%"*, walk through the reconciliation table. The `REVIEW`-as-half-decline treatment is the most common cause; the second is the overnight-batch reporting lag.
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for multi-processor enterprise merchants)</em></summary>
+
+The closest peer is [`stripe.stripe_payment_health_score`](/nerve-centre/kpi-cards/stripe/payment-health-score). Same composite shape; different audience. CyberSource is calibrated for enterprise volume profiles (50k+ tx/period, harder issuer mix) where Visa VDMP enrolment is a real and immediate threat at 1.0% disputes. Stripe is calibrated for SMB profiles where the dispute amplifier serves the same purpose but the typical operating point is further from the regulatory ceiling.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is the CyberSource health score lower than the Stripe one for the same brand?**
+Two structural reasons. First, CyberSource is positioned for enterprise volume with harder issuer-base mix: more international cards, more corporate cards, more cross-border, more recurring. All of these have lower baseline auth rates than the SMB-domestic-consumer mix Stripe sees. A 2, 4 point gap is normal. Second, enterprise merchants on CyberSource typically run multi-acquirer routing with CyberSource as the failover for high-risk traffic; the harder traffic ends up on CyberSource by design.
+
+**My score dropped 6 points overnight, what happened?**
+Open the four component cards in this order: [Decline Rate](/nerve-centre/kpi-cards/cybersource/decline-rate), [Auth Rate](/nerve-centre/kpi-cards/cybersource/authorisation-success-rate), [Dispute Rate](/nerve-centre/kpi-cards/cybersource/dispute-rate), [Avg Settlement Time](/nerve-centre/kpi-cards/cybersource/avg-settlement-time). Decline rate is amplified ×5 so a 1pp jump is 1.25 score points; this is the most common cause. Then check [Top Decline Reasons](/nerve-centre/kpi-cards/cybersource/top-decline-reasons). If a single decline-reason bucket grew (e.g. AVS mismatch from 22% to 35%), that's almost always a Decision Manager rule pack that fraud-ops shipped recently. Roll back the rule pack or dial it down.
+
+**How do I read AVS codes? My fraud-ops lead asks for the breakdown.**
+Address Verification System codes returned by the issuer:
+- **`Y`**. Address and 5-digit zip both match. The healthiest signal; auth-rate near 100%.
+- **`A`**. Address matches, zip does not. Common on military APO/FPO addresses, hotels, and corporate billing centres. Most enterprise merchants accept; tightening to `Y`-only declines 8, 15% of corporate transactions for very little fraud-prevention upside.
+- **`Z`**. Zip matches, address does not. Common on rural / international addresses where USPS standardisation differs. Treat similarly to `A`.
+- **`N`**. Neither matches. Highest-risk signal but still a wide band; some legitimate fresh-card / new-customer transactions land here. Decision Manager should weight this alongside other signals, not auto-decline.
+- **No AVS data returned**. Some non-US issuers don't participate in AVS. Don't penalise; weight other signals.
+
+**What's a good Decision Manager false-positive rate?**
+For enterprise merchants, target **REVIEW manual-approval rate around 75, 85%**. Above 90% means rules are over-tuned (review queue is doing nothing useful, just adding ops cost). Below 60% means rules are under-tuned or the high-risk traffic mix shifted. The true cost of a false positive is the lost legitimate sale; the true cost of a false negative is the dispute and the fee. CyberSource Decision Manager Replay can help validate rule-pack changes against historical traffic before deploying live.
+
+**Why is the dispute amplifier ×50, that feels harsh?**
+Because the Visa Dispute Monitoring Program (VDMP) starts enrolling merchants at 0.9% chargeback rate, and Visa Fraud Monitoring Program (VFMP) at lower fraud-loss thresholds. Crossing these triggers higher fees, mandatory rolling reserves, and eventual merchant-account termination at 12 months unsuccessful remediation. For a Fortune-500 with hundreds of millions in annual processing volume, losing a CyberSource merchant account is an existential outage. The ×50 amplifier ensures the composite drops below 70 well before VDMP letters arrive.
+
+**Why does CyberSource have lower `do_not_honor` and higher `insufficient_funds` than Stripe for recurring billing?**
+This is a real pattern. Recurring-billing books on CyberSource (typically B2B, subscription, utility, telecom) see `insufficient_funds` (reason 204) materially more often than `do_not_honor` (reason 203) because the issuer responses on recurring-MID flagged transactions skew toward customer-balance reasons rather than issuer-suspicion reasons. The fix is dunning + retry timing: retrying on payday-aligned schedules (1st-of-month, 15th-of-month, 28th-of-month for SSI/pension cohorts) recovers a meaningful share. See [Decline Retry Success Rate](/nerve-centre/kpi-cards/cybersource/decline-retry-success-rate) and [Dunning Recovery Rate](/nerve-centre/kpi-cards/cybersource/dunning-recovery-rate).
+
+**Does Token Management Service really lift auth rates that much?**
+Yes, materially. Tokenized cards (network tokens specifically, e.g. Visa VTS, Mastercard MDES) flow through the network with stronger metadata and auth rates run 4, 8 percentage points above un-tokenized fresh cards on the same merchant. PAN-based TMS tokens give a smaller uplift (1, 3pp) because the network treats them like any other card. Enterprise merchants with significant recurring revenue should target >80% of the recurring book on network tokens; the composite responds within one full sync cycle.
+
+**My multi-currency global merchant, does this score work?**
+Yes. The components are rates, not amounts, so multi-currency global enterprises (one CS merchant ID processing USD + EUR + GBP + AUD + JPY) get a single, valid composite. Currency-specific health is exposed via [Revenue by Currency](/nerve-centre/kpi-cards/cybersource/revenue-by-currency) for the amount lens and [Revenue by Country](/nerve-centre/kpi-cards/cybersource/revenue-by-country) + [Decline Rate by Card-Country](/nerve-centre/kpi-cards/cybersource/decline-rate-by-card-country) for the geography lens.
+
+**Can I customise the weights?**
+Not yet, the formula is fixed in the manifest. The default weights (35/25/20/20) reflect what enterprise CFOs and VPs of Payments ask first. If your business needs a different weighting (e.g. settlement-on-time weighted higher because you have very tight cash-flow forecasting), the formula lives in [cybersource.yaml](https://github.com/vortex-iq/agentic-workflow/tree/master/config/vortex_mind/manifests/cybersource.yaml) and is straightforward to add as a per-merchant override. Open a request.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Payment Health Score* is one of hundreds of KPI pulses Vortex IQ tracks across CyberSource and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

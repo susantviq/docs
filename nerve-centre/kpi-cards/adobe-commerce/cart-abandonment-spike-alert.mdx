@@ -1,0 +1,185 @@
+---
+title: "Cart-Abandonment Spike Alert, Adobe Commerce"
+sidebarTitle: "Cart-Abandonment Spike Alert"
+description: "Order-count divided by quote/cart-create count, fires when a checkout regression silently kills conversion. How to read it, why it matters, and how to act..."
+---
+
+**Card class:** Non-Hero  •  **Category:** Ecommerce Platform
+
+> Order-count divided by quote/cart-create count, fires when a checkout regression silently kills conversion.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Real-time canary that compares completed-order count against quote-create count to derive a checkout abandonment rate. Fires when the rate exceeds 2 standard deviations above the 30-day baseline. Designed to catch silent checkout regressions: a broken JavaScript event, a payment-method dropdown that no longer renders, a tax-calculation service timing out, an Adobe Commerce 2.4.x patch that changed the address-validation flow.
+
+| | |
+| --- | --- |
+| **What it counts** | `1 - (COUNT(orders) / COUNT(quotes_with_at_least_one_item))` over a rolling hour, compared against the 30-day mean and standard deviation of the same ratio at the same hour-of-week. Quote count comes from the `quote` table where `items_count > 0` and `created_at` falls in the window. |
+| **API field** | Quote count via `GET /rest/V1/carts/search` (or direct `quote` table read for performance); order count via `GET /rest/V1/orders`. The card joins on `quote_id` to identify converted vs abandoned quotes. |
+| **VAT / tax treatment** | n/a for the ratio itself (it is a count-based ratio, not a value). The "lost-revenue" companion estimate uses average `grand_total` per converted quote, which is tax-inclusive. |
+| **Shipping inclusion** | n/a for the abandonment ratio. Shipping configuration changes are a frequent root cause of abandonment spikes (a new freight rule made shipping eye-watering on a popular SKU), so the FAQs cover this. |
+| **Discounts** | n/a for the ratio. A discount-code field that broke (returns "Invalid coupon" on every legitimate code) is a classic spike trigger. |
+| **Credit Memo refund treatment** | n/a, this card is conversion-side. |
+| **`state` machine inclusion** | Order numerator includes orders in any `state` except `canceled`. Reasoning: a `pending_payment` order still represents the customer reaching checkout completion intent; only `canceled` truly didn't convert. The card's intent is funnel-stage detection, not cash-in-bank. |
+| **`pending_payment` quirk** | Included in the numerator. If your gateway is dropping callbacks (orders pile in `pending_payment` and never resolve), this card looks healthy because the customer reached order-create. The contrast diagnostic: if abandonment is flat but [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) shows `pending_payment` ballooning, the regression is post-checkout (gateway/webhook), not in-checkout. |
+| **Multi-currency `grand_total` vs `base_grand_total`** | n/a for the ratio. The lost-revenue companion uses `base_grand_total` so multi-currency stores roll up cleanly. |
+| **Store View scope (`store_id`)** | **All Store Views summed by default.** A US-only checkout regression on a multi-Store-View merchant may dilute below the 2-sigma threshold if the UK store is healthy. Per-Store-View variants strongly recommended for any merchant with regional checkout differentiation (different gateways, different shipping providers, different tax services per region). |
+| **Time window** | `RT` (real-time, hour-by-hour rolling). |
+| **Alert trigger** | `abandonment rate >2-sigma vs 30D baseline` at same hour-of-week. The same-hour-of-week comparator handles natural patterns (Sunday-night impulse-buyers vs Tuesday-morning B2B procurement). |
+| **Roles** | owner, marketing, engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+```
+COUNT(_id)
+  WHERE date BETWEEN [period_start, period_end]
+```
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A specialty kitchenware retailer on Adobe Commerce 2.4.6 with a US Store View, a UK Store View, and a B2B portal Store View. Tuesday 19 Apr 26, 11:00 GMT. The alert just fired on the UK Store View.
+
+**30-day baseline (Tuesdays 11:00 GMT, UK Store View):**
+
+| | Quote count | Order count | Abandonment rate |
+| --- | --- | --- | --- |
+| Mean (4 prior Tuesdays) | 412 | 132 | 67.9% |
+| Standard deviation | 38 | 14 | 2.4% |
+| 2-sigma upper bound | | | 72.7% |
+
+**Current hour (this Tuesday 11:00):**
+
+| Stream | Quote count | Order count | Abandonment rate | vs baseline |
+| --- | --- | --- | --- | --- |
+| US (consumer) | 308 | 96 | 68.8% | within range |
+| UK (consumer) | 446 | 89 | **80.0%** | **+12.1 pts, ~5-sigma** |
+| B2B portal | 22 | 19 | 13.6% | within B2B range |
+
+The alert fired because UK abandonment jumped from a baseline 67.9% to 80.0%. Quote volume looks healthy (446 vs 412 baseline) so traffic isn't the issue; it's that 357 of those 446 quote-creators didn't reach order-complete.
+
+What the investigation reveals:
+
+1. **The US store is fine.** The regression is UK-specific.
+2. **B2B is fine** (small sample, Company users with saved cards rarely abandon). This rules out a backend Adobe Commerce platform issue (the UK and B2B Store Views run on the same Magento installation).
+3. **Pulling the most recent 50 abandoned UK quotes**: 41 of 50 reached the shipping-method step but no order followed. That points at the shipping or payment phase.
+4. **Stripe Dashboard for the same hour**: Stripe shows no payment attempts that failed, just no attempts at all. So the customers aren't reaching the payment step.
+5. **Adobe Commerce admin > Stores > Configuration > Sales > Shipping Methods (UK Store View scope)**: a new free-shipping rule was deployed at 09:30 with a syntax error in the conditions, the `Royal Mail Tracked 24` method silently disappeared from the storefront for any cart under £50.
+6. **The fix:** roll back the shipping rule. Within 30 minutes of the rollback, abandonment returns to ~68%.
+7. **Lost revenue estimate** for the 1-hour incident window: 357 abandoned quotes × baseline conversion rate (32%) × baseline UK AOV (~£68) = ~£7,750 of revenue at risk if the rule had stayed live for the full day.
+
+The point of this card: a quote-to-order ratio change is a leading indicator. Total Revenue would have shown the dip 2-3 hours later (after the order-create rate collapsed enough to bend the hourly revenue curve). The alert caught it within the same hour.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+This alert is most useful when triangulated with funnel-stage cards and payment-side cards.
+
+| Card | Why pair it with Cart-Abandonment Spike Alert |
+| --- | --- |
+| [Total Orders](/nerve-centre/kpi-cards/adobe-commerce/total-orders) | The numerator. A drop here downstream of a quote-rate that's flat is the canonical abandonment signature. |
+| [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) | If `pending_payment` is ballooning while abandonment is flat, the regression is post-checkout (gateway callback failure), not in-checkout. |
+| [AOV](/nerve-centre/kpi-cards/adobe-commerce/average-order-value) | If abandonment spikes coincide with AOV change, a checkout step (shipping cost, tax estimate, freight rule) is the likely culprit. |
+| [Total Revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | Lagging confirmation. Abandonment leads revenue by 2 to 3 hours; a confirmed sustained abandonment spike means revenue will follow. |
+| [Guest vs Account Checkout](/nerve-centre/kpi-cards/adobe-commerce/guest-vs-account-orders) | If abandonment spikes only on guest checkout, the regression is likely in the guest path (address validation, account-create form). If it spikes on logged-in customers too, the regression is shared. |
+| [Discount %](/nerve-centre/kpi-cards/adobe-commerce/discount-of-revenue) | If discount usage drops sharply alongside abandonment, the discount-code field broke. |
+| [`stripe.stripe_payment_decline_rate`](/nerve-centre/stripe/stripe_payment_decline_rate) | If Stripe declines spiked, the regression is at the payment-attempt stage (stale Stripe public key, 3DS configuration changed, BIN-block list update). |
+| [`shopify.shopify_alert_cart_abandon_spike`](/nerve-centre/shopify/shopify_alert_cart_abandon_spike) | Cross-platform peer for agencies running multi-platform clients. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Adobe Commerce Admin:**
+
+Adobe Commerce has a native abandoned-cart view, though it is shaped for outreach rather than spike detection:
+
+> **Reports > Sales > Abandoned Carts** lists quotes with at least one item that did not convert, in the Adobe Commerce sense (no associated order). Filter by date range to see the hour-by-hour count. The Adobe view shows the absolute count; this card derives a ratio against quote volume which the Admin view does not natively compute.
+
+For Adobe Commerce B2B (paid edition), the Companies view also surfaces unfinished quotes per Company, but again does not compute the ratio.
+
+For the order side of the ratio:
+
+> **Sales > Orders** filtered to today, with a counter row at the top, gives the order denominator.
+
+Other Adobe Commerce Admin views that look relevant but are not:
+
+- **Reports > Sales > Tax**: tax aggregations, no funnel signal.
+- **Reports > Sales > Coupons**: coupon usage, lagging indicator at best.
+- **Customers > Now Online**: who is currently logged in, no quote signal.
+- **Marketing > Cart Price Rules**: rules engine, not realtime cart state.
+
+**Why our number may legitimately differ from the Adobe Commerce Abandoned Carts view:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Definition of "abandoned"**. Adobe Commerce Admin defines an abandoned cart as a quote not associated with any order, including `canceled` orders if the quote ID was reused. This card excludes `canceled` orders from the numerator (treating them as not-converted) but includes the quote in the denominator, which is the closer-to-funnel-truth definition. | Vortex IQ ratio slightly higher than Admin's implied ratio |
+| **Time-zone**. Admin renders in Store View timezone, the card runs UTC. Hour-of-week boundaries shift by the timezone offset. | ±N hours depending on Store View timezone |
+| **Quote eligibility**. Admin counts every quote with at least one item; the card additionally excludes quotes where `customer_is_guest=1` AND `items_count=1` AND last_updated within 5 minutes (a common bot-pattern). On bot-heavy stores this reduces noise materially. | Vortex IQ slightly lower quote count |
+| **Multi-Store-View scope**. Admin scopes to one Store View; this card sums by default. | Vortex IQ higher quote and order counts |
+| **Sync lag**. The card uses the most recent OpenSearch sync (5 to 15 minutes); Admin is live. | Vortex IQ slightly stale at the boundary |
+
+**Cross-connector reconciliation (when these connectors are connected for this merchant):**
+
+The cross-connector contrast is itself a diagnostic for this card.
+
+| Card | Expected relationship | What divergence tells you |
+| --- | --- | --- |
+| [`google_analytics.ga_checkout_funnel`](/nerve-centre/google_analytics/ga_checkout_funnel) | GA4 checkout-step drop-off should align with the abandonment spike | If GA4 shows the drop at step 2 (shipping) and the alert fired, you have your stage. If GA4 shows no drop but the alert fired, the issue is between order-create and order-confirm, not in the customer-facing funnel. |
+| [`stripe.stripe_payment_decline_rate`](/nerve-centre/stripe/stripe_payment_decline_rate) | Decline rate aligned with abandonment spike means payment regression | A decline-rate spike with steady abandonment means existing customers are getting blocked but new shoppers are still completing. |
+| [`google_search_console.gsc_clicks`](/nerve-centre/google_search_console/gsc_clicks) | Inbound traffic should be normal during a regression | If GSC clicks dropped at the same time as abandonment spiked, the page-level issue is broader (template error, redirect loop). |
+
+---
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The same alert exists with platform-specific definitions on other commerce connectors. This is **not a reconciliation**; your Adobe Commerce store does not have a parallel Shopify or BigCommerce store. These cross-links exist so agencies running multi-platform client books can navigate between equivalent metrics.
+
+- [`shopify.shopify_alert_cart_abandon_spike`](/nerve-centre/shopify/shopify_alert_cart_abandon_spike)
+- [`bigcommerce.bc_alert_cart_abandon_spike`](/nerve-centre/bigcommerce/bc_alert_cart_abandon_spike)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The alert fired but my Google Analytics checkout funnel looks fine, why?**
+Two common causes. First, GA4 misses 10 to 25% of customer activity due to ad blockers and consent rejection; the card uses Adobe-side server data which is closer to ground truth. Second, the abandonment may be happening at the order-confirm stage (after the customer clicks "Place Order") which GA4 attributes as a successful purchase event but Adobe never receives the gateway callback to mark `state = processing`. Cross-check [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) for `pending_payment` accumulation.
+
+**What's the difference between the Adobe Commerce Abandoned Cart report and this card?**
+The Adobe Admin report counts abandoned carts in absolute terms over a date range, optimised for the marketing team to send recovery emails. This card computes a ratio against quote volume and detects deviation from baseline, optimised for engineering and operations to detect regressions. The Admin report is a list; this card is a smoke alarm.
+
+**Adobe Commerce vs Magento Open Source: does this card work on the free edition?**
+Yes. The quote and order tables exist in both editions. The B2B Companies filter (used in some peer cards) requires Adobe Commerce; this alert does not. The only relevant difference is that some Adobe Commerce edition features (Page Builder, customer segments) can change checkout flow and create their own regression sources, those are absent on Open Source.
+
+**Why does the alert use 2-sigma rather than a fixed threshold like 75% abandonment?**
+Baseline abandonment varies hugely between merchants. A B2B-heavy Adobe Commerce store may have 35% baseline abandonment (logged-in repeat buyers); a fashion DTC store may baseline at 78%. A fixed 75% threshold would constantly fire on the fashion store and never fire on the B2B store. The 2-sigma comparator normalises against each merchant's own baseline and against same-hour-of-week patterns.
+
+**My multi-store Adobe Commerce, can I get a per-Store-View alert?**
+Yes, configure per-Store-View variants in the manifest, filtering both quote and order counts by `store_id`. This is strongly recommended for any merchant with regional checkout differentiation: different gateways per region, different shipping providers, different tax services. A region-locked regression on the combined view often dilutes below the 2-sigma threshold.
+
+**Why does abandonment fluctuate hour-by-hour even without a regression?**
+Smaller volume buckets are noisier. A merchant doing 50 orders per hour at baseline can swing the ratio by 5 to 10 points just on Poisson variance. The 2-sigma comparator absorbs natural variance; only sustained or extreme deviations trigger. For very low-volume stores (under 100 orders/day) consider widening the bucket to 6-hour rolling.
+
+**B2B accounts barely abandon, why include them in the count at all?**
+You're right that B2B abandonment baselines are far lower (often single digits). A B2B portal Store View with 100 quotes and 95 orders is typical. By default the card aggregates all Store Views, which can wash out a consumer-side regression. Filter to consumer Store Views only, or set up per-Store-View variants. The B2B portal having its own variant catches a different problem (the supplier relationship breakdown rather than checkout regression).
+
+**Quote-create count seems suspiciously high, are bots being counted?**
+Possibly. Adobe Commerce creates a quote on first add-to-cart, including from headless storefronts and from automated price-checker bots. The card excludes the most obvious pattern (single-item, guest, last-updated within 5 minutes of create) but sophisticated bots can evade. If your quote-create count is more than 5x your active-session count from GA4, install bot management (Cloudflare Bot Management, Akamai BotManager) and treat the elevated baseline as a known data quality issue.
+
+**Why doesn't the alert fire when revenue is down?**
+Two reasons. First, this is a leading indicator on the funnel; revenue drops are often lagging effects 2 to 6 hours later. Second, a revenue drop caused by upstream traffic loss (an SEO penalty, a paid-ads budget exhausted) shows up as fewer quotes AND fewer orders proportionally, leaving the abandonment ratio steady. Use [Revenue Drop Alert](/nerve-centre/kpi-cards/adobe-commerce/revenue-drop-alert) for cash-side monitoring and this card for funnel-side monitoring; they catch different failure modes.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Cart-Abandonment Spike Alert* is one of hundreds of KPI pulses Vortex IQ tracks across Adobe Commerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

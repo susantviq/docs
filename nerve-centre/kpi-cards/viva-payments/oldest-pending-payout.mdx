@@ -1,0 +1,184 @@
+---
+title: "Oldest Pending Payout (days), Viva Payments"
+sidebarTitle: "Oldest Pending Payout (days)"
+description: "Oldest Pending Payout (days) for Viva Payments stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Payment Gateway
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Days since the **oldest pending payout** was first eligible for settlement. A direct cash-flow tail-risk signal: anything above the merchant's expected settlement window suggests Viva is holding funds for a reason (rolling reserve, dispute hold, KYC re-verification, scheme bank-holiday bridge, or destination-bank acceptance issue). While [`viv_avg_settlement_days`](/nerve-centre/kpi-cards/viva-payments/avg-settlement-time) tells you the typical cycle, this card surfaces the worst case at any given moment, which is what surfaces problems first.
+
+| | |
+| --- | --- |
+| **What it counts** | `MAX(NOW() − payout.EligibleDate)` for payouts in pending state on the `/api/payouts` collection. The single oldest in-flight payout, expressed in calendar days. |
+| **API endpoint** | [`GET /api/payouts`](https://developer.vivawallet.com/apis-for-payments/payment-api/) (Settlement / Disbursement endpoint). Cross-referenced against `/api/transactions` for capture-date integrity. OAuth 2.0 client-credentials at `accounts.vivapayments.com/connect/token`. |
+| **Payout cycle distinction** | **Viva-IBAN: instant rail, sub-day** (typically minutes). **Non-Viva-IBAN EUR: SEPA T+1 to T+3** (weekends and EU bank holidays bridge). **GBP UK IBAN: Faster Payments T+0 to T+1**. **CHF / RON / non-EEA: T+2 to T+5** (local rails differ). |
+| **Pending vs settled state machine** | Pending = capture has cleared scheme, awaiting transfer to merchant IBAN. Settled = funds credited to destination IBAN. This card measures the gap between "eligible to settle" and "settled" in days. |
+| **Currency** | Days (numeric), currency-neutral. The oldest age across all currencies wins; if EUR oldest is 2 days and GBP oldest is 11 days, this card returns 11. |
+| **Reserves** | If Viva is holding a rolling reserve (typical for first 30 to 90 days or for higher-risk verticals such as travel, digital goods, subscription, gaming), payout age structurally extends with the reserve cycle length. A 14-day rolling reserve produces a baseline 14-day oldest age. |
+| **Dispute holds** | Funds held for active dispute / chargeback cases extend payout age until Visa or Mastercard adjudication completes. Visa rules permit up to 21 days for representment evidence and decision; Mastercard, similar. Single dispute aging to 18 to 21 days is normal background, not a system failure. |
+| **3DS late-completion impact** | A 3DS challenge the customer completes hours or days after the original session can leave the parent transaction in a delayed-pending state until the issuer confirms. Rare but real edge case, can briefly age this card by 2 to 4 days. |
+| **KYC / AML review** | Re-verification under EU MLD6, German GwG, UK MLR 2017 or equivalent can pause payouts entirely; this card spikes immediately when that happens. JP Morgan acquisition does not change the licensing entity (Viva.com remains the regulated EMI). |
+| **JP Morgan acquisition impact** | None on payout cadence. Settlement rails, scheme rules, IBAN issuance, and licensing entity are unchanged. The 2023 acquisition (49% with ramp to majority, completing in 2024) is a balance-sheet event, not an operational one. |
+| **Time window** | `RT` (real-time snapshot, the oldest pending right now, refreshed every 5 to 15 minutes). |
+| **Alert trigger** | `>5 days` warn for Viva-IBAN merchants; `>7 days` warn for non-Viva-IBAN; `>10 days` critical for both. Sentiment thresholds: good ≤2 days, warn ≤5 days, breach >5. Reserve-active merchants should configure a custom threshold. |
+| **Sentiment key** | `payout_age` (gauge inverse, lower is better) |
+| **Roles** | owner, finance |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Viva Payments data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A Cypriot omnichannel retailer ("Larnaca Linens"), Viva-IBAN account, established merchant with no rolling reserve, runs three physical stores in Larnaca, Limassol and Nicosia plus a pan-EU e-shop. Snapshot at 02 May 26.
+
+| Pending bucket | Age | Currency / Amount | Notes |
+| --- | --- | --- | --- |
+| Today's online captures | 0.1 day | EUR 18,400 | Will instant-settle to Viva-IBAN within minutes |
+| Today's POS captures (3 stores) | 0.4 day | EUR 22,100 | Awaiting end-of-day batch round-up |
+| Yesterday's late-evening POS | 0.9 day | EUR 4,200 | Crossed the EOD cutoff; rolls to next batch |
+| 3DS late-completion edge case | 2 days | EUR 320 | Customer completed challenge after original session |
+| Disputed transaction (in flight) | **17 days** | EUR 480 | Held until Visa representment decision, oldest pending |
+
+```text
+Oldest pending payout (this card)            = 17 days
+
+Cohort comparison (Vortex IQ benchmark, Cypriot retail SMBs):
+  Larnaca Linens (Viva-IBAN, established)    = 0.3-day median oldest age
+                                              (excluding the disputed tail)
+  Stripe-using peer cohort (median)          = 2.1 days
+  Adyen-using peer cohort (median)           = 1.9 days
+  PayPal-Braintree-using peer cohort (median)= 1.4 days
+
+The 17-day current reading is dispute-driven, not cycle-driven:
+  - Single disputed transaction (EUR 480) waiting Visa adjudication
+  - Visa CE 3.0 rules allow up to 21 days for evidence + decision
+  - Once resolved, EUR 480 either releases (won) or chargebacks (lost)
+
+Threshold check:
+  Viva-IBAN warn at >5 days                  = above
+  Sentiment "warn" tier                      = breached, dispute-driven
+  Action                                     = no action; ensure
+                                              representment evidence
+                                              was submitted on time
+```
+
+What the merchant should notice:
+
+1. **The 0.3-day median oldest age is the Viva-IBAN signature.** Even Larnaca Linens' worst-case daily oldest pending sits well under a single calendar day when no dispute is in flight. That benchmark is roughly 7x faster than the Stripe-using peer cohort and 4x faster than PayPal Braintree. The mechanism is structural: Viva.com holds its own EU electronic-money licence and issues an IBAN against the merchant balance, so funds never leave the regulated entity until the merchant chooses to sweep. Stripe and PayPal both bridge through partner banks via SEPA, which adds at minimum one settlement cycle.
+2. **The current 17-day reading is concentrated in a single disputed transaction.** This is the typical pattern for healthy Viva-IBAN merchants: oldest pending age is dominated by individual disputes following Visa or Mastercard timelines, not by the settlement cycle itself. The card's value is detecting *what kind of problem* is creating the tail risk, the dispute pattern is normal, the systemic-bottleneck pattern is not.
+3. **EUR 480 is a small absolute amount.** Tail-age problems on small disputes are background noise, finance should not over-react. The action is to confirm representment evidence was uploaded inside the Visa CE 3.0 window, not to clear the pending balance manually (it is not clearable, scheme rules govern timing). If Larnaca Linens wins, EUR 480 returns to pending and settles on regular cycle within hours.
+4. **If the oldest age were *not* a dispute, escalate to Viva.** A 17-day age driven by settlement bottleneck (rather than dispute) usually indicates one of three causes: destination-bank acceptance issue (rare for Viva-IBAN merchants since the IBAN is internal), reserve adjustment Viva applied silently after a risk-event, or a Viva-side processing delay (almost always announced). File a support ticket via the Dashboard with the transaction ID and days-pending; SLA for response is typically same business day.
+5. **POS captures briefly age past 0.5 day at end-of-day boundaries.** Notice the 0.9-day reading on yesterday's late-evening POS, this is expected: card-present captures after the configured EOD cutoff (usually 23:00 local) roll into the next batch. If POS oldest is consistently above 1.5 days, the EOD cutoff time is misconfigured or terminal connectivity is patchy; check the Smart POS terminal report.
+6. **JP Morgan acquisition does not change scheme timelines.** Visa CE 3.0 applies regardless of acquirer parent ownership; the 21-day representment window is identical at Viva, Stripe, Adyen, Worldpay or any other acquirer. Merchants asking "did anything change after JPM?" can be told operations are neutral, the JPM transaction is balance-sheet credibility (a globally systemic bank backs the platform), not a workflow change.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Oldest Pending Payout |
+| --- | --- |
+| [`viva_pending_payouts`](/nerve-centre/kpi-cards/viva-payments/pending-payouts) | The total in-flight balance. Pair age (this card) with amount to size the tail-risk. |
+| [`viv_avg_settlement_days`](/nerve-centre/kpi-cards/viva-payments/avg-settlement-time) | The average cycle. If this card is much greater than average, you have a bimodal distribution: most settles fast, a tail sits stuck. |
+| [`viv_payout_age_days`](/nerve-centre/kpi-cards/viva-payments/oldest-pending-payout) | Sibling oldest-pending card from the `viv_*` set; same calculation, kept for compatibility with older dashboards. |
+| [`viv_payouts_pending`](/nerve-centre/kpi-cards/viva-payments/pending-payouts) | Sibling pending-balance card from the `viv_*` set. |
+| [`viv_dispute_rate`](/nerve-centre/kpi-cards/viva-payments/dispute-rate) | Disputes are the most common driver of high oldest-age. Pair to confirm whether the tail is dispute-driven (normal) or systemic (escalate). |
+| [`viv_chargeback_rate`](/nerve-centre/kpi-cards/viva-payments/chargeback-rate) | Lost disputes finalise as chargebacks; resolution releases the held funds and clears the tail. |
+| [`viva_total_revenue`](/nerve-centre/kpi-cards/viva-payments/total-revenue) | Revenue context: pending age × revenue gives a rough measure of working capital trapped in the tail. |
+| Stripe oldest-pending payout / PayPal payout cycle | Cross-PSP comparison; expect Viva-IBAN to be 5 to 10x lower than Stripe default. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in the Viva Payments Dashboard:**
+
+Sign in at [viva.com/business/account/login](https://www.viva.com/en/business/account/login). Closest comparable views (in priority order for this card):
+
+> **Viva Business → Account → Pending settlements** (sortable by capture date)
+
+Sort the pending-settlements list by ascending Capture Date; the top row is the oldest pending. Compare its age in days against this card. The Dashboard renders capture date in your account timezone (Athens EET / EEST for Greek and Cyprus accounts; Europe/London for UK accounts; Europe/Paris for French accounts).
+
+Other Viva views that look similar but answer subtly different questions:
+
+- **Account → Reserves & Holds** (where active). Shows the held-reserve portion separately from in-transit pending. If your oldest pending age is 30+ days and your reserve cycle is 30 days, the two will overlap exactly, the held-reserve view is the explanation.
+- **Sales → Disputes** (Dispute Manager). Shows in-flight chargeback / pre-arbitration cases. If your oldest pending matches a dispute open date, the tail is dispute-driven and will resolve when the case does.
+- **Business → Marketplace → Splits** (where Marketplace Splits enabled). For platform merchants, the platform's residual settlement may age differently from sub-merchant settlements; check the splits ledger.
+- **Settings → Settlement schedule**. Your configured payout cadence (instant, daily, weekly). Mis-configured schedules (rare but possible after merchant requests a change) can produce a 7-day baseline oldest age that looks wrong but is intentional.
+
+**Why our number may legitimately differ from the Viva Dashboard:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Time zone** | Boundary days off | Viva Dashboard uses account timezone; Vortex IQ uses UTC for period boundaries. Athens is UTC+2 / UTC+3, so a payout eligible at 23:30 EEST shows as "yesterday" in Viva and "today" in our view, a 1-day age difference around the boundary. |
+| **Dispute holds** | Ours includes, some Viva views exclude | Some Dashboard pending-settlement views filter out disputed-in-flight (treated as a separate ledger). We always include them since they are still pending settlement to merchant. |
+| **Reserve releases** | Ours includes attached transactions | Held-reserve portions can age on this card if they are tied to a specific old transaction. The Viva Reserves view typically separates this; we combine for a single tail-risk reading. |
+| **Multi-currency arithmetic** | Ours is the max across all currencies | Dashboard often renders per-currency oldest separately. This card returns the maximum across all currencies, which may be a different currency than the headline view. |
+| **API rate limits / pagination** | Ours can lag for very high-volume merchants | Viva's API caps at typically 10 req/sec; engines paginating at 100 records per page may defer the freshest pending records to the next refresh. For aging-in-days metrics this rarely matters. |
+| **Instant-IBAN vs SEPA scheduling** | Ours unifies, Viva separates | Viva-IBAN settlements and SEPA settlements appear in different Dashboard tabs; this card unifies them into a single oldest-pending reading regardless of rail. |
+| **Refresh lag** | Ours stale by 5 to 15 minutes | Aging metrics in days are barely affected by minutes of lag; included for completeness. |
+
+**Cross-connector reconciliation:**
+
+| Comparison | Expected relationship | When divergence is legitimate |
+| --- | --- | --- |
+| `viva_payout_age` ↔ Stripe oldest pending payout | Viva typically 5 to 10x lower for Viva-IBAN merchants | Stripe default EU schedule is T+7; mature merchants negotiate to T+2. Viva-IBAN is sub-day. Dispute-driven aging follows Visa / Mastercard rules and is comparable across PSPs. |
+| `viva_payout_age` ↔ PayPal payout cycle (oldest balance held) | Different model | PayPal's balance is a held wallet; "pending" in PayPal usually means held-for-21-days new-merchant funds reserve, structurally different. |
+| `viva_payout_age` ↔ commerce platform Total Revenue (rail-level reconciliation) | Indirect | Commerce platform Total Revenue is a leading indicator; if Total Revenue is healthy but oldest pending is rising, the issue is in the rail (Viva), not the storefront. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference</em></summary>
+
+- Stripe pending-payout aging cards (where present)
+- PayPal balance-aging cards (where present)
+- Adobe Commerce / BigCommerce / Shopify Total Revenue (rail-level reconciliation)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**"Why is my Viva oldest pending payout age so much lower than my Stripe one?"**
+Architectural difference, not a bug. Viva.com holds its own EU electronic-money licence (regulated EMI under the Bank of Greece) and issues an internal IBAN against your merchant balance. Funds move from acquiring to your Viva-IBAN within minutes, on Viva's own books. Stripe, by contrast, bridges through partner banks and SEPA to the merchant's external bank, which adds at minimum one settlement cycle. Stripe's default EU schedule is T+7; a mature merchant typically negotiates to T+2. Viva-IBAN merchants regularly see oldest pending below 0.5 day in steady state. The 5 to 10x difference is real and structural. For a Mediterranean SMB with EUR 100k/month volume, that is roughly EUR 16,000 to EUR 23,000 in working capital that Viva keeps available which Stripe parks in the rail.
+
+**"Oldest pending is 17 days, should I worry?"**
+Almost always: no. The oldest pending in healthy Viva-IBAN merchants is typically dominated by a single in-flight dispute, which can age out to 21+ days under Visa CE 3.0 and Mastercard chargeback rules. Check whether the oldest pending corresponds to a transaction in the Disputes view. If it does, the age is expected and resolves automatically when the dispute does. If it does not (the oldest is a regular capture sitting stuck), escalate to Viva merchant support with the transaction ID.
+
+**"When do reserves release?"**
+Rolling reserves typically release on a 30-day, 60-day, or 90-day cycle depending on merchant tenure and risk profile. A 14-day rolling reserve means each day, transactions captured 14 days ago come out of reserve and settle; a 90-day reserve means a 90-day baseline oldest age that is structurally expected. Reserve release schedules are visible in the Dashboard under Account → Reserves & Holds. Reserves are renegotiable as merchant tenure and chargeback performance improve, established merchants in standard verticals can usually have the reserve removed entirely after 12 to 24 months of clean trading.
+
+**"How does dispute hold affect payout age?"**
+A disputed transaction stays in the pending pool until the dispute resolves. Visa CE 3.0 timelines: pre-arbitration up to 30 days, representment up to 21 days for evidence submission plus issuer review. Mastercard timelines are comparable. A single dispute can therefore age this card to 21 days legitimately. The card is not a chargeback alarm; for that, use [`viv_chargeback_rate`](/nerve-centre/kpi-cards/viva-payments/chargeback-rate). If the oldest age matches the open-date of a single dispute, the system is working as designed.
+
+**"JP Morgan now owns Viva. Does that change my payout cycle?"**
+No. JP Morgan Chase acquired 49% of Viva.com in 2023 with an option to take majority control (completed in 2024). Operations are neutral: the Viva Business Dashboard, Smart Checkout API, Smart POS terminals, settlement rails, fee structures, and licences as a regulated EMI all continue under existing Viva entities. Settlement timing, IBAN issuance, and scheme rules are unchanged. The practical implication of the JPM transaction is balance-sheet credibility (a globally systemic bank backs the platform), not a workflow change. KPIs in this card are unaffected.
+
+**"Multi-currency settlement, do I get one payout per currency? Does the oldest age go up?"**
+Yes, one settlement stream per currency rail. EUR settles via instant rail (Viva-IBAN) or SEPA (non-Viva-IBAN); GBP via UK Faster Payments (T+0 to T+1 for UK accounts); CHF via Swiss SIC; RON via Romanian instant rail; the others via local equivalents. Each currency has its own oldest-pending reading; this card returns the maximum across all currencies. If your EUR oldest pending is 0.3 days but your GBP oldest pending is 11 days, this card returns 11. Investigate the slow-rail currency: most often it is a UK FPS-eligibility issue with a non-FPS-enabled destination bank, falling back to BACS T+3.
+
+**"SEPA bank holiday impact, what should I expect?"**
+For Viva-IBAN merchants, none. Viva's instant rail operates 24/7 including weekends and EU bank holidays. For non-Viva-IBAN merchants, SEPA closes for weekends and the EU TARGET2 holiday calendar (New Year, Good Friday, Easter Monday, Labour Day, Christmas, Boxing Day). Greek Orthodox Easter and August holidays are particularly impactful for Greek-issuer-heavy merchants on non-Viva-IBAN setups. A bank-holiday week can legitimately push oldest pending to 5 to 6 days for a non-Viva-IBAN merchant; expected, not an alarm.
+
+**"Marketplace Splits, does the residual show up in pending?"**
+Yes. For platform merchants using Viva Marketplace Splits, the platform's residual after sub-merchant splits sits in pending until the platform settlement cycle completes. Sub-merchant settlements are a separate ledger with their own oldest-pending reading. If this card looks unexpectedly high on a Marketplace-enabled account, check the Marketplace → Splits view to see whether the residual is the driver. Marketplace residuals occasionally lag when a sub-merchant has a pending KYC re-verification.
+
+**"My oldest pending suddenly jumped from 0.5 days to 7 days, what to check?"**
+Three checks in order. (1) Disputes view: a new chargeback opening is the most common cause. (2) Reserves & Holds: did Viva apply a new reserve following a risk-event? Higher dispute rate, sudden volume spike, or vertical reclassification can trigger a reserve. (3) Settlement schedule: did anyone in your finance team change the configured cadence (rare but happens around vendor-onboarding for accounting software). If none of those, file a Viva support ticket; SLA for response is typically same business day.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Oldest Pending Payout (days)* is one of hundreds of KPI pulses Vortex IQ tracks across Viva Payments and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

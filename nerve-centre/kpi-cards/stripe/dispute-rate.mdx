@@ -1,0 +1,162 @@
+---
+title: "Dispute Rate, Stripe"
+sidebarTitle: "Dispute Rate"
+description: "Dispute Rate for Stripe stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Payment Gateway
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of successful Stripe charges in the period that were subsequently disputed by the cardholder, the headline chargeback risk metric. **Visa monitors merchants at 0.9 percent and adds compliance fines above 1.0 percent**; Mastercard's Excessive Chargeback Programme triggers at 1.5 percent. Brands that breach card-network thresholds face fines, reserve increases, and ultimately processor termination, which is why this card sits in the Executive Command Centre alongside Total Charge Volume rather than buried in a finance dashboard.
+
+| | |
+| --- | --- |
+| **What it counts** | `(count of disputes opened in the period) ÷ (count of charges with status = succeeded in the period) × 100`. Both numerator and denominator are anchored to the **created date of the underlying charge**, not the dispute creation date. A dispute opened in May against an April charge counts in April's window. |
+| **Card-network thresholds** | Visa: 0.9 percent monitoring threshold, 1.0 percent compliance fines, 1.8 percent VAMP (Visa Acquirer Monitoring Programme) escalation. Mastercard: 1.5 percent Excessive Chargeback Programme entry. Discover and Amex each have their own thresholds in similar bands. **The Vortex IQ alert fires at 1.0 percent because that is the most aggressive network's enforcement floor** and gives merchants warning before fines start accruing. |
+| **Currency** | n/a, this is a count-based ratio. The accompanying [`stripe_dispute_value`](/nerve-centre/kpi-cards/stripe/dispute-value) card provides the currency-denominated impact. |
+| **Fees / processing cost** | The metric itself is a percentage; the per-dispute fee ($15 USD plus the original transaction fee, not refunded even when the dispute is won) is captured in [`stripe_dispute_value`](/nerve-centre/kpi-cards/stripe/dispute-value). Brands losing 50 disputes a month are paying $750 in dispute fees alone, separate from the disputed amount. |
+| **Refunds** | Refunds **DO NOT** count as disputes. A merchant who pre-emptively refunds a customer to avoid a chargeback is reducing dispute count without affecting refund count. This is the textbook chargeback-avoidance play: respond to refund requests within 24 hours and you keep dispute rate low. |
+| **Friendly fraud disputes** | Counted. A dispute filed by a cardholder claiming "I didn't recognise this charge" against a legitimate purchase still counts in the numerator even if the merchant wins the dispute. **Win-rate matters for revenue recovery (see [`stripe_dispute_win_rate`](/nerve-centre/kpi-cards/stripe/dispute-win-rate)) but does not retroactively remove the dispute from the rate calculation**, which is why card networks measure raw dispute rate rather than net dispute rate. |
+| **Inquiries vs disputes** | Stripe Inquiry status (the early-warning step before a formal dispute) is **NOT** counted by default. Only `dispute.status IN (warning_needs_response, warning_under_review, warning_closed, needs_response, under_review, charge_refunded, won, lost)` count. Inquiries surface separately in [`stripe_early_fraud_warnings`](/nerve-centre/kpi-cards/stripe/early-fraud-warnings). |
+| **Dispute reason mix** | Not aggregated here. The mix of fraud / product not received / product unacceptable / subscription canceled / general reasons surfaces in [`stripe_dispute_reasons`](/nerve-centre/kpi-cards/stripe/dispute-reason-codes). Fraud-coded disputes carry higher card-network weight than service disputes for some monitoring programmes. |
+| **3DS-protected transactions** | Disputes against fully 3DS-authenticated charges typically result in liability shift to the issuing bank, but the dispute still counts in the rate. Liability-shift affects who pays, not whether the chargeback was filed. |
+| **Subscription disputes** | Counted, often disproportionately. Subscription billing generates "I didn't authorise this recurring charge" disputes when customers forget the recurring nature. Brands with subscription products should expect a 0.4-0.7 percent dispute rate baseline (vs 0.1-0.3 percent for one-shot purchases). |
+| **Time window** | `30D vsP` (30 days vs prior period). The 30-day rolling window aligns with the standard card-network reporting cadence and smooths the per-day noise; daily granularity is available in [`stripe_dispute_rate_trend`](/nerve-centre/kpi-cards/stripe/dispute-rate-trend). |
+| **Alert trigger** | `>1.0 percent` (Visa compliance threshold). Sub-thresholds: amber 0.7-1.0 percent (warning band), red >1.0 percent (compliance breach risk). |
+| **Sentiment key** | `dispute_rate` |
+| **Roles** | owner, finance, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Stripe data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US-based subscription beauty brand on Shopify processing through Stripe, monthly box plus one-shot retail product sales. Snapshot for the 30-day window ending Wednesday 15 May 26.
+
+| Source of dispute | Disputed charges | Charges in period | Dispute rate | Card-network weight |
+| --- | ---: | ---: | ---: | --- |
+| Subscription recurring (monthly box) | 47 | 8,400 | 0.56% | Medium (subscription disputes) |
+| Subscription first-charge (free trial conversion) | 18 | 1,200 | 1.50% | High (fraud-coded) |
+| One-shot retail | 12 | 4,200 | 0.29% | Low (service disputes) |
+| Subscription pause-then-charge | 9 | 380 | 2.37% | High (authorisation disputes) |
+| **Account total** | **86** | **14,180** | **0.61%** | Blended |
+
+What the per-source view is telling us:
+
+1. **The 0.61 percent blended dispute rate is in the amber band but not yet breaching Visa's 1.0 percent compliance floor.** Treat this as a 60-day warning rather than a fire. Merchants who let amber turn red typically face Visa monitoring placement within 90 days, which adds processor reserves of 5-10 percent of monthly volume on top of any fines.
+
+2. **The free-trial conversion segment at 1.50 percent is the load-bearing problem.** Free-to-paid trial conversions generate disproportionate "I didn't authorise this charge" disputes because customers either forget signing up or genuinely didn't realise the trial would convert. **The fix is operational: send a clear "your trial converts in 48 hours" reminder email with a one-click cancel link.** Brands that adopt this pattern reduce free-trial conversion dispute rate by 60-80 percent within 30 days.
+
+3. **The pause-then-charge segment at 2.37 percent reveals a billing-state bug.** Customers who paused subscriptions and then got charged anyway (whether through a system error or an undocumented "auto-resume after 90 days" rule) dispute aggressively because the charge feels arbitrary. **Investigate the pause-state logic before this scales**: if 9 disputes came from 380 pause-state charges, the same defect at full subscription volume could generate 200+ disputes a month.
+
+4. **One-shot retail at 0.29 percent is healthy.** This is the band most ecommerce brands operate in. The retail cohort here is doing nothing wrong; the operational fix work concentrates on the two subscription segments.
+
+5. **The 1.0 percent alert is correctly tuned for this brand.** The blended figure has not breached, but two segments individually have. Segment-level alerting (rolling out as a follow-up card) would catch the trial-conversion segment now rather than waiting for it to drag the blended figure into compliance breach.
+
+6. **What to do with the analysis.** (a) Ship the trial-conversion reminder email this week and measure dispute rate on the trial cohort 30 days later. (b) Audit the pause-state logic and document any auto-resume rules in the customer-facing email cadence. (c) Continue allowing subscription-recurring and one-shot retail to operate at current dispute rates; both are within healthy bands. (d) Re-baseline weekly: dispute rate is reactive (disputes can be filed up to 120 days after the charge), so today's measurement reflects charges from up to four months ago.
+
+The diagnostic flow when this card breaches the alert threshold:
+
+1. **Decompose by dispute reason.** [`stripe_dispute_reasons`](/nerve-centre/kpi-cards/stripe/dispute-reason-codes) breaks the dispute count into fraudulent / product not received / product unacceptable / subscription canceled / duplicate / credit not processed / general. Fraud-coded disputes carry the highest card-network weight (Visa VAMP scoring penalises them most) and tend to surface true card-fraud problems; service disputes (product not received, subscription canceled) tend to surface fulfilment or customer-service issues.
+2. **Cross-reference with [`stripe_dispute_win_rate`](/nerve-centre/kpi-cards/stripe/dispute-win-rate).** If win rate is also low (under 30 percent), the dispute defence pipeline is weak and disputes that could be won are being lost. If win rate is healthy (50-70 percent) but dispute rate is high, the problem is upstream (creative-to-checkout misalignment, billing-state confusion) rather than in the response process.
+3. **Check [`stripe_radar_blocked_volume`](/nerve-centre/kpi-cards/stripe/radar-blocked-charges) and [`stripe_radar_score_distribution`](/nerve-centre/kpi-cards/stripe/stripe-radar-risk-score-mix) for fraud-rule tuning.** A spike in fraud-coded disputes alongside a permissive Radar configuration is a clear signal to tighten the rule set; a spike alongside an already-tight Radar configuration suggests the fraudsters have moved to a new pattern that needs explicit blocking.
+4. **Pair with [`stripe_dispute_response_time`](/nerve-centre/kpi-cards/stripe/avg-dispute-response-time).** Disputes lost because the merchant did not respond on time are recoverable; disputes lost because the evidence was weak are not. Response-time monitoring catches the easy operational wins.
+5. **For subscription brands, layer the customer-lifecycle view from [`stripe_involuntary_churn`](/nerve-centre/kpi-cards/stripe/involuntary-churn).** Failed-charge-then-dispute is a common subscription pattern: the renewal fails, the customer doesn't see the failure email, the next retry succeeds, and they then dispute the unexpected successful charge. Tightening the dunning communications fixes both metrics.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why merchants reach for it |
+| --- | --- |
+| [`stripe_dispute_value`](/nerve-centre/kpi-cards/stripe/dispute-value) | The currency-denominated impact: dispute rate tells you how often, dispute value tells you how much. Pair them to size whether the chargeback problem is "many small" or "few large". |
+| [`stripe_dispute_reasons`](/nerve-centre/kpi-cards/stripe/dispute-reason-codes) | The breakdown by Visa/Mastercard reason code. Fraud-coded disputes carry higher network-monitoring weight than service disputes, even at the same headline rate. |
+| [`stripe_dispute_win_rate`](/nerve-centre/kpi-cards/stripe/dispute-win-rate) | The defence-side counterpart. High dispute rate plus low win rate is the worst case; high dispute rate plus healthy win rate suggests the operational pipeline is working but upstream traffic is the issue. |
+| [`stripe_dispute_response_time`](/nerve-centre/kpi-cards/stripe/avg-dispute-response-time) | The lever for win rate. Disputes lost because the merchant missed the response window are 100 percent operational waste. |
+| [`stripe_dispute_rate_trend`](/nerve-centre/kpi-cards/stripe/dispute-rate-trend) | The daily-granularity trend. Dispute rate shifts slowly because chargebacks lag charges by 30-90 days; the trend view surfaces the inflection points. |
+| [`stripe_disputes_open`](/nerve-centre/kpi-cards/stripe/open-disputes) | The current open-case count. The merchant's defence pipeline backlog. |
+| [`stripe_early_fraud_warnings`](/nerve-centre/kpi-cards/stripe/early-fraud-warnings) | Pre-dispute warnings from card networks. Allows pre-emptive refund to avoid the dispute being filed. |
+| [`stripe_chargeback_rate`](/nerve-centre/stripe/stripe_chargeback_rate) (alias) | Some merchants search for "chargeback rate" rather than "dispute rate". Both terms refer to the same metric in the Stripe context. |
+| [`stripe_radar_blocked_volume`](/nerve-centre/kpi-cards/stripe/radar-blocked-charges) | Stripe Radar's pre-emptive fraud-blocking volume. Tighter Radar rules reduce dispute rate but at the cost of more legitimate-customer false positives. |
+| [`stripe_xc_chargeback_forecast`](/nerve-centre/kpi-cards/stripe/chargeback-risk-forecast) | The cross-channel forecast that combines Stripe dispute rate with PayPal dispute rate, fraud signal velocity, and recent fraud-rule changes to estimate next-30-day chargeback exposure. |
+| [PayPal `pp_dispute_rate`](/nerve-centre/kpi-cards/paypal/dispute-rate) | The PayPal counterpart for brands running both processors. PayPal's dispute mechanism (resolution centre + claims) maps to a different escalation path than card-network disputes; the rates are not directly comparable but should both stay below 1 percent. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Stripe's own dashboard:**
+
+- **[Stripe Dashboard → Payments → Disputes](https://dashboard.stripe.com/disputes)** for the live list of open and closed disputes with full evidence trail and response-window countdown.
+- **Stripe Dashboard → Reports → Disputes** ([dashboard.stripe.com/reports](https://dashboard.stripe.com/reports)) for the dispute rate trend and dispute-reason breakdown over time. The "Disputes overview" widget on this page is the closest 1-to-1 comparison to this card.
+- **Stripe Dashboard → Radar → Reviews** ([dashboard.stripe.com/radar/reviews](https://dashboard.stripe.com/radar/reviews)) for the fraud-rule decisions that may have prevented or permitted disputed charges. Useful when investigating why dispute rate spiked.
+
+**Why the Vortex IQ dispute-rate number may legitimately differ from Stripe Dashboard:**
+
+| Reason | Direction | What to do |
+| --- | --- | --- |
+| **Anchor date convention.** Vortex IQ anchors dispute counts to the underlying charge's created date; Stripe Dashboard's "Disputes" view typically anchors to the dispute creation date. For the same period, the two views show different denominators. | Either direction depending on dispute filing pattern | For card-network compliance reporting, the Vortex IQ convention (anchored to charge date) matches how Visa and Mastercard calculate their monitoring thresholds. |
+| **Inquiry inclusion.** Stripe's UI sometimes folds inquiries (early-warning step before dispute) into the dispute count; Vortex IQ excludes inquiries by default. | Stripe Dashboard typically **higher** | Cross-check using the [`stripe_early_fraud_warnings`](/nerve-centre/kpi-cards/stripe/early-fraud-warnings) card to see the inquiry volume. |
+| **Page cap on charges.** The denominator is fetched via `/v1/charges`; merchants exceeding 1,000 charges per refresh see truncated denominators which artificially inflate the rate. | Vortex IQ **higher** for high-volume merchants | The warehouse-backed view (rolling out separately) removes the cap. |
+| **Time zone.** Stripe Dashboard uses the account's configured time zone; Vortex IQ uses UTC for period boundaries. | Boundary days **differ** | Largest impact on T (today) and 7D windows; for 30D the drift averages out. |
+| **Refund-before-dispute timing.** Customers who request a refund and the merchant processes it before they file a dispute appear in refund counts only. The exact timing of refund vs dispute filing affects which bucket counts the case. | Either direction | The combined view (refund rate + dispute rate) is what most merchants want; pair with [`stripe_refund_rate`](/nerve-centre/kpi-cards/stripe/refund-rate). |
+
+**Cross-connector reconciliation:**
+
+| Comparison | Expected relationship | When divergence is legitimate |
+| --- | --- | --- |
+| `stripe_dispute_rate` ↔ [PayPal `pp_dispute_rate`](/nerve-centre/kpi-cards/paypal/dispute-rate) | Roughly comparable but different denominator basis | PayPal dispute rate is calculated against PayPal-paid orders only; brands offering both processors should expect the two rates to diverge based on which payment method draws the higher-risk customer cohort (PayPal often draws more dispute-prone customers because the resolution-centre process is easier than filing a card-network chargeback). |
+| `stripe_dispute_rate` ↔ [`shopify.dispute_rate`](/nerve-centre/shopify/dispute_rate) | Stripe rate ≥ Shopify rate when Shopify is paying through Stripe | Shopify reports disputes for orders paid through Shopify Payments (which uses Stripe under the hood); the rates should align within a few basis points. Divergence usually comes from time-zone differences. |
+| `stripe_dispute_rate` ↔ Card-network monitoring score (e.g. Visa VAMP score) | Vortex IQ rate is the input the card networks use | The card networks weight different reason codes differently in their proprietary scoring; a brand with 0.8 percent Vortex IQ dispute rate but heavy fraud-reason concentration may show a higher Visa monitoring score. Cross-reference with [`stripe_dispute_reasons`](/nerve-centre/kpi-cards/stripe/dispute-reason-codes). |
+
+**Quick rule for support tickets:** if a merchant says *"Stripe shows 1.2 percent dispute rate, your card shows 0.8 percent"* in the same period, walk through the table above in order. The anchor-date convention is the most common cause; inquiry inclusion is the second-most-common; page cap on the denominator hits high-volume merchants. The card-network thresholds (Visa 1.0 percent compliance) are calculated using the Vortex IQ convention, so this card is the right number to use for compliance monitoring even when it differs from the Stripe Dashboard headline.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My dispute rate just crossed 1 percent. What happens next?**
+
+Visa places merchants exceeding 1.0 percent into the Visa Dispute Monitoring Programme (VDMP). The first stage is "Early Warning" (typically 4 consecutive months at 0.65-0.9 percent or one month above 0.9 percent), which is informational. The second stage, "Standard" (12 consecutive months above 0.9 percent or 3 months above 1.5 percent), triggers $50 USD per dispute fines plus monthly programme fees of $25,000 USD. The third stage, "Excessive" (high-risk classification), triggers loss of processing privileges. **Brands at 1.0 percent should treat this as a 60-day fix window**, not an immediate emergency, but absolutely as a written executive priority for the next quarter.
+
+**Why does Stripe charge a dispute fee even when I win?**
+
+The $15 USD dispute fee covers Stripe's cost of facilitating the chargeback response, which is non-refundable regardless of outcome. The disputed amount itself is returned to the merchant on a win. Brands losing 50 disputes a month are paying $750 in non-recoverable dispute fees on top of any disputed amounts that go to the cardholder. **Defending only disputes you have a >50 percent chance of winning is the optimal economic strategy** when win-rate is low; defending all disputes is the right call when the average win-rate is above 60 percent because the recovered revenue exceeds the fee cost.
+
+**Are inquiries the same as disputes?**
+
+No. An inquiry is a pre-dispute information request from the cardholder's bank, typically asking for transaction details before deciding whether to escalate to a formal chargeback. Inquiries do **not** count toward this card's rate calculation but **do** appear in [`stripe_early_fraud_warnings`](/nerve-centre/kpi-cards/stripe/early-fraud-warnings). Brands that respond to inquiries with proof of delivery and customer interaction often prevent the inquiry from escalating to a dispute, which is the cheapest way to keep dispute rate down (proactive resolution rather than defensive litigation).
+
+**A customer disputed a charge that was clearly legitimate. What do I do?**
+
+This is "friendly fraud" or "first-party fraud" and is increasingly common (industry estimates put it at 60-70 percent of all ecommerce chargebacks). Defend the dispute with: (a) order confirmation email with timestamp, (b) shipping carrier tracking and delivery confirmation, (c) IP address match between order and merchant account login, (d) any post-purchase customer service interaction (emails, support tickets, returns), (e) screenshot of customer's account showing the order in their order history, (f) any 3DS authentication or AVS match data from the original transaction. **Win rates on friendly-fraud disputes with full evidence packages run 50-70 percent**; without evidence they run 5-15 percent.
+
+**My subscription product has 1.5 percent dispute rate, and the brands you compare me to have 0.3 percent. Is that fair?**
+
+No. Subscription products generate structurally higher dispute rates because customers forget recurring authorisations, billing-state changes (paused, upgraded, downgraded) confuse customers, and free-to-paid trial conversions are a major dispute trigger. Subscription brands should benchmark against other subscription brands (typical band: 0.4-0.7 percent for established programmes). The card networks know this and apply slightly more lenient monitoring to subscription-coded merchant categories, though the 1.0 percent compliance floor is the same.
+
+**Can Vortex IQ respond to disputes for me?**
+
+Read-only by design. Vortex IQ surfaces dispute patterns, fraud-coded vs service-coded mix, and response-time gaps; the merchant's finance and operations teams execute inside Stripe Dashboard or via the Stripe Disputes API. The [`stripe_alert_dispute_threshold`](/nerve-centre/kpi-cards/stripe/dispute-threshold-watch) card fires a Vortex Mind Action when dispute rate breaches the threshold, but the response itself sits with the merchant.
+
+**Why does my dispute rate look different from a year ago?**
+
+Three common causes. (1) **Card-network reason code changes**: Visa redefined dispute reason codes in 2018 and Mastercard in 2021; comparing across the change boundaries requires re-mapping. (2) **Stripe Radar tuning**: tightening Radar rules reduces fraud-coded disputes but typically increases legitimate-customer false positives, so the dispute mix shifts. (3) **Customer base shift**: brands that scaled into new geographies, new acquisition channels, or new product categories often see dispute rate move because the customer cohort genuinely changed. Pair with [`stripe_dispute_reasons`](/nerve-centre/kpi-cards/stripe/dispute-reason-codes) and [`stripe_decline_rate_by_card_country`](/nerve-centre/kpi-cards/stripe/decline-rate-by-card-country) to confirm which cause applies.
+
+**Is dispute rate the only metric the card networks watch?**
+
+No. Visa VAMP also weights dispute count (separate from rate), fraud-coded share, and the "ratio of disputed to settled volume" (a value-weighted version of this card). Mastercard's ECP weights dispute count and value separately. The composite [`stripe_payment_health_score`](/nerve-centre/kpi-cards/stripe/payment-health-score) folds dispute rate, decline rate, dispute value, and fraud signals into one number that approximates how the card networks score the merchant overall.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Dispute Rate* is one of hundreds of KPI pulses Vortex IQ tracks across Stripe and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

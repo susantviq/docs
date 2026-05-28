@@ -1,0 +1,174 @@
+---
+title: "The Alert System, Vortex IQ Documentation"
+description: "Inside the Nerve Centre, every card can fire an alert when its metric crosses a threshold or breaks an expected pattern. Alerts route into the Actions Kanban for triage."
+---
+
+A KPI dashboard that only renders numbers is a passive surface. The merchant has to remember to look. The [Nerve Centre](/nerve-centre/overview) is built around the opposite principle: every card can fire an alert when its metric crosses a defined threshold or breaks an expected pattern, and alerts route into a triage queue with severity, owner, and supporting context already attached. This page explains how the alert system works end to end.
+
+## What an alert is
+
+An alert is a structured event emitted by the Nerve Centre runtime when a card's underlying metric meets a fire condition. An alert always carries:
+
+- **Card reference.** The card ID, connector key, and current metric value.
+- **Trigger reason.** Which fire condition matched (threshold breach, anomaly score, missing data).
+- **Severity.** Critical, high, medium, low, info. See [severity](#severity).
+- **Period.** The time window the metric was evaluated against.
+- **Baseline.** The reference value the metric was compared to.
+- **Delta.** Absolute and percentage change from the baseline.
+- **Trace ID.** A stable identifier for the alert run, used downstream to deduplicate.
+
+Alerts are first-class objects in the same way [Vortex Mind findings](/vortex-mind/concepts/severity-and-evidence-model) are. They have an ID, a state, an audit trail, and they can be queried after the fact.
+
+## Fire conditions
+
+A card fires an alert when at least one of three conditions is met.
+
+### Threshold breach
+
+The most common case. The card carries an `alert_trigger` field describing a numeric threshold:
+
+- `drop >15% vsP` (Total Revenue): fire when the metric falls more than 15 percent versus the prior comparable period.
+- `auth_rate < 0.85` (Stripe Auth Rate): fire when the authorisation rate drops below 85 percent.
+- `latency_p95 > 2500ms` (Datadog Checkout Latency): fire when 95th percentile latency exceeds 2,500 milliseconds.
+- `refund_rate > 0.04` (Shopify Refund Rate): fire when refund rate goes above 4 percent.
+
+Threshold conditions are evaluated on every card refresh. The runtime keeps the most recent fire state per card so a flapping metric (one that crosses and uncrosses repeatedly) does not spam the Kanban; it fires once on the first cross, then a follow-up "resolved" event when the metric returns to its band.
+
+### Anomaly score
+
+Some metrics do not have a fixed threshold but should still alert when they break their pattern. A merchant whose typical Sunday traffic is 60 percent of weekday traffic does not want a static "below 70 percent" rule; they want a "this Sunday is unusually quiet versus what Sundays usually look like for me" rule.
+
+The Nerve Centre runs a statistical anomaly detector on every card with `has_threshold: true`, computing a rolling baseline (typically 28 to 90 days), the variance, and a z-score for the latest reading. A z-score outside the configured band (default ±2.5 sigma) fires an alert with `trigger_reason: anomaly`.
+
+Anomaly alerts carry a confidence component in their severity calculation: a 3-sigma move with 90 days of supporting baseline is more credible than a 3-sigma move on a metric with only 14 days of history. Low-confidence anomaly alerts are downgraded automatically.
+
+### Missing data
+
+A connector can stop publishing data because of an OAuth expiry, a vendor API outage, or a refresh rate-limit. The Nerve Centre treats prolonged data absence as a fire condition in its own right. If a card has not received fresh data for more than its expected refresh window plus a tolerance (typically 1.5x), an alert fires with `trigger_reason: data_gap` and the card displays a "stale" badge in the UI.
+
+Data-gap alerts route to the workspace administrator role rather than the card's domain owner, because the fix is almost always a connection re-authorisation rather than a business decision.
+
+## Severity
+
+Every alert carries one of five severity tiers. Severity is set by the card's recipe at fire time and reflects the business impact of the metric movement, not the size of the movement on its own.
+
+| Tier | Default treatment | Example |
+| --- | --- | --- |
+| `critical` | Pages the on-call contact, Kanban auto-routes to top of queue, badge red. | Stripe authorisation rate drops below 50 percent (payment outage). |
+| `high` | Kanban card created with priority flag. Surfaces in the next briefing. | Total Revenue drops 18 percent versus prior period. |
+| `medium` | Kanban card created without priority flag. Surfaces in the next weekly report. | Refund rate climbs from 3.2 percent to 4.4 percent (above threshold but not catastrophic). |
+| `low` | Surfaces inline on the card with a sentiment colour change. No Kanban card unless subscribed. | AOV drops 4 percent (drift, not breach). |
+| `info` | Pure context, no Kanban routing. | "Total Revenue is back inside its band" (resolved event). |
+
+Severity is recipe-driven, which is a deliberate choice. A 5 percent drop in revenue is critical for one merchant and routine noise for another. The card's recipe defines the severity bands per metric per merchant tier; the workspace admin can override.
+
+For the underlying severity model and how confidence is computed see [Vortex Mind severity and evidence model](/vortex-mind/concepts/severity-and-evidence-model). The same severity vocabulary travels from Nerve Centre alerts through Vortex Mind findings into Actions.
+
+## Routing into Actions
+
+An alert is not a notification. It is a structured event that lands in the [Actions Kanban](/actions/kanban) as a card. The routing logic:
+
+1. **Alert fires.** Card breaches threshold or anomaly band.
+2. **Vortex Mind picks up the trigger.** If the alert's severity is high or critical, [Vortex Mind](/vortex-mind/concepts/how-diagnostics-work) starts a diagnostic run with the alert as the trigger anchor.
+3. **Diagnostic produces a finding.** Vortex Mind walks the connector graph, gathers evidence, produces a structured finding with severity and confidence.
+4. **Finding promotes to an Action.** If the finding qualifies (severity high or critical, or matches a recipe in the Recovery as a Service catalogue), an Action is created on the Kanban with the alert and the finding both attached.
+5. **Owner notified.** The Action's `owner_role` (derived from the card's `roles` field) determines who is paged. A revenue alert routes to the merchant owner; a payment alert routes to the payments owner; a deploy regression routes to engineering.
+
+For lower severity alerts (medium, low), the Kanban card is created without a triggered diagnostic. The merchant can manually invoke a diagnostic from the card if they want to investigate.
+
+## Channels and routing rules
+
+The notification surface is configurable per workspace under [Settings, Alerts](/platform/settings/alerts). Available channels:
+
+- **In-app banner.** Always on. The Nerve Centre header carries an alert count badge that links to the unread alert list.
+- **Email.** Daily digest by default, with critical alerts sent immediately.
+- **Slack.** Webhook-based, configurable per channel and per severity. A common setup: `#vortex-iq-critical` receives critical alerts only, `#vortex-iq-all` receives everything.
+- **Microsoft Teams.** Same model as Slack with a Teams webhook.
+- **Mobile push.** Requires the Vortex IQ mobile app (in build at the time of writing); critical alerts only by default.
+- **PagerDuty.** Critical alerts only, with an integration key from PagerDuty's Vortex IQ service.
+- **Webhook.** Generic JSON POST for partner integrations.
+
+The routing rules are layered:
+
+1. **Severity floor per channel.** Slack might route only `high` and above; PagerDuty might route only `critical`; email digest receives everything `medium` and above.
+2. **Owner role mapping.** A workspace can map roles to channels (engineering alerts go to `#engineering`, marketing alerts go to `#growth`).
+3. **Time-of-day rules.** Quiet hours per channel (no Slack pings between 22:00 and 07:00 local time, but in-app banners still update).
+4. **Mute rules.** Per-card mute (a known-noisy card can be muted for a defined window, after which the mute auto-expires).
+
+## Alert history and audit
+
+Every alert ever fired in a workspace is retained in the alert history, browsable from the Nerve Centre header by clicking the alert count badge or visiting `/v2/alerts/history`. The history view supports:
+
+- Filter by card, severity, channel, time window, owner role.
+- Drill into the alert's underlying metric snapshot at fire time.
+- See the linked Action card on the Kanban, if one was created.
+- See the linked Vortex Mind finding, if a diagnostic ran.
+- Annotate the alert (mark "false positive", "addressed in deploy X", "dependency on vendor outage Y").
+
+Annotations feed back into the alert system as supervised signal. A repeatedly false-positive alert at the same threshold is surfaced to the workspace admin with a suggestion to widen the band. A repeatedly true-positive alert that lands in the Kanban without follow-up is surfaced as an organisational risk.
+
+## Where alerts surface
+
+- **Nerve Centre header.** The alert count badge, top-right of every page in the V2 application. Click to see unread alerts.
+- **Connector tab.** Cards with active alerts render a coloured border in the sentiment colour, and a small alert icon top-right of the tile.
+- **Card tile itself.** The current value is rendered in the alert sentiment colour. A red Total Revenue tile is a tile that has fired an alert.
+- **Activity feed (right rail).** The right-hand rail of the Nerve Centre dashboard streams the latest alerts and incidents in chronological order. See the screenshots of the dashboard for the rail position.
+- **Briefings.** Daily morning briefings open with the alert digest from the previous 24 hours. Weekly briefings widen the window.
+- **Actions Kanban.** Every promoted alert is a card on the board, sortable by severity and owner.
+
+## Dashboard Settings: customising the alert and sentiment surface
+
+The Dashboard Settings page (gear icon on the Nerve Centre, accessible from `/v2/dashboard-settings`) lets the merchant customise:
+
+- **Card visibility.** Toggle individual cards on or off without deleting their alert subscriptions.
+- **Sensitivity per metric.** A "Sensitivity" tab lists the alerting cards with adjustable threshold sliders. The defaults are recipe-driven but workspace overrides are persistent.
+- **Profile-scoped alert routing.** A profile bound to the marketing connectors only fires alerts on those connectors. Switching to a finance profile flips the alert surface.
+- **Reset to defaults.** A reset button per category restores the recipe defaults, useful after experimenting with threshold tuning.
+
+The screenshot of the Dashboard Settings page shows the Sensitivity tab in action, with green / red threshold values per metric, percentage adjustments, and a sensitivity-band indicator (very high / high / medium / low) per row.
+
+## How it relates to other modules
+
+- **[Vortex Mind](/vortex-mind/concepts/how-diagnostics-work)** consumes alerts as triggers. A high or critical alert is the most common entry point into a diagnostic run.
+- **[Ask Viq](/ask-viq)** can be queried about active alerts: "what alerts fired today", "show me the open critical alerts on Stripe", "why did the refund rate alert fire". The same alert metadata renders inside the chat answer.
+- **[Actions](/actions/kanban)** receives the promoted alert as a Kanban card. Action lifecycle (Pending Review, In Progress, Done) is independent of alert state but the original alert remains backlinked.
+- **[Vortex Memory](/vortex-memory)** archives the alert with its evidence at the time the alert closes. Future runs of similar alerts can cite the historical archive ("this is the third time refund rate has spiked above 4 percent in the last 90 days; previous fire on 14 Mar 26 was caused by ...").
+
+## FAQ
+
+**Can I silence an alert without disabling the card?**
+Yes. Each alert subscription has a mute toggle with a duration picker. Common patterns: mute for 24 hours during a known promotional spike, mute for 7 days during a deploy freeze, mute permanently if the card is in active threshold tuning. Mutes auto-expire at the duration; permanent mutes raise a quarterly reminder.
+
+**What is the difference between an alert and an Action?**
+An alert is the event. An Action is the work item created in response. One alert produces zero or one Action depending on severity and recipe. An Action can also be created without an alert (manually, or by a Vortex Mind scheduled report).
+
+**How fast does an alert fire after the threshold is crossed?**
+For real-time cards, on the next render (typically within seconds). For Native and API-derived cards, on the next refresh cycle (typically within 5 to 15 minutes). For Hist and Backdated cards, on the next batch run (typically within 24 hours). The latency is set by the card's `data_type`. See [data freshness](/nerve-centre/kpi-cards/concepts/data-freshness).
+
+**Why did I not get a Slack ping for a medium alert?**
+Slack severity floors default to `high` and above. Medium alerts still appear in the in-app banner and the daily email digest. Lower the Slack floor in Settings if you want medium-tier alerts to ping the channel.
+
+**What happens when an alert resolves?**
+A resolved event fires with `severity: info`. It does not page anyone but it does close the loop on the original Action card if Vortex Mind has matched the resolution to the original finding. The Kanban card moves from In Progress to Done with a "resolved by drift back into band" annotation.
+
+**Can two alerts on the same card fire at once?**
+No. Each card maintains a single fire state. A card with two thresholds (e.g. low side and high side, see dual-axis sentiment in [sentiment model](/nerve-centre/kpi-cards/concepts/sentiment-model)) can fire on either side, but not both at once. The fire reason captures which side breached.
+
+**Are anomaly alerts noisier than threshold alerts?**
+Anomaly detection is tuned conservatively (default 2.5 sigma plus a minimum baseline length of 14 points), so the false-positive rate sits well below 5 percent in production workspaces. Workspaces can tighten or loosen the sigma threshold under Settings, Alerts, Anomaly Detection. The "false positive" annotation feedback loop tunes the per-workspace sigma over time.
+
+**Can a card alert without a numeric threshold?**
+Cards with `chart_type: kpi` and a categorical value (e.g. status indicators like "syncing", "errored") use a state-change rule rather than a numeric threshold. The card's recipe defines which state transitions fire an alert. The mechanism is the same; the trigger condition is "state changed from green to red" rather than "value crossed 4 percent".
+
+## Cross-links
+
+- Concept: [the KPI model](/nerve-centre/kpi-cards/concepts/kpi-model)
+- Concept: [sentiment model](/nerve-centre/kpi-cards/concepts/sentiment-model)
+- Concept: [time windows](/nerve-centre/kpi-cards/concepts/time-windows)
+- Concept: [data freshness](/nerve-centre/kpi-cards/concepts/data-freshness)
+- Platform: [Settings, Alerts](/platform/settings/alerts)
+- Module: [Vortex Mind, severity and evidence](/vortex-mind/concepts/severity-and-evidence-model)
+- Module: [Vortex Mind, how diagnostics work](/vortex-mind/concepts/how-diagnostics-work)
+- Module: [Actions, Kanban](/actions/kanban)
+- Module: [Ask Viq](/ask-viq)
+- Module: [Vortex Memory](/vortex-memory)

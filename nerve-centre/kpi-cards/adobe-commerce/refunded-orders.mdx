@@ -1,0 +1,176 @@
+---
+title: "Refunded Orders, Adobe Commerce"
+sidebarTitle: "Refunded Orders"
+description: "Refunded Orders for Adobe Commerce stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Ecommerce Platform
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Count of distinct Credit Memo documents created in the period. In Magento and Adobe Commerce a refund is **never** a status flip on the order; it is a separate Credit Memo document that points back to the original order. This card counts those Credit Memos, not orders that ended up refunded.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(creditmemo_id)` over `creditmemos` where `created_at` falls inside the period. One order can have multiple Credit Memos (partial refunds), each is counted once. Adobe Commerce REST endpoint: `GET /rest/V1/creditmemos`. |
+| **API field** | `entity_id` (Credit Memo PK) and `created_at` from the creditmemos index. The parent order is referenced via `order_id`. |
+| **Credit Memo vs order status** | The card counts Credit Memo documents. The original order's `status` may still read `complete` even after a full refund, Magento does not auto-flip the order to `closed` unless the refund covers the whole `grand_total`. So a status filter of `status=refunded` (the legacy stub query) misses partial refunds entirely. This is the most common reconciliation question merchants raise. |
+| **VAT / tax treatment** | n/a for a count card. The Credit Memo document itself contains `tax_amount` but this card sums document count, not value. See [Refund Value](/nerve-centre/kpi-cards/adobe-commerce/refund-value) for the monetary version. |
+| **Shipping inclusion** | n/a for the count. A Credit Memo that only refunds shipping (`shipping_amount` field) is still one document, still counted once. |
+| **Discounts** | n/a for the count. |
+| **Cancelled / voided orders** | **Excluded.** A `canceled` order generates no Credit Memo (cancellation reverses authorisation before capture). Only captured-then-refunded orders produce a Credit Memo. This card does not count `canceled`; use [Cancellation Rate](/nerve-centre/kpi-cards/adobe-commerce/cancellation-rate) for those. |
+| **Partial refunds** | **Each Credit Memo is one count.** An order with three partial refunds counts three. Merchants who want "orders that had any refund" need a `COUNT(DISTINCT order_id)` variant, currently roadmapped as a sibling card. |
+| **Source channel** | All Adobe Commerce channels included (storefront, Admin-created, B2B portal, Marketplace if installed). Off-platform refunds (refund issued by the gateway directly without a Credit Memo) are **not** counted, those show in [`stripe.stripe_refund_count`](/nerve-centre/kpi-cards/stripe/refund-count) but not here. |
+| **Multi-store scope** | Sums across all Store Views by default. Per-Store-View slicing available via `store_id` filter. |
+| **Time window** | `30D vsP` (rolling 30-day, compared to prior 30-day window). |
+| **Alert trigger** | None on this card. Volatility is captured on [Refund Rate](/nerve-centre/kpi-cards/adobe-commerce/refund-rate) instead. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+```
+COUNT(status=refunded)
+  WHERE date BETWEEN [period_start, period_end]
+```
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A mid-market homewares merchant on Adobe Commerce 2.4.7 with B2B Companies enabled, running 14 Apr 26 to 13 May 26 (rolling 30 days).
+
+**Raw counts pulled from `GET /rest/V1/creditmemos`:**
+
+| Slice | Credit Memo count | Notes |
+| --- | --- | --- |
+| All Credit Memos in window | 412 | one document per partial or full refund |
+| Of which: full refunds (covered original `grand_total`) | 247 | order's `status` typically flipped to `closed` |
+| Of which: partial refunds | 165 | order's `status` usually stays at `complete` |
+| Of which: shipping-only Credit Memos (`subtotal=0`, `shipping_amount>0`) | 38 | "we owe you the express upgrade you didn't get" |
+| Of which: tax-only adjustments | 12 | post-Avalara reconciliation Credit Memos issued by Finance |
+| **This card reports** | **412** | every Credit Memo counted once |
+
+**Distinct orders affected:** 358 (some orders had 2 or 3 Credit Memos each).
+
+**Why the difference matters:** if the merchant runs the legacy report query `COUNT(orders WHERE status=refunded)`, they would see roughly 247, the count of full-refund orders that flipped to `closed`. The 165 partial-refund Credit Memos and the 38 shipping-only memos are invisible to a status-based count. Operations sees a benign "247 refunds this month" while Finance sees "412 Credit Memos posted this month, $84,200 net refund value". Two truths, two systems. This card surfaces the document count which is the figure the Finance team needs for posting to the GL.
+
+**Comparison to prior 30 days (`vsP`):**
+
+| Window | Credit Memos | Distinct orders | Avg Credit Memos per refunded order |
+| --- | --- | --- | --- |
+| 14 Apr to 13 May 26 | 412 | 358 | 1.15 |
+| 15 Mar to 13 Apr 26 | 296 | 281 | 1.05 |
+| **Change** | **+39%** | **+27%** | partials accelerating |
+
+The card's headline number is up 39% but the deeper signal is the rise in average Credit Memos per refunded order from 1.05 to 1.15. That's a 10% jump in partial-refund frequency, often a sign that warehouse pick errors or wrong-size shipments are increasing. Operations should drill into [Top Refunded Products](/nerve-centre/kpi-cards/adobe-commerce/top-refunding-customers) to see which SKUs are driving the partial-refund pattern.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+This count card is the volume signal; pair it with the value, rate, and root-cause cards to interpret it.
+
+| Card | Why pair it with Refunded Orders |
+| --- | --- |
+| [Refund Value](/nerve-centre/kpi-cards/adobe-commerce/refund-value) | Counts vs dollars. A spike in count with flat value is small partial refunds (often shipping disputes). Spike in value with flat count is one whale refund. |
+| [Refund Rate](/nerve-centre/kpi-cards/adobe-commerce/refund-rate) | Normalises by order volume so seasonal traffic doesn't masquerade as a refund problem. |
+| [Refunds Over Time](/nerve-centre/kpi-cards/adobe-commerce/refunds-over-time) | Day-by-day shape. A Tuesday spike often signals a Monday batch of pick errors caught next-day. |
+| [Top Refunded Products](/nerve-centre/kpi-cards/adobe-commerce/top-refunding-customers) | The SKU-level cause. Concentrate Operations attention on the 3-5 SKUs producing 50% of refunds. |
+| [Return Status](/nerve-centre/kpi-cards/adobe-commerce/return-status) | RMA workflow status. Adobe Commerce B2B uses RMA for in-process returns; refunds are the downstream event. |
+| [Cancellation Rate](/nerve-centre/kpi-cards/adobe-commerce/cancellation-rate) | Pre-capture cancellations and post-capture refunds are different problems. Cancellation = order never paid for; refund = paid then reversed. |
+| [`shopify.refund_count`](/nerve-centre/kpi-cards/shopify/refunded-orders) | Same metric on Shopify, where refunds are stored on the order itself rather than as a separate document. Useful for agencies running cross-platform clients. |
+| [`stripe.stripe_refund_count`](/nerve-centre/kpi-cards/stripe/refund-count) | The payment-processor side. If Stripe refund count exceeds Adobe Commerce Credit Memo count, somebody is refunding on Stripe Dashboard without back-filling a Credit Memo, the GL will not match. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Adobe Commerce Admin:**
+
+The canonical Credit Memo grid:
+
+> **Sales > Operations > Credit Memos** with the "Created" date filter set to your period. The grid lists every Credit Memo with `creditmemo_id`, `order #`, `created_at`, and `refunded` amount. The row count at the bottom of the grid should match this card.
+
+If the Credit Memos menu item is missing, the admin user lacks the `Magento_Sales::creditmemo` ACL. Have a Super Admin add it under **System > Permissions > User Roles**.
+
+For the order-level view (which orders had any refund):
+
+> **Sales > Orders** with the **Status** column filtered to `Closed` (full refunds) plus **Status = Complete** with the additional condition that the order has a Credit Memo. Adobe Commerce does not expose "has Credit Memo" as a default filter, so an exact reconciliation requires either a custom report or the **Sales > Operations > Credit Memos** grid.
+
+Other Admin views that look relevant but aren't:
+
+- **Reports > Sales > Refunds** in 2.4.6+: aggregates by day, not by document count. Useful for trend, not exact reconciliation.
+- **Dashboard tile "Last Orders"**: limited to 5 rows; not aggregated.
+- **Reports > Sales > Tax**: tax slice only, ignores non-tax Credit Memos.
+
+**Why our number may legitimately differ from Adobe Commerce Admin:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Time-zone**. The Credit Memos grid uses the Admin user's locale timezone (set via `Stores > Configuration > General > Locale Options`). This card uses UTC unless overridden. A Credit Memo created at 23:00 PST shows on different days. | ±1 day at edges of period |
+| **Pending Credit Memos**. A Credit Memo started in Admin but never submitted (the form was abandoned) does not exist as a document, neither in the grid nor here. No divergence expected. | None |
+| **Off-platform refunds**. A refund issued via Stripe Dashboard, PayPal Resolution Center, or Authorize.Net Virtual Terminal directly without back-filling a Credit Memo in Adobe is invisible here. The merchant's bank statement will show the refund; this card and the Admin Credit Memos grid will both miss it. | This card under-counts vs bank if off-platform refunds occur |
+| **Multi-store scope**. The Admin Credit Memos grid defaults to "All Store Views"; this card matches that by default. If an Admin user has scope-restricted access (only one Store View), their grid will show fewer rows than this card. | Vortex IQ ≥ scoped Admin grid |
+| **Sync lag**. The OpenSearch index trails the database by 5-15 minutes. A Credit Memo posted in the last quarter-hour may not appear here yet. | Vortex IQ slightly lower than live Admin |
+| **Soft-deleted Credit Memos**. Adobe Commerce does not soft-delete by default, but customised installs sometimes do. A custom delete flag would hide rows from one view but not the other. | Custom-install dependent |
+
+**Cross-connector reconciliation (when these connectors are connected for this merchant):**
+
+| Card | Expected relationship | What divergence tells you |
+| --- | --- | --- |
+| [`stripe.stripe_refund_count`](/nerve-centre/kpi-cards/stripe/refund-count) | Stripe ≈ this card for Stripe-paid orders. PayPal, manual Authorize.Net, and bank-transfer refunds are not in Stripe. | If Stripe shows more refunds than Credit Memos, somebody is refunding on Stripe Dashboard without back-filling Adobe. The GL will not balance. Fix: train the team to always issue refunds via Adobe Admin (which calls the gateway), never directly on the gateway. |
+| [`paypal.pp_refund_count`](/nerve-centre/kpi-cards/paypal/refund-count) | PayPal portion only | Same logic as Stripe, scoped to PayPal-paid orders. |
+| [`google_analytics.ga_refund_events`](/nerve-centre/google_analytics/ga_refund_events) | GA4 sees only refund events that the storefront fires, often &lt;50% of total | GA4's refund attribution is unreliable; do not reconcile, use as directional only. |
+
+---
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The same metric exists with platform-specific definitions on other commerce connectors. This is **not a reconciliation**; your Adobe Commerce store does not have a parallel Shopify or BigCommerce store.
+
+- [`shopify.refund_count`](/nerve-centre/kpi-cards/shopify/refunded-orders)
+- [`bigcommerce.refund_count`](/nerve-centre/kpi-cards/bigcommerce/refunded-orders)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does this card disagree with `Sales > Orders` filtered to `status=refunded`?**
+Because Magento and Adobe Commerce do not auto-flip an order to `refunded` (or `closed`) on partial refund. A partial Credit Memo leaves the order's status at whatever it was (usually `complete`). A status-based filter only catches full refunds; this card catches every Credit Memo. Expect this card to be 30-60% higher than a status-based count for typical merchants.
+
+**Is one order with three Credit Memos counted three times?**
+Yes. The headline metric is Credit Memo count, not refunded-order count. If you specifically want "orders that had at least one refund", use the `COUNT(DISTINCT order_id)` variant (currently roadmapped, ping support to enable for your workspace).
+
+**A refund was issued on Stripe directly without a Credit Memo, why isn't it counted?**
+Adobe Commerce only sees Credit Memos. A refund issued in Stripe Dashboard without going back to Adobe is invisible here. The fix is process-level: train Customer Service to always issue refunds via Adobe Admin (Sales > Orders > [order] > Credit Memo), which then calls the gateway under the hood. This keeps Adobe, the gateway, and the GL in sync.
+
+**Why is shipping-only Credit Memos a thing?**
+Common scenarios: customer paid for express shipping but received standard, the merchant issues a Credit Memo for the shipping difference only (`subtotal=0`, `shipping_amount>0`). Adobe Commerce supports this natively in the Credit Memo form. It is one document, one count.
+
+**My multi-store Adobe Commerce, can I see Credit Memos per Store View?**
+Yes. By default this card sums all Store Views. To slice by Store View, configure the manifest filter on `store_id`. The Admin Credit Memos grid offers the same Store View filter at the top of the page.
+
+**Why does the Reports > Sales > Refunds total not match this card?**
+That report aggregates monetary refund value, not document count. It also re-aggregates from the `sales_refunded_aggregated` denormalised table which Magento refreshes nightly via `magento/module-reports`. If the indexer has not run today, the report can be 24 hours stale; this card is 5-15 minutes behind real-time.
+
+**Can a Credit Memo exist on a `canceled` order?**
+No. Cancellation reverses payment authorisation before capture; there is nothing to refund and Adobe blocks Credit Memo creation on `canceled` orders. The two state machines are mutually exclusive at the document level.
+
+**What about RMA returns? Are those counted here?**
+RMA is a workflow stage that *precedes* refund. An order in RMA `Pending Approval` has no Credit Memo yet, so it does not count. Once the RMA is approved and the refund is issued, a Credit Memo is created and counts here. See [Return Status](/nerve-centre/kpi-cards/adobe-commerce/return-status) for the upstream workflow.
+
+**Why does today's number sometimes drop?**
+It does not, Credit Memos are immutable once created. If the count drops between two refreshes, the indexer was running mid-refresh and the cached row count was momentarily inconsistent. Wait one full refresh cycle (15 minutes) and it stabilises.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Refunded Orders* is one of hundreds of KPI pulses Vortex IQ tracks across Adobe Commerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

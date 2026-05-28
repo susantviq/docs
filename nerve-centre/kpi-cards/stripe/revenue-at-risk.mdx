@@ -1,0 +1,179 @@
+---
+title: "Revenue at Risk (live), Stripe"
+sidebarTitle: "Revenue at Risk (live)"
+description: "Live decline-driven revenue loss while the spike is active. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Payment Gateway
+
+> Live decline-driven revenue loss while the spike is active.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A live, real-time projection of how much revenue is *currently* leaking through the checkout because Stripe declines are above their normal baseline. The merchant's live "this incident is costing me $X right now" number. Reads $0 when nothing is wrong, climbs as soon as a decline-rate spike begins.
+
+| | |
+| --- | --- |
+| **What it counts** | `(current_decline_rate − 30D_baseline_decline_rate) × commerce_sibling.checkout_attempts_per_min × commerce_sibling.avg_order_value × elapsed_minutes_in_spike`. Pure projection, not a sum of actual lost charges. |
+| **API resource & fields** | `GET /v1/charges` for live decline rate; commerce sibling (Shopify / BigCommerce / Adobe) for `checkout_attempts_per_min` and `aov`. Cross-channel derivation: this card cannot work without a commerce connector also being live. |
+| **Currency** | The commerce sibling's primary store currency (the one `aov` is reported in). Stripe declines themselves are multi-currency; the projection collapses to a single currency for the merchant's read. |
+| **Fees / processing cost** | n/a. This is "lost top-line revenue", not net. Real recovered revenue would be net of fees, but you cannot pay fees on a charge that didn't happen. |
+| **Refunds** | NOT a factor. The card measures revenue that *should have happened*; refunds are something else. |
+| **Disputes / chargebacks** | NOT a factor. Same reason. |
+| **Failed / declined payments** | This **is** the metric source. Specifically, the *excess* failures above a 30-day rolling baseline. Normal-rate failures don't contribute. |
+| **Spike detection** | A spike is "decline rate ≥ baseline + 1.5σ for ≥ 5 consecutive minutes". The card resets to $0 when the rate falls back to baseline. |
+| **Page cap relevance** | Live mode polls the most recent ~200 charges per minute, well under the 1,000-page cap. Daily-mode versions of this card would hit the cap on high-volume merchants. |
+| **Time window** | `RT` (real-time, recomputed every sync) |
+| **Alert trigger** | `> $0`, the moment the projection ticks above zero a Slack / email goes out. There is no "how much" threshold; any spike triggers. |
+| **Roles** | owner, finance |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Stripe data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US DTC apparel store on Shopify + Stripe. On 12 Apr 26 at 14:00 ET a Radar rule rolled out by a Stripe model update started flagging legitimate AmEx charges as `highest_risk_level`. Decline rate climbed from a steady 5.2% baseline to 11.8% over the next 18 minutes.
+
+| Input (live snapshot at 14:18 ET) | Value | Source |
+| --- | --- | --- |
+| Current 5-min decline rate | 11.8% | `stripe.charges` last 5 min |
+| 30D baseline decline rate | 5.2% | rolling, computed nightly |
+| Excess decline rate | 6.6 pp | derived |
+| Commerce sibling: checkout attempts / min | 18 | `shopify.checkout_attempts_per_min` |
+| Commerce sibling: AOV | $94.50 | `shopify.aov` (30D) |
+| Elapsed minutes in spike | 18 | counted from spike start |
+
+```text
+Excess declined attempts in window  = 6.6% × 18 attempts/min × 18 min
+                                    = 21.4 attempts that wouldn't have failed at baseline
+Revenue at Risk                     = 21.4 × $94.50
+                                    = $2,022 (and climbing)
+```
+
+What the card displayed:
+
+```text
+14:00 ET → $0      (baseline holding)
+14:05 ET → $124    (1.7 pp excess, spike just detected)
+14:10 ET → $740    (4.1 pp excess, climbing)
+14:15 ET → $1,520  (6.0 pp excess)
+14:18 ET → $2,022  (6.6 pp excess, alert fired at 14:05)
+14:35 ET → $2,022  (frozen, decline rate fell back to baseline)
+14:40 ET → $0      (spike officially cleared)
+```
+
+Three things to read from this:
+
+1. **The number is a projection, not a sum.** No $2,022 of charges actually had `amount = $94.50`. The card multiplies the excess decline rate by the commerce sibling's typical traffic and ticket size to estimate the lost revenue. Treat it as a live indicator of severity, not as a precise dollar figure to put in a P&L.
+2. **The card needs the commerce sibling to be live.** If Shopify / BigCommerce / Adobe isn't connected for this organisation, the card cannot estimate `checkout_attempts_per_min` or `aov` and shows $0 with a "needs commerce connector" badge. This is the single biggest reason merchants see "always $0", check the commerce-connector status first.
+3. **The card freezes when the spike clears.** The $2,022 figure stays visible for the merchant's incident-review session, then resets to $0 on the next baseline-holding minute. That's why the card is paired with [Recoverable Revenue](/nerve-centre/kpi-cards/stripe/recoverable-revenue), which captures the rolling 30-day version of the same loss.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why merchants reach for it next to Revenue at Risk |
+| --- | --- |
+| [Decline Rate](/nerve-centre/kpi-cards/stripe/decline-rate) | The numerator. When this card fires, open Decline Rate first to see the size of the spike. |
+| [Decline Reasons](/nerve-centre/kpi-cards/stripe/top-decline-reasons) | The decomposition of *why* the spike is happening. `highest_risk_level` (Radar), `do_not_honor` (issuer), `authentication_required` (3DS) each call for a different fix. |
+| [Decline vs Funnel](/nerve-centre/kpi-cards/stripe/decline-spike-vs-checkout-funnel-drop) | The companion cross-channel view. Confirms the spike is also showing up in the commerce sibling's checkout completion rate, separating "real lost revenue" from "buyer remorse". |
+| [Recoverable Revenue (decline-driven)](/nerve-centre/kpi-cards/stripe/recoverable-revenue) | The 30-day version of this card. Where this card is "live, frozen at spike end", that card is "rolling 30-day total". |
+| [Decline Rate Spike Alert](/nerve-centre/kpi-cards/stripe/decline-rate-spike-alert) | The alert version. Fires when this card's projection ticks above $0. |
+| [Top Declining Issuers](/nerve-centre/kpi-cards/stripe/top-declining-issuers) | If a single issuer is driving the spike (often the case during a Visa / Mastercard rule update), this card identifies it. |
+| [Auth Rate](/nerve-centre/kpi-cards/stripe/authorisation-success-rate) | The mirror image for context. Auth-rate drop should match decline-rate spike for the card to fire. |
+| Shopify / BC / Adobe [Checkout Completion](/nerve-centre/shopify/checkout_completion_rate) | The commerce sibling input. Without it, this card cannot compute. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Stripe Dashboard:**
+
+Stripe Dashboard does **not** have a direct counterpart for this card. Stripe doesn't model "lost revenue from a decline-rate spike" because Stripe doesn't have visibility into the merchant's commerce-side AOV or checkout-attempts-per-minute. This card is a Vortex IQ synthesis combining Stripe and the commerce sibling.
+
+The closest Stripe-native screens for cross-checking the inputs:
+
+- [Payments → Realtime](https://dashboard.stripe.com/payments) for the live decline rate.
+- [Reports → Decline analysis report](https://dashboard.stripe.com/reports) for the historical baseline.
+- [Disputes](https://dashboard.stripe.com/disputes) is **not** related; disputes happen weeks after auth, not during a live spike.
+
+A few other views can look like this card but aren't:
+
+- **Stripe Sigma "live" queries**. Custom SQL on Sigma can produce a live decline-rate number but cannot multiply by commerce-sibling AOV; the projection requires the cross-channel data.
+- **Radar → Insights**. Stripe-side fraud-rate movement, not lost revenue.
+- **Slack #incident-payments channels run by RevOps teams**. Those typically display total declined volume, not the *excess* over baseline.
+
+**Why our number may legitimately differ from the inputs:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Baseline window** | Ours uses a 30-day rolling baseline | A merchant whose decline rate has been climbing slowly for weeks will see a smaller projection than expected because the baseline has crept up with the rate. |
+| **Commerce-sibling sync lag** | Projection lower than reality | If the commerce sibling's `checkout_attempts_per_min` is stale by 5, 10 min, the multiplier is too low. The card warns when the commerce sibling is more than 15 min behind real-time. |
+| **AOV movement during the spike** | Variable | The card uses 30-day AOV, not the spike-window AOV. If a flash sale temporarily lowers AOV, the projection is too high; if a premium-tier launch raises it, too low. |
+| **Spike detection threshold (≥ 1.5σ)** | Slow declines invisible | A merchant whose decline rate creeps up by 0.3 pp / day for two weeks will see no $0 → spike transition; the baseline absorbs the drift. Watch [Decline Rate](/nerve-centre/kpi-cards/stripe/decline-rate) directly for that case. |
+| **Refresh lag** | Ours **5, 60 sec behind** real-time | Live mode polls every minute; the latest minute is always slightly stale. |
+
+**Cross-connector reconciliation:**
+
+This card *is* a cross-connector card by construction. The commerce-sibling reconciliation is built in:
+
+| Comparison | Expected relationship | When divergence is legitimate |
+| --- | --- | --- |
+| `stripe_revenue_at_risk_live` ↔ [`shopify.checkout_completion_rate`](/nerve-centre/shopify/checkout_completion_rate) | Both move together during a real incident. Decline spike + completion drop = real lost revenue. Decline spike alone = customers retried with a different card or processor. | If completion holds steady while declines spike, the projection is overstated; the merchant is recovering through retries. |
+| `stripe_revenue_at_risk_live` ↔ [`paypal.pp_decline_rate`](/nerve-centre/kpi-cards/paypal/decline-failure-rate) | If PayPal decline rate also spikes, the cause is upstream (traffic source, fraud wave); if only Stripe spikes, the cause is Stripe-specific (Radar, gateway config). | A Stripe-only spike with PayPal holding suggests Radar or 3DS misconfiguration; investigate Stripe-side first. |
+
+The card's whole reason to exist is the cross-channel view. If you only ever look at Stripe-only metrics, you cannot distinguish "$2k of revenue is leaking right now" from "decline rate moved a bit but customers retried fine".
+
+<details>
+<summary><em>Documentation cross-reference (no direct counterpart on other connectors)</em></summary>
+
+This card is a Stripe-specific synthesis. PayPal has the analogous [`paypal.pp_revenue_at_risk_live`](/nerve-centre/kpi-cards/paypal/revenue-at-risk) where the same logic runs against PayPal declines. They're not reconciliations, they cover different processors.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+> Reconciliation questions are answered in the **Reconciling against the vendor's own dashboard** section above.
+
+**"Why is the card always at $0?"**
+The most common cause is no commerce sibling connected. The projection is `excess_decline_rate × commerce_attempts_per_min × commerce_aov × elapsed_min`, and without a commerce connector the multiplier is unknown so the card defaults to $0. Connect Shopify / BigCommerce / Adobe and the card becomes meaningful. The second most common cause is "everything is healthy", which is the intended behaviour.
+
+**"My decline rate is high but the card still says $0, why?"**
+Because the rate is *steady* high, not *spiking* high. The card watches for movement above the 30-day baseline. A merchant running consistently at 11% decline rate has a baseline of 11%; no excess means no projection. Use [Decline Rate](/nerve-centre/kpi-cards/stripe/decline-rate) to see the absolute level; this card only fires on movement.
+
+**"Why does the dollar figure feel too high / too low?"**
+Three calibration points:
+
+1. The card uses 30-day commerce AOV, not the AOV inside the spike. Flash sales inflate the projection (lower-AOV traffic, higher-AOV multiplier); premium launches deflate it.
+2. The projection assumes every excess decline is one *lost* customer. In reality some customers retry with a different card or switch to PayPal; those recover. The companion [Recoverable Revenue](/nerve-centre/kpi-cards/stripe/recoverable-revenue) card models the recovery share.
+3. Commerce checkout-attempts-per-min can spike on its own (a celebrity tweet, an email send, a paid-traffic burst). If the spike happens to overlap with a normal decline-rate band, the card can briefly read non-zero. The detector requires ≥5 consecutive minutes of excess to fire and reduce these false positives.
+
+**"Are 3DS-failed charges in the projection?"**
+Indirectly. The card uses Stripe's *decline rate*, which by our definition only counts `status = failed` (not `requires_action`). So 3DS abandons don't push the live projection. If 3DS is the cause of a spike, [3DS Friction Loss](/nerve-centre/kpi-cards/stripe/3ds-friction-revenue-loss) is the right card; that one *does* count abandons.
+
+**"Multi-currency, what currency is the projection in?"**
+The commerce sibling's primary store currency. A merchant on a GBP Shopify store with GBP + EUR + USD checkouts sees the projection in GBP. The decline-rate input is currency-neutral; only the AOV multiplier carries currency, and Shopify reports AOV in the store's primary currency.
+
+**"Why does the card freeze at the spike-end value instead of resetting?"**
+So the merchant has a record of how much the incident cost during a post-incident review. The card resets to $0 on the next baseline-holding minute, typically a few minutes after the spike clears. If you missed the value, [Recoverable Revenue](/nerve-centre/kpi-cards/stripe/recoverable-revenue) accumulates spike-end values across the rolling 30 days.
+
+**"Can I change the spike threshold (1.5σ for 5 minutes)?"**
+Not yet. The detector lives in the manifest and is tuned to balance false-positive rate (cards firing when nothing is wrong) against detection speed. If you'd like a custom threshold, raise a request, the threshold is a per-merchant override away.
+
+**"What happens during planned campaigns (Black Friday, flash sales)?"**
+Decline rate naturally spikes during high-traffic events because new-customer mix is higher. The 30-day rolling baseline catches up over a few days, but during the first 24 hours of an event the card can fire on what is essentially "normal for this campaign". Filter mentally during the first day of any new-traffic event; by day 3 the baseline has absorbed it.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Revenue at Risk (live)* is one of hundreds of KPI pulses Vortex IQ tracks across Stripe and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

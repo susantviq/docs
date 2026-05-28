@@ -1,0 +1,176 @@
+---
+title: "Out-of-Stock Spike Alert, Adobe Commerce"
+sidebarTitle: "Out-of-Stock Spike Alert"
+description: "Out-of-Stock Spike Alert for Adobe Commerce stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Non-Hero  •  **Category:** Ecommerce Platform
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Real-time alert that fires when more than 5 enabled-and-visible Adobe Commerce SKUs transition to zero salable quantity within a 1-hour window. Designed to catch the supplier-stall pattern (a vendor stopped shipping a category), the warehouse-receive failure (a pallet arrived but never got booked into MSI), or the catalogue-import bug (a CSV upload accidentally set quantity to zero). Five SKUs simultaneously is rarely coincidence; it is almost always systemic.
+
+| | |
+| --- | --- |
+| **What it counts** | Distinct enabled product SKUs whose `salable_qty` transitioned from positive to zero (or `stock_status` flipped from `1` to `0`) within the most recent rolling hour. Filters: `status = 1` (enabled), `visibility != 1` (Visible in Catalog/Search/Both, excludes "Not Visible Individually" used for configurable child SKUs). Counts each parent configurable as one SKU even if multiple variants flipped, to avoid alert noise on multi-size products. |
+| **API field** | Adobe Commerce MSI: `getInventoryStatus` GraphQL query, or `GET /rest/V1/inventory/source-items` for source-level detail. Product visibility/status from `GET /rest/V1/products`. |
+| **VAT / tax treatment** | n/a, this is a stock-state alert, not a value alert. |
+| **Shipping inclusion** | n/a. The companion "revenue at risk" estimate uses post-discount, post-shipping `grand_total` average. |
+| **Discounts** | n/a for the count. The revenue-at-risk estimate uses each SKU's typical 7-day order rate × average post-discount `grand_total` contribution. |
+| **Credit Memo refund treatment** | n/a. |
+| **`state` machine inclusion** | n/a, this card looks at product state, not order state. The indirect link: orders in `pending_payment` reserve stock in MSI. A flood of `pending_payment` orders (gateway hung) can drive several SKUs to zero `salable_qty` even though no money was taken. The card cannot distinguish this from genuine stock depletion; cross-check with [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown). |
+| **`pending_payment` quirk** | Indirect amplifier (see above). MSI reserves stock for `pending_payment` orders; if the gateway never resolves, those reservations linger until the order moves to `canceled`. A burst of pending-stuck orders can therefore trip this alert spuriously. |
+| **Multi-currency `grand_total` vs `base_grand_total`** | n/a for the count. The revenue-at-risk uses `base_grand_total` so multi-currency stores roll up cleanly. |
+| **Store View scope (`store_id`)** | All Store Views by default. For multi-region MSI configurations where each region has its own stock-source, a SKU zero in source A but positive in source B is NOT counted as OOS by this card; only globally-zero SKUs trip the alert. Configure per-stock-source variants for region-locked merchants. |
+| **Time window** | `RT` (real-time). Rolling 1-hour window. |
+| **Alert trigger** | `>5 enabled SKUs go zero-stock in 1h`. Tuned to filter out routine variance (1 to 3 SKUs flipping per hour is normal on most stores). |
+| **Sentiment key** | `out_of_stock_count` |
+| **Roles** | owner, operations, marketing |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Adobe Commerce data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A specialty footwear brand on Adobe Commerce 2.4.6 with US, UK, and B2B Store Views. The merchant runs about 1,800 enabled SKUs across 240 product families. Snapshot taken Wednesday 14 Apr 26, 10:00 GMT. The alert just fired.
+
+**SKUs that flipped to zero salable_qty in the last hour:**
+
+| SKU | Family | Source stock affected | Last-hour orders against it | 7-day order velocity |
+| --- | --- | --- | --- | --- |
+| `BOOT-WL-BLK-9` | Wellington Boots Black size 9 | UK source | 4 | 12/wk |
+| `BOOT-WL-BLK-10` | Wellington Boots Black size 10 | UK source | 6 | 18/wk |
+| `BOOT-WL-BLK-11` | Wellington Boots Black size 11 | UK source | 3 | 14/wk |
+| `BOOT-WL-GRN-10` | Wellington Boots Green size 10 | UK source | 0 | 6/wk |
+| `BOOT-WL-GRN-11` | Wellington Boots Green size 11 | UK source | 0 | 5/wk |
+| `BOOT-WL-NVY-10` | Wellington Boots Navy size 10 | UK + US sources | 1 | 8/wk |
+| `BOOT-WL-NVY-9` | Wellington Boots Navy size 9 | UK source | 0 | 4/wk |
+
+**7 SKUs flipped to zero in 1 hour.** All are Wellington Boots variants. Five of seven are size 9 to 11, which are the most commonly-stocked sizes.
+
+What the investigation reveals:
+
+1. **The pattern is unmistakable**: an entire product family went out of stock simultaneously. This is rarely demand-driven.
+2. **Last-hour orders against the affected SKUs total 14, against a typical 90-orders/week baseline for the family.** Demand explains the flip on the size 10 black (6 orders × 3 typical inventory units = depleted), but it does NOT explain the green and navy SKUs flipping with zero recent orders.
+3. **Adobe admin > Catalog > Products > [BOOT-WL-GRN-11] > Quantity tab**: shows `qty = 5` at UK source. But `salable_qty = 0`. That's the smoking gun.
+4. **Cross-checking [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown)**: 28 orders entered `pending_payment` in the last 90 minutes (vs a typical 4 per hour). MSI reserved stock for all 28; on these slow-moving variants, the reservations exhausted available salable_qty.
+5. **Root cause**: the merchant's payment gateway (Stripe Connect) is silently failing webhook callbacks since 09:00. Orders are being created in `pending_payment`, MSI is reserving stock, but the orders are not transitioning to `processing`. After ~25 minutes the customer typically tries again, creating a duplicate order and another stock reservation.
+6. **The fix**: replay the failed Stripe webhooks (Stripe Dashboard > Developers > Webhooks > Failed deliveries > Resend). Within 5 minutes the orders move to `processing` (real stock decrement) or `canceled` (release the MSI reservation). The "OOS" SKUs return to positive salable_qty automatically.
+7. **Without this card the merchant would have**: paused the Wellington Boots ad campaign (avoiding ~$340/day waste, fine), restocked from the supplier (unnecessary, the stock was always physically present), and only discovered the gateway issue when revenue dropped enough to trip the [Revenue Drop Alert](/nerve-centre/kpi-cards/adobe-commerce/revenue-drop-alert) about 3 hours later.
+
+The point of this card: a multi-SKU OOS pattern with no demand explanation is almost always either a gateway issue, a catalogue-import bug, or a supplier-cancellation. The cross-check with order state distribution distinguishes them in seconds.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+This alert is most informative when paired with order-state and ad-spend cards.
+
+| Card | Why pair it with Out-of-Stock Spike Alert |
+| --- | --- |
+| [Active Ads on OOS SKUs](/nerve-centre/kpi-cards/adobe-commerce/active-ads-on-out-of-stock-skus) | The action card. Once SKUs flip to OOS, the spend on ads pointing at them is wasted within minutes. |
+| [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) | Distinguishes a "real" supplier OOS from a `pending_payment` reservation cascade. The distinction changes the fix entirely. |
+| [Catalogue Drift](/nerve-centre/kpi-cards/adobe-commerce/catalogue-drift) | If the OOS spike coincides with a catalogue import or a third-party feed sync, the cause is the import, not demand. |
+| [Top Refunded SKUs](/nerve-centre/kpi-cards/adobe-commerce/top-refunding-customers) | If a SKU is OOS because of mass returns (defective batch causing recalls), the OOS is a side-effect of a worse problem. |
+| [Revenue Drop Alert](/nerve-centre/kpi-cards/adobe-commerce/revenue-drop-alert) | Lagging effect. A sustained OOS spike on the merchant's top SKUs hits revenue 1 to 3 hours later. |
+| [Total Revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | The denominator-of-context. 7 SKUs out on a 200-SKU store is severe; 7 SKUs on a 20,000-SKU store is routine. |
+| [`google_ads.google_ads_spend`](/nerve-centre/google_ads/google_ads_spend) | The direct waste channel. |
+| [`shopify.shopify_alert_oos_spike`](/nerve-centre/shopify/shopify_alert_oos_spike) | Cross-platform peer for agency teams. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Adobe Commerce Admin:**
+
+For the live OOS list:
+
+> **Catalog > Products** with filter *Quantity ≤ 0* and *Status = Enabled* and *Visibility != Not Visible Individually* gives the candidate list. Adobe Admin shows physical `qty`, not `salable_qty`; for the salable view you need to click into each product and check the Sources tab.
+
+For Multi-Source Inventory (MSI) detail:
+
+> **Stores > Inventory > Sources** to see your configured stock-sources, then **Stores > Inventory > Stocks** to see the source-to-website mapping. A SKU's `salable_qty` is the sum of its source-level `qty` minus reservations, across all sources mapped to the website.
+
+For reservations:
+
+> Reservations are not directly visible in Admin; they exist in the `inventory_reservation` table. Use `bin/magento inventory:reservation:list` (CLI) or query the table directly to see active reservations against a SKU.
+
+Other Adobe Commerce Admin views that look relevant but are not:
+
+- **Reports > Products > Low Stock**: based on the merchant-configured low-stock threshold (typically 1 or 5 units), not zero.
+- **Catalog > Categories**: hierarchy, no live stock signal.
+- **Stores > Configuration > Catalog > Inventory**: configuration, not state.
+
+**Why our number may legitimately differ from a manual Admin check:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **`salable_qty` vs `qty`**. Admin's product grid shows physical `qty`. The card uses `salable_qty` which subtracts reservations. A SKU with `qty = 5, reservations = 5` shows as zero here but as 5 in the grid. | Card flags SKUs the grid says are in stock |
+| **Configurable parent counting**. The card counts each parent configurable as one SKU even when multiple variants flip. The Admin grid shows variants individually. | Card count lower than admin variant-by-variant count |
+| **Visibility filter**. Card excludes "Not Visible Individually" SKUs (configurable child products). Admin shows them. | Card count lower |
+| **Time-zone / sync lag**. MSI updates index in 1-5 minutes; reservations are real-time but the salable_qty derivation runs on a schedule. The card sees the most-recent salable_qty sync. | ±5 min boundary effects |
+| **Disabled-product exclusion**. Card excludes `status != 1`. A merchant who flipped a SKU to "Disabled" before the OOS event will not see it here. | Excludes legitimately-zero disabled SKUs |
+
+**Cross-connector reconciliation (when these connectors are connected for this merchant):**
+
+| Pair | Expected relationship | What divergence tells you |
+| --- | --- | --- |
+| [`google_ads.google_ads_spend`](/nerve-centre/google_ads/google_ads_spend) on the affected SKUs | Spend continues until feed syncs | Use [Active Ads on OOS SKUs](/nerve-centre/kpi-cards/adobe-commerce/active-ads-on-out-of-stock-skus) for the immediate action. |
+| Google Merchant Center product status | Should flip to "out of stock" within 1-4 hours | Faster than that means good feed-sync hygiene; slower means feed-sync issue. |
+| 3PL inventory feed | Should align with Adobe MSI within minutes | Divergence indicates either MSI desync from 3PL or stuck reservations. |
+
+---
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The same alert exists with platform-specific definitions on other commerce connectors.
+
+- [`shopify.shopify_alert_oos_spike`](/nerve-centre/shopify/shopify_alert_oos_spike)
+- [`bigcommerce.bc_alert_oos_spike`](/nerve-centre/kpi-cards/bigcommerce/oos-spike-alert)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The alert fired but my warehouse confirms stock is on the shelf, why?**
+Most common cause: MSI reservations against `pending_payment` orders. A burst of pending-stuck orders (gateway callback failure) reserves stock in MSI without taking payment. The salable_qty drops to zero even though physical stock is healthy. Cross-check [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) for a `pending_payment` spike. The fix is to resolve the gateway callback backlog, not to restock.
+
+**What's the difference between `qty` and `salable_qty` and why do they disagree?**
+`qty` is the physical-source stock count (what's on the warehouse shelf, per source). `salable_qty` is what's available to sell after subtracting active reservations (orders in `pending_payment` and `processing` that haven't shipped). A SKU with `qty = 10, reservations = 10` shows `salable_qty = 0` and is correctly flagged as OOS for storefront purposes; a customer cannot actually buy it.
+
+**Adobe Commerce vs Magento Open Source: any difference for this card?**
+MSI ships in both editions from Magento 2.3 onwards. The difference: Adobe Commerce edition adds a richer Inventory Management UI and the Source Selection Algorithm for multi-warehouse orders; Open Source has the same underlying tables. The card works identically on both.
+
+**My multi-source Adobe Commerce, the SKU is OOS at one warehouse but in stock at another, why is it flagged?**
+The card uses aggregate salable_qty across all stock-sources mapped to the website. A SKU at zero across all sources is OOS storefront-wide. If it is zero at one source but positive at another, the storefront still shows it as available and it is NOT flagged. For region-locked operations (UK warehouse only ships UK), set up per-Stock variants in the manifest so the card respects the source-to-website routing.
+
+**Why exclude configurable child SKUs?**
+Configurable products in Adobe Commerce work as a parent SKU with child variants per option (e.g. parent BOOT-WL-BLK with children BOOT-WL-BLK-7 through BOOT-WL-BLK-12). The parent itself is a virtual SKU; only children have stock. The card counts the parent as "OOS" only when ALL its child variants are zero, otherwise the parent still shows as buyable on the storefront. Counting individual children would over-fire (one size out of stock is normal); counting only fully-OOS parents is the right granularity.
+
+**The threshold of 5 SKUs feels arbitrary, can I change it?**
+Yes, configure in the manifest. For very large catalogues (50,000+ SKUs) raise to 20 or 50; for very small catalogues (under 200 SKUs) consider lowering to 3. The point is a count high enough to filter routine variance and low enough to catch systemic issues early. The 5-SKU default suits a typical 1,000 to 5,000 SKU mid-market catalogue.
+
+**Why doesn't my low-stock report show the same SKUs?**
+Adobe Commerce's "Low Stock Report" uses the merchant-configured low-stock threshold (default 1 or 5 units, set per-product or globally). It is a forecasting view (which SKUs to reorder), not an alarm view (which SKUs just went OOS). The two views overlap but ask different questions.
+
+**My multi-store Adobe Commerce, can I get per-Store-View OOS counts?**
+Yes, configure per-Store-View variants. Useful for merchants whose Store Views correspond to different warehouses or regional catalogues. Without per-Store-View variants, the card aggregates across all Store Views which can mask region-specific patterns.
+
+**The Adobe Commerce Inventory Management UI shows the SKU `qty = 0` but `is_in_stock = true`, why is it flagged?**
+Likely cause: the merchant-configured `Out-of-Stock Threshold` is negative (e.g. -10), allowing oversell. Adobe still considers it "in stock" until the threshold is crossed. The card detects the salable_qty hitting zero, which represents the customer-facing reality (no units to claim). If oversell is intentional, configure the manifest to skip SKUs where `backorders = 1` or `out_of_stock_threshold < 0`.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Out-of-Stock Spike Alert* is one of hundreds of KPI pulses Vortex IQ tracks across Adobe Commerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

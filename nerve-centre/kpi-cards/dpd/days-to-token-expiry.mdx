@@ -1,0 +1,143 @@
+---
+title: "Days to Token Expiry, DPD"
+sidebarTitle: "Days to Token Expiry"
+description: "Days to Token Expiry for DPD stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Shipping & Courier
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Days remaining until the DPD API authentication token currently used by the Vortex IQ connector will expire. DPD's web service issues an OAuth-style access token with a fixed lifetime (typically 90 days for the standard merchant API, 30 days for the Predict API surface). When the token expires every label-print, tracking-pull, and shipment-status webhook stops; the connector goes silent. This card is the early-warning siren.
+
+| | |
+| --- | --- |
+| **What it counts** | `DATEDIFF(token_expiry_at, NOW())` on the active DPD API credential set. Reads `expires_at` from the OAuth response captured at the last successful refresh, or the explicit `tokenExpiry` header on each call. |
+| **API endpoint** | DPD's auth endpoint within the `dpd.co.uk` API surface (the SOAP-era endpoint and the newer REST endpoint both expose token expiry). The card refreshes its read every 15 minutes. |
+| **What gets blocked at expiry** | Label generation (the dispatch system cannot create new DPD shipments), tracking refreshes (downstream tracking cards go stale), shipment-status webhooks (DPD stops pushing events to the Vortex IQ ingest endpoint), Predict slot-window data (the slot-accuracy card stops updating). |
+| **Token rotation** | DPD allows automated rotation via the refresh-token grant. Most accounts have rotation set up at first connection; some legacy accounts (especially those onboarded before 2023) require manual re-authentication. The card surfaces the gap regardless of rotation status. |
+| **Service level scope** | Per DPD account / sub-account. A merchant with multiple DPD accounts (e.g. one for DPD UK, one for DPD Local) sees one card per credential. |
+| **Time window** | `RT` (real-time, not period-windowed). |
+| **Alert trigger** | `<14 days` warn, `<3 days` critical (driven by the same data, two thresholds on the rendering side). 14 days is enough time for the merchant to either renew or escalate; below 3 days is incident-priority. |
+| **Currency** | n/a. The card surfaces a count of days, no monetary value. |
+| **Returns / RTO** | n/a. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your DPD data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK DTC fashion brand running DPD as the primary delivery carrier (Predict NextDay for high-value parcels, Standard for everything else), one DPD account, automatic refresh-token rotation enabled. Reading taken at 09:00 GMT on 12 Mar 26.
+
+| State | Days to expiry | Status | Action |
+| --- | --- | --- | --- |
+| Healthy steady state | 78 | Green | None. Rotation will refresh ~30 days before expiry. |
+| Approaching renewal | 18 | Green | None yet. Refresh job will fire at day 14. |
+| Refresh failed | 11 | Amber | Investigate refresh log. Run manual refresh. |
+| Refresh failed twice | 4 | Red | Incident. Re-authenticate manually before labels stop printing. |
+| Expired | -1 | Red (silent) | Connector is silent. Label printing has already stopped. |
+
+The reading on 12 Mar 26 is **18 days**, an amber-but-not-yet-action state. Five things to notice:
+
+1. **Auto-rotation should fire at day 14, not day 0.** Vortex IQ's connector logic refreshes 14 days before expiry as a buffer. If the reading sits at 14 for more than 24 hours, the refresh has failed and is not retrying. Check the connector logs.
+2. **A failed refresh on day 18 is not yet a crisis but is the moment to act.** Refresh failures usually have one of three causes. (a) The DPD account password was changed without updating the connector. (b) DPD rotated their OAuth client secret on their side (rare, but happens during platform migrations). (c) The refresh-token grant was revoked from DPD's portal (someone manually revoked sessions). Diagnose by attempting a fresh OAuth flow from the connector settings page; if that succeeds, the old refresh token was the issue.
+3. **At &lt;3 days, the playbook is "stop printing labels and re-auth before resuming"**. Label printing during the final hours can produce orphan consignments where DPD has the parcel but the dispatch system has no tracking number stored. Cleaning those up after the fact is manual.
+4. **The card does not auto-rotate.** It surfaces the gap. Rotation is the connector's job; the card is the alarm. If rotation is configured and working, this card should never read below ~75 days steady-state.
+5. **DPD Predict tokens are shorter-lived (30 days, not 90).** Brands using the Predict slot-window product see this card cycle from 30 to 14 to 30 every two to three weeks; that is normal. Brands using only Standard see a 90-day cycle.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+Token expiry is an operational-health metric. Pair it with these to monitor connector reliability:
+
+| Card | Why pair it with Token Expiry | What the combination tells you |
+| --- | --- | --- |
+| [API Error Rate](/nerve-centre/kpi-cards/dpd/api-error-rate) | A token approaching expiry often produces 401 / 403 responses on edge calls before fully expiring. | A sudden spike in API errors when this card reads &lt;14 days is the rotation about to fail. |
+| [Label Generation Success](/nerve-centre/kpi-cards/dpd/label-generation-success) | First-line operational impact of a token failure. Labels stop printing immediately on expiry. | If label-generation-success drops while token-expiry is still positive, the issue is upstream of auth. |
+| [Predict Slot Accuracy](/nerve-centre/kpi-cards/dpd/predict-slot-accuracy) | The Predict surface uses a separate, shorter-lived token. | The Predict token can expire while the Standard token is healthy, surfacing as a Predict-specific outage. |
+| [Shipments Total](/nerve-centre/kpi-cards/dpd/shipments) | A drop to zero new shipments concurrent with a token expiry is the smoke test for connector outage. | Useful for confirming the gap; not a leading indicator. |
+| Cross-connector: similar token-expiry cards on other connectors ([`shopify`](/nerve-centre/kpi-cards/shopify), [`bigcommerce`](/nerve-centre/kpi-cards/bigcommerce), [`royal_mail.roy_auth_token_expiry_days`](/nerve-centre/kpi-cards/royal-mail/days-to-token-expiry)) | Any token expiring is a connector-down event. The merchant's operations team often watches these as a panel. | A panel of all token cards across connectors is the single-glance health dashboard. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in DPD's own portal:**
+
+[DPD Customer Portal](https://www.dpd.co.uk/) → **API Settings → Active Tokens**. The portal lists every active OAuth token with its issued-at and expires-at timestamps. The token currently used by Vortex IQ should appear in the list with a label or client-name tag.
+
+For accounts using the legacy SOAP credentials, expiry is set on the password rather than a token; DPD enforces a 90-day password rotation. The card surfaces the days-to-rotation in the same way.
+
+**Why our number may legitimately differ from DPD's portal:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Cache lag** | Ours stale by 15 minutes | The card refreshes the token-state read every 15 minutes. A token refreshed in the last 15 minutes still shows the old expiry. |
+| **Token revoked but not expired** | DPD shows expired, ours shows positive | A merchant or DPD support can revoke a token from the portal before its natural expiry; the revoke is immediate but the expires-at field still shows the original future date. The connector will start failing 401s within minutes; this card's positive number is misleading. Pair with [API Error Rate](/nerve-centre/kpi-cards/dpd/api-error-rate). |
+| **Multiple tokens in flight** | Either | If a refresh was attempted but failed, the connector may still be using the old token while the portal shows a new failed-issue token. The card reads the *active* token; reconcile on which token-ID is active. |
+| **Time zone of expires-at** | Boundary days off | DPD's portal renders timestamps in UK local time (GMT or BST); the card stores in UTC. The "days remaining" calc uses UTC. On the boundary day, the two can differ by 1. |
+| **Predict vs Standard token** | Sees only one | A merchant on both Standard and Predict has two tokens; the card reads whichever is configured as the primary credential. The other can expire silently. |
+
+**Internal identity (within DPD):**
+
+`(token_expiry_days drops to 0) → (api_error_rate spikes 401) → (label_generation_success drops to 0) → (shipments_total → 0 from this minute forward)`. The four cards form a sequential failure cascade.
+
+- [`dpd.dpd_api_error_rate`](/nerve-centre/kpi-cards/dpd/api-error-rate)
+- [`dpd.dpd_label_generation_success`](/nerve-centre/kpi-cards/dpd/label-generation-success)
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | Causes of legitimate divergence |
+| --- | --- | --- |
+| Token-expiry cards on other connectors | Independent. Each connector has its own auth credential. | One connector's token expiry tells you nothing about another's. |
+
+---
+
+*Documentation cross-reference (across connectors with API-token auth).* Auth-token-expiry cards exist on every connector that uses a finite-lifetime credential. The card's behaviour is the same on all of them.
+
+- [`royal_mail.roy_auth_token_expiry_days`](/nerve-centre/kpi-cards/royal-mail/days-to-token-expiry)
+- [`hermes_evri.her_auth_token_expiry_days`](/nerve-centre/kpi-cards/hermes-evri/days-to-token-expiry)
+- [`apc.apc_auth_token_expiry_days`](/nerve-centre/kpi-cards/apc/days-to-token-expiry)
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card says 18 days, do I need to do anything?**
+Not yet, but verify auto-rotation is configured. Healthy steady-state on a 90-day token is 60 to 90 days; on a 30-day Predict token is 15 to 30 days. If the number sits at 18 for more than 24 hours without ticking up after a refresh job, rotation has failed. Action: open the connector settings page and trigger a manual refresh, then watch this card for the next 30 minutes. It should bounce back to 75+ days on success.
+
+**My token expired and labels stopped printing, what now?**
+Three steps. (1) **Re-authenticate from the connector settings page.** Click "Re-connect DPD" and complete the OAuth flow with the same DPD account. This issues a new token and the card should immediately read 89 days or so. (2) **Reprocess any orphan labels.** Orders that attempted to print labels during the expiry window may have been left in "fulfilment pending" state. Re-run the dispatch queue. (3) **Confirm webhook ingestion has resumed.** Check that new tracking events are flowing for shipments dispatched in the last hour; if not, DPD's webhook subscription was probably tied to the old token and needs re-subscription.
+
+**Why does the Predict token expire faster than the Standard token?**
+DPD's Predict surface is a separate API product introduced in 2017 with its own auth lifecycle, generally enforcing a 30-day rotation. Standard merchant API tokens are 90 days. The two are managed independently; the merchant configures both on first connection.
+
+**Auto-rotation is enabled but the token still expired, why?**
+Three possible causes. (1) **DPD account password changed.** Some refresh-token grants on legacy DPD accounts re-prompt for password on rotation; if the password was changed, rotation fails silently. (2) **OAuth client secret rotated by DPD.** Rare, but DPD has rotated their client secret during platform migrations; the merchant has to re-onboard. (3) **The connector logs show a 429 (rate-limited).** DPD's auth endpoint can return 429 if the connector retries too aggressively; the card will see one missed refresh window. The next attempt usually succeeds.
+
+**I have multiple DPD accounts, why does the card show only one number?**
+The card surfaces the *primary credential* configured for the connector. If the merchant has multiple DPD accounts (e.g. one for DPD UK, one for DPD Local, one for DPD Direct), each is a separate connector instance with its own card. Filter the dashboard by connector instance to see all four expiry numbers.
+
+**Does this card warn me 14 days in advance via email?**
+Yes if alerting is configured. The threshold-trip event when the number drops below 14 fires a notification through whichever channel the merchant has set (email, Slack, Microsoft Teams). The connector also fires a critical alert on &lt;3 days regardless of notification settings, this is treated as an outage-level event.
+
+**Why does the card sometimes read negative numbers?**
+The token has expired and rotation has not yet succeeded. The connector is likely already failing API calls; this card is just confirming the cause. Action: re-authenticate immediately. The number will reset on a successful re-auth.
+
+**How does this interact with DPD's quarterly platform maintenance windows?**
+DPD publishes scheduled maintenance windows on its developer portal; during these windows the auth endpoint can briefly return 503. The card may show a refresh failure during the window. Check the maintenance schedule before treating a failed refresh as a real incident.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Days to Token Expiry* is one of hundreds of KPI pulses Vortex IQ tracks across DPD and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

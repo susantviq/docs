@@ -1,0 +1,161 @@
+---
+title: "Late Order Processing Queue, AbeBooks"
+sidebarTitle: "Late Order Processing Queue"
+description: "Late Order Processing Queue for AbeBooks stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Marketplace
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Live alert table listing every AbeBooks order whose `dispatch_due_by` deadline has passed without a confirm-shipment event. Each row is an SLA breach in progress; the longer the row stays in the table, the larger the seller-standing damage and the higher the buyer-complaint risk.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(orders WHERE dispatch_due_by < NOW() AND dispatch_confirmed_at IS NULL AND status NOT IN ('CANCELLED', 'REFUNDED'))`. Maintains a row per order with order ID, buyer info, ISBN, dispatch_due_by, hours overdue, listed price. |
+| **API endpoint + report** | Computed locally from the AbeBooks Inbound Orders feed (`dispatch_due_by` field on every order) joined to the seller's outbound confirm-shipment events. Recomputes every 4 hours; alert state updated in real time when a confirm-shipment event lands. |
+| **Severity** | **P1**. Each row past `dispatch_due_by` directly damages [Dispatch SLA Compliance](/nerve-centre/kpi-cards/abebooks/dispatch-sla-compliance), which drives seller-standing tier, which drives search rank, which drives revenue. |
+| **What it doesn't count** | Cancelled orders (already cancelled, no SLA risk), refunded orders (closed loop), orders on seller-marked vacation/holiday days (clock paused). Orders that confirmed shipment 5 minutes ago even if 20 minutes late are no longer in this list (closed late-dispatch records, not active queue). |
+| **Why separate from Pending Dispatch** | [Pending Dispatch](/nerve-centre/kpi-cards/abebooks/pending-dispatch) shows ALL orders awaiting shipment (including ones still well within budget). This card shows only orders ALREADY past their deadline. Pending Dispatch is the workload view; this is the alert view. |
+| **Fees / commission** | Not applicable directly. Indirect: SLA breaches that cumulate into a seller-standing demotion suppress search rank, reducing revenue and therefore commission. |
+| **Refunds / cancellations** | If the seller cancels a late order rather than ship it, the order moves to [Cancellation Rate](/nerve-centre/kpi-cards/abebooks/cancellation-rate), but doesn't become an SLA breach. AbeBooks polices both metrics independently; cancelling instead of shipping doesn't avoid the penalty. |
+| **Currency** | Not applicable; this is a count + per-order detail, not a money figure. |
+| **Common reasons orders land here** | (1) **Inbound feed lag** ate the dispatch budget before the seller saw the order, ~24%. (2) **Staff absence / sickness / scheduling gap**, ~21%. (3) **Stockout deferred** (couldn't find the book in the warehouse, didn't cancel quickly), ~18%. (4) **Confirm-shipment late** (book shipped on time but outbound-confirm event delayed by feed cadence), ~17%. (5) **Volume spike absorbed pick capacity**, ~12%. (6) **Other**, ~8%. |
+| **Multi-marketplace overlap** | Independent per marketplace. A book on Alibris with a different deadline isn't here; that's [Alibris Late Order Processing Queue](/nerve-centre/kpi-cards/alibris/late-order-processing-queue). |
+| **Time window** | `RT` (live alert state, refreshed every 4 hours minimum). |
+| **Alert trigger** | `any order past dispatch_due_by`, no tolerance threshold; every breach surfaced. |
+| **Roles** | owner, operations. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your AbeBooks data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK independent bookseller, 1,250 orders/month, 2-business-day handling time. Snapshot 01 May 26 09:00 UTC.
+
+| Order ID | Hours overdue | ISBN | Title | Buyer location | Listed price | Risk class |
+| --- | --- | --- | --- | --- | --- | --- |
+| AB-2645012 | 1.2h | 9780241972847 | The Information (Penguin) | UK | £8.50 | Low |
+| AB-2645003 | 4.6h | 9780099273560 | Beloved (Vintage) | DE | £6.20 | Low |
+| AB-2644891 | 8.1h | 9780571272198 | Rare 1st ed. Heaney | US | £180.00 | High |
+| AB-2644774 | 14.4h | 9780340739402 | Atlas Shrugged hb | UK | £15.40 | Medium |
+| AB-2644612 | 22.8h | 9780571195220 | A Tale for the Time Being | FR | £9.80 | High |
+| AB-2644511 | 31.2h | 9781847085610 | Stoner (Vintage) | US | £7.20 | High |
+| AB-2644350 | 42.0h | 9780571235681 | Signed Heaney (rare) | AU | £240.00 | Critical |
+| AB-2644287 | 55.4h | 9780099282716 | Disgrace (Vintage) | UK | £6.80 | Critical |
+
+Card reads **8 orders**; alert is firing (threshold `>0`). Three of these are rare-book orders averaging £140 each.
+
+Six things to notice that are specific to AbeBooks and the book trade:
+
+1. **The 8 late orders represent 0.64% of monthly volume but 100% of the SLA hit.** Each one is a confirmed breach. If [Dispatch SLA Compliance](/nerve-centre/kpi-cards/abebooks/dispatch-sla-compliance) was sitting at 95.8%, these 8 alone drag it to 95.2%. A few more breaches in the same week pushes you below 95% and into seller-standing demotion territory.
+2. **Triage by hours-overdue, not by order date.** AB-2644287 is 55.4h overdue and AB-2645012 is 1.2h overdue; the former needs immediate intervention (possibly a courier upgrade and a buyer apology), the latter just needs to be shipped this morning. Sort the queue by hours-overdue descending.
+3. **The two rare-book orders (AB-2644891, AB-2644350) are P0.** Rare-book buyers are repeat collectors who spend a lot, leave detailed feedback, and tell other collectors. A late dispatch on a £180 or £240 rare order generates 3 to 8x the negative-feedback risk per order vs commodity. Ship today, courier upgrade at the seller's expense, and proactively message the buyer with the tracking link.
+4. **Confirm-shipment-late vs actually-late.** Investigation showed AB-2645003 (4.6h overdue) and AB-2644774 (14.4h overdue) actually shipped 6 hours and 18 hours ago respectively, but the outbound-confirm cron job only runs daily at 18:00 UTC. The books are in transit; the alert is about the confirmation event, not the shipment. The fix is operational: run outbound-confirms hourly, not daily.
+5. **Inbound feed lag ate the budget on AB-2644774.** Order placed by buyer at 14:00 UTC on 28 Apr 26; AbeBooks set dispatch_due_by at 14:00 UTC on 30 Apr 26 (2 business days). The inbound feed arrived at 06:00 UTC on 29 Apr 26 (16 hours after order placement), so the bookseller only had 32 of the nominal 48 hours. A 4-hourly inbound feed cadence (vs daily) would have given the full 44+ hours.
+6. **The £471 of revenue across these 8 orders isn't the headline metric.** The seller-standing damage (potential demotion, weeks of search-rank suppression, ~£3,000 to £8,000 of indirect revenue impact) far exceeds the direct revenue exposure. The card surfaces the order detail so the merchant can prioritise; the strategic impact lives on [Dispatch SLA Compliance](/nerve-centre/kpi-cards/abebooks/dispatch-sla-compliance) and [Total Revenue](/nerve-centre/kpi-cards/abebooks/total-revenue).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+Late order processing is the active-breach view. Pair with these to triage, recover, and prevent:
+
+| Card | Why pair it with Late Order Processing Queue |
+| --- | --- |
+| [Dispatch SLA Compliance](/nerve-centre/kpi-cards/abebooks/dispatch-sla-compliance) | The aggregate metric this card feeds into. Each row in this card costs ~0.08 percentage points on a 1,250-order/month seller. |
+| [Pending Dispatch](/nerve-centre/kpi-cards/abebooks/pending-dispatch) | The leading indicator. Orders sitting at 60 to 90% of their dispatch budget will be the next entries on this card if they don't ship soon. |
+| [Avg Time to Process (hrs)](/nerve-centre/kpi-cards/abebooks/avg-time-to-process) | The distribution view. Whether the late-order pattern is a few outliers or a distribution shift. |
+| [Inbound Orders File Lag](/nerve-centre/kpi-cards/abebooks/inbound-orders-file-lag) | Cause check. Lag here eats your dispatch budget before you see the order. |
+| [Last Successful Upload](/nerve-centre/kpi-cards/abebooks/last-successful-upload) | Indirect cause. A failed outbound-confirm upload makes shipped orders appear unshipped, putting them on this card falsely. |
+| [Cancellation Rate](/nerve-centre/kpi-cards/abebooks/cancellation-rate) | Companion budget. Some sellers cancel late orders to remove them from this list; doing so transfers the risk to cancellation rate (3% threshold). |
+| [Total Revenue](/nerve-centre/kpi-cards/abebooks/total-revenue) | Downstream. Seller-standing demotion suppresses search rank by 25 to 35%, hits revenue 7 to 30 days after the breach pattern starts. |
+| [Alibris Late Order Processing Queue](/nerve-centre/kpi-cards/alibris/late-order-processing-queue) | Peer marketplace. Same fulfilment operation; Alibris-only breaches usually point to confirm-shipment feed cadence on Alibris not matching AbeBooks. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in the AbeBooks seller dashboard:**
+
+Two views matter:
+
+1. [**My AbeBooks → Order History → filter by Pending + Past Due**](https://www.abebooks.com/books/orders). Row-level audit of every order with its dispatch_due_by deadline; AbeBooks highlights overdue rows in red.
+2. [**My AbeBooks → Performance Dashboard**](https://www.abebooks.com/dashboard). The aggregate seller-standing view that's the downstream consequence of this card.
+
+**Why our alert may legitimately differ from AbeBooks's UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Refresh cadence** | Ours updates every 4h | Vortex IQ recomputes every 4 hours; the AbeBooks order-detail page is real-time. An order that confirmed shipment 30 minutes ago will still appear on this card until the next refresh. |
+| **Time zone** | Boundary effects | AbeBooks uses US Eastern Time on .com orders and UK time on .co.uk orders for the dispatch-due clock; the connector uses UTC. Boundary 1 to 5 hour gaps are normal for orders falling near the deadline. |
+| **Outbound-confirm latency** | Ours shows late even when AbeBooks shows shipped | If the seller's confirm-shipment cron job runs hourly and the cron just-missed firing 5 minutes after a real shipment, the order shows on this card for up to 1 hour even though AbeBooks already has the confirmation. Run cron more frequently (every 15 minutes) to close this gap. |
+| **Vacation/holiday handling** | Ours can show false breaches | If the seller marks vacation days in their AbeBooks profile, the dispatch_due_by clock pauses; the connector should respect this but legacy configurations sometimes don't. Check the connector's vacation-day sync if false-positives appear during holidays. |
+| **Cancelled-but-not-yet-acked** | Ours can briefly show cancelled rows | A buyer-cancelled order may take up to 30 minutes to propagate; during that window the order appears on this card before disappearing. |
+
+**Cross-connector reconciliation:**
+
+Late-order processing is fundamentally per-marketplace. Cross-connector reconciliation surfaces shared root causes (confirm-shipment cron, scheduling).
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| [`alibris.al_alert_late_processing`](/nerve-centre/kpi-cards/alibris/late-order-processing-queue) | **Same fulfilment, different queue.** A bookseller running both marketplaces from one warehouse sees correlated late-order spikes during staff absence or volume surges. | Each marketplace sets its own dispatch_due_by; Alibris's tends to be 24h longer than AbeBooks's for the same handling time. Late on AbeBooks doesn't always mean late on Alibris. |
+| [`amazon.amzn_alert_late_processing`](/nerve-centre/amazon/amzn_alert_late_processing) | **Strictest peer.** Amazon's `Late Shipment Rate` measures the same concept with a tighter 4% breach threshold (i.e. 96% on-time). Amazon-late orders typically also appear on this card. | Amazon's clock starts when the order is paid; AbeBooks's starts when the seller is notified. Same fulfilment delay can read differently. |
+| [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | **Different model.** Shopify is your DTC site; you set the shipping promise; no third-party SLA threshold. | Late-on-Shopify is buyer-trust damage but not platform-imposed penalty. |
+
+---
+
+<details>
+<summary><em>Marketplace-peer documentation cross-reference</em></summary>
+
+Late-order alerts exist on every marketplace where the merchant fulfils. Each marketplace's deadline rules differ; the cross-link is for navigation when multiple alerts fire simultaneously.
+
+- [`alibris.al_alert_late_processing`](/nerve-centre/kpi-cards/alibris/late-order-processing-queue)
+- [`amazon.amzn_alert_late_processing`](/nerve-centre/amazon/amzn_alert_late_processing)
+- [`ebay.ebay_alert_late_shipment`](/nerve-centre/ebay/ebay_alert_late_shipment) (when connected)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The alert just fired with 8 orders. What do I do in the next hour?**
+Three actions in order: (1) **Sort by hours-overdue descending**; address the worst breaches first. (2) **Spot-check rare-book / high-value orders**, ship them today with courier upgrade if needed; rare-book buyers leave 3 to 8x more reputational damage per breach than commodity. (3) **Identify the cause of each breach**, the operational fix differs (run confirm-shipment cron more often, fix the inbound feed lag, or contact the buyer if it's a stockout). Don't bulk-cancel late orders to clear the queue; that pushes the breach to [Cancellation Rate](/nerve-centre/kpi-cards/abebooks/cancellation-rate) where you also get penalised.
+
+**Why does AbeBooks penalise me here when the book actually shipped on time but my confirm-shipment was late?**
+Because AbeBooks can only see what your outbound feed tells them. From AbeBooks's perspective, an unconfirmed order is unshipped, regardless of physical reality. The fix is operational: run outbound-confirm cron every 15 minutes (or use AbeBooks's API to confirm shipments in near-real-time). Sellers who confirm-and-then-pack physically do this anyway; the gap is the cron schedule, not the warehouse process.
+
+**Multi-marketplace, can I avoid this by selling exclusively on AbeBooks?**
+Theoretically, but it's the wrong trade. Single-marketplace concentration carries 3 to 5x the platform-failure risk and reduces total revenue by 30 to 60%. The right move is operational discipline: tight confirm-shipment cycles, daily ops review of the queue, vacation-day handling configured correctly. Most multi-marketplace sellers run a clean 99% on-time on AbeBooks; the operational discipline is achievable.
+
+**Listing-quality / Buy Box impact, what's the recovery time after a breach cluster?**
+Each breach hits [Dispatch SLA Compliance](/nerve-centre/kpi-cards/abebooks/dispatch-sla-compliance) for 30 days (it stays in the 30-day rolling window). A 12-breach week takes 30 days to age out. If the cumulative effect drops you below 95% SLA, the search-rank demotion kicks in within 24 hours; the demotion lifts within 7 to 14 days of returning above 95%. Total recovery: 30 to 45 days from the last breach.
+
+**Inventory-sync lag, can it cause this card to fire even when I'm being diligent?**
+Yes, this is one of the most frustrating false-positive sources. If your warehouse-management system marks an order shipped at 16:00 yesterday but the outbound-confirm cron only fires at 06:00 today (14h gap), and the order's dispatch_due_by was 02:00 today, AbeBooks records the dispatch at 06:00 and counts it as 4h late. The book physically shipped on time. Fix: confirm-shipment cron every 15 minutes minimum. Some sellers run it every 5 minutes during business hours.
+
+**ISBN match quality, can it cause late dispatches?**
+Indirectly. If a book's ISBN in your inventory tool doesn't match the physical book on the shelf (you typed in the wrong ISBN at intake), staff pick the wrong book, realise at packing, then either: (a) find the correct copy elsewhere in the warehouse (delays dispatch by 2 to 6h), or (b) cancel the order (avoids the late-dispatch but hits cancellation rate). [ISBN Coverage](/nerve-centre/kpi-cards/abebooks/isbn-coverage) is the upstream metric.
+
+**Rare books vs commodity books, do they have different breach impact?**
+Yes, and it's the biggest gap most sellers miss. A late dispatch on a £8 commodity paperback costs maybe £0.20 of margin and modest reputational risk. A late dispatch on a £180 rare hardback costs £15+ of margin AND 3 to 8x reputational impact (the rare-book community is small and word travels). Per-breach financial weight is 30 to 80x higher on rare. ALWAYS triage rare-book breaches first.
+
+**When does the card auto-clear?**
+Each row clears when the order's confirm-shipment event lands. The whole card is empty when no row is past dispatch_due_by. New orders entering the late state appear on the card within one 4-hour refresh cycle.
+
+**Is there ever a reason to cancel a late order rather than ship it?**
+Yes, but rarely. If on inspection at packing the book is in materially worse condition than catalogued (heavy water damage, missing pages), cancellation is correct, the buyer wouldn't accept it anyway. Use the *Out-of-stock* reason on AbeBooks (not *Buyer-requested*); the latter is fraud. The cancellation hits [Cancellation Rate](/nerve-centre/kpi-cards/abebooks/cancellation-rate), which has its own threshold but is preferable to a stockout-shipment that becomes a refund + return.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Late Order Processing Queue* is one of hundreds of KPI pulses Vortex IQ tracks across AbeBooks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

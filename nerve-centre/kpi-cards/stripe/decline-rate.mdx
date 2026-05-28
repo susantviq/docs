@@ -1,0 +1,161 @@
+---
+title: "Decline Rate, Stripe"
+sidebarTitle: "Decline Rate"
+description: "Decline Rate for Stripe stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** Hero  •  **Category:** Payment Gateway
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of charge attempts on `/v1/charges` that ended in `status = failed`. Mathematical near-complement of [Auth Rate](/nerve-centre/kpi-cards/stripe/authorisation-success-rate), but isolates only explicit "no" responses (issuer-declined and Radar-blocked); SCA abandons sit elsewhere.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(charges WHERE status='failed') ÷ COUNT(charges) × 100`. Both issuer-declined (`outcome.type = issuer_declined`) and Stripe-blocked (`outcome.type = blocked`) attempts contribute. |
+| **API resource & field** | `GET /v1/charges`, fields `status`, `outcome.type`, `outcome.reason`, `failure_code`. |
+| **Currency** | n/a (rate metric). The numerator and denominator span all currencies; multi-currency stores get a single, valid percentage. |
+| **Fees / processing cost** | n/a. Stripe doesn't charge processing fees on declines. |
+| **Refunds** | NOT a factor. Refunded charges have `status = succeeded`, not `failed`. |
+| **Disputes / chargebacks** | NOT a factor. Disputed charges had to authorise first. |
+| **Failed / declined payments** | This **is** the metric. The numerator. |
+| **3DS abandons / SCA-required** | NOT counted as decline. They sit at `status = canceled` or `requires_action`, neither of which is `failed`. They pull [Auth Rate](/nerve-centre/kpi-cards/stripe/authorisation-success-rate) down but **not** the decline rate up. This is the most common merchant-confusion point. |
+| **Capture mode** | Auth-only holds that Stripe never captured stay `pending`, not `failed`. They don't contribute to decline rate. |
+| **Page cap** | 1,000 charges per refresh. High-volume merchants (>1,000/day) see the rate computed on the most recent slice. |
+| **Time window** | `T/7D vsP` |
+| **Alert trigger** | `> 8%`. Above 8% almost always means an issue worth investigating: Radar mis-tuned, traffic source compromised, or 3DS misconfiguration cascading into issuer declines. |
+| **Roles** | owner, finance, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Stripe data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK fashion DTC brand running a Black Friday weekend campaign. The 7-day window covers 27 Mar 26 to 02 Apr 26 and the engine fetched 1,000 charges (page cap hit). Of those:
+
+| Bucket | `status` | `outcome.type` | `outcome.reason` | Count | Notes |
+| --- | --- | --- | --- | --- | --- |
+| Authorised cleanly | succeeded | authorized | - | 880 | The bulk of healthy traffic |
+| Issuer declined, soft | failed | issuer_declined | `do_not_honor` | 41 | Issuer-side; recoverable via Smart Retry |
+| Issuer declined, soft | failed | issuer_declined | `insufficient_funds` | 23 | Customer-side; usually recoverable next billing cycle |
+| Issuer declined, hard | failed | issuer_declined | `lost_card` | 6 | Hard decline; do not retry |
+| Radar blocked | failed | blocked | `highest_risk_level` | 18 | Stripe-side, fraud-prevention rule fired |
+| 3DS abandoned | requires_action | - | - | 24 | NOT a decline (denominator-only effect via auth rate) |
+| Auth-only pending | pending | authorized | - | 8 | Capture pending; not yet a success |
+
+```text
+Window numerator (status='failed')         = 41 + 23 + 6 + 18 = 88
+Window denominator                         = 1,000
+Decline Rate                               = 88 ÷ 1,000 × 100 = 8.8%
+```
+
+Three observations:
+
+1. **8.8% is just above the alert threshold.** The card flips amber. The most likely cause is the Black Friday traffic spike attracting more first-time buyers with weaker card profiles, but the fact that 18 charges were blocked by Radar suggests either a Radar rule fired more aggressively than usual or the traffic source brought in a known fraud cluster.
+2. **The 3DS abandons are NOT in this number.** 24 customers walked away mid-3DS challenge. Those don't make decline rate look worse but they do drag [Auth Rate](/nerve-centre/kpi-cards/stripe/authorisation-success-rate) down by 2.4 points. UK merchants frequently miss this gap because Stripe Dashboard's "Failed payments" tab also excludes them.
+3. **Decline Rate decomposition matters more than the number.** 41 `do_not_honor` charges are recoverable by Smart Retries; 6 `lost_card` charges are unrecoverable. The 18 Radar blocks need a different fix (Radar rule tuning) than the 41 issuer declines (Smart Retries / dunning). Open [Decline Reasons](/nerve-centre/kpi-cards/stripe/top-decline-reasons) to see the breakdown before deciding what to do.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why merchants reach for it next to Decline Rate |
+| --- | --- |
+| [Auth Rate](/nerve-centre/kpi-cards/stripe/authorisation-success-rate) | The mirror image. Auth + decline + abandon rates approximately equal 100%. Open both side-by-side. |
+| [Decline Reasons](/nerve-centre/kpi-cards/stripe/top-decline-reasons) | The decomposition. Whether the cause is `do_not_honor` (issuer-side), `insufficient_funds` (customer-side), `highest_risk_level` (Radar-side), or `authentication_required` (3DS-side) determines the fix. |
+| [Recoverable Declines](/nerve-centre/kpi-cards/stripe/recoverable-declines) | Of the failed charges, which would Smart Retries / dunning recover anyway? Tells you the dollar impact of acting now vs waiting. |
+| [Top Declining Issuers](/nerve-centre/kpi-cards/stripe/top-declining-issuers) | Ranks the issuer banks declining you most. A single bad issuer can add 2, 4 points to the rate on its own. |
+| [Decline Rate by Card Country](/nerve-centre/kpi-cards/stripe/decline-rate-by-card-country) | Geographic split. International cards on a US-merchant Stripe account decline 3, 8x more than domestic. |
+| [Radar Score Distribution](/nerve-centre/kpi-cards/stripe/stripe-radar-risk-score-mix) | The Radar-side share. If "highest" risk-level share is above 1, 2%, Radar rules are doing serious work and may be over-firing. |
+| [Decline vs Funnel](/nerve-centre/kpi-cards/stripe/decline-spike-vs-checkout-funnel-drop) | Cross-channel pairing. When decline rate spikes, do we also see Shopify / BC / Adobe checkout completion drop? If yes, declines are causing real revenue loss. |
+| [Payment Health Score](/nerve-centre/kpi-cards/stripe/payment-health-score) | Decline rate carries 25% of the composite, amplified ×5 (so a 2-point absolute jump moves the score 2.5 points). |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Stripe Dashboard:**
+
+The closest Stripe-native view is **Stripe Dashboard → Payments → Failed payments tab** at [dashboard.stripe.com/payments?status=failed](https://dashboard.stripe.com/payments?status=failed). Set the same date range, divide that count by the "All payments" count for the same window, and the figures should agree within ~1% (with the caveats below).
+
+A handful of nearby views can look like this card but aren't:
+
+- **Reports → Decline analysis report**. Stripe's own analytics layer; the single closest match. Set the same date range and figures should agree within ~1%.
+- **Payments → All payments → filter "Declined"**. Same data as the failed tab, different UI; figures match.
+- **Radar → Reviews**. Manual-review cases, not declines. They sit at `outcome.type = manual_review` and never reach `failed` (they end up succeeded or blocked). Different metric.
+- **Realtime feed**. Streaming feed shows live failures but isn't aggregated.
+- **Sigma / Atlas custom queries**. Will agree to ours if the query reads the same `status = 'failed'` predicate; merchants sometimes write a custom query that includes `requires_action` and then complain ours is lower (correctly, ours excludes that bucket).
+
+**Why our number may legitimately differ from Stripe Dashboard:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Page cap** (1,000 charges per refresh) | Ours **based on the latest 1,000** | High-volume merchants (>1,000/day) see the rate computed on the most recent slice. Sampling bias is small unless the merchant has very different decline rates across the day. |
+| **Time zone** | Boundary days drift | Stripe Dashboard uses the account-level time zone; we use UTC. The "Today" cell can be 5, 8 hours out of step. |
+| **Outcome reason backfill** | Ours **slightly off on the most recent 24h** | Stripe's `outcome.type` and `outcome.reason` can be backfilled hours after the charge as Radar feedback loops settle. The numerator is correct (status doesn't change after `failed`), but the *breakdown* in [Decline Reasons](/nerve-centre/kpi-cards/stripe/top-decline-reasons) can shift. |
+| **Refresh lag** | Ours **5, 15 min behind** | The latest hour is always slightly stale. |
+| **Definition: `requires_action`** | Ours **lower** if merchant counts SCA abandons as declines | We follow the strict Stripe definition: only `status = failed` is a decline. Some merchant queries treat `requires_action` as decline; that view will read 1, 4 points higher than ours. |
+
+**Cross-connector reconciliation:**
+
+| Comparison | Expected relationship | When divergence is legitimate |
+| --- | --- | --- |
+| `stripe_decline_rate` ↔ [`paypal.pp_decline_rate`](/nerve-centre/kpi-cards/paypal/decline-failure-rate) | Should be similar bands (4, 8%). PayPal slightly lower typically because Express Checkout reduces fraud surface. | Different processors, different traffic mixes. A large gap is usually traffic composition, not platform fault. |
+| `stripe_decline_rate` ↔ [`shopify.checkout_completion_rate`](/nerve-centre/shopify/checkout_completion_rate) | Inverse relationship. When decline rate spikes, checkout completion drops. | If decline rate spikes but completion holds, something downstream of payments (manual review, fraud team intervention) is recovering charges. If both move together, declines are causing real lost revenue. |
+
+The cross-channel pairing is what [`stripe_xc_decline_vs_funnel`](/nerve-centre/kpi-cards/stripe/decline-spike-vs-checkout-funnel-drop) was built to surface. When decline rate is moving, that card answers "is it costing us real revenue, or just shuffling around?"
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple processors)</em></summary>
+
+The decline-rate metric exists with the same definition on PayPal. This is **not** a reconciliation, your Stripe charges aren't running through PayPal in parallel.
+
+- [`paypal.pp_decline_rate`](/nerve-centre/kpi-cards/paypal/decline-failure-rate)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+> Reconciliation questions ("why doesn't this match Stripe Dashboard?") are answered in the **Reconciling against the vendor's own dashboard** section above.
+
+**"What's a healthy decline rate?"**
+The Stripe-published healthy band for ecommerce is **3, 7%**. Subscription and SaaS billing tends higher (8, 12%) because dunning cycles repeatedly retry already-failed cards. Below 3% usually means a low-risk customer base (B2B, returning subscribers, no high-ticket items). Above 8% triggers our alert; above 12% is unusual outside dunning-heavy verticals and almost always means something is broken (Radar mis-tuned, traffic source compromised, processor misconfiguration).
+
+**"Are 3DS-failed charges counted as declines?"**
+**No.** They sit at `status = canceled` or `requires_action`, neither of which is `failed`. Most merchants find this surprising the first time. The reasoning: 3DS failures are a *customer-action* outcome (they walked away), not an issuer decision. They do drag [Auth Rate](/nerve-centre/kpi-cards/stripe/authorisation-success-rate) down. If you want a "wider decline rate" that includes 3DS failures, watch [Auth Rate](/nerve-centre/kpi-cards/stripe/authorisation-success-rate) instead and treat its complement as your number.
+
+**"Are SCA-required charges that the customer abandoned counted?"**
+No, same reason as above. They sit at `status = requires_action` or `canceled`. Pair with [3DS Abandon Rate](/nerve-centre/kpi-cards/stripe/3ds-challenge-abandon-rate) for that view.
+
+**"Are delayed-capture authorisations counted?"**
+No. Auth-only holds that Stripe never captured stay `pending`. They contribute to neither the auth-rate numerator nor the decline-rate numerator until they resolve.
+
+**"Why is my decline rate spiking on Smart Retries?"**
+Stripe Smart Retries (and any custom dunning) re-tries previously-failed charges. Each retry is a new charge attempt with its own success/fail status. If the retry succeeds, `metadata.retry_attempt` is populated and you'll see the win in [Retry Success Rate](/nerve-centre/kpi-cards/stripe/smart-retry-success-rate). If it fails again, it adds another row to your decline rate. Subscription stores running weekly dunning cycles often see a 2, 4 point swing in decline rate over the cycle, this is normal. The relevant question is whether net recovered revenue (post-retry) is going up or down, not the rate.
+
+**"Multi-currency, does the rate work?"**
+Yes. Decline rate is currency-neutral (count metric). Numerator and denominator span all currencies. If you want a per-currency view, [Decline Rate by Card Country](/nerve-centre/kpi-cards/stripe/decline-rate-by-card-country) is the closest proxy (card country and presentment currency correlate strongly).
+
+**"Why is my decline rate higher right after launching a new market?"**
+First-time international buyers skew toward higher-risk profiles than your existing customer base: more international issuers without strong relationships with your acquirer, more cards without Verified-by-Visa enrolment, more issuers with conservative defaults for cross-border merchants. Decline rate jumping 2, 5 points after opening a new region is normal. Confirm by checking [Decline Rate by Card Country](/nerve-centre/kpi-cards/stripe/decline-rate-by-card-country). The fix is usually adding local payment methods (iDEAL in NL, Sofort in DE, Bancontact in BE), not tightening Radar.
+
+**"Stripe says my decline rate is fine but yours says it's elevated, who's right?"**
+Both, usually. The most common cause is the page cap: Stripe Dashboard sees the full day's charges; we see the latest 1,000. If your decline rate runs higher in the evening (post-work shopping with more fraud attempts), our snapshot will read higher than Stripe's daily average. Solution: compare matching windows. If it persists across the same window, walk through the reconciliation table above; outcome-reason backfill on the most recent 24h is the next most common cause.
+
+**"Why isn't dispute rate part of decline rate?"**
+Because disputes happen to *successful* charges, weeks or months after the auth. They're a fulfilment/fraud signal, not a payment-acceptance signal. Watch [Dispute Rate](/nerve-centre/kpi-cards/stripe/dispute-rate) separately.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Decline Rate* is one of hundreds of KPI pulses Vortex IQ tracks across Stripe and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

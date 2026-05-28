@@ -1,0 +1,161 @@
+---
+title: "Inventory Sync Drift, Sage"
+sidebarTitle: "Inventory Sync Drift"
+description: "SKUs whose on-hand count differs between Sage Intacct (system of record) and commerce platform. Sync-failure detector. How to read it, why it matters, and ..."
+---
+
+**Card class:** Cross-Channel  •  **Category:** Ecommerce Platform
+
+> SKUs whose on-hand count differs between Sage Intacct (system of record) and commerce platform. Sync-failure detector.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> SKUs whose on-hand count drifts between Sage Intacct (the system of record for Inventory Control) and the commerce platform's published storefront stock count. The operational twin of the Revenue Gap card: same root cause (sync failure between Intacct and commerce), different symptom (inventory not revenue). Each row is one Item with the Intacct on-hand, the commerce-platform on-hand, the absolute drift, and the owning Intacct dimension (Item, Location, Warehouse).
+
+| | |
+| --- | --- |
+| **What it counts** | `abs(intacct.item.on_hand - commerce.variant.inventory_quantity)` per SKU, where the drift exceeds the configured tolerance (default 5 units). Listed with the Intacct Item record, the Location dimension (warehouse), and the commerce-platform variant record. |
+| **Tax treatment** | Not applicable. This is a unit-count comparison, not a financial figure. |
+| **Shipping** | Not applicable. |
+| **Currency** | Not applicable. |
+| **Channels / sources** | Default: each commerce channel compared against Intacct on-hand at the matched Location dimension. Multi-warehouse Intacct accounts: drift computed per Location, since one Location may sync to one commerce channel and another to a marketplace. |
+| **Tolerance** | Default ±5 units; configurable per Item class. Tighter (±1) for high-velocity B2B distribution; looser (±10 or ±20) for low-velocity assortment items where small drifts are economically inconsequential. |
+| **Owning Intacct dimension** | Each row is tagged with the dimension whose mapping is broken: Item (most common, an Item record exists in Intacct but not in commerce or vice versa), Location (a Warehouse is on-hand in Intacct but the commerce sync only covers a subset of warehouses), Class (rare, Class restructure broke the lookup), or "config" (a webhook / credential / workflow problem with no dimensional cause). |
+| **Time window** | `RT` (real-time, refreshes on dashboard load and on inventory-change webhook events) |
+| **Alert trigger** | `any SKU drift >5 units`. Healthy stores run zero or near-zero drift continuously; spikes correlate with credential rotations, Implementation Partner inventory adjustments, large purchase-order receipts, or new Warehouse setup. |
+| **Implementation Partner alignment** | The Partner's inventory-management workflow typically runs Intacct-side cycle counts and adjustment journals; the commerce-side count updates via the integration. If the Partner posts a large adjustment outside the integration's notification window, this card spikes briefly until the next sync. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Sage data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US B2B distributor on Sage Intacct Multi-Entity Console with three Locations: a primary warehouse in New Jersey (USD entity), a secondary in Texas (USD entity), and a Canadian DC in Ontario (CAD entity). BigCommerce B2B Edition on the front-end. Intacct's Inventory Control module is the system of record. Reading: real-time on 02 May 26.
+
+**Headline:** 47 Items showing drift, total absolute drift across all Items: 1,184 units. Largest single-Item drift: SKU `WIDGET-PRO-A` at 142 units.
+
+**Top 8 drift cases:**
+
+| Item | Intacct on-hand | Commerce on-hand | Drift (units) | Location | Owning dimension | Cause |
+| --- | --- | --- | --- | --- | --- | --- |
+| WIDGET-PRO-A | 384 | 526 | 142 | NJ-Primary | Location | A 142-unit Inventory Adjustment posted manually in Intacct yesterday afternoon (cycle-count correction); the integration only reads on a 60-min refresh, last sync ran 4 hours ago |
+| GADGET-2026-X | 0 | 84 | 84 | NJ-Primary | Item | New SKU `GADGET-2026-X` exists in Intacct (created last week) but the commerce-side Item record was created from a stale CSV import; the variant has 84 units on Shopify that do not exist on the warehouse floor |
+| KIT-VEGA-2026 | 220 | 156 | 64 | NJ-Primary | config | Webhook backlog after the integration's credential rotated yesterday; 64 units of Sales Order fulfilment have happened since the last successful webhook delivery |
+| BUNDLE-SOLAR | 145 | 145 | 0 | NJ-Primary, TX-Secondary | (n/a) | Drift = 0 at the bundle level but the Location split has shifted: 100 NJ + 45 TX in Intacct, vs 145 all-NJ on commerce |
+| WIDGET-PRO-B | 78 | 0 | 78 | TX-Secondary | Location | The TX warehouse was added to Intacct last week but not yet enabled in the commerce-side multi-Location stock display |
+| SEASONAL-Q2 | 0 | 12 | 12 | NJ-Primary | Item | Discontinued SKU; Intacct shows 0 on-hand and active = false, but commerce has not yet pulled the discontinuation, so 12 units remain orderable on the storefront |
+| LARGE-CASE-CA | 84 | 84 | 0 | ON-Canadian | (n/a) | Healthy, listed for awareness; Canadian sub Location syncs cleanly |
+| MIN-COMPONENT | 1,420 | 1,420 | 0 | NJ-Primary | (n/a) | Healthy, listed for awareness |
+
+Five things to notice:
+
+1. **WIDGET-PRO-A's 142-unit drift is the highest-priority but lowest-risk row.** Intacct shows 384, commerce shows 526. The Implementation Partner posted a 142-unit Inventory Adjustment yesterday afternoon (a cycle count revealed the warehouse had over-counted in the prior period and the adjustment wrote down the on-hand). The commerce-side stock count has not yet refreshed because the integration runs on a 60-minute pull cadence. Risk: in the next 4 hours, customers can place orders for stock that does not exist (commerce thinks 526, reality is 384). Recovery: force-refresh the integration immediately, then post a manual stock-adjustment to commerce. Systemic fix: configure inventory-adjustment webhooks from Intacct (push) rather than poll-based (pull); most integrations support this but it requires the Web Services User permission to be configured.
+2. **GADGET-2026-X's 84-unit drift is the killer over-sell risk.** Intacct shows 0, commerce shows 84. This is not "stock we cannot sell"; this is "stock the storefront thinks it can sell that does not exist on the floor". Every order placed against GADGET-2026-X right now generates a customer-promised order with no fulfilment. Recovery, immediate: pause the SKU on commerce (set on-hand to 0 or hide it) within the next 30 minutes. Investigate the source of the phantom 84: a stale CSV import that loaded a planning forecast as on-hand, a duplicate Item record in commerce, or a manual override an admin set. The 84 units never existed in Intacct; the commerce side is wrong.
+3. **KIT-VEGA-2026's 64-unit drift traces to the credential rotation.** Yesterday's credential rotation broke the webhook delivery; 64 units of Sales Order fulfilment shipped from the warehouse and were posted to Intacct's Item.on_hand reduction, but the webhook to commerce did not fire because the credential was bad. Recovery: replay the webhook queue (Vortex IQ stores the failed deliveries in its dead-letter queue for 7 days) once the credential is rotated. Systemic fix: monitor webhook delivery success rate as a separate alert; this should be the first card the Operations team checks at 9am.
+4. **BUNDLE-SOLAR's drift = 0 is interesting because the Location split has shifted, not the total.** Intacct shows 100 NJ + 45 TX = 145; commerce shows 145 all-NJ. From a total-stock perspective the drift is zero, but from an order-routing perspective the commerce side will route every order to NJ even if TX is closer to the customer. This is the silent multi-Location issue. The fix is to enable per-Location stock display on the commerce platform (BigCommerce supports this, Shopify Plus supports this, Adobe Commerce supports this), then map Intacct Locations to commerce locations in the field map.
+5. **WIDGET-PRO-B's 78-unit drift in the TX warehouse highlights the Location-dimension mapping gap.** TX-Secondary was added to Intacct last week as a new Location dimension, but the commerce integration only had NJ-Primary configured at setup. Until the field map is updated to include TX-Secondary, every TX-on-hand unit is invisible to commerce. 78 units of WIDGET-PRO-B sit unsellable because the storefront never sees them. Recovery: extend the field map's Location-dimension mapping to include TX-Secondary, then resync the affected Items.
+
+**Net operational impact:** the 47 drift rows decompose into roughly 15 over-sell-risk Items (commerce thinks it has stock it does not), 22 under-sell-loss Items (commerce thinks it has less stock than it does), 8 multi-Location split issues, and 2 healthy zero-drift rows listed for awareness. The Operations team should pause the over-sell-risk Items in the next 30 minutes (15 minutes of action prevents potential customer-experience damage) and the under-sell-loss Items can be resynced over the next hour (recovers selling capacity but does not have an immediate customer-facing risk).
+
+**This is the Sage Intacct operational telemetry that no Implementation Partner pack and no commerce-platform inventory report can deliver alone.** Intacct sees its own on-hand, commerce sees its own published stock, and the gap between them is where over-sells and lost-sales live. Vortex IQ surfaces it in real-time, dimensionally decomposed, with the recovery action attached to each row.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Inventory Sync Drift |
+| --- | --- |
+| [OOS with Open Order Demand](/nerve-centre/kpi-cards/sage/oos-with-open-order-demand) | The over-sell-risk twin: when commerce thinks stock exists but Intacct shows zero, the next over-sell is one click away. |
+| [Total Inventory Value](/nerve-centre/kpi-cards/sage/sage-total-inventory-value) | Intacct-side denominator, the on-hand totals this card compares against. |
+| [Low Stock Alerts](/nerve-centre/kpi-cards/sage/low-stock-alerts) | Surfaces SKUs at risk of stock-out; combined with this card, identifies SKUs at risk of stock-out AND drift simultaneously. |
+| [Inventory Aging](/nerve-centre/kpi-cards/sage/inventory-aging) | The aged-stock view; drift in aged-stock buckets is usually accounting policy, not operational. |
+| [Revenue Gap, Detailed Breakdown](/nerve-centre/kpi-cards/sage/revenue-gap-detailed-breakdown) | The financial twin; same root cause (Intacct-commerce sync broken), different symptom. |
+| [Commerce Orders Without Sage Intacct Order](/nerve-centre/kpi-cards/sage/commerce-orders-without-sage-intacct-order) | The order-side leak; this card is the inventory-side leak. Both fire simultaneously when a sync regresses. |
+| [`shopify.inventory_quantity`](/nerve-centre/shopify/inventory_quantity) | Shopify-side inventory feed; the comparison side of this card for Shopify-fronted stores. |
+| [`bigcommerce.inventory_level`](/nerve-centre/bigcommerce/inventory_level) | Same for BigCommerce-fronted stores. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Sage Intacct:**
+
+Sage Intacct's Inventory Control module is the system of record for on-hand. The closest native views are:
+
+> **Reports → Inventory → Stock Status by Item** with the Location dimension pinned (the per-Location on-hand snapshot)
+> **Reports → Inventory → Inventory Adjustment Log** for recent stock-corrections that may explain transient drift
+> **Interactive Custom Report** against the Inventory Item data source for an audit-grade tie-out, joined on `ITEM.NAME` and `LOCATION.NAME`
+> **Order Entry → Open Orders by Item** to see SOs that have committed stock and reduced available-to-promise
+
+The commerce-platform side: BigCommerce Admin's Products report, Shopify Admin's Inventory page, Adobe Commerce's Catalog → Inventory view. Manually diff per Item and per Location.
+
+The Implementation Partner pattern: most Partners run the cycle-count workflow inside Intacct (cycle count posts as an Inventory Adjustment), which corrects Intacct's on-hand. The commerce-side correction is downstream of the integration; if the Partner's adjustment is large and the integration is poll-based, the drift appears immediately and resolves on next sync. If the integration is webhook-based with proper retry logic, the drift appears for under a minute.
+
+**Why our drift list may legitimately differ from a manual cross-check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Read timing** | Material | Intacct on-hand is read on Vortex IQ's sync cadence (typically 15 to 60 minutes); commerce on-hand is read in real-time. A read-time gap of even 30 minutes can explain transient drift on high-velocity Items. |
+| **Available-to-promise vs on-hand** | Material | Intacct distinguishes on-hand (physical) from available-to-promise (on-hand minus committed SOs). Most commerce platforms publish available-to-promise; if your Intacct integration syncs on-hand, you will always show drift equal to the committed-SO total. Confirm the field-map setting. |
+| **Multi-Location aggregation** | Either | If commerce shows aggregated multi-warehouse stock and Intacct sums all Locations, drift = 0. If commerce shows only the primary Location, drift includes the secondary-Location stock. The BUNDLE-SOLAR case in the Worked Example illustrates the per-Location split issue. |
+| **Tolerance setting** | Either | Default ±5 units; tighter for high-velocity, looser for low-velocity. The number of rows is sensitive to this. |
+| **Discontinued Item handling** | Either | Items with `active = false` in Intacct may still show on commerce until the discontinuation propagates. Tune the field map to exclude discontinued Items from the drift comparison. |
+| **Pending receipts** | Card lower | Inbound stock that has a Purchase Order receipt pending but not yet posted shows in Intacct as on-hand once received; commerce updates on the integration's next pull. Drift between receipt-posting and next-sync is normal. |
+
+**Cross-connector reconciliation:**
+
+This card IS the cross-connector inventory-leak detector. The Sage Intacct dimensional advantage shows up most clearly in the per-Location split case (BUNDLE-SOLAR in the Worked Example) and the new-Location-mapping case (WIDGET-PRO-B in TX-Secondary): both are Location-dimension issues that need a dimensional read to diagnose. Other ERP equivalents (NetSuite Locations, SAP Plants, Acumatica Warehouses) have similar concepts but lack the queryable-dimension parity that makes the Intacct read so direct. For multi-Location merchants, this card is one of the strongest reasons to choose Intacct as the financial spine.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My drift count is consistently 5 to 10 Items. Should I worry?**
+Probably not. A small steady-state drift count usually reflects the integration's poll cadence (Items in flux during the sync window) and a few low-velocity SKUs near the tolerance edge. Investigate when the count spikes above your normal baseline, not when it sits at the baseline.
+
+**My drift count just spiked from 4 to 78. What happened?**
+Three usual causes: (1) a credential rotation broke webhook delivery (KIT-VEGA-2026 case in the Worked Example), (2) the Implementation Partner posted a large Inventory Adjustment outside the integration's notification window (WIDGET-PRO-A case), or (3) a new Location dimension was added in Intacct without updating the field map (WIDGET-PRO-B case). Open the Vortex IQ event log and the Intacct Inventory Adjustment Log for the time the spike occurred; one of those three causes will be evident.
+
+**Should I tune tolerance per Item?**
+Yes for any merchant with mixed-velocity inventory. Set tighter tolerance (±1) for top-50 velocity Items where over-sells are reputationally damaging; set looser (±10 or ±20) for the long tail where small drifts are economically inconsequential. The field map supports per-Item tolerance overrides; most merchants configure tolerance by Item Class (high-velocity Class = ±1, slow-velocity Class = ±10).
+
+**Multi-Location: how do I read drift when commerce shows aggregated stock and Intacct shows per-Location?**
+Configure the field map to aggregate Intacct on-hand across the configured Location set before comparison. The card then reads as a total-stock comparison; the Location-dimension column shows the Locations included in the aggregate. The per-Location split issue (BUNDLE-SOLAR case) requires the commerce platform to support per-Location stock display; if it does not, this is a structural limit not a sync issue.
+
+**Available-to-promise vs on-hand: which does Intacct sync to commerce?**
+Configurable. Most Intacct integrations sync available-to-promise (on-hand minus committed Sales Orders) because that is the number a commerce shopper should see. Some merchants prefer to sync raw on-hand and have commerce subtract committed-SO at the storefront level. Vortex IQ reads whichever Intacct field your field map points at; confirm the setting if you see persistent drift equal to the committed-SO total.
+
+**Sage Intacct Inventory Control vs the Sage Intacct ASSETS module: which feeds this card?**
+Inventory Control. The ASSETS module tracks fixed assets, not stock. This card reads `INVENTORYITEM.QTYONHAND` from the Inventory Control module's data source.
+
+**REST vs XML API freshness, does it affect this card?**
+Yes, more than for revenue cards. Inventory changes happen at higher frequency than revenue postings (every Sales Order fulfilment, every Purchase Order receipt, every Inventory Adjustment). The XML API is faster for bulk reads of the on-hand snapshot; REST is used for incremental change-event delivery where supported. For real-time intraday accuracy, ensure the field map is configured for the highest-frequency available source.
+
+**My Implementation Partner says all my drifts are normal "in-flight" inventory. Are they right?**
+Sometimes. In-flight inventory (units committed to an open Sales Order but not yet shipped) is normal and accounts for some drift. The diagnostic test: drift on Items with no open SOs is a sync issue; drift on Items with large open-SO totals matches the available-to-promise vs on-hand setting (see above). Cross-reference [Open Orders](/nerve-centre/kpi-cards/sage/sage-open-so-value) per Item to separate the two cases.
+
+**Can I auto-resync drifted Items from this card?**
+Yes via Ask Viq. Vortex IQ supports a "force resync" action that re-reads Intacct on-hand for the listed Items and pushes the corrected count to commerce. Requires merchant authorisation and the relevant integration permissions. The action is idempotent: if Intacct's on-hand has already changed since the drift was detected, the resync uses the new Intacct value as authoritative.
+
+**What about kits, bundles, and assemblies?**
+Sage Intacct's Inventory Kit functionality (or assemblies in some configurations) means a "kit Item" is composed of component Items. Commerce platforms typically treat the kit as a single sellable Item with a single on-hand count. The drift comparison runs at the kit-Item level, not the component-Item level, so a kit shows drift only if the kit's published count diverges from Intacct's kit-availability. Component-level drift is invisible to this card; for component-stock visibility, run a separate per-component query.
+
+**Sage Intacct vs NetSuite vs Acumatica on this card?**
+NetSuite has the most mature multi-Location support (Inventory Item Locations subrecord) but the dimensional cut requires SuiteAnalytics workbooks. Sage Intacct's Location dimension is queryable directly from the GL Detail and Inventory Item data sources, which makes the card's per-Location decomposition cleaner. Acumatica's warehouse model is similar to Intacct but the API surface is less mature. For multi-warehouse mid-market merchants, Intacct is typically the cleanest fit; for single-warehouse merchants, all three behave similarly on this card.
+
+**My Multi-Entity Console account: should I run drift detection per entity or consolidated?**
+Per entity. Each entity in Multi-Entity Console has its own Inventory Control module and its own Locations. Aggregating across entities would mix US-warehouse stock with Canadian-warehouse stock, which is operationally meaningless. The card defaults to per-entity drift; the dashboard filter respects the entity scope.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Inventory Sync Drift* is one of hundreds of KPI pulses Vortex IQ tracks across Sage and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,163 @@
+---
+title: "Multi-Currency, Vortex IQ Documentation"
+description: "How the Nerve Centre handles multi-currency commerce. Per-currency display, FX translation for cross-currency aggregation, and the avg / total pattern that commerce cards use."
+---
+
+International commerce makes currency a load-bearing concept on every revenue, refund, shipping, and tax KPI. A store taking GBP, EUR, and USD orders in the same window cannot have a single "Total Revenue" number without choosing between two presentation models: per-currency (three separate values) or FX-translated (one consolidated value with the conversion logic disclosed). The [Nerve Centre](/nerve-centre/overview) supports both, with explicit defaults per card and per workspace, so the merchant always knows which model is in play. This page documents the currency-code model, when FX translation runs, the `{avg, total}` object pattern that commerce cards use, and the precision rules for refunds, shipping, and tax.
+
+## The two models
+
+| Model | What it does | When to use it |
+| --- | --- | --- |
+| **Per-currency** | The card renders one row per currency code present in the period's data. | When the merchant operates each currency as a distinct book (e.g. UK and US entities reporting separately). |
+| **FX-translated** | The card converts every transaction to the workspace's reporting currency at a defined FX rate, then aggregates. | When the merchant operates a single book and wants the consolidated picture. |
+
+The card's recipe sets the default; the workspace can override globally or per-card. Hero cards on commerce platforms (Shopify, BigCommerce, Adobe Commerce) default to per-currency display so a merchant cannot silently misread an FX-translated number as the natural-currency book.
+
+## Currency code, the source of truth
+
+Every transaction in a vendor's data carries a currency code (`GBP`, `EUR`, `USD`, `JPY`, `AUD`). The Nerve Centre's ingest layer captures the code at write time and never strips it. So the cache of the trailing 30 days of Shopify orders carries one row per order with that order's `currency` field.
+
+When a card renders, it reads the cache and groups by currency. Three things can happen:
+
+1. **All orders in one currency.** The card renders the single value with a currency symbol prefix (£165,890).
+2. **Multiple currencies in the period.** The card renders one row per currency or, if FX-translated, the consolidated value with the FX disclosure.
+3. **The currency code is missing on some rows.** This is a data-quality flag; the card renders the value with a "(unknown currency on N rows)" annotation. Common cause: vendor API gaps or test orders.
+
+Currency code is detected automatically; the merchant does not configure per-card. The detection is from:
+
+- **OpenSearch index.** For commerce platforms, the ingest writes a `currencyCode` field per order; the cards read it.
+- **Vendor field.** For payment processors (Stripe, PayPal), the API response carries the currency code on every charge.
+- **Workspace fallback.** If a card cannot read a currency code from any of the above (rare), it falls back to the workspace's default currency configured under [Settings, Account](/platform/workspace-admin).
+
+## Per-currency display
+
+When a card renders in per-currency mode, the tile groups by currency and shows one row per code. The visual:
+
+- Each row carries the currency symbol (£, €, $, ¥) detected from the code.
+- Rows are ordered by total descending (largest currency first).
+- A "Total in workspace currency" footer can be enabled per card, showing the FX-translated total beneath the per-currency rows.
+
+Per-currency is the safer default for commerce platforms because:
+
+- Refunds, shipping, and tax are computed per currency by the vendor; aggregating across currencies arithmetically (without FX) produces a meaningless number.
+- The merchant operating a UK entity and a US entity has different VAT and sales-tax obligations per currency; per-currency display preserves the entity boundary.
+- Multi-currency Shopify uses `presentmentCurrency` to track the storefront-side currency separately from the shop currency; per-currency display reflects this directly.
+
+## FX translation
+
+When the merchant wants a consolidated view, the card switches to FX-translated mode. The translation logic:
+
+- Each transaction is converted at the FX rate captured at the time of the transaction (Shopify, BigCommerce, and Adobe Commerce all expose this rate via their multi-currency APIs).
+- The converted values are summed in the workspace's reporting currency (set under [Settings, Account](/platform/workspace-admin)).
+- The card discloses the translation: "Total revenue (FX translated to GBP at order-time rate): £198,240" with a tooltip showing the source currencies and weights.
+
+Three FX modes are supported:
+
+- **Order-time rate.** The historical rate at which the original transaction was processed. This is the most accurate for accounting purposes; it matches what the vendor banked.
+- **Window-end rate.** A single rate applied across the period (the rate at the period's end boundary). This is faster to compute but less accurate for long-period aggregation.
+- **Live rate.** The current FX rate at render time. This is useful for "what is the consolidated value today if I converted now" reading; not appropriate for historical reporting.
+
+The default is order-time rate for hero commerce cards and window-end rate for non-hero standard cards. The workspace can override under [Dashboard Settings, Currency](/platform/settings/data-refresh).
+
+## The &#123;avg, total&#125; pattern for commerce cards
+
+Commerce cards (Shopify, BigCommerce, Adobe Commerce) often need to show two values per period: the period's total and the per-day average. The runtime represents this as a `{avg, total}` object on each period bucket. The card renderer knows how to format the object as "Avg: X / Total: Y" in the tile.
+
+Why the pattern exists:
+
+- A merchant looking at "30D Total Revenue" wants both the total (the headline number) and the daily average (the run-rate). Without the average, comparing two stores of different sizes is harder.
+- A merchant looking at "7D Refund Rate" wants the period's averaged rate, not the sum of seven daily rates (which is meaningless). The `avg` in the object is the period rate; the `total` is the period count of refunded orders.
+
+Implementation note for the curious: `formatMetricPeriodValue()` in the dashboard JS expects this shape and renders it accordingly. The `hideTodayColumn = true` flag on commerce platforms suppresses the today column because today's incomplete data would distort the average; the card uses `90days → 30days → 7days` for the headline summary card on commerce.
+
+The pattern does **not** apply to:
+
+- Marketing platforms (Klaviyo, Mailchimp, Dotdigital) where the metric is naturally a rate or a count without an avg/total distinction.
+- Payment processors (Stripe, PayPal) where the metric is a sum or a rate but not both.
+- Real-time cards where the period concept does not apply.
+
+## Refunds, shipping, and tax precision
+
+Currency precision matters most on the three sub-totals every commerce card has to handle:
+
+### Refunds
+
+Refunds are processed in the order's original currency, not the workspace currency. A £100 GBP order refunded in full is £100 out, not the FX-converted equivalent of £100 at refund time. Vortex IQ tracks refunds per currency to match the vendor's accounting.
+
+The implication for cards: a card like *Refund Rate* that consumes both a refunds numerator and an orders denominator must compute per currency to be meaningful. A blended cross-currency refund rate is computed only when the merchant explicitly switches to FX-translated mode; the per-currency mode shows three separate refund rates (GBP, EUR, USD).
+
+### Shipping
+
+Shipping cost is in the order currency. Multi-currency stores often have currency-specific shipping rate cards (GBP UK shipping vs USD US shipping vs EUR EU shipping); the values do not aggregate without FX. Cards that include shipping (e.g. Total Revenue with `totalShippingPrice` rolled up) preserve currency precision in the data and aggregate per currency in the render.
+
+### Tax
+
+Tax (VAT in the EU and UK, sales tax in the US, GST in Australia) is the most currency-sensitive sub-total because the rate itself differs by jurisdiction and is captured per order in the order currency. Cards that report on tax (e.g. *Total Tax Collected*, *Average Tax Per Order*) always render per currency by default; FX-translated tax is supported but flagged because cross-currency tax aggregation can mislead in jurisdictions where the rate-base changes.
+
+## Workspace currency setting
+
+The workspace currency is set under [Settings, Account, Workspace Settings](/platform/workspace-admin) at workspace creation time and rarely changes. It governs:
+
+- The reporting currency for FX-translated cards.
+- The default currency display in briefings and exports.
+- The fallback currency when a card cannot detect the currency from the data.
+
+Changing the workspace currency causes FX-translated cards to recompute. Per-currency cards are unaffected (they render per-currency regardless of the workspace setting).
+
+## How currency surfaces in the UI
+
+- **Card tile.** The currency symbol prefix on the headline value. Multi-currency cards render one row per code.
+- **Tooltip.** Hovering the value shows the currency code and any FX disclosure if applicable.
+- **Connector tab header.** When a connector spans multiple currencies, the tab carries a small currency-mix badge ("3 currencies").
+- **Dashboard banner.** When a workspace operates in multiple currencies and one currency has crossed an alert threshold, the banner identifies the currency.
+- **Briefings.** Briefings call out per-currency hero card values when the merchant operates multi-currency.
+
+## How it relates to other modules
+
+- **[Vortex Mind](/vortex-mind)** preserves currency in its evidence bundles. A finding about "revenue dropped 18 percent" carries the currency code in its evidence so the merchant knows which book is affected.
+- **[Ask Viq](/ask-viq)** parses currency from natural language ("revenue in GBP last week", "total in dollars") and renders the answer per currency or FX-translated as requested. The currency disclosure is part of the answer's source-of-truth model.
+- **[Actions](/actions)** carries currency into Kanban cards. A revenue-recovery Action's "expected impact" is sized in the currency of the underlying signal.
+- **[Vortex Memory](/vortex-memory)** archives currency-precise values per snapshot. Historical queries preserve the currency boundary.
+
+## FAQ
+
+**My store takes GBP and EUR. What does my Total Revenue card show?**
+By default, two rows: one for GBP with the £ symbol, one for EUR with the € symbol. The footer carries an "FX-translated total in workspace currency" if you have enabled it.
+
+**Why does my Shopify Total Revenue not match Shopify Admin?**
+Shopify Admin reports in shop currency with vendor-side FX conversion. Vortex IQ defaults to per-currency display. If you want apples-to-apples with Shopify Admin, switch the card to FX-translated mode with order-time rate; the values will agree to within rounding.
+
+**Which FX rate is used for translation?**
+Order-time rate by default for hero commerce cards. The vendor exposes this rate on each transaction. Window-end rate is the alternative for fast aggregation; live rate is for "what does this look like today" reading. The card's tooltip discloses which rate is in play.
+
+**What about cryptocurrencies?**
+Crypto-denominated transactions (BTC, ETH) are supported as standard currency codes. They render in per-currency mode by default. FX translation to fiat at order-time rate is supported where the vendor publishes the rate.
+
+**My multi-currency rate spread is wide. Can I see the FX impact separately?**
+Yes. Cards with FX translation enabled support a "FX impact" sub-card that shows the difference between order-time and window-end FX. A wide spread in the impact is itself a signal (currency volatility risk) and the card has its own threshold rule.
+
+**Is per-currency display the same as the multi-currency selling feature in Shopify?**
+Closely related but not identical. Shopify multi-currency selling lets the storefront present prices in customer-local currency at the point of sale; the order is recorded with both `presentmentCurrency` (what the customer paid) and `shopMoney.amount` (the shop currency value). Vortex IQ reads `presentmentCurrency` for per-currency display because it is the customer-facing book.
+
+**Does Vortex Mind reason across currencies?**
+Yes, when the diagnosis is a currency-aware question. A finding about "European revenue dropped" walks the EUR-denominated transactions; a finding about "blended margin compressed" walks the FX-translated aggregate. The diagnosis carries the currency context in its evidence.
+
+**Can I have different reporting currencies per profile?**
+The workspace currency is workspace-scoped; profiles do not override it. Profiles can override which connectors and clones are visible (see [multi-property and multi-account](/nerve-centre/kpi-cards/concepts/multi-property-and-multi-account)) but currency is a workspace-level concept. For agencies with clients in different reporting currencies, run a workspace per client.
+
+## Cross-links
+
+- Concept: [the KPI model](/nerve-centre/kpi-cards/concepts/kpi-model)
+- Concept: [data freshness](/nerve-centre/kpi-cards/concepts/data-freshness)
+- Concept: [time windows](/nerve-centre/kpi-cards/concepts/time-windows)
+- Concept: [multi-property and multi-account](/nerve-centre/kpi-cards/concepts/multi-property-and-multi-account)
+- Concept: [hero, cross-channel, tiers](/nerve-centre/kpi-cards/concepts/hero-cross-channel-tiers)
+- Concept: [sentiment model](/nerve-centre/kpi-cards/concepts/sentiment-model)
+- Platform: [Settings, Account](/platform/workspace-admin)
+- Platform: [Settings, Currency Display](/platform/settings/data-refresh)
+- Sample card: [Shopify Total Revenue](/nerve-centre/kpi-cards/shopify/total-revenue)
+- Module: [Vortex Mind](/vortex-mind)
+- Module: [Ask Viq](/ask-viq)
+- Module: [Actions](/actions)
+- Module: [Vortex Memory](/vortex-memory)

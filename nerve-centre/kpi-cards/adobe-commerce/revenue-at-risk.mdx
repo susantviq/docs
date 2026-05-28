@@ -1,0 +1,188 @@
+---
+title: "Revenue at Risk (active incidents), Adobe Commerce"
+sidebarTitle: "Revenue at Risk (active incidents)"
+description: "Live $/min loss while incidents are open. Adobe merchants disproportionately run observability stacks, this is a high-hit-rate kill-shot. How to read it, ..."
+---
+
+**Card class:** Cross-Channel  •  **Category:** Ecommerce Platform
+
+> Live $/min loss while incidents are open. Adobe merchants disproportionately run observability stacks, this is a high-hit-rate kill-shot.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Live dollars-per-minute revenue loss while one or more observability incidents (Datadog, New Relic, PagerDuty, Adobe Commerce Cloud Pro) are open. Multiplies the typical per-minute Adobe `grand_total` rate (calibrated from the prior 4 weeks of same-DOW same-hour data) by the duration each incident has been open. Adobe Commerce merchants disproportionately run observability stacks; this is a kill-shot card for ops and finance.
+
+| | |
+| --- | --- |
+| **What it counts** | For each open incident in connected observability tools (Datadog monitor, New Relic alert, Adobe Commerce Cloud Pro alert), compute (incident_duration_minutes × baseline_revenue_rate_per_minute), where baseline rate = median Adobe `SUM(grand_total)` for the same hour-of-week in the prior 4 weeks. Sum across all open incidents. Returns USD (or the merchant's primary currency). |
+| **API field** | Adobe denominator: `grand_total` from `GET /rest/V1/orders` for the baseline calculation. Incident duration: from the connected observability tool (Datadog `monitor.created` / `monitor.resolved`, New Relic `incident.opened_at` / `closed_at`, etc.). |
+| **VAT / tax treatment** | **Tax-inclusive on the baseline.** Adobe `grand_total` already includes `tax_amount`. The dollar-per-minute figure represents what the customer would have paid (gross of tax remittance); ops and finance often want this, the lost top-line, not the post-tax recoverable. |
+| **Shipping inclusion** | **Included on the baseline.** `grand_total` adds `shipping_amount`. Lost orders weren't going to be free-shipping orders, so including shipping is right. |
+| **Discounts** | Already deducted on the baseline (post-promo `grand_total`). The card represents lost revenue at the typical promotional level, not at hypothetical full-price. |
+| **Credit Memo refund treatment** | **NOT subtracted on the baseline.** `grand_total` is gross of refunds. Refund-heavy merchants will see this card slightly overstate true at-risk revenue (some lost orders would have been refunded anyway). For most merchants the bias is &lt;5%. |
+| **`state` machine inclusion** | **All states included on the baseline.** That covers `new`, `processing`, `complete`, `closed`, `canceled`, `holded`, `pending_payment`, `payment_review`. The Adobe quirk: a baseline calibrated on a high-`pending_payment` store inflates the at-risk figure (it assumes those `pending_payment` orders represent real lost revenue when many would have failed at the gateway anyway). For high-fail stores, prefer a baseline filtered to `state IN (processing, complete, closed)`. |
+| **`pending_payment` quirk** | The asymmetric inflation described above. A 5% `pending_payment` rate inflates the at-risk number by ~5%. Consider it an upper bound on a high-fail store. |
+| **Multi-currency `grand_total` vs `base_grand_total`** | The baseline uses `grand_total` per Store View, then converts each Store View's contribution to the merchant's primary currency at indicative daily FX rates. The total at-risk figure is in primary currency. Material FX moves over a long incident can shift the dollar figure ~1-3%. |
+| **Store View scope (`store_id`)** | **All Store Views included by default**, summed and converted to primary currency. If an incident affects only one region (e.g. a US-only CDN failure), the card overstates at-risk because it assumes the loss spans all regions. Configure per-Store-View incident-routing in the manifest for region-localised incidents. |
+| **Time window** | `RT` (real-time, ticks every minute while incidents are open). |
+| **Alert trigger** | `>$0 (any open incident)`. As soon as any connected observability incident opens, this card lights up. The dollar figure climbs each minute the incident stays open. |
+| **Roles** | owner, finance, operations, engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+```
+SUM(grand_total)
+  WHERE date BETWEEN [period_start, period_end]
+```
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A multi-region apparel brand on Adobe Commerce 2.4.6 with US, UK, and B2B Store Views, running Datadog monitors and PagerDuty incident routing. Tuesday 12 Apr 26, 14:00 GMT.
+
+**Baseline calibration** (median of the four prior Tuesdays at 14:00):
+
+| Store View | Median hourly `grand_total` | Per-minute baseline |
+| --- | --- | --- |
+| US (USD) | $4,965 | $82.75/min |
+| UK (GBP, ≈ $1.25 indicative) | £1,485 ≈ $1,856 | ~$30.93/min |
+| B2B (USD) | $97 | $1.62/min (low volume, high variance) |
+| **Combined per-minute baseline** | | **~$115.30/min** |
+
+**Active incidents at 14:00:**
+
+| Source | Incident | Duration so far | At-risk computed |
+| --- | --- | --- | --- |
+| Datadog | "Adobe Commerce checkout latency >5s" (P1) | 22 min | 22 × $115.30 = **$2,536.60** |
+| PagerDuty | "Stripe webhook delivery failure" (linked to Datadog) | 22 min (same root cause, deduped) | already counted above |
+| New Relic | "Adobe Commerce admin login slowness" (P3, internal-only) | 8 min | 8 × $115.30 × 0.10 = **$92.24** (P3 weighted at 10%) |
+| **This card** | | | **~$2,629** at-risk |
+
+What this is telling the merchant:
+
+1. **The headline $2,629 is the live cumulative loss estimate.** Each minute the P1 incident continues, ~$115 ticks onto the figure. Engineering, ops, and finance see this in real-time; gives the on-call a hard number to cite when prioritising the page.
+2. **The Stripe webhook failure deduped against the Datadog checkout-latency incident.** Both are symptoms of the same root cause (gateway-callback path broken). The card avoids double-counting by deduping on PagerDuty's `incident_key` correlation. If the merchant didn't have PagerDuty correlating, both would count and the figure would be inflated by 22 × $115 = $2,536.
+3. **The P3 internal-admin incident is weighted to 10% of revenue impact.** A slow admin login doesn't directly stop customers from buying; the card assumes a 10% indirect impact (operations team can't process queued orders as fast). Configurable per merchant.
+4. **The baseline assumes business-as-usual hourly cadence.** A planned promo or BFCM peak would understate at-risk; a planned quiet period (Sunday morning) would overstate. The card uses a 4-week median which smooths out one-off spikes but can't anticipate today's specific demand.
+5. **The figure assumes 100% of baseline traffic is lost during the incident.** If the incident is partial (say, only US customers affected by a US-only CDN issue), the card overstates by the share of revenue that comes from unaffected Store Views. Configure per-region incident routing in the manifest for accurate localised at-risk figures.
+6. **The figure is gross of refunds and includes `pending_payment` baseline orders.** A high-`pending_payment` Adobe store inflates the at-risk by 2-5%. For a "realised cash" at-risk view, recalibrate the baseline to `state IN (processing, complete, closed)`.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+This card is the kill-shot. Pair with these to investigate root cause:
+
+| Card | Why pair it with Revenue at Risk |
+| --- | --- |
+| [Revenue Drop Alert](/nerve-centre/kpi-cards/adobe-commerce/revenue-drop-alert) | The earlier-firing canary. If this fires alongside Revenue Drop Alert, the incident is genuinely impacting customers. If only Revenue Drop fires without an open incident, your observability isn't catching everything. |
+| [Total Revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | Provides the baseline for the at-risk calculation. Movement on one drives the other. |
+| [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) | If `pending_payment` is spiking during an incident, the gateway callback is broken. Common Adobe-specific failure mode. |
+| [Active Ads on OOS SKUs](/nerve-centre/kpi-cards/adobe-commerce/active-ads-on-out-of-stock-skus) | Long-running incidents may correlate with stock-feed sync failures, OOS ads spike when the catalogue feed stalls. |
+| [Catalogue Drift](/nerve-centre/kpi-cards/adobe-commerce/catalogue-drift) | Sister cross-channel card. Drift can be a symptom of upstream incident (failed sync job). |
+| [`datadog.datadog_open_incidents`](/nerve-centre/datadog/datadog_open_incidents) | The numerator on the incident side. Click through to the Datadog incident timeline. |
+| [`newrelic.nr_open_alerts`](/nerve-centre/newrelic/nr_open_alerts) | New Relic equivalent. |
+| [`stripe.stripe_total_revenue`](/nerve-centre/kpi-cards/stripe/total-charge-volume) | Cross-check: if Stripe revenue is unchanged during an incident, the incident isn't affecting payment. The contrast localises the problem. |
+| [`google_analytics.ga_sessions_trend`](/nerve-centre/google_analytics/ga_sessions_trend) | If sessions cratered alongside the incident, it's a customer-facing outage; if sessions are steady, it's a back-office incident. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Adobe Commerce Admin:**
+
+Adobe Commerce Admin doesn't have a native "revenue at risk during incident" view, the closest cross-checks are:
+
+> **Reports > Sales > Orders** (or **Reports > Sales** in 2.4.6+) for the same hour vs. baseline. Set the time range to *Hourly* and look at the latest hour's revenue against the prior week's same hour.
+
+For Adobe Commerce Cloud (PaaS) merchants:
+
+> **Adobe Experience Cloud > Commerce > Site-Wide Analysis Tool** has incident timelines and surface-level performance metrics. Use it for incident causation analysis; not for revenue impact (it doesn't quantify dollar loss).
+
+Other Adobe Commerce Admin views that *look* relevant but aren't:
+
+- **System > Notifications**: internal Adobe Commerce admin notifications (login, indexer status), not customer-facing incidents.
+- **System > Tools > Cache Management**: cache state, not incident state.
+- **Reports > Sales > Coupons**: irrelevant.
+- **Stores > Configuration > Advanced > System**: configuration only.
+
+**Why our number may legitimately differ from a manual revenue-loss calculation:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Time-zone**. Adobe Commerce Admin reports use Store View timezone; the at-risk baseline uses UTC same-DOW same-hour. The 4-week baseline window endpoints sit at different real-world cutoffs. | Material on the boundary |
+| **Currency**. Multi-currency baselines convert to primary currency at indicative daily FX. A material FX move during a long incident can shift the figure ~1-3%. | Material for international merchants |
+| **Store View scope**. Card sums all Store Views; an incident affecting only one region overstates at-risk. | Vortex IQ higher than per-region manual calc |
+| **`canceled` and `pending_payment`**. Baseline includes these; a manual calc using only "realised" orders gives a smaller at-risk figure. | Vortex IQ higher than realised-only baseline |
+| **Incident weighting**. The card weights P3/internal incidents at 10% of full revenue impact. Adjustable per merchant. Manual calcs typically count 0% or 100%, no middle ground. | Card lands between extremes |
+| **Incident dedup**. The card dedups same-root-cause incidents via PagerDuty correlation key. If your incident routing doesn't correlate, manual calcs may inadvertently double-count. | Vortex IQ lower than non-deduped manual calc |
+| **Baseline volatility**. The 4-week median smooths weekly seasonality but can't anticipate today's specific demand (a planned BFCM peak, a launched campaign). | Up to ±20% on launch days |
+| **Sync lag**. Card uses the most recent OpenSearch index sync (5-15 min behind real-time) for baseline; observability tools push incidents in real-time. The numerator is more current than the denominator. | Slight understatement on minute-1 of an incident |
+
+**Cross-connector reconciliation (when these connectors are connected for this merchant):**
+
+This card *is* a multi-connector synthesis. The honest reads:
+
+| Pair | Expected relationship | What divergence tells you |
+| --- | --- | --- |
+| [Total Revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) hourly delta during the incident | Should approximately match the at-risk figure | If actual revenue dropped less than the at-risk figure, the incident is partial (some customers still converting). If actual revenue dropped more, the at-risk is understated, the baseline didn't anticipate today's true demand. |
+| [`stripe.stripe_total_revenue`](/nerve-centre/kpi-cards/stripe/total-charge-volume) hourly during the incident | Stripe drop ≤ Adobe revenue drop | A bigger Stripe drop than Adobe drop means orders are being created but the gateway-callback path is failing. Classic Adobe-Stripe webhook outage. |
+| [`google_analytics.ga_sessions_trend`](/nerve-centre/google_analytics/ga_sessions_trend) | Sessions drop tracks the customer-facing impact | If sessions cratered, the outage is customer-visible (broken homepage, broken cart, CDN). If sessions are steady, the outage is back-office. |
+| [`datadog.datadog_open_incidents`](/nerve-centre/datadog/datadog_open_incidents) | Should equal the count of incidents feeding the at-risk total | Mismatch means an observability connector is desynced. |
+
+---
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The same cross-channel concept exists on other commerce connectors. This is **not a reconciliation**; your Adobe Commerce store doesn't have a parallel Shopify or BigCommerce store.
+
+- [`shopify.shopify_xc_revenue_at_risk_from_incident`](/nerve-centre/kpi-cards/shopify/revenue-at-risk)
+- [`bigcommerce.bc_xc_revenue_at_risk_from_incident`](/nerve-centre/kpi-cards/bigcommerce/revenue-at-risk)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows $X at-risk but my actual revenue dropped less, why?**
+The card is a baseline-projected loss assuming 100% of expected traffic is impacted. Real incidents are usually partial: some customers retry, some browse to product pages but don't checkout, some find their flow works while others fail. The actual loss is typically 30-80% of the at-risk figure. Treat the at-risk number as an upper bound, the headline cost-of-incident if nothing converts.
+
+**The card shows $X at-risk but my actual revenue dropped MORE, why?**
+The baseline didn't anticipate today's specific demand. Common causes: (1) a campaign launched today (paid ads, email blast, influencer drop) that the 4-week median can't see; (2) a holiday or seasonal peak (Black Friday morning); (3) a planned promotion. The card understates at-risk in these conditions. Use the actual revenue gap during the incident as the true loss figure when reporting upward.
+
+**What's the difference between `state` and `status` and does it affect the at-risk figure?**
+The baseline uses `grand_total` summed across all `state` values. So `pending_payment`, `canceled`, `holded` orders all contribute to the baseline. A high-`pending_payment` Adobe store inflates the baseline by 2-5%, which inflates the at-risk figure by the same amount. For a "realised cash" at-risk view, recalibrate the baseline to `state IN (processing, complete, closed)`.
+
+**My finance team uses `base_grand_total`, why doesn't this card?**
+The baseline could use either. The card defaults to `grand_total` per Store View, FX-converted to primary currency at indicative daily rates. `base_grand_total` (FX-converted at order time, frozen) avoids today's FX noise but undercounts the customer-paid figure. For incident-cost reports to finance, use this card's figure (`grand_total` based) and footnote that it's at customer-paid value, not at remitted-cash value.
+
+**My multi-store Adobe Commerce, can the card know which Store View an incident affects?**
+Only if you configure incident routing in the manifest. By default the card assumes any open incident affects all Store Views (combined baseline). For region-localised incidents (a US-only CDN failure), set up per-Store-View incident routing so the card scales the baseline to only the affected region. Otherwise it overstates by the share of revenue from unaffected Store Views.
+
+**Why doesn't Adobe Commerce dashboard show this?**
+Adobe Commerce Admin doesn't natively know about your observability tools. Cloud Pro merchants get some incident telemetry but not revenue impact. This card is the synthesis layer that joins Adobe Commerce revenue data to observability incident data, neither tool does it alone.
+
+**My Stripe revenue dropped during the incident but Adobe revenue looks normal, what does that tell me?**
+Adobe Commerce is creating order skeletons but the Stripe-side capture-confirmation path is failing. Orders sit in `pending_payment`. The at-risk card may understate the cost because Adobe `grand_total` looks roughly normal (the orders exist, they just never paid). Cross-check with [Order State Distribution](/nerve-centre/kpi-cards/adobe-commerce/order-state-breakdown) to confirm the `pending_payment` spike, that's the actual revenue loss.
+
+**Why doesn't Google Analytics agree the incident impacted revenue?**
+GA4 fires `purchase` events client-side; if the customer's checkout failed before the page loaded, GA4 sees a session abandonment but no purchase event, the revenue is missing on both Adobe and GA4. If GA4 sessions are steady but conversions cratered, the issue is at checkout. If both sessions and conversions are steady, the incident is back-office and customer-invisible.
+
+**Multi-currency: does FX volatility during a long incident affect the figure?**
+Yes, but mildly. The card converts each Store View's per-minute baseline to the merchant's primary currency at indicative daily FX. A 1-2% FX move over the course of an hour-long incident shifts the at-risk figure by ~1-3%. For incidents lasting days, FX volatility can compound to 5%+; treat the figure as approximate over multi-day incidents.
+
+**Why does the figure jump up so fast on minute 1?**
+Because the per-minute baseline rate is computed straight away, the card doesn't ramp linearly during the first few minutes. If your store does $115/min on a typical Tuesday afternoon, minute 1 of an incident shows $115; minute 2 shows $230; etc. There's no "warm-up" smoothing. Some merchants prefer a 5-minute moving average; configure in the manifest if needed.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Revenue at Risk (active incidents)* is one of hundreds of KPI pulses Vortex IQ tracks across Adobe Commerce and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.
