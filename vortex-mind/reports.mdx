@@ -1,0 +1,257 @@
+---
+title: "Vortex Mind diagnostic reports: the seven OpenClaw types"
+sidebarTitle: "Diagnostic Reports"
+description: "Full reference for all seven OpenClaw report types: what each one diagnoses, which data sources it reads, what findings it produces, and how to run it."
+---
+
+Vortex Mind ships seven OpenClaw diagnostic report types. Each report runs on its own cadence, answers a specific question, and emits findings into the connector graph for downstream composition by the four briefings and by Ask Viq. The reports are designed to compose: Decline Recovery Intelligence cites Payment Performance findings as evidence; Customer Recovery Opportunity reads from the unrecovered customer pool that Decline Recovery surfaced; Daily Revenue Leakage summarises what the deeper weekly reports found.
+
+## How to run a report
+
+You can trigger any report through three paths:
+
+<Steps>
+  <Step title="Use the Generate Report screen">
+    In the Vortex Mind UI, click **Generate Report**, select the report type, choose your date window, and click **Generate**. The report appears under **View Reports** once the run completes. Most reports complete in 60 to 180 seconds.
+  </Step>
+  <Step title="Wait for the schedule">
+    Each report has a default cadence (see the table in each report section below). You can edit the schedule per workspace in Settings.
+  </Step>
+  <Step title="Trigger from Ask Viq">
+    A natural-language question that resolves to a diagnostic intent — "why did revenue drop last Tuesday?" or "how much revenue did I lose at checkout last month?" — routes straight into an on-demand Vortex Mind run.
+  </Step>
+</Steps>
+
+Every run produces merchant-facing HTML, a structured output JSON block that downstream consumers parse, graph emissions that enrich the connector graph, and zero or more Kanban Action cards for your approval.
+
+---
+
+## The seven reports
+
+<AccordionGroup>
+
+  <Accordion title="1. Payment Performance Intelligence">
+
+    **What it diagnoses.** Which payment methods, gateways, or BINs are costing you revenue, and what the fix is. When Stripe, Braintree, or PayPal are connected as vendor sources, the report surfaces decline reason codes and BIN-level patterns. Without those, it falls back to order-index payment-method analysis only.
+
+    **Default cadence.** Weekly, every Monday at 07:00 local.
+
+    **Primary audience.** Merchant operator, payments engineer, agency finance lead.
+
+    **Data sources read.**
+
+    | Layer | Source | What it surfaces |
+    |---|---|---|
+    | Payment method aggregates | Order index | Attempts, successes, declines, and auth rate per payment method with country and currency buckets. |
+    | Decline reason codes | Stripe, Braintree, PayPal, Cybersource, Adyen, Authorize.Net vendor files | Soft vs hard decline split, recoverable vs not-recoverable framing, reason-by-reason value sizing. |
+    | BIN-level patterns | Vendor file when BIN is exposed | Top 10 issuer BINs with high decline rates, country-tagged and issuer-named where available. |
+    | Geo and currency performance | Order index plus vendor cross-reference | Country-level auth-rate gap vs the global blended rate; currency-level patterns. |
+
+    **Report sections.** Headline → Auth Rate by Payment Method → Decline Reasons → BIN-Level Decline Hotspots → Geo Performance → Currency Performance → Recommendations.
+
+    **Findings produced.** `finding:PAY-AUTH-*`, `finding:PAY-DECLINE-*`, `finding:PAY-BIN-*`. Each recommendation is sized using a documented formula — for example, soft-decline auto-retry is sized as `sum(soft_decline_value) × benchmark_recovery_rate` where the benchmark is 30 to 60 percent.
+
+    **When to run it.** On the Monday schedule as a standing read. Also trigger it immediately when your Nerve Centre auth-rate card breaches — Vortex Mind will fire the report scoped to the affected window — or ask Ask Viq "why is my auth rate dropping?".
+
+    <Note>
+      The report requires at least 14 days of history and at least 100 payment attempts in the window. Below either threshold it renders a placeholder rather than risk false signals.
+    </Note>
+
+  </Accordion>
+
+  <Accordion title="2. Decline Recovery Intelligence">
+
+    **What it diagnoses.** How much revenue is leaking at checkout and how much is actually recoverable. It separates noise — customers who self-recovered — from real opportunity — customers who never returned. The gap, which the report calls the "Size of the Prize", is what you can actually go and capture.
+
+    **Default cadence.** Weekly, every Monday at 07:00 local (CFO-aligned).
+
+    **Primary audience.** CFO, merchant operator, agency growth lead.
+
+    **Data sources read.**
+
+    | Source | What it unlocks |
+    |---|---|
+    | Order index | The declined and incomplete failure populations; recovery joins by lowercased email then customer ID. |
+    | Stripe or other payment vendor | Decline reason codes for the declined population, which powers Recommendation 1's sizing. |
+    | Klaviyo | Recovery attribution to specific flows; identifies which recoveries came from the abandoned-cart sequence. |
+    | Twilio | SMS recovery channel sizing. |
+    | Datadog or Sentry | Evidence on the incomplete population: latency or 5xx errors during the failure window. |
+    | Vortex Apps (StagingPro / RollbackPro) | Deploy markers that align with sudden failure spikes. |
+
+    **Report sections.** Executive Summary → Size of the Prize → Declined vs Incomplete Side by Side → Trend → Decline by Payment Method → Repeat-Failure Customers → Drilldown Tables → Recommendations.
+
+    **Findings produced.** `finding:RECOVERY-CHURN-*`, `finding:RECOVERY-FLOW-*`. Recovery is defined as the same customer — joined by lowercased email, falling back to customer ID — placing a captured order within 30 days. Recoveries beyond 30 days are not credited.
+
+    **The recoverable range.** The report sizes the addressable opportunity using two benchmark bands: 30 to 60 percent for soft-decline auto-retry, and 8 to 15 percent for abandoned-cart email and SMS. The conservative combined floor is what to use for budget planning; the high end is what strong execution can achieve.
+
+    **When to run it.** Read alongside Payment Performance Intelligence on Mondays — Payment Performance diagnoses which pipe is leaking; this report sizes the leak and the recoverable prize.
+
+    <Note>
+      The report requires at least 7 days of order history. Below that the recovery joins are not statistically meaningful and the recipe will refuse to run.
+    </Note>
+
+  </Accordion>
+
+  <Accordion title="3. Checkout Conversion Failure">
+
+    **What it diagnoses.** Where in your checkout funnel you are losing shoppers, and how much of that loss is recoverable. It pairs GA4 session-level funnel events with the order index's checkout-failure population, so you see not just the percentage drop between two steps but the dollar value behind it and the specific friction explaining it.
+
+    **Default cadence.** Weekly, every Wednesday.
+
+    **Primary audience.** Merchant operator, dev team, agency.
+
+    **Data sources read.**
+
+    | Input | Source | Required |
+    |---|---|---|
+    | GA4 funnel events | `session_start`, `view_item`, `add_to_cart`, `begin_checkout`, `add_shipping_info`, `add_payment_info`, `purchase` | Recommended |
+    | Order index failure population | `paymentStatus=declined` and `status=Incomplete` | Required |
+    | Integration graph | Open findings in `CHECKOUT-*`, `WEBPERF-*`, `CHECKOUT-PAY-*` namespaces | Recommended |
+    | Active payment methods | Connected payment connector (Stripe, PayPal, Cybersource) | Recommended |
+
+    **Report sections.** Headline → Funnel visualisation → Drop-off by step → Device breakdown → Failed cart correlation → Recommendations.
+
+    **Findings produced.** `finding:CHECKOUT-STAGE-*`, `finding:CHECKOUT-VALIDATION-*`. The report also detects tracking gaps: when GA4 payment attempts exceed order-index failures by more than 1.5x, it surfaces an untracked drop-out finding.
+
+    **When to run it.** When checkout conversion has dropped vs the prior period and the cause is not obvious. When a payment-method change, checkout-form change, or commerce-platform deploy has shipped in the last 14 days. When mobile and desktop conversion rates have diverged.
+
+    <Warning>
+      The report requires at least 14 days of session history. Without GA4 connected, sections 2–4 (funnel visualisation, drop-off by step, device breakdown) are unavailable. You still get the failed-cart correlation and payment-step recommendations.
+    </Warning>
+
+  </Accordion>
+
+  <Accordion title="4. Daily Revenue Leakage">
+
+    **What it diagnoses.** What went wrong yesterday and what you should fix today. It is deliberately tight — a hard cap of 600 words — so you read it in two minutes before your first meeting and walk into the day knowing what to focus on.
+
+    **Default cadence.** Daily at 07:00 local. Delivered by email and in-app. Voice delivery is opt-in.
+
+    **Primary audience.** Merchant operator and agency account manager.
+
+    **Data sources read.** Order index for yesterday's failed and incomplete orders, plus the trailing 7-day daily average for comparison. When Klaviyo is connected, recovery attribution to specific flows is surfaced. Graph emissions from this briefing create `briefing_flagged_customer` edges that the Customer Recovery Opportunity report reads on Tuesday.
+
+    **Report sections.**
+
+    | Section | What it tells you |
+    |---|---|
+    | Yesterday at a Glance | Failed order count, value, organic recovery percentage, direction vs the 7-day average, and a callout on high-value unrecovered orders. |
+    | Top 5 Customers to Recover Today | Ranked by failed cart value. Name, email, payment method, and attempt count per customer. |
+    | One Action for Today | The single highest-leverage move selected by a fixed decision tree: a payment-method spike investigation, a post-deploy finding review, a manual outreach to a high-value customer, or a Klaviyo flow check. |
+
+    **When to run it.** This runs automatically every morning. You can also trigger it via Ask Viq with "what happened yesterday?".
+
+    <Note>
+      The briefing always sends, even on quiet days with zero failures. Skipping silent days would create ambiguity about whether the absence is good news or a system fault.
+    </Note>
+
+  </Accordion>
+
+  <Accordion title="5. Customer Recovery Opportunity">
+
+    **What it diagnoses.** Which specific customers to contact today, in which channel, and with what message. This is an action queue, not a dashboard. Each row is a customer the merchant should reach out to, with a recovery likelihood score and a pre-suggested outreach template.
+
+    **Default cadence.** Weekly, every Tuesday (so you have the queue ready for the working week).
+
+    **Primary audience.** Merchant operator, customer success manager, agency outreach staff.
+
+    **Data sources read.**
+
+    | Source | What it unlocks |
+    |---|---|
+    | Order index | The unrecovered customer pool from the period. |
+    | Customer index (Shopify, BigCommerce, Adobe Commerce) | LTV, prior orders, and last-active-date for the historical buyer boost and the compounding view. |
+    | Stripe or other payment vendor | Decline reason codes for the hard-decline penalty. |
+    | Klaviyo | Email-subscribed status and flow availability for the Klaviyo recovery channel. |
+    | Twilio | Phone number availability and SMS opt-in status for the SMS channel. |
+
+    **Recovery likelihood model.** Each customer receives a deterministic score from 0 to 1, built from: a 0.10 base, a +0.10 bonus per additional attempt (capped at +0.40), a +0.20 bonus for known buyers with prior orders, a +0.10 bonus for same-day multiple attempts, a -0.30 penalty for hard declines (expired or lost card), and a -0.15 penalty for high-risk geographies. The priority score is `recovery_likelihood × cart_value`.
+
+    **The five outreach channels.** Phone or personal email (high-value carts above £1,000 with two or more attempts) → personal email from account manager (known buyers) → Klaviyo recovery flow (email-subscribed customers) → Twilio SMS (opted-in customers with a phone number) → automated email (default fallback).
+
+    **Report sections.** Headline → The Action Queue (top 50) → Channel Mix Summary → Outreach Scripts → Compounding View (LTV alongside cart value for known buyers).
+
+    **When to run it.** Tuesday is the default. Run on-demand via Ask Viq with "who should I email today?" or trigger it from a Nerve Centre cart-abandonment breach.
+
+    <Note>
+      Already-recovered customers, customers contacted within the last 7 days, and GDPR-erased customers are automatically suppressed from the queue. A custom prompt can change the queue's framing but can never bypass these safeguards.
+    </Note>
+
+  </Accordion>
+
+  <Accordion title="6. Google Ads Revenue Intelligence">
+
+    **What it diagnoses.** The state of your Google Ads account at the strategic level — spend trajectory, ROAS trend, waste categories, scaling opportunities, and cross-channel gaps that no single tool can surface. Every insight ends in an action; every action carries a quantified impact and an automation hook.
+
+    **Default cadence.** Quarterly as a baseline. Run on a tighter cadence (every 30 days or weekly) when an anomaly trigger fires.
+
+    **Primary audience.** Merchant, CFO, paid-media manager, agency.
+
+    **Data sources read.**
+
+    | Input | Source | Required |
+    |---|---|---|
+    | Google Ads | Account summary, campaign performance, keyword performance, search terms report, ad extensions | Required |
+    | GA4 | Channel mix, source/medium, device/user segment, checkout funnel | Recommended |
+    | Klaviyo | Email send and attributed-revenue blocks | Optional |
+    | Order index | UTM-attributed paid revenue from the commerce platform | Recommended |
+    | Integration graph | Open findings in `AD-SPEND-*`, `AD-TRACK-*`, `KL-*`, `CHECKOUT-*` namespaces | Recommended |
+
+    **Report sections.** Executive Summary (Problem callout + Opportunity callout) → Key KPIs Snapshot → Trend Analysis → Waste Identification → Opportunity Identification → Cross-Channel Insights → Funnel Analysis → Action Plan → 90-Day Roadmap → Projected Impact.
+
+    **The Action Plan.** Each action card in section 8 carries a timing badge (Immediate, This Week, This Month, Quick Win), connector pills, an impact row, a "why it's failing" causal explanation, a verb-led Do This checklist, and a cross-check from a second source. Actions also carry automation hooks: `pause_campaign`, `update_budget`, `add_negatives`, `add_keywords`, `update_bid_strategy`, `activate_klaviyo_flow`, `update_utm_template`, or `manual_review`.
+
+    **When to run it.** When reviewing Google Ads spend vs revenue at the strategic level. When ROAS has shifted noticeably in the last 90 days. When a new agency is taking over and needs a baseline.
+
+    <Warning>
+      The report requires at least 90 days of Google Ads history. Below that threshold the trend section cannot identify the diminishing-returns inflection point and the report blocks rather than render misleading numbers.
+    </Warning>
+
+  </Accordion>
+
+  <Accordion title="7. Paid Traffic Waste">
+
+    **What it diagnoses.** How much of your paid ad spend is failing at checkout, and which specific campaigns are wasting it. This is the agency-facing punch-list companion to Google Ads Revenue Intelligence. When you want the executive read, run the revenue-intelligence report. When you need to know which campaigns to pause this morning, run this one.
+
+    **Default cadence.** Monthly (first Monday). Most workspaces schedule weekly during active campaigns.
+
+    **Primary audience.** Merchant, paid-media manager, agency.
+
+    **Data sources read.**
+
+    | Input | Source | Required |
+    |---|---|---|
+    | Google Ads | Campaign performance: cost, clicks, conversions, conversion value | Required |
+    | GA4 | Channel mix filtered to paid groupings with `sessionCampaignName` attribution | Required |
+    | Order index | Failure population: `paymentStatus=declined` and `status=Incomplete` | Required |
+    | Integration graph | Open findings in `AD-SPEND-*`, `AD-TRACK-*` namespaces | Recommended |
+
+    **Report sections.** Headline → Wasted Spend by Campaign → Pause Now list → Fix Tracking list → Failure Mode by Campaign → Recommendations.
+
+    **The Pause Now list.** Surfaces campaigns where wasted spend exceeds 30 percent AND ROAS is below 1x. Both conditions must hold — a campaign with 40 percent wasted spend but a 4x ROAS is still profitable and does not appear on the list.
+
+    **The Fix Tracking list.** Catches campaigns where more than 20 percent of GA4 sessions arrive without a `utm_campaign` value matching a Google Ads campaign. The recommendation is to fix the UTM template, not to pause.
+
+    **Failure mode breakdown.** The cross-tab in section 5 shows each campaign's declined percentage vs incomplete percentage. High declined percentage (60 percent or more) is a payment-side issue — not a pause candidate; fix the payment. High incomplete percentage (60 percent or more) is a UX or intent issue — investigate or pause.
+
+    **When to run it.** When reviewing paid performance weekly or monthly. When an anomaly trigger fires in the Google Ads Revenue Intelligence report. When evaluating which campaigns to cut before a budget reset.
+
+    <Note>
+      Wasted spend is computed as `(failed_at_checkout / sessions) × campaign_spend`. The failed-at-checkout count is the order-index failure population attributed to the campaign via UTM or `sessionCampaignName`.
+    </Note>
+
+  </Accordion>
+
+</AccordionGroup>
+
+## How the reports relate to each other
+
+The seven reports compose deliberately. Running them together gives you a joined picture that no single report provides on its own:
+
+| Start here | Then read |
+|---|---|
+| **Payment Performance Intelligence** diagnoses which pipe is leaking. | **Decline Recovery Intelligence** to size the financial leak and the recoverable prize. |
+| **Decline Recovery Intelligence** surfaces the unrecovered customer pool. | **Customer Recovery Opportunity** to name the specific customers and act on them. |
+| **Daily Revenue Leakage** summarises yesterday's failures. | The parent **Decline Recovery Intelligence** for the full diagnosis and depth. |
+| **Google Ads Revenue Intelligence** surfaces waste categories at the strategic level. | **Paid Traffic Waste** for the campaign-level punch list to act on this week. |
+| **Checkout Conversion Failure** identifies the largest funnel drop-off step. | **Decline Recovery Intelligence** when the failure is payment-side; Vortex Mind playbooks when the failure correlates with a deploy. |

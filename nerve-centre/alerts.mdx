@@ -1,0 +1,167 @@
+---
+title: "Set up and manage real-time alerts in Nerve Centre"
+sidebarTitle: "Alerts"
+description: "Nerve Centre alert cards fire when a metric breaks its expected pattern. Each alert routes to your Kanban Board with severity, owner, and full context attached."
+---
+
+A dashboard that only renders numbers is a passive surface — you have to remember to look. The Nerve Centre is built around the opposite principle: every card can fire an alert when its metric crosses a defined threshold or breaks an expected pattern, and alerts route into a triage queue with severity, owner, and supporting context already attached. You do not need to set up alert rules from scratch. Every card ships with a recipe-driven default threshold tuned to the metric's behaviour.
+
+## What an alert is
+
+An alert is a structured event emitted by the Nerve Centre runtime when a card's underlying metric meets a fire condition. Every alert carries:
+
+- **Card reference** — the card ID, connector key, and current metric value
+- **Trigger reason** — which fire condition matched (threshold breach, anomaly score, or missing data)
+- **Severity** — Critical, High, Medium, Low, or Info
+- **Period** — the time window the metric was evaluated against
+- **Baseline** — the reference value the metric was compared to
+- **Delta** — absolute and percentage change from the baseline
+- **Trace ID** — a stable identifier for the alert run, used downstream to deduplicate
+
+Alerts are first-class objects. They have an ID, a state, an audit trail, and you can query them after the fact from the alert history at **Nerve Centre header → alert count badge → History**.
+
+## How alerts fire
+
+A card fires an alert when at least one of three conditions is met.
+
+### Threshold breach
+
+The most common case. The card carries an `alert_trigger` field describing a numeric threshold:
+
+| Example trigger | Metric | Connector |
+|---|---|---|
+| `drop >25% vs prior 7D same-DOW` | ROAS Drop Alert (`gads_alert_roas_drop`) | Google Ads |
+| `any keyword CPC >2× 30D baseline` | CPC Spike Alert (`gads_alert_cpc_spike`) | Google Ads |
+| `>$0 (any campaign with spend, no conv)` | Zero-Conversion Spend (`gads_zero_conversion_spend`) | Google Ads |
+| `drop >15% vsP` | Total Revenue | Shopify |
+| `auth_rate < 0.85` | Authorisation Rate | Stripe |
+| `refund_rate > 0.04` | Refund Rate | Shopify |
+| `latency_p95 > 2500ms` | Checkout Latency p95 | Datadog |
+
+Threshold conditions are evaluated on every card refresh. The runtime keeps a fire-state per card so a flapping metric (one that crosses and uncrosses repeatedly) does not spam the Kanban: it fires once on the first crossing, then sends a resolved event when the metric returns to its band.
+
+### Anomaly score
+
+Some metrics do not have a fixed threshold but should still alert when they break their pattern. A merchant whose typical Sunday traffic is 60 percent of weekday traffic does not want a static "below 70 percent" rule — they want "this Sunday is unusually quiet versus what Sundays usually look like for me."
+
+The Nerve Centre runs a statistical anomaly detector on every card with `has_threshold: true`. It computes a rolling baseline (typically 28 to 90 days), the variance, and a z-score for the latest reading. A z-score outside the configured band (default: ±2.5 sigma) fires an alert with `trigger_reason: anomaly`.
+
+Anomaly alerts carry a confidence component: a 3-sigma move with 90 days of baseline is more credible than a 3-sigma move on 14 days of history. Low-confidence anomaly alerts are automatically downgraded to a lower severity tier.
+
+### Missing data
+
+A connector can stop publishing data because of an OAuth expiry, a vendor API outage, or a refresh rate-limit. The Nerve Centre treats prolonged data absence as a fire condition. If a card has not received fresh data for more than its expected refresh window plus a tolerance (typically 1.5×), an alert fires with `trigger_reason: data_gap` and the card shows a "stale" badge. Data-gap alerts route to the workspace administrator role rather than the card's domain owner, because the fix is almost always a connection re-authorisation.
+
+## Alert severity tiers
+
+Every alert carries one of five severity tiers. Severity is set by the card's recipe at fire time and reflects the business impact of the metric movement.
+
+| Severity | Default treatment | Example |
+|---|---|---|
+| `critical` | Pages the on-call contact. Kanban auto-routes to top of queue. Badge turns red. | Stripe authorisation rate drops below 50 percent (payment outage). |
+| `high` | Kanban card created with priority flag. Surfaces in the next briefing. | Total Revenue drops 18 percent versus prior period. |
+| `medium` | Kanban card created without priority flag. Surfaces in the next weekly report. | Refund rate climbs from 3.2 percent to 4.4 percent. |
+| `low` | Surfaces inline on the card with a sentiment colour change. No Kanban card unless subscribed. | AOV drifts down 4 percent. |
+| `info` | Pure context, no Kanban routing. | "Total Revenue is back inside its band" — a resolved event. |
+
+<Warning>
+Severity is recipe-driven, not metric-size-driven. A 5 percent revenue drop is critical for one merchant and routine noise for another. The workspace admin can override the default severity bands under **Settings → Alerts → Sensitivity**.
+</Warning>
+
+## Real alert card examples
+
+### ROAS Drop Alert — `gads_alert_roas_drop` (Hero)
+
+A real-time (`RT`) Hero alert on Google Ads. Fires when today's ROAS drops more than 25 percent versus the average ROAS on the same day of week over the prior seven days. The card is suppressed before 14:00 local time to avoid false positives from incomplete morning data (Google Ads conversion data has a 1–4 hour ingestion lag).
+
+When this alert fires, the first diagnostic step is to open the Clicks vs Conversions card (`gads_clicks_vs_conversions`). If clicks held but conversions dropped sharply, the most common cause is a broken conversion pixel on the checkout confirmation page — not a performance regression. The card documentation includes a full worked example with a UK fashion brand showing a 60 percent ROAS drop traced to a developer change that removed the Google Ads conversion tag.
+
+### CPC Spike Alert — `gads_alert_cpc_spike`
+
+A real-time Non-Hero alert on Google Ads. Fires when any keyword's cost-per-click exceeds twice its 30-day baseline. Causes include auction-side competition (a competitor entered the auction), Quality Score drop, or a bid-strategy misconfiguration. The alert appears in the Alerts & Anomalies category on the Google Ads connector tab.
+
+### Wasted-Spend Burst Alert — `gads_alert_wasted_spend_burst`
+
+Fires when wasted spend (spend on search terms that produced zero conversions) increases sharply within a defined window. Signals that keyword targeting or match types have widened to attract irrelevant traffic.
+
+### Disapproved-Ad Burst Alert — `gads_alert_disapproved_burst`
+
+Fires when the number of disapproved ads in a Google Ads account increases above a threshold. Disapproval bursts often follow automated creative uploads or policy changes.
+
+### Conversion-Tracking-Broken Alert — `gads_alert_conversion_tracking_broken` (Hero)
+
+A Hero alert that watches the click-to-conversion ratio across the account. When the ratio falls far below its baseline while clicks remain stable, the most likely cause is a conversion pixel outage rather than genuine performance decline. This is the most actionable alert in the ad-platform archetype because the fix (restoring the tag) is quick and the cost of not fixing it (wasted spend on unmeasured campaigns) compounds every hour.
+
+### Shopify Alerts
+
+Shopify carries its own dedicated alert cards in the same Alerts & Anomalies category:
+
+- `shp_alert_revenue_drop` — fires when revenue falls beyond the threshold versus the prior comparable period.
+- `shp_alert_refund_spike` — fires when refund rate climbs above the configured threshold.
+- `shp_alert_oos_spike` — fires when out-of-stock SKUs increase sharply, indicating an inventory event.
+- `shp_alert_fulfilment_delay` — fires when unfulfilled orders age past the SLA threshold.
+- `shp_alert_negative_review_burst` — fires when negative review volume spikes.
+
+## How to respond to an alert
+
+<Steps>
+  <Step title="See the alert in the Nerve Centre">
+    The alert count badge (top-right of the Nerve Centre header) updates in real time. Connector tabs with active alerts show a coloured dot on the tab label. Card tiles with active alerts show a coloured border and render their primary value in the alert's sentiment colour.
+  </Step>
+  <Step title="Open the alert details">
+    Click the alert badge or click directly on the card tile to open the alert detail panel. The panel shows the current value, the baseline the metric was compared to, the delta, the trigger reason, and a link to the card's full documentation page.
+  </Step>
+  <Step title="Check sibling cards">
+    Every alert card has a set of sibling cards that help you triage. For a ROAS Drop Alert, open Clicks vs Conversions first (30-second triage: did clicks drop too, or only conversions?). For a Spend Anomaly, open Spend by Campaign to identify which campaign moved. The card documentation page lists the recommended siblings.
+  </Step>
+  <Step title="Invoke Vortex Mind">
+    For High and Critical alerts, Vortex Mind automatically starts a diagnostic run with the alert as the trigger anchor. For Medium and Low alerts, you can invoke the diagnostic manually by clicking **Investigate** on the alert detail panel. Vortex Mind walks the connector graph, gathers cross-connector evidence, and produces a structured finding.
+  </Step>
+  <Step title="Act on the Kanban">
+    High and Critical alerts that pass the severity threshold create a card on the Actions Kanban. Move the card through Pending Review → In Progress → Done as you triage. The original alert and any Vortex Mind finding remain backlinked to the Action card for audit purposes.
+  </Step>
+</Steps>
+
+## How alerts connect to Vortex Mind findings
+
+Alerts and Vortex Mind findings share the same severity vocabulary. When a high or critical alert fires:
+
+1. The alert event is emitted by the card runtime.
+2. Vortex Mind picks it up and starts a diagnostic run, using the card's metric ID as the anchor.
+3. Vortex Mind walks the connector graph, gathering evidence from related connectors (for example, a Google Ads ROAS Drop Alert triggers Vortex Mind to check Shopify order volume, GA4 Paid Search revenue, and the Clicks vs Conversions card before concluding whether it is a measurement break or a real performance decline).
+4. The diagnostic produces a structured finding with severity and confidence attached.
+5. If the finding qualifies, it promotes to an Action on the Kanban.
+
+When the alert resolves (the metric returns to its band), a resolved event fires with `severity: info`, the Action card moves to Done, and Vortex Memory archives the alert with its evidence for future pattern matching.
+
+## Configure alert channels and routing
+
+You can customise where alerts surface under **Settings → Alerts**.
+
+| Channel | Default behaviour |
+|---|---|
+| In-app banner | Always on. Alert count badge updates in real time. |
+| Email | Daily digest by default. Critical alerts send immediately. |
+| Slack | Webhook-based. Default floor: High and above. Configure per channel and per severity. |
+| Microsoft Teams | Same model as Slack. |
+| PagerDuty | Critical alerts only, via a PagerDuty integration key. |
+| Webhook | Generic JSON POST for partner integrations. |
+
+<Tip>
+A common Slack setup: route `critical` alerts to `#vortex-iq-critical` and all alerts to `#vortex-iq-all`. Set quiet hours per channel (for example, no pings between 22:00 and 07:00 local) so high-severity alerts still reach on-call but low-severity alerts wait for morning.
+</Tip>
+
+## Adjust alert thresholds
+
+The **Dashboard Settings** page (gear icon on any connector tab, or navigate to `/v2/dashboard-settings`) includes a **Sensitivity** tab. For each alerting card you see:
+
+- The current green target value
+- The current red threshold value
+- A sensitivity slider (Very high / High / Medium / Low)
+- A **Reset to defaults** button per category
+
+Customisations are versioned and audit-trailed. You can see who changed a threshold and when, and revert to the recipe default at any time.
+
+<Note>
+Tightening a sentiment threshold also tightens the alert threshold unless you decouple the two under the advanced settings for that card. Widening the threshold during a known event (a Black Friday promotional period, for example) prevents false-positive alerts without disabling the card's monitoring.
+</Note>

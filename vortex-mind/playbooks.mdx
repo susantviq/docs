@@ -1,0 +1,159 @@
+---
+title: "Vortex Mind playbooks: investigation workflows"
+sidebarTitle: "Playbooks"
+description: "Vortex Mind playbooks diagnose specific cross-channel patterns across your connector graph. Each produces a pass/fail finding and a concrete recommended Action."
+---
+
+A playbook is a named investigation flow that walks the Vortex Mind connector graph to diagnose a specific cross-channel pattern. Unlike reports — which survey the whole account on a scheduled cadence — a playbook answers a single yes/no question: is this specific pattern firing right now? When it fires, it produces a finding and a recommended Action. When it does not, the run is silent.
+
+Playbooks are the answer to the questions no single tool can answer. Is one of your SKUs out of stock while you are still spending on it? That requires the fulfilment platform plus the ad platform. Is a production incident bleeding revenue per minute? That requires the monitoring tool plus the commerce platform. Is your checkout-rate drop caused by a decline spike or a UX regression? That requires the payment gateway plus the order index plus GA4.
+
+Every playbook follows the same structural pattern: a **trigger** that fires the run, the **required connectors** for it to operate, a deterministic sequence of **investigation steps**, **pass/fail criteria**, and a **recommended action** when the pattern is detected.
+
+---
+
+## Stockout with active spend
+
+**Scenario.** One or more of your SKUs has gone out of stock, but your ad platform is still running campaigns bound to that SKU — burning budget at zero conversion rate. Your commerce platform knows the SKU is out of stock; your ad platform does not. This playbook closes the gap.
+
+**Report types it draws from.** Paid Traffic Waste, Google Ads Revenue Intelligence.
+
+<Steps>
+  <Step title="Build the active-spend SKU set">
+    Query the ad platform for every active campaign. For each campaign, extract the SKU set from the product feed (Performance Max and Shopping campaigns) or from the Final URLs (Search campaigns where the URL maps to a product detail page). The output is every SKU currently bound to active spend, with its campaign ID and 7-day spend.
+  </Step>
+  <Step title="Build the out-of-stock SKU set">
+    Query the fulfilment connector for every SKU with `available_quantity = 0` in your primary fulfilment region. Include SKUs in incoming-stock state so the recommendation can surface the restock ETA.
+  </Step>
+  <Step title="Compute the intersection">
+    The intersection of active-spend SKUs and out-of-stock SKUs is the playbook's primary output. For each SKU in the intersection, compute the daily burn (7-day rolling average of campaign spend allocated to the SKU), the restock ETA from the fulfilment connector, and the marketplace status if you have a marketplace connector wired.
+  </Step>
+  <Step title="Apply the burn threshold">
+    The pattern fires for any SKU where daily burn exceeds the configurable threshold (default: $5 per day). SKUs below the threshold are logged but not surfaced. A campaign-level escalation triggers when more than 50 percent of a campaign's product set is out of stock — in that case the recommendation is to pause the entire campaign rather than individual product groups.
+  </Step>
+  <Step title="Generate the action">
+    For each surfaced SKU, the playbook creates a `pause_ad_group` action (or `pause_campaign` for campaign-level escalations) in your Kanban board. Each action carries an auto-resume hook: when the fulfilment connector reports the SKU back in stock, the pause reverses automatically. A Slack message lands in your Vortex Mind alerts channel with the SKU, the daily burn, the restock ETA, and the recommended pause.
+  </Step>
+</Steps>
+
+<Note>
+  Required connectors: a fulfilment platform (Shopify, BigCommerce, Adobe Commerce, or a WMS connector) AND Google Ads. Without both, the playbook cannot run. A marketplace connector (Amazon SP-API, eBay) is recommended but not required.
+</Note>
+
+**Trigger cadence.** Daily at 06:00 in your workspace timezone. Also fires immediately when the fulfilment connector pushes a "quantity went to 0" event for a SKU. High-velocity merchants (more than $50K per day in ads against fast-moving inventory) typically configure every 4 hours.
+
+**Actions generated.** `pause_ad_group` for SKU-level pauses (auto-fire eligible when daily burn is below $50). `pause_campaign` for campaign-level escalations (always manual review). Each action carries a reverse hook that fires automatically on restock.
+
+---
+
+## Incident revenue at risk
+
+**Scenario.** A production incident has hit your checkout service. Engineering knows — the monitoring tool paged them. What nobody knows in the moment is how much revenue is being lost per minute. This playbook computes that figure, posts it to your exec channel, and keeps updating it every five minutes until the incident closes.
+
+**Report types it draws from.** Checkout Conversion Failure, Daily Revenue Leakage.
+
+<Steps>
+  <Step title="Detect the active incident">
+    Read from the monitoring connector's active-incident endpoint. An incident is considered active when it is unresolved, its impact tag includes `checkout`, `payment`, `catalogue`, `cart`, or a custom tag you have configured, and it started within the last 4 hours. The output is a list of active incidents with start time, severity, and service tag.
+  </Step>
+  <Step title="Compute the baseline checkout rate">
+    Query the commerce platform for the last 7 days of checkout completions per minute, then compute a baseline as the median of the same minute-of-day across those 7 days. A Tuesday-evening incident is baselined against Tuesday-evening normal, not against an overall daily average.
+  </Step>
+  <Step title="Read the current checkout rate">
+    Query the most recent minute of checkout data from the commerce platform (typically with a 30 to 60 second ingestion lag). Compute the gap between the baseline rate and the current rate, and the percentage drop.
+  </Step>
+  <Step title="Compute revenue loss per minute">
+    Multiply the gap by the rolling 7-day average order value: `revenue_loss_per_minute = max(0, gap) × baseline_aov`. Track the cumulative revenue at risk as the integral of the per-minute figure over the incident's duration.
+  </Step>
+  <Step title="Apply the alert threshold and notify">
+    The alert fires when checkout rate has dropped 30 percent or more below baseline AND revenue loss per minute exceeds $50 (both thresholds are configurable), sustained for at least 2 consecutive minutes. The Slack message includes the incident ID, the rate drop, the revenue loss per minute, the cumulative loss so far, and live links to both the incident and the commerce dashboard. Updates post every 5 minutes until resolution. A post-incident summary is written to a Jira ticket automatically when the Jira connector is wired.
+  </Step>
+</Steps>
+
+<Note>
+  Required connectors: a monitoring tool (Datadog, New Relic, PagerDuty, Sentry, or a custom incident webhook) AND your commerce platform. A notification connector (Slack, Teams, email, or PagerDuty) is required to receive alerts. Without the monitoring connector, the playbook can only run on the commerce-side anomaly trigger (a checkout-rate drop of 30 percent or more with no corresponding monitoring incident registered).
+</Note>
+
+**Trigger cadence.** Fires immediately when the monitoring connector reports a new incident in the checkout, payment, or catalogue service families. Also fires when the commerce platform reports a sudden checkout-completion drop of more than 30 percent versus the rolling 1-hour baseline — this handles the gap where a customer-impacting issue exists but the monitoring tool has not yet detected it. Runs every minute during an active incident.
+
+**Actions generated.** No pause-style automation hooks — the appropriate response to an incident is engineering action. The playbook generates Slack/Teams notifications sized to severity, a Jira post-incident ticket with the full revenue-at-risk timeline, and a Vortex Memory archive entry for retrospectives.
+
+<Warning>
+  When the same checkout service is involved in three incidents within 30 days, the playbook escalates to a "Recurring incident" warning routed to your Site Reliability lead. The frequency-based escalation threshold is configurable.
+</Warning>
+
+---
+
+## Catalogue drift
+
+**Scenario.** You list on your commerce platform and one or more marketplaces. Over time, a price changes on one channel, a title is edited on another by a third-party tool, an image is refreshed in one place but not the other. None of these changes propagate automatically. This playbook computes a per-SKU diff across every connected catalogue and surfaces every drift before it costs revenue or triggers a compliance flag.
+
+**Report types it draws from.** Daily Revenue Leakage (revenue context for affected SKUs).
+
+<Steps>
+  <Step title="Build the canonical SKU set">
+    Read the commerce platform's catalogue. For each SKU, capture the price, title, image hash (perceptual hash of the primary image), description hash, and availability. The commerce platform is treated as canonical by default — you can override this per drift type in the playbook settings.
+  </Step>
+  <Step title="Build per-marketplace SKU sets">
+    For each connected marketplace, read the listing data using the connector's SKU mapping table. Many merchants use the same SKU identifier everywhere, but the mapping handles marketplace-specific identifiers where they differ.
+  </Step>
+  <Step title="Compute the diffs">
+    For each SKU present on both the commerce platform and a marketplace, compute: price drift (tolerance: 1 percent, below which is treated as rounding noise), title drift (substring match, case-insensitive, accent-normalised), image drift (perceptual hash comparison, tolerance 5 percent), description drift (any hash difference), and availability drift (any mismatch).
+  </Step>
+  <Step title="Classify severity and apply thresholds">
+    Price and availability drifts are always surfaced regardless of the SKU's revenue. Title and image drifts are surfaced only when the SKU has had more than $50 in 7-day revenue. Description drifts are surfaced only above $500 in 7-day revenue. This suppresses noise on long-tail SKUs.
+  </Step>
+  <Step title="Generate re-sync actions">
+    For each surfaced drift, the playbook generates a `re_sync_marketplace_sku` action with the SKU, the source channel, the target channel, and the fields to sync. Price and availability re-syncs are auto-fire eligible when the delta is small and the direction matches your configured canonical. Title and image re-syncs default to manual review because cross-channel content is sometimes intentionally different.
+  </Step>
+</Steps>
+
+<Note>
+  Required connectors: your commerce platform AND at least one marketplace (Amazon SP-API, eBay, Walmart, Otto, or similar). With more than one marketplace connected, the playbook produces an N-way diff: commerce vs Amazon, commerce vs eBay, Amazon vs eBay — all pairs are checked.
+</Note>
+
+**Trigger cadence.** Daily at 02:00 in your workspace timezone. Also fires incrementally when either the commerce platform or a marketplace pushes an SKU update event — the incremental run scopes to the changed SKU only, completing in under a second.
+
+**Actions generated.** `re_sync_marketplace_sku` per drifted field. A Slack summary lands in your alerts channel with the total drift count, the highest price delta, and the action count queued in the Kanban board.
+
+<Tip>
+  Mark SKUs with intentional channel-specific pricing as "channel-specific pricing" in Settings → Vortex Mind → Custom Playbooks → Catalogue Drift → Exceptions to exclude them from price-drift detection. The exception list supports per-marketplace granularity.
+</Tip>
+
+---
+
+## Decline-driven checkout drop
+
+**Scenario.** Your checkout conversion rate has dropped, and you need to know whether the cause is a payment gateway issue, a UX regression, a form problem, or something else entirely. This playbook correlates the payment gateway's declined-transaction rate against the commerce platform's checkout-completion rate on a continuous basis and fires when a decline spike is statistically responsible for the drop.
+
+**Report types it draws from.** Decline Recovery Intelligence, Payment Performance Intelligence, Checkout Conversion Failure.
+
+<Steps>
+  <Step title="Read the decline timeline">
+    Query the payment gateway connector for declined transactions in the last hour, bucketed in 5-minute intervals. For each bucket, compute the decline count, the decline rate (declines divided by total attempts), the top 3 decline reason codes, and the top 3 BINs with the most declines.
+  </Step>
+  <Step title="Read the checkout completion timeline">
+    Query the commerce platform for checkout completions in the same 1-hour window, bucketed identically. For each bucket, compute the completion rate (completions divided by `begin_checkout` events) and the gap versus the rolling 7-day same-hour-of-day baseline.
+  </Step>
+  <Step title="Compute the correlation">
+    Calculate the Pearson correlation coefficient across the 12 5-minute buckets in the hour. A correlation above 0.6 between higher declines and lower completions is the trigger. The playbook also computes the lead time — whether declines lead completions, completions lead declines, or they are simultaneous — using cross-correlation at lags of ±1 and ±2 buckets.
+  </Step>
+  <Step title="Diagnose the failure pattern">
+    When the correlation is high, drill into the decline reason codes to identify the specific failure type: issuer-side decline (`do_not_honor`, `pickup_card`) → recommend soft-decline auto-retry; form UX issue (`incorrect_cvc`) → recommend investigating the CVC field; BIN concentration (more than 30 percent of declines from one BIN range) → escalate to a BIN block finding and recommend contacting the issuer; gateway-side outage (`processor_error`) → recommend failover to a backup gateway if configured.
+  </Step>
+  <Step title="Generate the action">
+    A Slack message lands in your Vortex Mind alerts channel with the decline rate, the completion rate, the correlation coefficient, the top decline reason, and the recommended action. A Kanban card is created for actions that require approval (soft-decline retry configuration, BIN block investigation). Gateway failover is auto-fire eligible when the workspace has a configured backup gateway and the failover is bilateral and reversible.
+  </Step>
+</Steps>
+
+<Note>
+  Required connectors: a payment gateway (Stripe, PayPal, Braintree, Cybersource, or Adyen) AND your commerce platform. Without both, the playbook runs in degraded mode: gateway-only gives you decline patterns without checkout impact; commerce-only gives you a checkout-rate alert without causal diagnosis.
+</Note>
+
+**Trigger cadence.** Hourly as a steady-state run (5 to 15 seconds per gateway). Also fires immediately when the commerce platform reports a checkout completion drop of 15 percent or more versus the 1-hour baseline, or when the payment gateway reports a declined-transaction rate rise of 25 percent or more.
+
+**Actions generated.** Soft-decline auto-retry configuration (`update_gateway_config`, auto-fire eligible when whitelisted). Form UX investigation, BIN block check, and fraud rules tuning all default to manual review — payment configuration changes are high-risk and the playbook surfaces the recommendation while you execute.
+
+<Tip>
+  When your dominant decline reason is `suspected_fraud` and your workspace has a stable fraud profile, you can configure the playbook to surface "fraud blocks normal" rather than firing an alert. Tune this in the playbook settings to avoid alert fatigue on known-acceptable fraud-block rates.
+</Tip>
