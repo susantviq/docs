@@ -1,0 +1,134 @@
+---
+title: "Dryrun Environments, On-Demand Adobe Commerce Cloud Staging"
+description: "Dryrun Environments is the cross-project list of every dryrun environment running in DryRunPro. Spin up on-demand Adobe Commerce Cloud staging from any branch, run SWAT reports, generate Docker snapshots, tear down when done."
+---
+
+The **Dryrun Environments** tab is the cross-project list of every dryrun environment that DryRunPro is currently maintaining, across every project in your tenancy. Where the [Projects](/vortex-apps/dryrunpro/projects) tab is project-centric ("which Adobe Commerce Cloud projects do I manage?"), this tab is environment-centric ("which dryruns are running right now and what state are they in?").
+
+Live URL: [app.vortexiq.ai/v2/apps/dryrunpro/staging](https://app.vortexiq.ai/v2/apps/dryrunpro/staging)
+
+This page documents what a dryrun is, why on-demand staging matters for Adobe Commerce Cloud, the table layout, the lifecycle states, and the two top-bar actions ("Create Staging Environment" and "Upgrade to Adobe commerce") plus the three secondary actions ("Enable/Disable Magento Extension", "Configuration settings", "Adobe US Events").
+
+## What a dryrun environment is
+
+A dryrun is a **temporary, fully composed, Fastly-fronted clone** of an Adobe Commerce Cloud topology, spun up against any branch you point it at. Under the hood it is a coordinated set of Docker containers (PHP-FPM, MySQL, Redis, OpenSearch, RabbitMQ) that mirror the production stack, plus a media volume cloned from the source environment, plus a database cloned from the source environment, plus a CDN entry that exposes the dryrun on a public URL such as `https://staging-47k74xtjq6jya-2.dryrunpro.com`.
+
+You point a dryrun at a branch (e.g. `staging`, `master`, `pr-1068`) and DryRunPro runs the Adobe Commerce Cloud build pipeline against that branch's code, but with the dryrun's database and media instead of production's. The result is a public, testable, throwaway Magento environment that does not interfere with the Adobe-side integration / staging / production tier.
+
+When the dryrun has done its job, you tear it down. The containers stop, the database is dropped, the media volume is reclaimed, the CDN entry is revoked, and the URL stops resolving.
+
+## Why on-demand staging matters for Adobe Commerce Cloud
+
+Adobe Commerce Cloud ships with three environment tiers per project: integration, staging, and production. Many enterprise teams have several feature branches in flight at any given time, plus a hot-fix queue, plus a release candidate. The three-tier ceiling forces serialisation: only one feature can sit in staging at a time, and the integration environment is shared chaos.
+
+DryRunPro removes the ceiling. Every Adobe Commerce Cloud project gets unlimited dryrun environments on demand. Engineers do not wait for the staging slot. QA can run a dozen parallel SWAT reports. Release managers can rehearse two release candidates side by side. Migration teams can run cutover dummies without ever touching the live integration environment.
+
+## The table layout
+
+The dryrun list is a paginated table with the following columns:
+
+| Column | What it shows |
+| --- | --- |
+| **Project Title** | The DryRunPro project name (e.g. "Xupes Downgrade Branch", "Ulster Weavers Ltd", "Krispy Kreme UK and Ireland"). Click to open [Project Overview](/vortex-apps/dryrunpro/projects/project-overview). |
+| **Cloud Project** | The Adobe-side Cloud Project ID handle (e.g. "8f1db1556746", "a8m6oy2jlqm7n"). |
+| **Cloud Project Branch** | The Adobe-side branch the dryrun was cloned from (e.g. "doongrade", "master", "staging"). |
+| **Assigned to** | The DryRunPro user who owns the dryrun (e.g. "DryrunPro admin", "alex S"). |
+| **Dryrun URL** | A clickable link, e.g. "Access site". Resolves to the dryrun's public URL via Fastly. |
+| **SWAT report** | A status link: "Open" if the SWAT report is ready, or "Processing" while still being generated. |
+| **Status** | Current lifecycle state: Completed, Failed, Processing, etc. |
+| **Started** | Timestamp of when the build started. |
+| **Ended** | Timestamp of when the build finished. |
+| **Duration** | Elapsed wall-clock time (e.g. "4h", "13m"). |
+| **Created by** | The user who triggered the create. |
+| **Action** | Two buttons: green **View** (opens [Staging Detail](/vortex-apps/dryrunpro/staging/staging-detail)) and red **Delete**. |
+
+A search box top-right filters the table by free text against any column. The "Show / entries" dropdown at top-left controls pagination size.
+
+## Top-bar actions
+
+Two prominent buttons sit above the table:
+
+**Create Staging Environment** (green). Opens the spin-up wizard. You pick a project, pick a branch, pick a dryrun name, and DryRunPro starts the build. The new row appears in the table immediately with status "Processing".
+
+**Upgrade to Adobe commerce** (green). Promotes a passing dryrun back into the Adobe-side environment ladder. Use this when the dryrun has been validated by QA and you want the same code committed up the Adobe staging tier. The promotion runs the Adobe Cloud CLI under the hood and writes the dryrun's branch into the chosen Adobe environment.
+
+## Secondary action buttons
+
+Three blue buttons sit on a second row:
+
+**Enable/Disable Magento Extension** opens a popup that reads the Magento extension list from the active dryrun and lets you toggle modules on or off without re-running a full build. The toggle is persisted to the dryrun and survives container restarts.
+
+**Configuration settings** opens a key-value editor for Magento `core_config_data` and `env.php` overrides. Useful for ad hoc "set base URL to X" or "switch payment to sandbox" tweaks during a QA pass.
+
+**Adobe US Events** is a regional log subscription. When enabled, DryRunPro tails the Adobe Commerce Cloud event stream for the project and surfaces events that affect dryrun availability (Adobe-side maintenance, region failover). It is most relevant to merchants whose primary region is the US.
+
+## Lifecycle states
+
+A dryrun moves through these states over its lifetime:
+
+| State | Meaning |
+| --- | --- |
+| **Pending** | The job has been queued but has not started yet. Usually fewer than 30 seconds. |
+| **Processing** | The build pipeline is running. Composer install, code compilation, database clone, media sync, container spin-up. Typically 4 to 12 minutes for a healthy Adobe Commerce Cloud project. |
+| **Completed** | The build finished successfully. The Dryrun URL is live, the SWAT report is being generated. |
+| **Active** | The dryrun is running and available for QA. The View action opens the [Staging Detail](/vortex-apps/dryrunpro/staging/staging-detail) page. |
+| **Failed** | The build pipeline returned a non-zero exit. The duration column shows how far it got (e.g. "Failed (4h)"). View opens the build logs for diagnosis. |
+| **Stopping** | A teardown has been triggered. Containers are being stopped. |
+| **Stopped** | The dryrun has been torn down. The URL no longer resolves. The row remains in the table for 7 days for audit purposes. |
+
+The Failed state is the one that most often needs human attention. The most common failure modes:
+
+1. The Adobe-side branch references a Composer dependency that DryRunPro cannot resolve. Check the [DRP Composer overrides](/vortex-apps/dryrunpro/projects/project-overview#drp-composer-overrides) on the project.
+2. The database clone exceeded the storage allocation for the dryrun. Adobe-side production databases above 50 GB sometimes need a size override. Open a ticket.
+3. The deploy-bot SSH key has rotated and the dryrun could not authenticate. Re-run the [Add Project](/vortex-apps/dryrunpro/projects/add-adobe-commerce-cloud-project) wizard's step 4 to re-validate.
+
+## Spinning up your first dryrun
+
+1. Click **Create Staging Environment** in the top-bar.
+2. Pick the project (the dropdown shows all projects on the [Projects](/vortex-apps/dryrunpro/projects) tab).
+3. Pick the Adobe-side branch (the dropdown shows the project's Adobe Cloud Environments list).
+4. Optionally, set a dryrun name (defaults to "&lt;project>-&lt;branch>").
+5. Optionally, pre-attach a Docker package or composer override.
+6. Click **Start**.
+
+The dryrun appears in the table with status "Processing". Wait until it goes to "Completed" / "Active" (4 to 12 minutes), then click View to open the [Staging Detail](/vortex-apps/dryrunpro/staging/staging-detail) page and copy the Dryrun URL.
+
+## Tearing down
+
+To delete a dryrun, click the red **Delete** action in the table row. DryRunPro asks for confirmation. On confirm, the dryrun moves to Stopping, then Stopped. The URL stops resolving within ~30 seconds.
+
+The Stopped row stays visible for 7 days for audit, then is purged. Docker packages produced by the dryrun remain available on the [Docker packages](/vortex-apps/dryrunpro/docker) tab independently.
+
+## Cross-links
+
+- [Staging Detail](/vortex-apps/dryrunpro/staging/staging-detail), the per-environment detail page.
+- [Project Overview](/vortex-apps/dryrunpro/projects/project-overview), to spin up dryruns from a project's context.
+- [Docker Packages](/vortex-apps/dryrunpro/docker), where Docker snapshots from past dryruns live.
+- [Settings, CDN](/vortex-apps/dryrunpro/settings/cdn), where the dryrun URL CDN mode is configured.
+- [Roles](/vortex-apps/dryrunpro/roles), permissions for who can spin up and tear down.
+
+## Frequently asked questions
+
+**How long does a dryrun take to spin up?**
+Typically 4 to 12 minutes for a healthy Adobe Commerce Cloud project. Larger databases (>30 GB) and projects with deep Magento extension stacks push the upper end. The Started, Ended, and Duration columns show the actual times.
+
+**How long does a dryrun stay alive?**
+As long as you want. There is no automatic expiry by default. Some agency tenancies set a 7-day or 14-day default expiry policy via Settings; check with your DryRunPro account manager.
+
+**Can two dryruns coexist for the same project?**
+Yes. That is the entire point of the on-demand fleet. The Staging count on the [Projects](/vortex-apps/dryrunpro/projects) card shows how many are active per project. There is no per-project ceiling.
+
+**Can I run a dryrun against a feature branch like `pr-1068`?**
+Yes. Pick the branch in the Create Staging Environment wizard's branch dropdown. Any branch listed in the project's Adobe Cloud Environments list is selectable.
+
+**What is the SWAT report?**
+A static-analysis pass run by DryRunPro across the dryrun's codebase (Magento extension audit, security check, deprecated API usage, performance hot-spots). The Open link in the table opens the report in the dryrun's UI. Reports are generated automatically on Completed.
+
+**Can I share a dryrun URL with a non-DryRunPro user?**
+Yes. The dryrun URL resolves through the configured CDN and is publicly accessible by default. To gate it, set the dryrun's CDN mode to "DRP behaviour" and add a basic-auth password on the [Staging Detail](/vortex-apps/dryrunpro/staging/staging-detail) page.
+
+**My dryrun build is stuck in Processing for over 30 minutes.**
+That is unusually long. Click View to open the build logs and look for errors. Most often it is a Composer dependency that cannot be resolved, or a database clone that has hit a storage cap. Open a ticket with the staging ID for support.
+
+**What is the difference between Completed and Active?**
+Completed means the build pipeline finished successfully. Active means the containers are running and the URL is live. They are usually the same instant, but a dryrun in Completed that has been "stopped" (containers paused to save resources) is still Completed but not Active.

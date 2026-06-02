@@ -1,0 +1,149 @@
+---
+title: "DryRunPro CDN Settings, Fastly and Cloudflare for Adobe Commerce Staging"
+---
+
+The **Settings, CDN** page is where DryRunPro stores the tenancy-wide CDN credentials for Fastly and Cloudflare. These credentials power the public dryrun URLs (`https://staging-<id>-<n>.dryrunpro.com`), the edge DNS automation that points new dryruns at the right CDN tier, and the cache-invalidation hooks that keep dryruns current. Live URL: /v2/apps/dryrunpro/settings/cdn
+
+Reach it via the **Settings** sub-menu in the left rail, then **CDN (Fastly / Cloudflare)**.
+
+This page is **Admin-only**. The header explicitly reads "CDN Settings (Admin only)" because the credentials configured here are tenancy-wide and grant access to every dryrun's edge layer.
+
+This page documents the Fastly block, the Cloudflare block, the Staging edge DNS automation toggle, and the three buttons at the bottom: Save CDN Settings, Test Fastly, Test Cloudflare.
+
+## Why DryRunPro needs CDN credentials
+
+A dryrun is not just a Magento Docker fleet. To be useful (and to faithfully replicate the Adobe Commerce Cloud production topology), every dryrun also needs:
+
+- A **public hostname**, so QA can reach it from any browser.
+- A **TLS certificate**, so the dryrun is HTTPS by default.
+- A **CDN edge**, so cache behaviour mirrors production (Fastly for Adobe Commerce Cloud).
+- A **DNS record**, mapping the public hostname to the CDN edge.
+
+DryRunPro automates all four. To do so, it needs API access to Fastly (the canonical Adobe Commerce Cloud CDN), and Cloudflare (an alternative CDN supported for tenancies that prefer it). The credentials live on this page.
+
+## Fastly (DRP account) block
+
+The Fastly section is the primary block at the top of the page.
+
+**Fastly Service ID**, a string field. Pre-populated with the Service ID for the DryRunPro tenancy's Fastly service (e.g. `MWstzRb18alWfJjjbFN5Zp`). This is the Fastly handle that owns the wildcard DNS for `*.dryrunpro.com` and serves every dryrun's traffic.
+
+**Fastly API Token**, a password field. Pre-populated with "Saved. Enter new value to replace." once a token is in place. The token is encrypted at rest in the tenancy secrets store. Leave blank to keep the current token. Enter a new value to rotate.
+
+The caption underneath reads: "Token is stored encrypted. Leave blank to keep current value."
+
+**Fastly edge CNAME target (optional)**, a string field. Pre-populated with the Fastly edge hostname (e.g. `x.sni.global.fastly.net`). DryRunPro creates the Cloudflare DNS record for each dryrun pointing at this CNAME.
+
+The caption reads: "If step 8 cannot infer the hostname from the Fastly API, paste the CNAME target from Fastly (TLS → DNS details). DRP creates the Cloudflare record after this is known; leaving this empty uses API inference only."
+
+In most tenancies you can leave the edge CNAME field blank because Fastly's API returns the right value. The override exists for edge cases where the API does not surface a per-service hostname.
+
+## Cloudflare (DRP account) block
+
+The Cloudflare section sits directly underneath.
+
+**Cloudflare Zone ID**, a string field. Pre-populated with the Cloudflare zone ID that owns `dryrunpro.com` (e.g. `89d9ecc8750eabc6b14f438a378da0e2`).
+
+**Cloudflare API Token**, a password field. Pre-populated with "Saved. Enter new value to replace." once a token is in place. Leave blank to keep, enter a new value to rotate.
+
+The caption reads: "Token is stored encrypted. Leave blank to keep current value."
+
+DryRunPro uses the Cloudflare API for two operations:
+
+1. Creating per-dryrun DNS records pointing at the Fastly edge.
+2. Purging the Cloudflare cache when a dryrun rebuilds (so the new build is visible without waiting for TTL expiry).
+
+Even tenancies that primarily run Magento behind Fastly typically still use Cloudflare as the DNS host, because Cloudflare's API is faster than Route 53 for the high-frequency record creation that DryRunPro performs.
+
+## Staging edge (DNS automation)
+
+A third block at the bottom of the configurable area, labelled "Staging edge (DNS automation)".
+
+The caption reads: "Used when adobe::cron runs finalize for cdn_mode Fastly/Cloudflare Magento modes. Warden/local always skips. The toggle below can override STAGING_EDGE_DNS_ENABLED in .env. The edge origin host is always **auto-detected** (same logic as staging detail Server connection), unless you set STAGING_EDGE_ORIGIN_ADDRESS or PRODUCTION_SERVER_HOST in .env."
+
+**Automated edge DNS**, a single dropdown with values:
+
+- **On** (default): DryRunPro creates and manages the edge DNS record per dryrun automatically.
+- **Off**: DryRunPro skips DNS automation. You will need to create the DNS records manually for each dryrun.
+
+The On state is what almost every tenancy wants. The Off state is reserved for tenancies that operate their own DNS pipeline outside DryRunPro and want the platform not to interfere.
+
+## The three save / test buttons
+
+At the bottom of the page, three buttons in a horizontal strip:
+
+**Save CDN Settings** (dark blue). Persists every change on the page to the tenancy config. The encrypted API tokens are written to the secrets store. The Fastly Service ID and Cloudflare Zone ID are written to the database.
+
+**Test Fastly** (light grey). Runs a live API call against the Fastly Service ID using the saved API token. On success: green badge "Fastly OK". On failure: red badge with the API error (most often "Invalid token" or "Service not found"). Use this after rotating the token to confirm the rotation took.
+
+**Test Cloudflare** (light grey). Same idea against the Cloudflare Zone ID and API token. On success: green "Cloudflare OK". On failure: red badge with the error. Use after rotation.
+
+Run both tests after every credential rotation. The tests are non-destructive (no DNS records are created or modified), so it is safe to click them at any time.
+
+## When you would visit this page
+
+- **Initial tenancy setup**, paste the Fastly and Cloudflare credentials supplied by your DryRunPro account manager.
+- **Annual token rotation**, every twelve months as part of standard hygiene.
+- **After an incident** where a token was inadvertently exposed (e.g. logged to a debug file), rotate immediately.
+- **Switching CDN provider**, swapping Cloudflare for a different DNS host, or moving to a tenancy-owned Fastly service from the shared one.
+- **Debugging "dryrun URL does not resolve"**, click Test Fastly and Test Cloudflare to confirm DryRunPro can still reach both APIs.
+
+## Per-dryrun CDN mode override
+
+The page-level CDN settings define the **tenancy** baseline. Each dryrun can override its own CDN mode on the [Staging Detail](/vortex-apps/dryrunpro/staging/staging-detail) page via the CDN mode dropdown:
+
+- **None (default DRP behaviour)** uses the tenancy's Fastly without applying Magento-specific VCL.
+- **Fastly Magento mode** applies the Adobe-recommended Fastly Magento module configuration to the dryrun.
+- **Cloudflare Magento mode** uses Cloudflare with Magento-friendly page rules instead of Fastly.
+- **Pass-through** disables CDN entirely.
+
+The per-dryrun override draws on the credentials configured here. So if you have not configured Cloudflare on this page, the Cloudflare Magento mode option will fail when applied to a dryrun.
+
+## Cache invalidation flow
+
+When a dryrun rebuilds (via Re-Sync, container restart, or extension install), DryRunPro automatically:
+
+1. Computes the new content fingerprint.
+2. Calls the Fastly API to purge surrogate keys associated with the dryrun.
+3. Calls the Cloudflare API to purge the cache for the dryrun's hostname.
+4. Triggers Magento's own cache flush via Cloud CLI.
+
+All three happen in parallel, so the dryrun is fully cache-cleared within ten to fifteen seconds of build completion. No manual purge action is required from the engineer.
+
+## Cross-links
+
+- [Staging Detail](/vortex-apps/dryrunpro/staging/staging-detail), the per-dryrun CDN mode dropdown that depends on these credentials.
+- [Add Adobe Commerce Cloud Project](/vortex-apps/dryrunpro/projects/add-adobe-commerce-cloud-project), where projects are first connected (CDN is independent of project addition; these credentials work tenancy-wide).
+- [Roles](/vortex-apps/dryrunpro/roles), specifically the Admin role, which is the only one that can edit this page.
+- [Permissions](/vortex-apps/dryrunpro/permissions), the underlying permission slug is bundled into Admin.
+
+## Frequently asked questions
+
+**Where do I get the Fastly API Token?**
+From your Fastly account dashboard, under Account, API Tokens. Create a token with `global` scope on the DryRunPro Fastly service. Paste it into the Fastly API Token field on this page and click Save CDN Settings.
+
+**Where do I get the Cloudflare API Token?**
+From your Cloudflare account dashboard, under My Profile, API Tokens, Create Token. Use the "Edit zone DNS" template scoped to the dryrunpro.com zone. Paste it here and Save.
+
+**Why are the saved tokens displayed as "Saved. Enter new value to replace."?**
+Tokens are encrypted at rest and never decrypted for display. The placeholder confirms a token is saved without exposing its value. Leave the field blank to keep the existing token; enter a new value to replace.
+
+**The Test Fastly button returns "Service not found".**
+The Fastly Service ID does not match a service the API token has access to. Check that the token is for the right Fastly account and that the Service ID is for a service in that account.
+
+**The Test Cloudflare button returns "Invalid token".**
+The Cloudflare API token has expired or has been revoked. Generate a new token in the Cloudflare dashboard, paste it on this page, click Save, then re-test.
+
+**Can I disable Cloudflare entirely?**
+Yes. Leave the Cloudflare fields blank and set Automated edge DNS to Off. DryRunPro will skip Cloudflare API calls. You will be responsible for DNS records yourself, which most tenancies find more painful than just keeping Cloudflare configured.
+
+**Why is this page Admin-only?**
+The credentials saved here grant access to every dryrun's edge layer. They are tenancy-wide secrets. We restrict access to the Admin role to limit blast radius from a compromised user account.
+
+**Does Save CDN Settings restart any dryruns?**
+No. Saving credentials is a config-only change. Existing dryruns continue running with whatever CDN config they already have. Only new dryruns (and dryruns that explicitly re-apply their CDN mode via the Staging Detail page) pick up the new credentials.
+
+**Can I run a separate Fastly account per project?**
+Not from this page. The Fastly Service ID configured here is tenancy-wide. If you need per-project Fastly isolation, raise it as a feature request through your DryRunPro account manager. Most agency tenancies happily share one Fastly service across all projects.
+
+**What happens if I rotate the Cloudflare token and forget to update this page?**
+DNS automation will fail on the next dryrun create or rebuild. The build itself succeeds, but the public URL will not resolve. Click Test Cloudflare to detect the issue and update the token immediately.

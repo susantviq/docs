@@ -1,0 +1,130 @@
+---
+title: "Deployment and Monitoring for App Builder Apps"
+description: "How App Builder apps deploy, run, and get monitored. Sandbox to production lifecycle, scheduling and triggers, run history, log inspection, error handling, version rollback, and observability for AI-agent-built ecommerce apps."
+---
+
+Once an App Builder app is built, the next set of operational concerns kicks in. Where does it run? How do you schedule it? What happens when a run fails? How do you see what the agent did? How do you change an app that is already live? This page covers the full post-build surface.
+
+## Two runtimes, sandbox and production
+
+Every App Builder app deploys into one of two runtimes.
+
+**Sandbox** is the test surface. It runs the same code, with the same connectors and credentials, but routes write actions to safe destinations by default. A Slack message goes to a sandbox channel, an email goes to your inbox, a Jira ticket goes to a sandbox project, a Shopify product update is queued for review without being applied. Sandbox runs are free of side effects on production systems.
+
+**Production** is the live surface. It runs the app on its real schedule, against real data, and routes write actions to real destinations. Each production run is logged to [Vortex Memory](/vortex-memory/overview) with the full reasoning trace.
+
+The lifecycle is **sandbox first, production after explicit promotion**. There is no path that ships an app to production without passing through sandbox first. This is the safety net that makes "the AI agent built it" a tolerable architecture.
+
+## Scheduling and triggers
+
+App Builder supports four trigger types.
+
+| Trigger type | When it fires |
+| --- | --- |
+| **Schedule** | A cron expression. Daily, weekly, monthly, hourly, custom. Timezone-aware. |
+| **Event** | A webhook fired by an external system: Shopify order webhook, BigCommerce product update, Stripe charge succeeded, a custom internal webhook, a Vortex Mind report completion. |
+| **Threshold** | A Nerve Centre KPI crossing a threshold: conversion rate drops 10% week over week, refund rate exceeds 5%, ad spend exceeds budget. |
+| **Manual** | Run on demand from the App Builder console. Useful for ad-hoc apps that you only run when needed. |
+
+Schedules are expressed in plain English at plan time ("every Tuesday at 9am") and the agent translates to a cron expression. You can edit the cron directly in the plan view if you need finer control.
+
+For event triggers, the agent registers the webhook against the source system. You do not need to configure webhooks manually. The agent handles the registration, the verification, and the lifecycle (re-register if the webhook is dropped, deactivate if the app is paused).
+
+For threshold triggers, the agent subscribes to the Nerve Centre alert system. When the threshold breaches, the alert fires the app and passes the breach context (which KPI, by how much, on which integration) into the run.
+
+## Run history and observability
+
+Every run produces an entry in the run history view. The view shows:
+
+| Column | Detail |
+| --- | --- |
+| Run ID | A unique identifier for the run (timestamp + hash). |
+| Started at | When the run began (dd MMM yy hh:mm). |
+| Duration | How long the run took. |
+| Status | succeeded / failed / partial / skipped / paused. |
+| Trigger | Which trigger fired the run (schedule / event / threshold / manual). |
+| Output | A short summary of what the run produced. |
+| Cost | Tokens or compute used (visible to admins; informational, not billed per run on most plans). |
+
+Click a run to open the **run detail** view, which shows:
+
+1. **Input data.** The data the agent fetched at run start (the orders read from Shopify, the metrics read from GA4, the report content from Vortex Mind).
+2. **Reasoning trace.** The agent's chain of thought between tool calls. "I read the orders. I grouped by SKU. I noticed there are 47 SKUs. I sorted by revenue. I took the top 10."
+3. **Tool calls.** Every tool the agent called, the arguments it passed, the response it received. Useful for debugging and audit.
+4. **Output.** The final output (the Slack message text, the email body, the ticket payload). For write actions, the destination and the system response (Slack message URL, Jira issue key, etc).
+5. **Errors.** Any errors the agent hit, what the error handler did, whether the run recovered or failed.
+
+The reasoning trace is the killer feature of App Builder observability. You can answer "why did the agent send that exact message?" by reading the trace, without grep-ing logs.
+
+## Error handling
+
+Production apps fail occasionally. Connector quotas trip. Networks blip. Source systems return unexpected data. App Builder handles errors at three layers.
+
+### Tool-level retries
+
+Transient errors (rate limits, network timeouts, 500 responses) trigger automatic retries with exponential backoff. The default policy is 3 retries over 60 seconds. If the tool succeeds on retry, the run continues without intervention.
+
+### Agent-level recovery
+
+If a tool fails permanently (the connector is disconnected, the data is malformed, the destination channel is deleted), the agent decides what to do based on the **error handler** defined in the plan:
+
+- **Skip.** Skip this step and continue with the rest of the run.
+- **Fallback.** Route to a fallback channel or a fallback action.
+- **Abort.** Stop the run and log the failure.
+
+The merchant defines the error handler in plain English at plan time ("if Slack is down, send the message to my email instead"). The agent translates to a try-catch structure.
+
+### App-level alerts
+
+If the agent aborts a run, the merchant gets a notification (configurable per app: email, Slack, in-product banner). The notification links to the failed run for inspection.
+
+If an app fails 3 runs in a row, App Builder pauses the app automatically and posts an urgent alert. This prevents a broken app from spamming alerts indefinitely.
+
+## Versioning and rollback
+
+Every edit to an app creates a new version. Versions are immutable. The version history is visible in the app detail view, with timestamps and a short label of what changed.
+
+To roll back, click any past version and choose **Restore**. The app reverts to that version. The reverted version becomes the latest.
+
+Sandbox runs do not produce new versions; they run against the current draft. Production promotions produce a new version. This means you can experiment in sandbox without polluting the version history, and every production run is traceable to the exact version that ran it.
+
+## Pause, resume, archive, delete
+
+Apps have four lifecycle states.
+
+- **Active.** Running on its trigger.
+- **Paused.** Trigger is suspended. The app is preserved; it just does not run. Use this when you want to temporarily disable an app without deleting it (a marketing app paused during a peak season, a finance app paused during a system migration).
+- **Archived.** The app is hidden from the main view but preserved with all its history. Archived apps cannot run; they can be unarchived to active state.
+- **Deleted.** The app is removed permanently after a 30-day soft-delete period. Run history and reasoning traces are preserved in [Vortex Memory](/vortex-memory/overview) for audit even after deletion.
+
+## Cost and resource visibility
+
+Each app surfaces its run cost in the run history view. Cost is a function of tokens consumed by the agent's reasoning, tool calls made, and any third-party API costs (paid Twilio sends, Klaviyo per-message pricing).
+
+Workspace admins can see aggregate cost across all apps in the **Apps cost report**. Most plans include a generous monthly allowance covering typical use; high-volume workflows may incur an overage. See your plan documentation for specifics.
+
+## Cross-links
+
+- See the lifecycle from the build side on [Building an app](/vortex-apps/app-builder/building-an-app).
+- Understand what the agent does at run time on [How it works](/vortex-apps/app-builder/how-it-works).
+- See the toolkit available at run time on [Tools and integrations](/vortex-apps/app-builder/tools-and-integrations).
+
+## Frequently asked questions
+
+**What happens if I edit an app that is currently running?**
+Edits are saved as a draft until you promote them. The currently running production version is unaffected by the draft until you click promote. This means you can iterate in sandbox without disrupting the live app.
+
+**Can I run an app manually outside its schedule?**
+Yes. Click **Run now** in the production view. The manual run executes immediately, against live data, with full write actions (no sandbox routing). The run is logged like any other.
+
+**Can I pause an app for a fixed period and have it resume automatically?**
+Yes, set a resume date in the pause dialog. The app resumes at the resume timestamp without manual intervention.
+
+**How do I monitor app health across many apps?**
+The App Builder home shows a status grid for every app in your workspace: last run status, next run time, recent failure count. Click any app to drill in. For deeper monitoring, the app status feeds into Nerve Centre as a cross-cutting category.
+
+**What if I need to debug an app that ran weeks ago?**
+The run history is preserved indefinitely on most plans, with full reasoning traces in [Vortex Memory](/vortex-memory/overview). You can replay any past run, inspect the data the agent saw, and reproduce the exact output.
+
+**Can I share run results outside Vortex IQ?**
+Yes. The run output is a structured payload that can be exported as JSON, copied to clipboard, or piped to a webhook. Most merchants who want a permanent shareable record route the output to a Confluence page, a Notion database, or an email digest as part of the app itself.
