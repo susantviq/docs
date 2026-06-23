@@ -1,0 +1,135 @@
+---
+title: "Stock-Out Burst, OpenCart"
+sidebarTitle: "Stock-Out Burst"
+description: "Real-time alert that fires when many SKUs hit zero stock in a short window on OpenCart, the canary for a sync error, a bad import, or a genuine demand spike. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ecommerce Platform](/nerve-centre/connectors#connectors-by-type)
+
+> Real-time alert that fires when many SKUs drop to zero stock in a short window, distinguishing a fulfilment sync error or a broken import from a genuine demand spike.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A single SKU selling out is business as usual. A *burst* of SKUs hitting zero within an hour is almost never demand, it is usually a mistake: a stock-sync feed that wrote zeros, a bulk CSV import with an empty quantity column, or a warehouse-management integration that pushed bad data. This alert fires when more than five SKUs transition to quantity zero within the last hour, so you can catch a data accident before customers see "out of stock" on products you actually have in the warehouse.
+
+| | |
+| --- | --- |
+| **What it counts** | The number of products whose stock quantity transitioned from positive to zero within a rolling one-hour window. |
+| **Stock source** | Product quantity is held in `oc_product` (the `quantity` column). Stores using a stock-sync extension or warehouse integration have this column written by that integration rather than by hand. |
+| **Subtract / out-of-stock flag** | OpenCart's "Subtract Stock" setting and the per-product out-of-stock status govern whether a zero-quantity product still shows as buyable. The burst counts the quantity transition regardless of the storefront stock behaviour. |
+| **Disabled products** | Products that are disabled (not visible on the storefront) are excluded; a zero on a hidden product is not customer-facing. |
+| **Currency / refunds** | Not applicable. This is a stock-event alert, not a money metric. |
+| **Multi-store** | Stock in OpenCart is shared across `store_id` storefronts by default (one product, one quantity), so a burst affects all stores at once. |
+| **Time window** | RT (rolling 1-hour window) |
+| **Alert trigger** | `> 5 SKUs transitioned to quantity = 0 in the last 1 hour` |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your OpenCart data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A Malaysian electronics store on OpenCart 4.x with around 4,200 active SKUs. Stock is kept in sync with a warehouse system via a nightly CSV import and an hourly delta feed. On 14 Mar 26 the hourly feed runs against a malformed export.
+
+| Time (14 Mar 26) | SKUs hitting zero this hour | State |
+| --- | --- | --- |
+| 13:00 | 1 | Normal, a fast-mover sold out |
+| 14:00 | 2 | Normal |
+| 15:00 | 47 | **ALERT FIRES** (well over 5) |
+| 16:00 | 3 | Normal, after feed corrected |
+| Genuine spike case (different day) | 6 in 1h during a flash sale | **ALERT FIRES** (real demand) |
+
+What's interesting here:
+
+1. **47 SKUs going to zero in one hour is not demand, it is data.** No storefront sells 47 distinct SKUs out simultaneously. The 15:00 hourly delta feed had a column-misalignment bug that wrote zero into the quantity field for a whole product category. The alert caught a sync accident, not a sales event.
+2. **Every one of those 47 products silently went unbuyable.** With Subtract Stock on and out-of-stock products hidden from purchase, the storefront started turning away orders for products sitting in the warehouse. Each minute of this is lost revenue on items you can actually ship.
+3. **The genuine-spike case still fires, and that is fine.** On a separate flash-sale day, six real fast-movers sold out within an hour and the alert fired. That is a legitimate fire: it tells the owner to reorder or pull ads for sold-out lines. The alert surfaces the burst; the human decides whether it is an accident or a triumph.
+4. **The fix was upstream, not in OpenCart.** The malformed feed was corrected at the source and the next clean run restored quantities. The lesson the merchant took was to add a sanity check on the feed (reject any run that zeros more than N SKUs) so the bad data never reaches OpenCart again.
+5. **One product, all stores.** Because OpenCart shares stock across storefronts, every `store_id` served by the install showed the same 47 products out of stock at once. A single bad feed degraded the whole multi-store estate.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Stock-Out Burst |
+| --- | --- |
+| [Out-of-Stock Products](/nerve-centre/kpi-cards/opencart/out-of-stock-products) | The standing count of zero-stock SKUs. The burst alert is the *rate of change*; this is the *level*. After a burst, this shows how deep the hole is. |
+| [Low-Stock SKUs](/nerve-centre/kpi-cards/opencart/low-stock-skus) | The leading indicator. SKUs that were already low are the ones a bad feed tips to zero first. |
+| [Revenue at Risk (live)](/nerve-centre/kpi-cards/opencart/revenue-at-risk-live) | Quantifies the sales exposure from products that just became unbuyable. |
+| [Top-Velocity SKUs vs Ad Spend](/nerve-centre/kpi-cards/opencart/top-velocity-skus-vs-ad-spend) | If a burst zeros a SKU you are actively advertising, you are paying to send traffic to a dead product. |
+| [OpenCart Inventory vs Marketplace Listings](/nerve-centre/kpi-cards/opencart/opencart-inventory-vs-marketplace-listings) | A stock-sync fault often diverges OpenCart from your marketplace listings at the same time. |
+| [Platform Error Spike or Extension Conflict](/nerve-centre/kpi-cards/opencart/platform-error-spike-or-extension-conflict) | If a stock-sync extension itself is the broken component, both alerts can fire together. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against OpenCart
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in the OpenCart admin:**
+
+Catalog → Products shows each product's Quantity column; sort by quantity ascending to bring zero-stock items to the top. Reports → Products Viewed and Reports → Products Purchased help you judge whether a sell-out was demand or accident. If you use a stock-sync or import extension, its own log (often under Extensions or System → Maintenance) records what each run wrote.
+
+OpenCart admin views that *look* like the same number but aren't:
+
+- **Catalog → Products filtered to "Out of Stock"** shows the *current* count of zero-stock SKUs, not how many transitioned in the last hour. It is the level, not the burst.
+- **The Dashboard** shows no stock detail; it will not reflect a burst at all.
+- **A product's Quantity field after a manual edit** changes the level immediately but is not a "burst" the way a feed-driven mass zeroing is.
+
+**Why our number may legitimately differ from the OpenCart admin:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Timezone.** The one-hour window is evaluated in UTC by default; OpenCart timestamps follow the store timezone. The window edges can appear shifted. | Cosmetic timing shift |
+| **Multi-store.** Stock is shared across `store_id` by default, so the burst counts the product once even though it affects every storefront. | Card counts products, not store-product pairs |
+| **Disabled products.** The burst excludes disabled products; an admin "out of stock" filter may include them. | Card lower than an unfiltered admin count |
+| **Subtract Stock off.** Stores that do not subtract stock can have quantities that do not move with sales; transitions to zero then come only from edits or feeds. | Fewer organic transitions |
+| **API / DB sync lag.** Vortex IQ reads on a sync cadence; a transition in the last minute may not yet be reflected. | Self-resolves at next sync |
+
+**Cross-connector note:** if you also list on a marketplace, a stock-sync fault frequently shows up here *and* as a divergence on [OpenCart Inventory vs Marketplace Listings](/nerve-centre/kpi-cards/opencart/opencart-inventory-vs-marketplace-listings). If OpenCart zeroed but the marketplace still shows stock, the marketplace is about to oversell.
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The same idea of an out-of-stock burst alert exists on other commerce platforms. This is **not a reconciliation**, your OpenCart store has no parallel store elsewhere to compare against. These links help agencies running multi-platform client books navigate between equivalent alerts.
+
+- [`shopify.oos_spike_alert`](/nerve-centre/kpi-cards/shopify/oos-spike-alert)
+- [`bigcommerce.oos_spike_alert`](/nerve-centre/kpi-cards/bigcommerce/oos-spike-alert)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why five SKUs and not one?**
+A single SKU selling out is normal trading and would make the alert unbearably noisy. Five or more hitting zero inside one hour is the point where a *pattern* emerges, and patterns are usually caused by data, not demand. You can tune the threshold for a very large or very small catalogue.
+
+**The alert fired during a flash sale, was it wrong?**
+No. A flash sale that genuinely sells several lines out in an hour is exactly the kind of burst worth knowing about, so you can reorder or pause ads on the dead lines. The alert surfaces the burst; you decide whether it is an accident or a success.
+
+**My stock-sync feed zeroed half my catalogue, how do I recover?**
+Correct the feed at the source and re-run a clean sync to restore quantities. Then add a guard rail: reject any run that zeros more than a sane number of SKUs at once, so a bad export can never reach OpenCart again. The data lives in `oc_product`; a good run will overwrite the bad zeros.
+
+**Does this count products I deliberately set to zero?**
+Yes, a transition to zero is a transition to zero regardless of cause. If you intentionally retire a batch of SKUs at once, expect a fire. That is acceptable, the alert is cheap to dismiss when the cause is known.
+
+**Why do all my storefronts show the same products out of stock?**
+Because OpenCart shares stock across `store_id` storefronts by default. One product has one quantity. A burst therefore degrades every store on the install simultaneously, which is why catching it fast matters.
+
+**A product shows quantity zero but customers can still buy it, why?**
+That depends on the per-product out-of-stock setting and the global Subtract Stock setting. OpenCart can be configured to allow ordering of zero-stock items (backorder behaviour). The burst counts the quantity transition regardless of whether the storefront still accepts the order.
+
+**Will disabled products trigger the alert?**
+No. Disabled products are not customer-facing, so a zero on them is not a burst worth alerting on. Only enabled, storefront-visible products are counted.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Stock-Out Burst* is one of hundreds of KPI pulses Vortex IQ tracks across OpenCart and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

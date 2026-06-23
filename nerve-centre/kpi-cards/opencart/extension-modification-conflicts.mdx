@@ -1,0 +1,145 @@
+---
+title: "Extension / Modification Conflicts, OpenCart"
+sidebarTitle: "Extension / Modification Conflicts"
+description: "Count of conflicting OCMOD or vQmod modifications on your OpenCart store. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ecommerce Platform](/nerve-centre/connectors#connectors-by-type)
+
+> The number of OCMOD or vQmod modifications that are currently colliding with each other or with OpenCart core, each one a silent risk of a broken storefront feature.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> OpenCart applies extensions as XML-based modifications (OCMOD, or vQmod on older builds) that patch core files in place rather than replacing them. When two modifications try to edit the same line, or a modification targets code that a core update has moved or renamed, the patch fails or applies in the wrong place. This card counts those conflicts. Each conflict can quietly disable checkout, search, a payment method, or the admin without throwing a visible error, so the trigger is `>0`.
+
+| | |
+| --- | --- |
+| **What it counts** | The number of OCMOD / vQmod modification rules that fail to apply cleanly, or that overlap with another modification on the same target file and search block. Derived from the modification cache rebuild against the `oc_modification` table. |
+| **What a "conflict" is** | Two modifications editing the same search string, an `operation` that finds no match after a core or theme update, or a patch that applies in an order that breaks a later one. |
+| **OCMOD vs vQmod** | OpenCart 3.x and 4.x use OCMOD natively (rules stored in `oc_modification`). Older 2.x stores often still run the vQmod engine. Both produce the same class of conflict; this card normalises across them. |
+| **Severity** | Not all conflicts are equal. A conflict on a checkout or payment template is critical; a conflict on a rarely-touched admin report is cosmetic. The card counts all; the detail view ranks by the storefront area touched. |
+| **Refresh dependency** | Conflicts only surface after the modifications are refreshed (Extensions → Modifications → Refresh). A store that has not refreshed since installing an extension can carry a latent conflict that this card flags before the merchant hits it live. |
+| **Multi-store** | OpenCart multi-store instances share one codebase and one modification cache, so a conflict affects every `store_id` at once. |
+| **Time window** | `RT` (real time, evaluated each sync) |
+| **Alert trigger** | `>0`, driven by sentiment on platform health |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+```
+COUNT(modification_rules)
+  WHERE apply_status = 'failed'
+     OR overlaps_another_rule(target_file, search_block) = true
+```
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK auto-parts merchant runs OpenCart 3.0 with around 22 installed extensions: a one-page checkout, a Stripe payment module, a layered navigation filter, a SEO pack, and a currency switcher among them. On 12 May 26 they applied an OpenCart point release to patch a security advisory. Two days later, on 14 May 26, support tickets start mentioning that the discount code box has vanished at checkout.
+
+| Modification | Target file | Status after core update | Effect |
+| --- | --- | --- | --- |
+| One-page checkout | `catalog/.../checkout.twig` | Applied, but now overlaps SEO pack | Coupon field markup shifted |
+| SEO pack | `catalog/.../checkout.twig` | Applied second, overwrites checkout edit | Coupon `div` removed |
+| Stripe payment | `catalog/.../payment.twig` | Failed - search string moved by core update | Stripe button intermittently missing |
+| Layered navigation | `catalog/.../category.twig` | Applied cleanly | None |
+| Currency switcher | `catalog/.../header.twig` | Applied cleanly | None |
+| **Conflicts (this card)** | | | **2** |
+
+What's interesting here:
+
+1. **The store looked fine in the admin.** OpenCart did not throw a fatal error. The modification cache rebuilt "successfully" because OCMOD skips a rule whose search string is not found rather than failing the whole rebuild. The card flagged `2` the moment the post-update refresh ran, two days before the merchant connected the dots from the support tickets.
+2. **The checkout conflict is the expensive one.** The one-page checkout and the SEO pack both edit `checkout.twig`. Whichever applies last wins, and the coupon field lost. Customers with a valid code abandoned rather than paying full price. This is direct, ongoing revenue loss, which is why the card is a Hero and pairs with [Order Volume](/nerve-centre/kpi-cards/opencart/order-volume).
+3. **The Stripe conflict is intermittent, which is worse for diagnosis.** A failed patch on the payment template means the Stripe button renders only when a cached version of the page is served. Intermittent faults are the hardest for merchants to reproduce; a card that says "2 conflicts, one on payment.twig" turns a week of guesswork into a five-minute fix.
+4. **The fix is an ordering and re-target job, not a re-install.** Reorder the OCMOD load priority so checkout edits apply after the SEO pack, and update the Stripe module's search string to match the new core markup, then refresh. The card should drop back to `0` on the next sync.
+5. **This is the single most OpenCart-specific failure mode.** Hosted platforms isolate apps; OpenCart patches shared files. Almost every OpenCart store accumulates conflicts over its life, and they cluster right after core updates, theme changes, and bulk extension installs.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Extension / Modification Conflicts |
+| --- | --- |
+| [Installed Extensions / Modules](/nerve-centre/kpi-cards/opencart/installed-extensions-modules) | The denominator. Conflicts as a share of installed extensions tells you whether your stack is fragile or just large. |
+| [Platform Error Spike or Extension Conflict](/nerve-centre/kpi-cards/opencart/platform-error-spike-or-extension-conflict) | A spike here is usually a symptom of a new conflict. Watch the two together after any update. |
+| [Error Log Volume (24h)](/nerve-centre/kpi-cards/opencart/error-log-volume-24h) | A failed modification frequently throws PHP notices or warnings into the log. A conflict and a log spike landing together confirms causation. |
+| [OpenCart Version Status](/nerve-centre/kpi-cards/opencart/opencart-version-status) | Conflicts cluster right after a version change. If this card moved, check whether a core update just landed. |
+| [Failed Orders (24h)](/nerve-centre/kpi-cards/opencart/failed-orders-24h) | A conflict on a payment or checkout template shows up downstream as failed orders. The link is causal. |
+| [Order Volume](/nerve-centre/kpi-cards/opencart/order-volume) | The bottom-line check. A silent checkout conflict suppresses order volume before anyone files a ticket. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against OpenCart
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in OpenCart admin:**
+
+Extensions → Modifications. This screen lists every installed modification and has a **Refresh** button (the blue refresh icon, top right) that rebuilds the modification cache. After a refresh, OpenCart writes a modification log; the **Log** sub-area shows which rules could not be applied. The rules themselves live in the `oc_modification` table, and the compiled output sits in the `system/storage/modification/` directory.
+
+For vQmod stores (typically OpenCart 2.x), the equivalent is the `vqmod/xml/` directory and the `vqmod/logs/` folder, plus the vQmod admin checker if installed.
+
+Other OpenCart views that *look* related but are not the same number:
+
+- **Extensions → Extensions**: lists installed and available extensions by type, not conflicts. That is the [Installed Extensions / Modules](/nerve-centre/kpi-cards/opencart/installed-extensions-modules) card.
+- **Error log (System → Maintenance → Error Logs)**: shows PHP errors, some of which are caused by conflicts, but also many that are not.
+- **The storefront itself**: a missing feature is the *effect* of a conflict, not a count of conflicts.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Refresh lag.** OpenCart only recomputes conflicts when Modifications is refreshed. If the merchant has not refreshed since the last extension change, the admin shows a stale state while Vortex IQ flags the latent conflict. | Vortex IQ higher until the merchant refreshes |
+| **Severity weighting.** The admin log lists every skipped rule flatly. This card de-duplicates rules that belong to the same disabled extension and ranks by storefront impact, so the raw admin log line count can be higher. | Admin log line count higher |
+| **vQmod vs OCMOD.** On mixed stores running both engines, the admin splits the view across two screens. This card sums both. | Vortex IQ higher than either single screen |
+| **Disabled extensions.** A disabled extension's modification is not applied, so it cannot conflict. If the admin still lists its rule, it is not counted here. | Vortex IQ lower |
+| **Sync lag.** A conflict introduced seconds ago is picked up on the next sync, not instantly. | Self-resolves at next sync |
+
+**Cross-connector note:** unlike commerce KPIs, this metric has no payment-processor or analytics equivalent. It is a platform-health signal unique to file-patching extension architectures.
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The closest equivalents on hosted platforms are app-health and integration-conflict signals rather than file-patch conflicts, because Shopify and BigCommerce apps run in isolation rather than editing core files. These cross-links exist so agencies running multi-platform client books can navigate between related platform-health metrics across the docs.
+
+- [`shopify.app_conflicts`](/nerve-centre/kpi-cards/shopify/app-conflicts) (planned)
+- [`bigcommerce.app_conflicts`](/nerve-centre/kpi-cards/bigcommerce/app-conflicts) (planned)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What exactly is an OCMOD conflict?**
+OCMOD modifies core files by searching for a block of code and inserting, replacing, or deleting around it. A conflict happens when two modifications target the same block, or when the block a modification is searching for no longer exists because a core update or theme change moved it. The patch then applies in the wrong place or silently skips.
+
+**Why does my store look fine but the card says there is a conflict?**
+OpenCart does not fail loudly. A skipped OCMOD rule just means the feature it powers is missing or broken, with no error page. The card catches the conflict at refresh time, often before a customer or support ticket surfaces the broken feature.
+
+**The conflict appeared right after I updated OpenCart, is that a coincidence?**
+Almost never. Core updates move and rename code, which breaks the search strings extensions rely on. Conflicts cluster after core updates, theme swaps, and bulk extension installs. Always refresh Modifications and check this card immediately after any update.
+
+**Can a conflict break my checkout or payments?**
+Yes, and that is the worst case. Conflicts on checkout or payment templates can hide the coupon field, drop a payment button, or break the place-order step. These translate directly into [Failed Orders (24h)](/nerve-centre/kpi-cards/opencart/failed-orders-24h) and lost [Order Volume](/nerve-centre/kpi-cards/opencart/order-volume).
+
+**How do I fix a conflict?**
+Usually one of three moves: reorder the modification load priority so patches apply in a compatible order, update the offending extension's search string to match current core markup, or disable and re-install the extension in a clean order. Then refresh Modifications. The card should drop on the next sync.
+
+**Does disabling an extension clear its conflict?**
+Yes. A disabled extension's modification is not applied, so it cannot conflict. If you are unsure which extension is at fault, disabling suspects one at a time and refreshing is a valid bisection method.
+
+**I run vQmod on an old 2.x store, does this card work?**
+Yes. The connector reads the vQmod log and XML directory on 2.x stores and normalises those conflicts into the same count. The underlying mechanism differs but the failure mode is identical.
+
+**Why is the count higher than the lines in my modification log?**
+We de-duplicate. One broken extension can produce several skipped rules in the raw log; this card groups them by extension and ranks by storefront impact, so the headline number is usually lower and more actionable than the raw log line count.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Extension / Modification Conflicts* is one of hundreds of KPI pulses Vortex IQ tracks across OpenCart and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

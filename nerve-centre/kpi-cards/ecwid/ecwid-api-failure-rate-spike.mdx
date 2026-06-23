@@ -1,0 +1,141 @@
+---
+title: "Ecwid API Failure Rate Spike, Ecwid"
+sidebarTitle: "Ecwid API Failure Rate Spike"
+description: "Ecwid API Failure Rate Spike: detection-layer alert when the REST API or webhook sync starts erroring above threshold. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ecommerce Platform](/nerve-centre/connectors#connectors-by-type)
+
+> Real-time alarm when the Ecwid REST API or webhook integration starts erroring above threshold.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A detection-layer alert that fires when the share of failing calls to the Ecwid REST API or inbound webhooks crosses the threshold inside a rolling one-hour window. It is not a business KPI; it is an integration-health alarm. When this card lights up, the numbers on every other Ecwid card may be stale or incomplete, because the pipe that feeds them is broken. The usual causes are an expired OAuth token, a revoked scope, an Ecwid platform incident, or rate-limit throttling.
+
+| | |
+| --- | --- |
+| **What it tracks** | The rolling error rate across calls Vortex IQ makes to the Ecwid REST API plus the inbound webhook deliveries it receives, measured over the last 1h. An error is any non-success HTTP response (4xx / 5xx), a timeout, or a malformed payload. |
+| **API endpoint** | Synthetic across the connector's traffic to `GET /v3/{store-id}/...` (orders, products, customers) and the webhook receiver for `order.created`, `order.updated`, `order.paid`, `product.updated`. No single endpoint; the card watches the connection itself. |
+| **What counts as a failure** | HTTP 401 / 403 (auth / scope), 429 (rate limit), 5xx (Ecwid platform), connection timeout, and schema-mismatch payloads we cannot parse. |
+| **What it excludes** | Expected empty results (a store with zero orders is not an error); single transient blips below the threshold; calls retried and succeeded inside the window. |
+| **Currency** | Number. The card surfaces an error rate (percentage) and the count of failing calls; it is not a money metric. |
+| **Time window** | `RT` (real-time, rolling 1h evaluation). |
+| **Alert trigger** | `API error rate >5% in last 1h`. |
+| **Sentiment** | Inverse gauge. Sensitive card; a non-zero reading is bad by definition, and the alert is the headline. |
+| **Roles** | owner, engineering, operations. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Ecwid data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+**A UK hobby seller running an Ecwid widget on a WordPress photography blog. The alert fires at 09:14 on 18 Mar 26.**
+
+The merchant has not touched their integration in months. Overnight, Ecwid expired the OAuth access token that the connector uses to read orders, and the silent refresh failed because a scope had been narrowed during an Ecwid app-permissions update.
+
+**What tripped:**
+
+| Signal | Last 1h | Baseline | Status |
+| --- | --- | --- | --- |
+| API calls attempted | 142 | ~140 | normal |
+| Calls failing (HTTP 401) | 131 | ~1 | spiking |
+| Error rate | 92.3% | <1% | far above 5% trigger |
+| Webhooks received | 0 | ~6 | stalled |
+
+```text
+Error rate = 131 / 142 = 92.3%
+Trigger is >5% in last 1h. Alert FIRES.
+Dominant error: HTTP 401 (auth). OAuth token / scope problem, not a data problem.
+```
+
+**What the merchant sees.** A red alert in the Nerve Centre alert feed reading "Ecwid API Failure Rate Spike, API error rate >5% in last 1h", with the dominant error class (401 auth) called out. Critically, the revenue and orders cards stop advancing, they freeze at the last good reading rather than dropping to zero, so the merchant is not panicked into thinking sales died.
+
+**The playbook.**
+1. Read the error class. A 401 / 403 cluster means auth or scope, not a sales problem. A 5xx cluster means Ecwid's platform; check the Ecwid status page and wait. A 429 cluster means rate-limit throttling; the connector backs off automatically.
+2. For the 401 here, reconnect the Ecwid connector from Vortex IQ settings. This re-runs the OAuth handshake and re-grants the `read_orders`, `read_catalog`, and `read_customers` scopes.
+3. Confirm the error rate falls back under 5% within the next evaluation window and that webhook deliveries resume.
+4. If a 5xx incident, no merchant action fixes it; the card auto-clears once Ecwid recovers and the backfill completes.
+
+The point of the card is that it separates "your integration is broken" from "your business is down". Without it, an expired token looks exactly like a sales collapse.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why it matters next to this alert | What the combination tells you |
+| --- | --- | --- |
+| [Total Revenue](/nerve-centre/kpi-cards/ecwid/total-revenue) | The number most affected by a broken pipe. | If revenue looks frozen and this alert is live, the freeze is a sync artefact, not a real drop. |
+| [Order Volume](/nerve-centre/kpi-cards/ecwid/order-volume) | The fastest-moving feed. | Order volume flatlining at the same minute the alert fired confirms a pipeline stall, not demand. |
+| [Order Processing Backlog](/nerve-centre/kpi-cards/ecwid/order-processing-backlog) | Downstream of failed webhooks. | Missed `order.created` webhooks can hide a backlog that surfaces in a burst once sync recovers. |
+| [Inventory Sync Drift Across Storefronts](/nerve-centre/kpi-cards/ecwid/inventory-sync-drift-across-storefronts) | Stock feeds use the same API. | An API spike often co-fires with drift; stock numbers stop updating across surfaces. |
+| [Active Storefront Surfaces](/nerve-centre/kpi-cards/ecwid/active-storefront-surfaces) | Surface health. | If surfaces also drop off, the outage is upstream of one channel rather than the whole connector. |
+| [Channel-Specific Order Drop](/nerve-centre/kpi-cards/ecwid/channel-specific-order-drop) | Disambiguates scope. | A single-channel drop with a clean API rate points to that channel, not the connector. |
+| [Stock-Out Burst (>5 SKUs in <1h)](/nerve-centre/kpi-cards/ecwid/stock-out-burst-5-skus-in-1h) | Shares the real-time layer. | A feed error can masquerade as a stock-out burst; check the API alert first. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against Ecwid
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Ecwid's own dashboard:**
+
+> **Ecwid Control Panel (`my.ecwid.com`) -> Settings -> Apps -> Vortex IQ (or My Apps)**
+> Confirm the app is still authorised and the granted scopes include order, catalogue, and customer read access. If the app shows as disconnected or a scope is missing, that is the root cause.
+
+For platform-wide incidents, cross-check the Ecwid / Lightspeed status page; a 5xx cluster on this card usually maps to a posted incident there.
+
+**Why our number may differ from Ecwid's Control Panel:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Vantage point** | Ours only | Ecwid's Control Panel does not show the health of a third-party app's API calls; this alert is measured from our side of the connection. |
+| **Rate-limit handling** | Ours higher transiently | Ecwid throttles heavy callers with 429s; we count those as failures until back-off succeeds, while Ecwid simply records a throttled request. |
+| **Webhook delivery** | Ours only | A webhook Ecwid believes it sent but that never reached us counts as a failure here; Ecwid's view shows it as delivered. |
+| **Evaluation lag** | Boundary minutes | The 1h window rolls continuously; a spike at the very edge of the hour may read slightly differently than a static Ecwid log slice. |
+
+**Internal identity:**
+
+`ecwid_api_failure_rate = failing_calls_1h / total_calls_1h`, evaluated continuously; the alert fires above 5%.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Is this telling me my sales dropped?**
+No. This is an integration-health alarm, not a sales metric. It tells you the connection feeding your Ecwid cards is erroring, which means other numbers may be stale. Your actual store may be selling fine; you just cannot see it accurately until the pipe is fixed.
+
+**What is the single most common cause?**
+An expired or revoked OAuth token, surfacing as a cluster of HTTP 401 / 403 errors. Reconnecting the Ecwid connector from Vortex IQ settings fixes it in most cases.
+
+**It says 5xx errors. What do I do?**
+Nothing on your side. A 5xx cluster is an Ecwid platform problem. Check the Ecwid status page, wait for recovery, and the card auto-clears once sync catches up and backfills the missed window.
+
+**What does a 429 spike mean?**
+Rate limiting. Ecwid throttles callers who exceed its request budget. The connector automatically backs off and retries; if 429s dominate, the alert usually self-resolves within a window or two without action.
+
+**Why is the threshold 5% and the window only 1h?**
+A short window catches a breaking integration fast, before stale numbers mislead a morning check-in. The 5% floor tolerates the odd transient blip (which is normal on any network) while still firing on a genuine fault.
+
+**My revenue card froze instead of dropping to zero. Is that a bug?**
+No, it is deliberate. When the feed errors, cards hold their last good reading rather than reporting a false zero. The frozen state plus this alert is the correct signal that the data is stale, not that sales stopped.
+
+**Could a WordPress / Wix outage cause this?**
+Not directly. This card watches the Ecwid API and webhooks, not your host site. A host outage stops orders flowing but the Ecwid API itself stays healthy, so revenue would genuinely drop while this card stays green. The two signals together help you tell host outage from integration fault.
+
+**How fast does the alert clear after I reconnect?**
+Within the next 1h evaluation window, usually minutes. Once successful calls outnumber failures enough to drop the rate under 5%, the alert resolves and the missed window is backfilled.
+
+**Does a non-zero reading always mean trouble?**
+A brief sub-threshold blip is normal and will not fire the alert. The card only raises an incident when the error rate crosses 5% over the rolling hour, which indicates a sustained fault rather than network noise.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Ecwid API Failure Rate Spike* is one of hundreds of KPI pulses Vortex IQ tracks across Ecwid and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

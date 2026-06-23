@@ -1,0 +1,138 @@
+---
+title: "OAuth Token Refresh Failure, Square Online"
+sidebarTitle: "OAuth Token Refresh Failure"
+description: "OAuth Token Refresh Failure: flags when the Square connection has failed to refresh its access token. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ecommerce Platform](/nerve-centre/connectors#connectors-by-type)
+
+> Square access tokens are 30-day lived: refresh failures silently break ingest; must alert.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A live alert that fires when Vortex IQ cannot refresh the Square access token for your connection. Square access tokens are short-lived (around 30 days) and are kept alive by a refresh token. If a refresh fails and is not noticed, data ingest stops silently, every other Square card goes stale while still looking plausible. This is the card that protects the trustworthiness of all the others.
+
+| | |
+| --- | --- |
+| **What it counts** | The number of Square access-token refresh failures recorded for your connection in the last 24 hours. Sourced from the connector's OAuth refresh attempts against Square. |
+| **Channel / source treatment** | **Connection-level, not channel-level.** A token covers the whole Square merchant account, so a refresh failure affects POS, Square Online, and Square Invoices ingest at once. |
+| **Currency / unit** | Count of refresh failures (whole number). Each row shows the connection, the failure reason returned by Square, and the timestamp. |
+| **Time window** | `RT` (real time), with the alert evaluated over the last 24 hours. |
+| **Alert trigger** | Fires when any refresh failure occurs in the last 24 hours. Because the consequence is silent data loss, the threshold is a single failure, not a count. |
+| **Roles** | owner, engineering |
+| **Why it is a hero card** | Token expiry is the most common silent failure mode for any OAuth connector. A stale dashboard that looks fine is more dangerous than one that is obviously broken. |
+| **Typical causes** | The refresh token was revoked (merchant disconnected the app or changed permissions), the app credentials rotated, a Square API outage during the refresh window, or scope changes that invalidated the grant. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Square Online data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US lifestyle brand on Square. One store, a Square Online storefront, and Square Invoices for wholesale. The connection has run cleanly for months until the alert fires on 14 Mar 26.
+
+| Connection | Token age at failure | Refresh attempts (24h) | Failure reason | Status |
+| --- | --- | --- | --- | --- |
+| Square (production) | ~30 days | 3 | `unauthorized` (refresh token invalid) | Ingest paused |
+| Square (sandbox / test) | n/a | 0 | none | Healthy |
+| **Refresh failures (this card)** | | **3** | | **Alerting** |
+
+Three things to notice:
+
+1. **The dashboard did not look broken before the alert.** Every Square card kept showing its last successful read, which looked like a normal quiet day. Without this alert, the merchant might have spent days trusting numbers that had stopped updating. The refresh failure is the only signal that the data behind the other cards has frozen.
+2. **Three attempts then a hard alert.** The connector retried the refresh a few times in case the cause was transient, a brief Square outage clears itself. When the retries also failed with `unauthorized`, the cause was clearly the grant itself, not the network, so the alert escalated immediately.
+3. **The fix is a reconnect, not a retry.** An invalid refresh token cannot be revived by retrying. Someone with access to the Vortex IQ workspace needs to reconnect Square through the connector settings, which runs a fresh OAuth grant and issues a new token pair. Until then, ingest stays paused.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with OAuth Token Refresh Failure |
+| --- | --- |
+| [Total Revenue](/nerve-centre/kpi-cards/square-online/total-revenue) | The headline that goes stale first. If revenue looks suspiciously flat, check this card before assuming a real slowdown. |
+| [Total Orders](/nerve-centre/kpi-cards/square-online/total-orders) | A frozen token freezes order ingest. A sudden plateau in order volume with no demand-side cause is a classic symptom of a refresh failure. |
+| [Active Locations](/nerve-centre/kpi-cards/square-online/active-locations) | If location data stops updating, the location context behind every per-location card is stale. This card explains why. |
+| [POS to Online Inventory Drift Alert](/nerve-centre/kpi-cards/square-online/pos-online-inventory-drift-alert) | Inventory alerts depend on fresh data. A paused ingest means drift and oversell could be building unseen. Restoring the token restores those safeguards. |
+| [Oversell Risk (negative on-hand projected)](/nerve-centre/kpi-cards/square-online/oversell-risk-negative-on-hand-projected) | Same reason. A stale connection blinds the oversell projection, so a token failure is also an inventory-safety failure. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against Square
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in the Square Dashboard:**
+
+[Square Dashboard, Settings, Account & Settings, Connected apps / App integrations](https://squareup.com/dashboard). Confirm that the Vortex IQ connection is still present and authorised, and that no one has revoked it. If the connection is missing or shows reduced permissions, that explains an `unauthorized` refresh failure. Developers can also review token and webhook activity in the Square Developer Dashboard for the application.
+
+Other places that *look* relevant but aren't the fix:
+
+- **Connected apps list**: this is where you confirm the grant still exists. If the app was removed, reconnect from the Vortex IQ side.
+- **Square Developer Dashboard, OAuth**: shows the application's OAuth configuration and recent token activity. Useful for diagnosis, but the reconnect happens in your Vortex IQ workspace.
+- **Square status page**: rules out a Square-side outage as the cause of a transient failure.
+- **Square Dashboard, Sales reports**: confirms Square still has the data, which proves the gap is on the ingest side, not the merchant side.
+
+**Why our alert may fire when Square looks healthy:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Transient Square outage**. A brief API issue during the refresh window can fail a refresh even though the grant is valid. | Self-resolves; the next successful refresh clears the alert |
+| **Revoked grant**. The merchant disconnected the app or changed scopes in Connected apps; Square is healthy but the token is gone. | Requires a reconnect from Vortex IQ |
+| **Rotated app credentials**. If the application's client secret was rotated, existing refresh tokens can be invalidated. | Requires a reconnect |
+| **Clock or retry timing**. A refresh attempted right at the expiry boundary can fail and succeed on the next attempt. | Self-resolves on retry |
+
+**Cross-connector note:**
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| Any Square Online card | All depend on a valid token | Every Square card shares the same connection token. A single refresh failure stales them all simultaneously, which is why this card is treated as the connection's heartbeat. |
+| [`shopify.oauth-token-refresh-failure`](/nerve-centre/kpi-cards/shopify/oauth-token-refresh-failure) | Same failure mode, different platform | Shopify tokens have different lifetimes and refresh mechanics. The concept is identical: a silent auth failure stops ingest. |
+
+**Why Square makes this a hero card:** Square access tokens last around 30 days and rely on an automatic refresh to stay alive. That short lifetime means a single broken refresh quietly takes the whole connection offline within the month. On longer-lived or non-expiring tokens this risk is lower, but on Square it is a structural reality, so the refresh failure earns a hero slot as the guardian of every other card's accuracy.
+
+---
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+OAuth refresh failure is a connector-health concept common to any platform that uses expiring tokens. The mechanics differ per platform but the consequence, silent ingest failure, is the same. These links are provided where a comparable concept exists, not as a reconciliation.
+
+- [`shopify.oauth-token-refresh-failure`](/nerve-centre/kpi-cards/shopify/oauth-token-refresh-failure)
+- [`bigcommerce.oauth-token-refresh-failure`](/nerve-centre/kpi-cards/bigcommerce/oauth-token-refresh-failure)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What does a refresh failure actually break?**
+It stops Vortex IQ from pulling fresh data out of Square. Every Square card keeps showing its last successful read, so the dashboard looks plausible but is frozen. Until the token is restored, revenue, orders, inventory, and customer cards are all stale.
+
+**Why do Square tokens expire at all?**
+Square access tokens are short-lived (around 30 days) for security, and a longer-lived refresh token is used to mint new access tokens automatically. This is standard OAuth practice. The trade-off is that if the automatic refresh ever fails, the connection goes dark, which is exactly what this card watches for.
+
+**The alert fired but my Square Dashboard works fine. Why?**
+Because the failure is on the connection between Vortex IQ and Square, not inside Square. Your own login and dashboard use a different session. The most common causes are a revoked grant, rotated app credentials, or a brief Square outage during the refresh window.
+
+**How do I fix it?**
+If the cause was transient (a short outage), the next successful refresh clears the alert on its own. If the grant was revoked or credentials rotated, reconnect Square from the connector settings in your Vortex IQ workspace. That runs a fresh OAuth flow and issues a new token pair, and ingest resumes.
+
+**Will I lose data while the token is broken?**
+No data is lost in Square itself. Square keeps every order, payment, and inventory change. Once the connection is restored, Vortex IQ backfills the gap so the history is complete. What you lose is real-time visibility during the outage.
+
+**Why alert on a single failure instead of a count?**
+Because the consequence is silent and total. Unlike a noisy metric where one blip is normal, a single refresh failure can mean the whole connection is offline. The cost of a false alarm (a quick check) is far lower than the cost of a missed one (days of stale numbers), so the threshold is one.
+
+**Who should respond to this alert?**
+It is scoped to owner and engineering because the fix is a reconnect or a credentials check, not a merchandising decision. Whoever administers the Vortex IQ workspace and the Square connection should action it promptly, since every other Square card depends on it.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*OAuth Token Refresh Failure* is one of hundreds of KPI pulses Vortex IQ tracks across Square Online and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

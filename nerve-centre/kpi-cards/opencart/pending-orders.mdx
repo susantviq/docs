@@ -1,0 +1,136 @@
+---
+title: "Pending Orders, OpenCart"
+sidebarTitle: "Pending Orders"
+description: "Live count of OpenCart orders currently in a Pending status, awaiting payment confirmation or a first action. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ecommerce Platform](/nerve-centre/connectors#connectors-by-type)
+
+> The live count of orders sitting in a Pending status, the queue of sales that have started but not yet confirmed payment or received a first action.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A Pending order in OpenCart is one that exists but has not yet cleared its first gate, typically awaiting payment confirmation from an offline method (bank transfer, cheque, cash on delivery) or a callback from an online gateway. A small, stable backlog is normal. A spike usually means a payment callback is failing, a gateway is down, or an offline-payment queue has been left unattended. This card watches the level so you can tell "business as usual" from "money is stuck".
+
+| | |
+| --- | --- |
+| **What it counts** | The number of orders whose current status is Pending. |
+| **Order source** | Order records live in `oc_order`; the current status is held there and the full status history in `oc_order_status` / the order-history table. |
+| **What "Pending" means** | An order awaiting payment confirmation or a first action. Offline methods (bank transfer, cheque, COD) sit here until the merchant confirms receipt; online gateways sit here until a success callback arrives. |
+| **Missing-status orders** | OpenCart also has an order-status of `0` (incomplete / abandoned checkout) that is distinct from Pending. Those are not counted here; see [Failed Orders (24h)](/nerve-centre/kpi-cards/opencart/failed-orders-24h). |
+| **Currency / value** | This card counts orders, not money. OpenCart stores order totals and tax separately and supports multiple currencies, so a value view is handled by [Revenue at Risk (live)](/nerve-centre/kpi-cards/opencart/revenue-at-risk-live). |
+| **Multi-store** | Orders carry a `store_id`. By default this card counts Pending orders across every storefront on the install. |
+| **Time window** | RT (live snapshot) |
+| **Alert trigger** | `> 2x the 30-day average` |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+```
+COUNT(orders)
+  WHERE order_status = 'Pending'
+```
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A German homeware store on OpenCart 4.x taking both card payments (online gateway) and bank transfer (offline). Its 30-day average Pending backlog is about 18 orders at any moment. The snapshot is taken at 10:00 on 21 Mar 26.
+
+| State | Pending orders | Notes |
+| --- | --- | --- |
+| Awaiting bank transfer (normal) | 16 | Customers who chose transfer, payment not yet received |
+| Awaiting card-gateway callback (normal) | 3 | Should clear within minutes |
+| Card-gateway callbacks failing since 08:30 | 27 | Stuck, callback URL returning errors |
+| **Pending Orders (this card)** | **46** | 2.5x the 30-day average of 18 |
+
+What's interesting here:
+
+1. **46 against a baseline of 18 trips the alert.** The card fires at more than twice the 30-day average, and 46 is 2.5x. Without the baseline, 46 might look like a busy morning; against history it clearly is not.
+2. **The cause is a broken callback, not slow customers.** Sixteen bank-transfer orders pending is normal trading. The 27 card orders stuck since 08:30 are the anomaly: the gateway's success callback is failing, so paid orders never advance out of Pending. Those customers were charged but their orders look unconfirmed.
+3. **Offline and online pending need different handling.** Bank-transfer pending clears when the merchant reconciles the bank feed and confirms receipt. Card-callback pending clears when the integration is fixed and the callbacks replay. Treating both as one queue hides the real problem.
+4. **Money is quietly stuck.** Every card order trapped in Pending is cash taken but unfulfilled. The companion [Revenue at Risk (live)](/nerve-centre/kpi-cards/opencart/revenue-at-risk-live) puts a currency figure on the pile so the owner can see the exposure, not just the count.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Pending Orders |
+| --- | --- |
+| [Processing Orders](/nerve-centre/kpi-cards/opencart/processing-orders) | The next stage in the lifecycle. Pending that never becomes Processing is the warning sign. |
+| [Order Processing Backlog](/nerve-centre/kpi-cards/opencart/order-processing-backlog) | The aggregate view of unfinished work across statuses; Pending is one feeder into it. |
+| [Failed Orders (24h)](/nerve-centre/kpi-cards/opencart/failed-orders-24h) | Pending that fails payment outright lands here. A rising failure count drains the Pending queue the wrong way. |
+| [Revenue at Risk (live)](/nerve-centre/kpi-cards/opencart/revenue-at-risk-live) | Puts a dollar value on orders stuck in Pending too long. |
+| [Order Status Distribution](/nerve-centre/kpi-cards/opencart/order-status-distribution) | Shows Pending as a share of all statuses, so you can see whether the queue is proportionate. |
+| [Platform Error Spike or Extension Conflict](/nerve-centre/kpi-cards/opencart/platform-error-spike-or-extension-conflict) | A broken payment callback often shows up here too, explaining a Pending spike. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against OpenCart
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in the OpenCart admin:**
+
+Sales → Orders, then filter the Order Status column to "Pending", gives you the same queue this card counts. Each order's history tab (backed by `oc_order_status` and the order-history table) shows when and why it entered Pending. Reports → Sales → Orders can summarise counts by status over a period. For payment-method context, System → Settings (and each payment extension's configuration) tells you which methods land orders in Pending by design.
+
+OpenCart admin views that *look* like the same number but aren't:
+
+- **Sales → Orders with no status filter** counts every order, not just Pending.
+- **The Dashboard "orders" tile** is usually a recent-period count, not a live Pending level.
+- **Orders at status `0` (incomplete / missing)** are abandoned or never-confirmed checkouts, a different bucket from Pending. They appear only when you enable "missing orders" visibility.
+
+**Why our number may legitimately differ from the OpenCart admin:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Timezone.** Vortex IQ reads on a UTC cadence; OpenCart timestamps follow the store timezone. A snapshot taken mid-callback can differ by a sync interval. | Cosmetic timing shift |
+| **Multi-store.** Orders carry a `store_id`; this card counts across all storefronts unless filtered. An admin filtered to one store will show fewer. | Card higher than a single-store admin view |
+| **Status-name customisation.** OpenCart lets you rename or add statuses. If "Pending" has been renamed or a custom pre-payment status added, the mapping may need adjusting. | Either direction |
+| **Incomplete vs Pending.** Status `0` (incomplete) is excluded here but can appear in some admin lists. | Card lower than a list that includes incompletes |
+| **API / DB sync lag.** An order that just entered Pending may not yet be reflected. | Self-resolves at next sync |
+
+**Cross-connector note:** if your card payments run through a connected gateway, a Pending spike caused by failing callbacks will often coincide with the gateway's own dashboard showing successful charges that OpenCart never marked complete. That mismatch (gateway says paid, OpenCart says pending) is the clearest fingerprint of a callback fault.
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The same idea of a pending-order queue exists on other commerce platforms, though each platform names its pre-confirmation status differently. This is **not a reconciliation**, your OpenCart store has no parallel store elsewhere to compare against. These links help agencies running multi-platform client books navigate between equivalent metrics.
+
+- [`shopify.financial_status_breakdown`](/nerve-centre/kpi-cards/shopify/financial-status-breakdown)
+- [`bigcommerce.order_status_breakdown`](/nerve-centre/kpi-cards/bigcommerce/order-status-breakdown) (planned)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Is a Pending order the same as an abandoned cart?**
+No. An abandoned or never-confirmed checkout sits at OpenCart's status `0` (incomplete / missing), which is a separate bucket. A Pending order is a real order awaiting payment confirmation or a first action. See [Failed Orders (24h)](/nerve-centre/kpi-cards/opencart/failed-orders-24h) for the failure side.
+
+**Why is my Pending count always non-zero?**
+If you accept offline payment methods (bank transfer, cheque, cash on delivery), orders legitimately sit in Pending until you confirm receipt. A steady, modest backlog is normal. The alert keys off a sudden jump above twice the 30-day average, not the mere presence of pending orders.
+
+**Pending spiked but my sales did not, what happened?**
+Most often a payment-gateway callback is failing, so paid card orders never advance out of Pending. Check the gateway's own dashboard: if it shows successful charges that OpenCart still marks Pending, the callback URL or integration is the culprit.
+
+**I renamed my order statuses, will this still work?**
+OpenCart lets you rename and add statuses freely. The card maps to the Pending status as configured for your install; if you have renamed it or introduced a custom pre-payment status, the mapping may need a one-time adjustment so the right status is counted.
+
+**Does this count orders across all my storefronts?**
+Yes by default. Orders carry a `store_id`, and the card sums Pending across every storefront on the install unless you filter to one store. An admin view filtered to a single store will naturally show fewer.
+
+**How do I clear a stuck Pending queue?**
+For offline payments, reconcile against your bank feed and confirm receipt to advance each order. For online payments, fix the failing callback and replay or manually advance the affected orders. Once the underlying status changes in `oc_order`, the count drops at the next sync.
+
+**Should I worry about the dollar value, not just the count?**
+Yes, and this card deliberately counts orders, not money. Pair it with [Revenue at Risk (live)](/nerve-centre/kpi-cards/opencart/revenue-at-risk-live), which puts a currency figure on orders that have been stuck too long.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Pending Orders* is one of hundreds of KPI pulses Vortex IQ tracks across OpenCart and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,138 @@
+---
+title: "Products Missing SKU / Model, OpenCart"
+sidebarTitle: "Products Missing SKU / Model"
+description: "Count of OpenCart products with an empty SKU or empty Model field, the identifiers feeds and marketplaces depend on. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Standard](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ecommerce Platform](/nerve-centre/connectors#connectors-by-type)
+
+> The count of products with an empty SKU or empty Model field, the identifiers that product feeds, marketplaces, and stock systems rely on to match a product.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> In OpenCart, every product has a Model field (required at the schema level) and an optional SKU field. Humans shop by name, but machines match by identifier: Google Shopping feeds, marketplace listings, warehouse systems, and accounting exports all key off SKU or Model. A product with a blank identifier still sells on your storefront, but it falls out of every downstream feed silently. This card counts the products carrying that hidden liability so you can fix them before a feed rejects them.
+
+| | |
+| --- | --- |
+| **What it counts** | The number of products with an empty SKU field or an empty Model field (or both). |
+| **Field source** | Both fields live in `oc_product`: `model` and `sku`. |
+| **Model vs SKU** | OpenCart requires Model at the schema level, so a truly empty Model is rare and usually a sign of a bad import that bypassed validation. SKU is optional and frequently left blank, which is the more common cause of this count. |
+| **Why it matters** | Product feeds (Google Shopping, marketplaces), stock-sync extensions, and accounting exports match on these identifiers. A blank one means the product silently drops out of, or fails to match in, those systems. |
+| **Disabled products** | Disabled products can be included or excluded depending on configuration; by default the count reflects catalogue hygiene across enabled, feed-eligible products. |
+| **Currency / refunds** | Not applicable. This is a catalogue-data-quality metric. |
+| **Multi-store** | Products are shared across `store_id` storefronts, so a blank identifier affects every store's feeds at once. |
+| **Time window** | RT (live snapshot) |
+| **Alert trigger** | `> 5 products` |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+```
+COUNT(products)
+  WHERE sku IS EMPTY
+     OR model IS EMPTY
+```
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A Spanish auto-parts store on OpenCart 4.x with around 6,800 products, listing on its own storefront plus a Google Shopping feed and one marketplace. A bulk CSV import on 12 Mar 26 brought in 400 new lines. The snapshot is taken on 13 Mar 26.
+
+| Segment | Products | Notes |
+| --- | --- | --- |
+| Blank SKU only | 31 | Sell fine on storefront, drop out of feeds that key on SKU |
+| Blank Model (import bypassed validation) | 4 | Should be impossible by schema; bad import |
+| Both blank | 2 | Worst case, invisible to every downstream system |
+| **Products Missing SKU / Model (this card)** | **37** | well over the alert threshold of 5 |
+
+What's interesting here:
+
+1. **The storefront looks perfect, the feeds do not.** All 37 products display and sell normally on the OpenCart storefront. The damage is invisible until a feed run rejects them or a marketplace fails to match them, which is exactly why a live count beats waiting for a feed error report.
+2. **Four blank Models should not exist.** OpenCart requires Model at the schema level, so a blank Model almost always means an import wrote rows that bypassed normal validation (a direct DB insert or a permissive import extension). Those four are a red flag about the import process itself, not just the products.
+3. **SKU blanks are the common, fixable case.** Thirty-one products simply never had a SKU entered. For an auto-parts store, SKU is often the manufacturer part number the marketplace matches on, so a blank SKU means lost marketplace visibility on parts that may be in demand.
+4. **One blank, every feed.** Because products are shared across storefronts, a single blank identifier degrades the Google feed and the marketplace listing simultaneously. Fixing it once in `oc_product` repairs every downstream system at the next feed run.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Products Missing SKU / Model |
+| --- | --- |
+| [Total Products](/nerve-centre/kpi-cards/opencart/total-products) | The denominator. Missing identifiers as a share of the catalogue tells you how widespread the hygiene problem is. |
+| [Disabled Products](/nerve-centre/kpi-cards/opencart/disabled-products) | A product disabled and missing a SKU is doubly invisible; the two hygiene checks pair naturally. |
+| [Empty Categories (0 Products)](/nerve-centre/kpi-cards/opencart/empty-categories-0-products) | The category-side catalogue-health check that complements this product-side one. |
+| [OpenCart Inventory vs Marketplace Listings](/nerve-centre/kpi-cards/opencart/opencart-inventory-vs-marketplace-listings) | Blank identifiers are a leading cause of products failing to match across to a marketplace. |
+| [Out-of-Stock Products](/nerve-centre/kpi-cards/opencart/out-of-stock-products) | A blank SKU on an out-of-stock product makes restock-feed matching fail too. |
+| [Extension / Modification Conflicts](/nerve-centre/kpi-cards/opencart/extension-modification-conflicts) | A permissive import extension is a common reason Model validation gets bypassed. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against OpenCart
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in the OpenCart admin:**
+
+Catalog → Products lists every product; the Model column is shown by default and you can open each product's Data tab to see both Model and SKU. There is no built-in "missing identifier" filter, so admins usually export the catalogue or sort to find blanks. Reports → Products Viewed and Reports → Products Purchased help you judge which blank-identifier products actually have demand and therefore matter most to fix first.
+
+OpenCart admin views that *look* like the same number but aren't:
+
+- **The Model column in Catalog → Products** shows the Model but not the SKU; a product can have a Model and still be missing its SKU, so eyeballing this column undercounts.
+- **A product page that displays a SKU** may be showing an option-level or variant SKU rather than the base product SKU; the card checks the base `oc_product.sku`.
+- **A feed extension's "products exported" total** counts what made it into the feed, not what was silently dropped for a blank identifier.
+
+**Why our number may legitimately differ from the OpenCart admin:**
+
+| Reason | Direction of divergence |
+| --- | --- |
+| **Disabled-product handling.** Whether disabled products are included is configurable; an admin export of all products may count differently. | Either direction |
+| **Multi-store.** Products are shared across `store_id`, so the card counts the product once even though the blank affects every store's feed. | Card counts products, not store-product pairs |
+| **Option / variant SKUs.** OpenCart can hold SKUs at the option level; the card evaluates the base product SKU, which may read as blank even when options carry one. | Card higher than a variant-aware view |
+| **Whitespace vs truly empty.** A field containing only spaces may read as blank to the card but look filled in the admin. | Card higher than a naive visual check |
+| **API / DB sync lag.** A SKU added in the last minute may not yet be reflected. | Self-resolves at next sync |
+
+**Cross-connector note:** if you run a Google Shopping or marketplace feed, blank identifiers here are the upstream cause of feed disapprovals and unmatched listings downstream. Fixing this count is usually the fastest way to lift feed coverage on [OpenCart Inventory vs Marketplace Listings](/nerve-centre/kpi-cards/opencart/opencart-inventory-vs-marketplace-listings).
+
+<details>
+<summary><em>Same-metric documentation cross-reference (for agencies running multiple platforms)</em></summary>
+
+The same idea of a missing-identifier catalogue check exists on other commerce platforms. This is **not a reconciliation**, your OpenCart store has no parallel store elsewhere to compare against. These links help agencies running multi-platform client books navigate between equivalent metrics.
+
+- [`shopify.sku_coverage`](/nerve-centre/kpi-cards/shopify/sku-coverage)
+- [`bigcommerce.sku_coverage`](/nerve-centre/kpi-cards/bigcommerce/sku-coverage)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Isn't Model required in OpenCart? How can it be empty?**
+Model is required through the normal admin form and at the schema level, so a blank Model almost always means a bulk import or direct database write bypassed that validation. A non-zero blank-Model count is therefore as much a warning about your import process as about the products themselves.
+
+**My products sell fine, so why does a blank SKU matter?**
+On the storefront it does not. It matters downstream: Google Shopping feeds, marketplace listings, stock-sync extensions, and accounting exports match on SKU or Model. A blank identifier means the product silently drops out of, or fails to match in, those systems, costing visibility you never see fail.
+
+**The admin shows a SKU but the card says it is missing, why?**
+OpenCart can store SKUs at the option or variant level as well as on the base product. This card checks the base `oc_product.sku`. A product whose only SKU lives on an option will read as blank at the base level. It can also be a whitespace-only value that looks filled but is effectively empty.
+
+**Should I fix Model or SKU first?**
+Fix blank Models first: they should be impossible and signal a broken import. Then fix blank SKUs on products with real demand (use Reports → Products Purchased to prioritise), since those are the ones losing feed and marketplace visibility.
+
+**Does the count include disabled products?**
+That depends on configuration. By default the focus is catalogue hygiene across feed-eligible products, but the behaviour can be set to include or exclude disabled items to match how you run your feeds.
+
+**Why is the number the same across my storefronts?**
+Products are shared across `store_id` storefronts in OpenCart, so a single blank identifier affects every store's feeds at once and is counted a single time.
+
+**Can I auto-generate the missing SKUs?**
+Yes, many merchants backfill SKUs with a CSV update or an extension. The card will drop as soon as the `oc_product.sku` values are populated and the next sync runs, so a single bulk fix can clear most of the count.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Products Missing SKU / Model* is one of hundreds of KPI pulses Vortex IQ tracks across OpenCart and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.
