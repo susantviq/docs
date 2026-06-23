@@ -1,0 +1,169 @@
+---
+title: "Slow Queries During Checkout Window (5m), MySQL"
+sidebarTitle: "Slow Queries During Checkout Window (5m)"
+description: "Slow Queries During Checkout Window (5m) for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A correlated table that lists every slow query (a statement whose execution exceeded `long_query_time`) recorded on the MySQL instance during a rolling 5-minute window, lined up against the storefront's live checkout volume for the same minutes. For a platform or SRE team, this answers one blunt question: "are slow database queries happening at the exact moment shoppers are trying to pay?" A slow query during a quiet hour is a tuning task. The same slow query co-occurring with a checkout drop is an active revenue leak, which is why this card crosses the database connector with the storefront connector rather than living in either alone.
+
+| | |
+| --- | --- |
+| **Data source** | `Slow_queries` delta from `SHOW GLOBAL STATUS` plus the per-statement rows from `performance_schema.events_statements_summary_by_digest` (or the slow query log / `mysql.slow_log` table when `log_output = TABLE`). Each row is a slow statement: digest, schema, mean and max latency, rows examined, and a count for the window. The storefront side is the checkout/order rate pulled from the connected ecommerce connector for the identical minutes. |
+| **Metric basis** | Statement-level slow events, NOT a single scalar. The card is a table broken down by row (one row per slow digest seen in the window), joined in time to checkout volume. A query only appears if it crossed `long_query_time` inside the window. |
+| **Aggregation window** | Rolling 5 minutes (`5m`), refreshed on the live cadence. The window is short on purpose: checkout impact is a now problem, not a daily-average problem. |
+| **What counts as a "slow query"** | Any statement whose wall-clock execution time exceeded the instance's `long_query_time` threshold (default 10s, but most production instances run it at 1s or below). Statements that were slow only because they waited on a lock still count, the shopper waited regardless of the cause. |
+| **What does NOT count** | (1) Fast queries, even high-volume ones; (2) Slow queries outside the 5-minute window; (3) Administrative statements excluded by `log_slow_admin_statements = OFF`; (4) Queries below `min_examined_row_limit` if that filter is set; (5) Replica-side apply latency (that lives on the [Replication Lag](/nerve-centre/kpi-cards/mysql/replication-lag-seconds-behind-source) card). |
+| **The checkout join** | The storefront side is sourced from the connected commerce connector (Shopify, BigCommerce, or Adobe Commerce) order/checkout rate for the same 5 minutes. The "co-occur" logic compares the slow-query burst against a dip in that checkout rate. |
+| **Time zone** | Statements are timestamped in the instance's `system_time_zone`; Vortex IQ normalises to UTC for cross-connector windowing and renders in your display time zone. |
+| **Time window** | `5m` (rolling 5-minute window, live refresh) |
+| **Alert trigger** | `>5 slow queries co-occur with checkout drop`. More than five slow statements inside the window AND a measurable fall in checkout/order rate over the same minutes pages the on-call. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card is built in two passes that are then joined on time.
+
+**Pass one, the database side.** Every refresh, the engine reads the `Slow_queries` counter from `SHOW GLOBAL STATUS` and computes the delta against the previous sample. A non-zero delta means at least one statement crossed `long_query_time` since the last read. To turn that count into rows, the engine reads `performance_schema.events_statements_summary_by_digest` filtered to statements whose `MAX_TIMER_WAIT` (or last-seen timer) lands inside the 5-minute window, ordered by latency descending. Where Performance Schema is unavailable, it falls back to the slow query log table (`mysql.slow_log`, requires `log_output = TABLE`). Each surviving statement becomes one row: normalised digest, default schema, count in window, mean latency, max latency, and rows examined.
+
+**Pass two, the checkout side.** For the identical 5 minutes, the engine pulls the checkout or order rate from the connected commerce connector and compares it to the trailing baseline (the same weekday-and-hour pattern). A "checkout drop" is a statistically meaningful fall below that baseline, not just any minute-to-minute wobble.
+
+**The join and the alert.** The two passes are aligned minute by minute. The headline counts the slow statements in the window; the alert fires only when both conditions are true at once: more than five slow statements present, and a checkout drop detected over the same window. That AND is the whole point. Five slow queries with healthy checkout is a backlog tuning ticket; five slow queries with a checkout dip is money walking out of the door right now.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK homeware brand runs Magento (Adobe Commerce) on a primary MySQL 8.0 instance with `long_query_time = 1`. Snapshot taken on 14 Apr 26 at 20:05 BST, in the middle of an evening email-campaign traffic peak.
+
+| Digest | Schema | Count (5m) | Mean | Max | Rows examined |
+| --- | --- | --- | --- | --- | --- |
+| `SELECT ... FROM sales_flat_quote WHERE ...` | `magento` | 9 | 2.4s | 6.1s | 1.9M |
+| `SELECT ... FROM catalog_product_index_price ...` | `magento` | 6 | 1.8s | 3.3s | 740k |
+| `UPDATE inventory_stock_item SET qty = ...` | `magento` | 4 | 1.3s | 2.0s | 12k |
+| `SELECT ... FROM core_session WHERE session_id = ...` | `magento` | 3 | 1.1s | 1.4s | 88k |
+
+The window holds **22 slow statements across 4 digests**, comfortably over the alert's "5" line. On the storefront side, the checkout rate has fallen from a baseline of roughly 38 checkouts in 5 minutes to 21. Both conditions are true, so the card lights red and the on-call is paged.
+
+The platform team reads three things at a glance:
+
+1. **The quote-table query is the bleeder.** `sales_flat_quote` is on the hot path: every "add to basket" and every checkout step touches it. At 1.9M rows examined per execution and a 6.1s max, it is a full or near-full scan, almost always a missing or stale index after a recent deploy or a statistics drift. This is the digest to attack first.
+2. **The price-index query is collateral.** `catalog_product_index_price` going slow at the same instant points at a shared root cause: the InnoDB buffer pool is thrashing under the traffic peak, so even normally-cached pages are hitting disk. Confirm with [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate); if it has dropped below 95%, the buffer pool is the systemic cause, not each query individually.
+3. **The checkout dip is real, not noise.** 38 to 21 is a 45% fall during the exact minutes the database is slow. That is the difference between "tune this later" and "act now".
+
+```text
+Cost framing for the open window:
+  - Baseline checkout rate: ~38 per 5 min; observed: 21. Shortfall: 17 checkouts.
+  - Average order value: £64
+  - Some shoppers retry and succeed; assume 60% recover, 40% abandon.
+  - Lost orders this window: 17 × 0.40 = ~7
+  - Revenue at risk this window: 7 × £64 = ~£448
+  - If the slow-query condition persists for an hour at this rate: ~£5,400
+```
+
+The correct on-call response is not to debug the index in the moment. It is to (a) confirm the buffer pool / a runaway query is the cause, (b) kill the worst offending session with `KILL QUERY` if a single rogue statement is starving the pool, and (c) decide on a storefront mitigation (throttle the email-campaign send rate so traffic stops outrunning the database) while the index fix is prepared and deployed.
+
+Three takeaways the team should remember:
+
+1. **The count alone is not the signal; the co-occurrence is.** Twenty slow queries during a 03:00 batch window is expected and harmless. The same twenty during a checkout dip is the alertable event. Always read the checkout column next to the count.
+2. **Repeated digests beat one-off spikes.** A single slow statement that ran once may have been an unlucky lock wait. The same digest appearing nine times in five minutes is a structural problem (bad plan, missing index, buffer-pool pressure) that will keep firing until it is fixed.
+3. **Rows examined is the smoking gun.** A slow query that examined 1.9M rows to return a handful is an index problem you can fix. A slow query that examined few rows but still took seconds is a locking or resource-contention problem, a different fix entirely. Read the rows-examined column to tell them apart.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards platform teams should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow Queries During Checkout Window | What the combination tells you |
+| --- | --- | --- |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mysql/slow-query-rate) | The instance-wide rate, not the checkout-windowed view. | A high overall rate with this card quiet means the slow queries are off the checkout path; both high means the slow load is landing on shoppers. |
+| [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest) | The 24h digest leaderboard that names the worst statements. | The digest at the top of this card during the incident should appear in the 24h leaderboard, that is your permanent fix target. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) | The percentile view of overall query health. | p95 spiking in the same window confirms the slowdown is broad, not confined to one digest. |
+| [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) | The most common systemic cause of correlated slow queries. | Hit rate falling below 95% as this card fires equals buffer-pool thrashing, fix capacity not individual queries. |
+| [InnoDB Deadlocks (last 5m)](/nerve-centre/kpi-cards/mysql/innodb-deadlocks-last-5m) | Lock contention as an alternative cause of slow checkout statements. | Deadlocks plus slow checkout queries means a locking problem, not an indexing one. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mysql/connection-pool-saturation) | Slow queries hold connections open longer, draining the pool. | Both high means a feedback loop: slow queries saturate the pool, the pool starves new checkouts. |
+| [MySQL QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mysql/mysql-qps-spike-vs-ecom-order-rate) | The volume-side cross-channel peer. | A QPS spike with no order spike points at a bot or scraper generating the slow load, not real shoppers. |
+| [MySQL Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/mysql/mysql-pool-saturation-vs-traffic-burst) | The capacity-side cross-channel peer. | If the burst saturated the pool first, the slow queries are a symptom of capacity, not query plans. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL's own tooling:**
+
+> **`SHOW GLOBAL STATUS LIKE 'Slow_queries';`** for the running counter; take two readings a few minutes apart and subtract to get the window delta.
+> **`performance_schema.events_statements_summary_by_digest`** ordered by `MAX_TIMER_WAIT` for the per-digest latency leaderboard that feeds the table rows.
+> **The slow query log** (file at `slow_query_log_file`, or the `mysql.slow_log` table when `log_output = TABLE`) for the raw statements with timestamps, parse with `mysqldumpslow` or `pt-query-digest`.
+> **Managed services:** on Amazon RDS / Aurora use Performance Insights and the slow query log in the console; on Google Cloud SQL use Query Insights; on Azure Database for MySQL use the Query Performance Insight blade. These expose the same counters with their own retention.
+
+**Why our number may legitimately differ from MySQL's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **`long_query_time` setting** | Count varies | The card counts whatever the instance defines as slow. If your `long_query_time` is 10s but you expected 1s, the count will look low until you tune the threshold. |
+| **Window boundaries** | Edge statements shift | A statement straddling the 5-minute boundary is attributed to the window its completion timestamp falls in; manual `Slow_queries` deltas over a different interval will not match exactly. |
+| **Performance Schema vs slow log** | Slight row differences | The digest summary aggregates by normalised statement; the raw slow log keeps each execution. Counts agree, but the slow log may show parameter values the digest view hides. |
+| **Counter reset on restart** | Sudden drop | `Slow_queries` resets to zero on instance restart or `FLUSH STATUS`. A restart inside the window deflates the delta. |
+| **Admin statement filtering** | Count lower | If `log_slow_admin_statements = OFF`, slow `ALTER`/`ANALYZE` statements are not counted here even though they ran slowly. |
+| **Time zone** | Timestamps shift | The instance logs in `system_time_zone`; Vortex IQ renders in your display time zone. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes the divergence |
+| --- | --- | --- |
+| [`shopify.orders-over-time`](/nerve-centre/kpi-cards/shopify/orders-over-time) / [`shopify.total-revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) | The checkout drop on this card should show as a dip in storefront orders for the same minutes. | If orders are flat while this card shows a drop, the join is reading a different store or time zone, check the connector mapping. |
+| [`bigcommerce.abandoned-cart-spike-alert`](/nerve-centre/kpi-cards/bigcommerce/abandoned-cart-spike-alert) | Slow checkout queries should correlate with a rise in abandoned carts. | Abandonment up with this card quiet means the friction is front-end (JS, payment iframe), not the database. |
+| [`datadog.checkout-service-health-sales`](/nerve-centre/kpi-cards/datadog/checkout-service-health-sales) | The APM view of the same checkout slowness. | Datadog shows the application latency; this card shows the database cause underneath it. They should rise together when the DB is the bottleneck. |
+
+<details>
+<summary><em>Documentation cross-reference (same-concept peer)</em></summary>
+
+The "slow query co-occurring with a business drop" pattern exists on every database engine. This is **not** a reconciliation, your MySQL instance has no parallel Postgres or SQL Server to compare against. These references exist only so a team running multiple database engines can cross-link the same idea across docs.
+
+- PostgreSQL equivalent: statements above `log_min_duration_statement`, joined to `pg_stat_statements`.
+- SQL Server equivalent: queries flagged by Query Store / the slow-query Extended Events session.
+- MongoDB equivalent: operations above `slowOpThresholdMs` in the profiler / slow-query log.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows slow queries but checkout looks fine. Why is it not alerting?**
+By design. The alert requires both conditions: more than five slow statements AND a measurable checkout drop in the same window. Slow queries alone, without a checkout dip, are a tuning ticket rather than an incident, so the card stays amber/quiet and feeds the [Slow-Query Rate %](/nerve-centre/kpi-cards/mysql/slow-query-rate) and [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest) cards instead. The whole reason this card exists is to separate "slow but harmless" from "slow and costing money".
+
+**My `long_query_time` is 10s. Should I lower it?**
+For an OLTP storefront, almost certainly yes. A 10s threshold means a query has to be catastrophically slow before it is counted, by which point shoppers have already abandoned. Most production ecommerce instances run `long_query_time` between 0.5s and 2s so the card catches the queries that actually hurt checkout. Lower it during a maintenance window, watch the slow-query volume, and tune to a level that surfaces real problems without flooding the log.
+
+**Performance Schema is disabled on my instance. Does the card still work?**
+Partly. With Performance Schema off, the engine falls back to the slow query log (you need `slow_query_log = ON`, ideally `log_output = TABLE` so it can read `mysql.slow_log` over SQL). You still get the rows and counts, but you lose some of the per-digest aggregation that Performance Schema provides for free. Enabling Performance Schema (it is on by default in MySQL 8.0) gives the richest table.
+
+**Why does the same digest appear multiple times in one window?**
+Each row's count is how many times that normalised statement crossed `long_query_time` in the 5 minutes. A count of nine means the same query plan ran slowly nine times, which is the strongest possible signal that it is a structural problem (missing index, stale statistics, buffer-pool pressure) and not a one-off unlucky lock wait. Repeated digests are your priority fix targets.
+
+**How does the checkout side know which store to join against?**
+The card reads the commerce connector linked to the same Vortex IQ profile (Shopify, BigCommerce, or Adobe Commerce). If you run multiple storefronts off one database, confirm the connector mapping in the profile so the join lines up the right store's checkout rate. A mismatched mapping is the most common cause of "the numbers do not agree".
+
+**A slow query examined very few rows but still took seconds. Is the card wrong?**
+No. Wall-clock time, not rows examined, is what makes a query slow and what the shopper feels. A statement that examined few rows but took seconds was almost certainly waiting on a lock or starved of a resource (CPU, I/O, or a saturated buffer pool). Read the rows-examined column to classify it: high rows examined means an indexing problem; low rows examined with high latency means contention. Pair with [InnoDB Deadlocks (last 5m)](/nerve-centre/kpi-cards/mysql/innodb-deadlocks-last-5m) to confirm locking.
+
+**Can the card distinguish a real shopper slowdown from a bot-driven one?**
+Indirectly, by pairing. If queries-per-second spikes but the storefront order rate does not, the load is likely a scraper or bot rather than buying shoppers; that pattern is exactly what [MySQL QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mysql/mysql-qps-spike-vs-ecom-order-rate) surfaces. This card tells you checkout is hurting; that sibling tells you whether the cause is real demand or automated abuse.
+
+**Does a restart or `FLUSH STATUS` affect the reading?**
+Yes. The `Slow_queries` counter is cumulative and resets to zero on instance restart or an explicit `FLUSH STATUS`. If either happens inside the window, the delta will under-report. The per-digest Performance Schema view is more resilient because it carries its own timers, but a full restart clears that too. After a restart, give the card one full window to re-establish a baseline before trusting the count.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow Queries During Checkout Window (5m)* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,153 @@
+---
+title: "Keyspace Hit Rate %, Redis"
+sidebarTitle: "Keyspace Hit Rate %"
+description: "Keyspace Hit Rate % for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cache](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Keyspace Hit Rate %** is the share of key lookups that Redis served from memory rather than missing. It is computed as `keyspace_hits / (keyspace_hits + keyspace_misses)` from `INFO stats`. This is the Redis-defining metric: a cache exists to answer "do you have this?" with "yes" as often as possible. A high hit rate means Redis is absorbing read load that would otherwise fall on your primary database; a falling hit rate means more of that load is leaking through to the backend, which is where latency spikes and database overload usually begin.
+
+| | |
+| --- | --- |
+| **Data source** | `keyspace_hits / (keyspace_hits + keyspace_misses)` from `INFO stats`. Both are cumulative counters since restart. The card differences consecutive polls so the displayed rate reflects the current window, not the all-time average since boot. |
+| **Metric basis** | Ratio (percentage), derived from two cumulative counters. The Redis-defining metric. |
+| **Aggregation window** | `RT/1h`: a live real-time gauge plus a one-hour trend so a momentary dip is visible separately from a sustained decline. |
+| **What is a "hit"** | A read command (`GET`, `HGET`, `MGET`, `EXISTS`, etc.) that found the requested key in the keyspace. `keyspace_hits` increments. |
+| **What is a "miss"** | A read command for a key that does not exist (never written, already expired, or evicted). `keyspace_misses` increments. |
+| **What does NOT count** | (1) Write commands (`SET`, `DEL`); (2) Administrative commands (`INFO`, `CONFIG`); (3) `SCAN`/`KEYS` iteration. Only key-level read lookups move the counters. |
+| **Counter window** | Because the underlying counters are cumulative since restart, the lifetime ratio is heavily smoothed; the card reports the per-window rate so a fresh problem is not hidden behind months of good history. |
+| **Time window** | `RT/1h` (live gauge plus a one-hour trend) |
+| **Alert trigger** | `<80%`. Below 80%, more than one in five lookups is missing and leaking to the backend; the card turns amber/red and warns the on-call. |
+| **Roles** | owner, platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:worked_example */}
+The card reads two fields from `INFO stats` and computes the ratio over the current window:
+
+```text
+hit_rate_window = (hits[t] - hits[t-1])
+                  / ((hits[t] - hits[t-1]) + (misses[t] - misses[t-1]))
+                * 100
+```
+
+The raw inputs:
+
+```text
+# Stats
+keyspace_hits:88210334       <- cumulative read hits since restart
+keyspace_misses:1944120      <- cumulative read misses since restart
+```
+
+Using the windowed delta (not the lifetime totals) matters. A node up for 30 days with a 98% lifetime hit rate can be running at 70% right now after a deploy invalidated the cache; the lifetime ratio would hide that, the windowed ratio surfaces it. A miss is not inherently bad, every cold key starts as a miss, but a rising miss share means the cache is doing less of its job and the backend is doing more of it.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team uses Redis 7.2 to cache product and pricing lookups in front of MySQL. Healthy steady state is around 96%. Snapshot over one hour on 03 Jun 26 after a catalogue re-import.
+
+| Time (BST) | hits delta | misses delta | Hit rate | Note |
+| --- | --- | --- | --- | --- |
+| 10:00 | 1,420,000 | 58,000 | 96.1% | Steady state |
+| 10:30 | 1,390,000 | 61,000 | 95.8% | Calm |
+| 11:02 | 980,000 | 410,000 | 70.5% | Re-import flushed cached product keys |
+| 11:10 | 1,050,000 | 360,000 | 74.5% | Cache re-warming, still leaking to MySQL |
+| 11:30 | 1,330,000 | 120,000 | 91.7% | Most hot keys back in cache |
+| 12:00 | 1,410,000 | 60,000 | 95.9% | Recovered |
+
+The card alerts at 11:02 when the rate drops below 80%. The on-call DBA reads it alongside the database connector and [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live):
+
+```text
+At 11:02:
+  - hit rate         : 70.5%  (was 96%)
+  - misses/sec       : ~228   (was ~32)
+  - MySQL read QPS   : up 4.1x  (the misses fell through to the database)
+  - p95 page latency : up from 180ms to 620ms
+
+Diagnosis: the catalogue re-import deleted the cached product keys
+(a cache invalidation), so every product read missed Redis and hit MySQL
+until the cache re-warmed. Not a Redis fault, an invalidation pattern.
+```
+
+The fix is process, not config: stagger or pre-warm the cache after a bulk re-import rather than flushing it cold, or use a versioned key namespace so old keys serve until the new ones are written. Three things this shows:
+
+1. **A hit-rate dip after a deploy or import is usually a cold cache, not a broken Redis.** The metric is doing its job: it is telling you the backend is suddenly carrying read load it normally would not. The action is to warm the cache, not to resize Redis.
+2. **The 80% line is a leak threshold, not a quality grade.** At 96% the backend handles 4% of reads; at 80% it handles 20%, a 5x increase in backend read load. That non-linear effect on the database is why the alert sits at 80 and not lower.
+3. **Distinguish a dip from a decline.** A sharp dip that recovers within the hour is a cache-warming event. A hit rate that has drifted from 96% to 88% to 82% over days is a structural problem: the working set is outgrowing memory and eviction is dropping hot keys (pair with [Evicted Keys / minute](/nerve-centre/kpi-cards/redis/evicted-keys-minute) and [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory)).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Keyspace Hit Rate % | What the combination tells you |
+| --- | --- | --- |
+| [Evicted Keys / minute](/nerve-centre/kpi-cards/redis/evicted-keys-minute) | Eviction of hot keys is the leading cause of a structural hit-rate decline. | Hit rate down plus eviction up equals an undersized cache dropping wanted data. |
+| [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) | Memory pressure forces the eviction that lowers hit rate. | Hit rate down plus memory over 90% equals the eviction spiral. |
+| [Expired Keys / minute](/nerve-centre/kpi-cards/redis/expired-keys-minute) | TTL churn turns into misses when expired keys are re-read. | A jump in expiry followed by a hit-rate dip equals TTLs set too short for the read pattern. |
+| [Total Keys (db0)](/nerve-centre/kpi-cards/redis/total-keys-db0) | The keyspace size context for a hit-rate move. | Hit rate down while key count falls equals a flush/invalidation; down with key count flat equals a read-pattern change. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live) | The throughput context for the miss rate. | Hit rate down with ops up equals more cold traffic; down with ops flat equals the same traffic now missing. |
+| [Command Latency p95 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p95-ms) | Misses themselves are cheap in Redis; the cost is downstream. | A hit-rate dip with a backend latency spike confirms misses are leaking to the database. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The composite that weights hit rate at 20%. | A sustained hit-rate decline is one of the biggest single contributors to a falling score. |
+| [Redis OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/redis/redis-ops-spike-vs-ecom-order-rate) | Separates genuine demand from a stampede. | A hit-rate collapse with an ops spike but flat orders equals a cache stampede or bot. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis:**
+
+> `INFO stats` and read `keyspace_hits` and `keyspace_misses`: `redis-cli INFO stats | grep -E 'keyspace_hits|keyspace_misses'`. Difference two readings to get the windowed rate the card reports.
+> `INFO keyspace` for per-database key counts, useful when a hit-rate drop coincides with a key-count drop (an invalidation).
+> `redis-cli --stat` for a live one-line throughput view including hits and misses per second.
+> `CONFIG RESETSTAT` resets the cumulative counters to zero; useful before a controlled test, but note it also resets every other `INFO stats` figure.
+
+For ElastiCache or MemoryDB, the same fields are available via `INFO`; the CloudWatch metrics `CacheHits` and `CacheMisses` are the managed-service equivalents and let you compute the same ratio at one-minute granularity.
+
+**Why our number may legitimately differ from a manual reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Lifetime vs window.** A manual `INFO` shows the cumulative-since-restart ratio; the card shows the current window. | Manual often higher | Months of good history smooth out a fresh dip in the lifetime figure. |
+| **Counter reset.** `CONFIG RESETSTAT` or a restart zeroes the counters. | Card rebaselines | The card detects the reset and resumes from the new baseline; a naive manual delta would read oddly across the reset. |
+| **Poll spacing.** The windowed rate depends on poll cadence. | Either | A short dip between polls is averaged across the interval. |
+| **CloudWatch granularity (managed).** `CacheHits`/`CacheMisses` are one-minute aggregates. | Marginal | The native counters are exact; CloudWatch is binned. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My hit rate is 99% but the application still feels slow. How?**
+Hit rate measures whether Redis had the key, not how fast it returned it. A 99% hit rate with high [Command Latency p95 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p95-ms) usually means the values themselves are large (multi-megabyte hashes, big sorted sets) or a slow Lua script is in the path. The cache is hitting; the commands are just expensive. Check `SLOWLOG GET` and key sizes with `MEMORY USAGE <key>`.
+
+**Is a low hit rate always bad?**
+No. Some workloads are legitimately low-hit by design: a deduplication set, a one-shot idempotency-key check, or a rate limiter where most keys are first-seen. For those, a "miss" is the expected and correct answer. The 80% alert assumes a read-through cache; if your Redis is not a read cache, raise or disable the threshold in the Sensitivity tab so a healthy low-hit workload does not page you.
+
+**My hit rate dropped right after a deploy. Is Redis broken?**
+Almost certainly not. The most common cause is a cache invalidation: the deploy changed a key format, flushed a namespace, or re-imported data, so every read missed until the cache re-warmed. It recovers as hot keys come back. To avoid the dip entirely, pre-warm the cache or use versioned key prefixes so old keys keep serving until new ones exist.
+
+**The lifetime hit rate in `redis-cli INFO` is higher than the card. Which is right?**
+Both, they measure different windows. `INFO` shows the cumulative ratio since the instance started, which can be smoothed by months of good history. The card shows the current window so a fresh problem is visible. For "is the cache healthy right now", trust the card; for "how has it done overall since boot", read the raw `INFO` totals.
+
+**Counters look stuck at the same numbers. Why?**
+Either the instance has no read traffic in the window (check [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live)), or you are reading a replica that serves no reads, or `CONFIG RESETSTAT` was run and the deltas are starting from zero again. The counters only move on key-level read commands; pure write traffic does not change them.
+
+**Does a `MGET` for 100 keys count as one hit or many?**
+The counters increment per key looked up, not per command. An `MGET` of 100 keys where 90 exist records 90 hits and 10 misses. This is why batch-read patterns move the counters in large steps and why the ratio is robust even though one command touched many keys.
+
+**Can I improve hit rate by raising `maxmemory`?**
+If the decline is caused by eviction of hot keys, yes: more memory means fewer evictions means more hits. Confirm first with [Evicted Keys / minute](/nerve-centre/kpi-cards/redis/evicted-keys-minute), if eviction is zero, the misses are coming from cold keys or short TTLs, and more memory will not help. In that case the lever is longer TTLs, cache pre-warming, or a better key-coverage strategy, not a bigger node.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Keyspace Hit Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,168 @@
+---
+title: "Database Disk Usage %, gauge"
+sidebarTitle: "Database Disk Usage %"
+description: "Database Disk Usage % for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of provisioned data volume currently consumed by the PostgreSQL instance: table data, indexes, WAL, temporary files, and the catalogue. For a platform team this is the single most unforgiving capacity number on the board. PostgreSQL does not gracefully degrade when the data disk fills: once the volume hits 100%, the database refuses new writes, autovacuum cannot reclaim space, and on many managed services the instance is forced into a read-only or recovery state. This card is the early-warning gauge that keeps you ahead of that wall.
+
+| | |
+| --- | --- |
+| **What it tracks** | Used bytes divided by total provisioned bytes on the volume that holds the PostgreSQL data directory (`PGDATA`), expressed as a percentage. Includes heap, indexes, the WAL directory (`pg_wal`), temporary files, and catalogue bloat. |
+| **Data source** | "Database Disk Usage % for the selected period." On a self-managed host the engine reads filesystem stats for the `PGDATA` mount and cross-checks against `pg_database_size()` summed across databases plus `pg_wal` size. On Amazon RDS / Aurora it reads the CloudWatch `FreeStorageSpace` metric against allocated storage. On Cloud SQL it reads `database/disk/bytes_used` against `database/disk/quota`. |
+| **Time window** | `RT` (real-time, refreshed on the live polling cycle, typically every 60 seconds). |
+| **Alert trigger** | `> 90%`. Crossing 90% pages the on-call DBA. This is deliberately aggressive: the gap between 90% and a write-stopping 100% can be minutes on a busy write-heavy instance or during a runaway `pg_wal` build-up. |
+| **Threshold basis** | Percentage of provisioned volume, not of any soft quota. The gauge turns amber approaching the threshold and red at breach. |
+| **What does NOT count** | Storage used by sibling instances, read replicas on separate volumes, backups stored off-volume (S3, GCS), and snapshot storage. Those are billed and tracked elsewhere; this gauge is the live data volume only. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The gauge is `used_bytes / total_provisioned_bytes * 100`, sampled on the real-time cycle.
+
+On a self-managed instance the engine derives `used_bytes` two ways and reconciles them:
+
+1. Filesystem-level: `statvfs` on the `PGDATA` mount point gives `total` and `available`; `used = total - available`. This is authoritative because it captures everything on the volume, including temp files and any non-PostgreSQL data sharing the mount.
+2. PostgreSQL-level: the sum of `pg_database_size(datname)` across all databases, plus the size of `pg_wal`, plus temporary file usage from `pg_stat_database.temp_bytes`. This is what PostgreSQL itself believes it is using.
+
+The headline gauge uses the filesystem figure because that is what actually fills. The PostgreSQL-level figure is retained so the drill-down can attribute growth to heap, indexes, WAL, or temp files.
+
+On managed services there is no filesystem access, so the engine uses the provider's own storage metric:
+
+- RDS / Aurora: `100 - (FreeStorageSpace / AllocatedStorage * 100)`. Aurora auto-scales storage, so the gauge there reflects used against the current allocated ceiling, which is itself elastic.
+- Cloud SQL: `database/disk/bytes_used / database/disk/quota * 100`.
+
+WAL deserves special attention. A stuck replication slot, a failing `archive_command`, or a long-running base backup can cause `pg_wal` to grow without bound while the rest of the database is quiet. Because WAL lives on the data volume by default, a WAL blow-up shows up here first and can be the difference between 70% and 100% within the hour.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a self-managed PostgreSQL 15 primary on a 500 GB gp3 volume backing an order-management service. Snapshot taken on 14 Apr 26 at 02:10 BST during the overnight batch window.
+
+| Component | Size | Share of volume |
+| --- | --- | --- |
+| Heap (table data) | 268 GB | 53.6% |
+| Indexes | 121 GB | 24.2% |
+| `pg_wal` | 64 GB | 12.8% |
+| Temp files (active sort spill) | 19 GB | 3.8% |
+| Catalogue + misc | 6 GB | 1.2% |
+| **Used total** | **478 GB** | **95.6%** |
+| Free | 22 GB | 4.4% |
+
+The gauge reads **95.6%** in red and the alert has already paged the on-call DBA, because 90% was crossed at 01:54. Reading the drill-down, two things stand out:
+
+1. `pg_wal` at 64 GB is roughly 4x its steady-state size of around 16 GB. A quick check of `pg_replication_slots` shows a slot named `analytics_cdc` with a `restart_lsn` far behind the current WAL position: the downstream change-data-capture consumer has been down since 22:30, so PostgreSQL is retaining every WAL segment since then.
+2. Temp files at 19 GB come from an overnight reporting query spilling a large sort to disk because `work_mem` is too small for it.
+
+```text
+Triage decision tree the DBA follows:
+  1. Is the volume about to hit 100%?  Yes (95.6%, growing ~3 GB/hour from WAL retention).
+  2. Fastest safe reclaim?  Restore the analytics_cdc consumer OR, if it cannot
+     be recovered quickly, drop the orphaned replication slot:
+        SELECT pg_drop_replication_slot('analytics_cdc');
+     This releases ~48 GB of retained WAL within one checkpoint cycle.
+  3. Second reclaim: kill the overnight report spilling temp files, OR raise
+     work_mem for that session so it sorts in memory.
+  4. Medium term: expand the gp3 volume from 500 GB to 750 GB (online, no
+     downtime) to restore headroom while the heap keeps growing.
+```
+
+After dropping the orphaned slot and the next checkpoint, `pg_wal` returns to 17 GB and the gauge falls to **84.3%**, back under the alert threshold. The platform team then files a follow-up to add a separate monitor on replication-slot lag so an idle consumer never silently fills the data disk again.
+
+Three lessons platform teams should carry from this:
+
+1. **Disk usage is not just table growth.** The scary, fast movements come from WAL retention and temp-file spill, not from the heap creeping up. When this gauge jumps suddenly, check `pg_wal` and temp files before assuming you simply need more storage.
+2. **90% is a real deadline, not a vanity threshold.** A write-heavy primary can close the last 10% in well under an hour. The aggressive alert exists so you have time to act, not to nag.
+3. **Reclaim before you resize.** Expanding a volume is the right medium-term fix, but the immediate move is almost always to release retained WAL (orphaned slots, broken archiving) or kill a runaway temp spill. Those reclaim space in minutes; a resize plus rebalance can take longer.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Database Disk Usage % | What the combination tells you |
+| --- | --- | --- |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The composite that folds disk pressure into one executive number. | A red disk gauge is one of the fastest ways to drag the composite below 70. |
+| [WAL Lag Bytes (primary to standby)](/nerve-centre/kpi-cards/postgresql/wal-lag-bytes-primary-standby) | WAL build-up is the most common cause of sudden disk growth. | Rising WAL lag plus rising disk usage equals a stuck slot or broken archiving retaining segments. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/postgresql/last-successful-backup-hours-ago) | A long-running or hung base backup can pin WAL and inflate disk. | Stale backup plus rising disk equals investigate the backup pipeline first. |
+| [Oldest Autovacuum Age (hours)](/nerve-centre/kpi-cards/postgresql/oldest-autovacuum-age-hours) | Vacuum reclaims dead-tuple space; starved vacuum bloats the heap. | High vacuum age plus high disk equals bloat is part of the problem, not just live data. |
+| [Top Tables by Dead Tuples](/nerve-centre/kpi-cards/postgresql/top-tables-by-dead-tuples) | Pinpoints which tables are wasting volume to bloat. | The worst offenders here are where a `VACUUM FULL` or repack will reclaim the most space. |
+| [Memory Usage %](/nerve-centre/kpi-cards/postgresql/memory-usage) | Low `work_mem` forces sorts to spill to disk as temp files. | Memory pressure plus disk pressure equals temp-file spill is consuming the volume. |
+| [Replication Lag (seconds)](/nerve-centre/kpi-cards/postgresql/replication-lag-seconds) | A lagging standby holds back WAL recycling on the primary. | Lag plus disk growth confirms the standby is the reason WAL is not being cleared. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL and the host:**
+
+> **Filesystem truth (self-managed):** `df -h $PGDATA` on the host shows the volume the gauge tracks. This is the number that matters when the disk is about to fill.
+> **PostgreSQL's own view:** `SELECT pg_size_pretty(sum(pg_database_size(datname))) FROM pg_database;` for total logical size, and `SELECT pg_size_pretty(sum(size)) FROM pg_ls_waldir();` for the WAL directory.
+> **Per-table attribution:** `SELECT relname, pg_size_pretty(pg_total_relation_size(relid)) FROM pg_stat_user_tables ORDER BY pg_total_relation_size(relid) DESC LIMIT 20;`
+> **Managed services:** the RDS / Aurora console CloudWatch tab shows `FreeStorageSpace`; the Cloud SQL console shows storage usage under the instance overview.
+
+**Why our number may legitimately differ from the native tooling:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Filesystem vs logical size** | Vortex IQ may read higher | `df` includes WAL, temp files, filesystem reserved blocks, and any non-PostgreSQL data on the mount; `sum(pg_database_size())` does not. We headline the filesystem figure because that is what fills. |
+| **Reserved blocks** | Vortex IQ slightly higher | ext4 reserves around 5% of the volume for root by default; that space counts as used against the provisioned total but is invisible to PostgreSQL. |
+| **CloudWatch sampling lag** | Brief lag on RDS | `FreeStorageSpace` is published at one-minute granularity; during a fast WAL build-up the console may trail the live host by up to a minute. |
+| **Aurora elastic storage** | Different baseline | Aurora grows storage automatically in 10 GB increments, so the denominator (allocated) moves; the gauge reflects used against the current ceiling, which is not fixed. |
+| **Temp file transience** | Vortex IQ can spike then fall | A large sort spill inflates used bytes then releases when the query finishes; a snapshot mid-query reads higher than one taken seconds later. |
+
+**Cross-source reconciliation:**
+
+| Source | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| `df -h $PGDATA` (filesystem) | Should match the gauge within a percent | Reserved blocks and rounding; the filesystem is the authority during an incident. |
+| `pg_database_size()` sum + `pg_wal` size | Will read lower than `df` | WAL, temp files, and filesystem overhead are not in the per-database sum. |
+| RDS `FreeStorageSpace` | `100 - (free / allocated)` should match | One-minute publish lag; Aurora elastic allocation changes the denominator. |
+
+<details>
+<summary><em>A note on per-tablespace volumes</em></summary>
+
+If the instance uses tablespaces on separate mounts (for example indexes on a fast NVMe volume and cold partitions on cheaper storage), each volume can fill independently. The headline gauge tracks the `PGDATA` volume, since that is where WAL and the catalogue live and is the one that stops writes when full. Per-tablespace volumes are surfaced in the drill-down. A common surprise is an index tablespace filling while the main data volume looks healthy.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The gauge says 95% but `sum(pg_database_size())` only accounts for 70% of the volume. Where is the rest?**
+Almost always WAL and temp files, neither of which is counted in `pg_database_size()`. Run `SELECT pg_size_pretty(sum(size)) FROM pg_ls_waldir();` to size `pg_wal`, and check `pg_stat_database.temp_bytes` for active spill. Filesystem reserved blocks (around 5% on ext4) and any non-PostgreSQL files on the mount make up the remainder. The gauge tracks the filesystem because that is what actually fills.
+
+**Why is the alert at 90% and not 95%? It feels early.**
+Because the last 10% can vanish faster than you can respond. A runaway replication slot or broken `archive_command` retains WAL on the data volume, and on a busy primary that can add several GB per hour with no warning. The 90% page buys you the time to reclaim space before the database stops accepting writes at 100%.
+
+**What actually happens when PostgreSQL hits 100% disk?**
+The instance can no longer write WAL, so it refuses new write transactions and may panic-shutdown to protect data integrity. Autovacuum cannot run (it needs to write), so you cannot reclaim space the easy way. On RDS the instance enters a storage-full state and may become unavailable. Recovery usually means expanding the volume or, on self-managed hosts, manually freeing space (dropping orphaned slots, clearing temp files) before PostgreSQL will restart cleanly. Avoiding 100% is far cheaper than recovering from it.
+
+**On Aurora the gauge looks low even though my workload is huge. Is it broken?**
+No. Aurora separates compute from a distributed, auto-scaling storage layer that grows in 10 GB increments up to a large ceiling. The gauge shows used against the current allocated amount, which keeps expanding, so it rarely approaches 100% the way a fixed gp3 volume does. On Aurora, watch the absolute storage cost and growth rate rather than the percentage.
+
+**Does dropping a large table immediately free disk?**
+`DROP TABLE` and `TRUNCATE` release space back to the filesystem promptly. `DELETE` does not: it only marks rows dead, and the space is reused by future inserts only after autovacuum processes the table. To return space to the operating system after large deletes you need `VACUUM FULL` (which takes an exclusive lock and rewrites the table) or an online repack tool such as `pg_repack`. This is why a table can stay large on disk long after its logical row count drops.
+
+**Can I move WAL off the data volume to protect against this?**
+Yes. Mounting `pg_wal` on its own volume (via a symlink or the `--waldir` option at initdb) isolates WAL growth from data growth, so a stuck slot fills the WAL volume rather than stopping all writes on the data volume. Many production deployments do this. The headline gauge then tracks the data volume; the WAL volume is surfaced separately. It is a sound mitigation but does not remove the need to monitor replication slots.
+
+**The number jumps up and down by a few percent within minutes. Why so noisy?**
+Temporary files. Large sorts, hash joins, and index builds spill to disk and release when they finish, so a snapshot taken during a heavy query reads higher than one taken a moment later. If the noise is large, raise `work_mem` for those workloads so they sort in memory, or schedule heavy reporting off the primary. Persistent growth (not transient spikes) is the signal to act on.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Database Disk Usage %* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

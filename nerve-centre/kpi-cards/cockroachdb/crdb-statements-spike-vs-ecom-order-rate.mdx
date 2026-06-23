@@ -1,0 +1,152 @@
+---
+title: "CRDB Statements Spike vs Ecom Order Rate, CockroachDB"
+sidebarTitle: "CRDB Statements Spike vs Ecom Order Rate"
+description: "CRDB Statements Spike vs Ecom Order Rate for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **CRDB Statements Spike vs Ecom Order Rate** plots CockroachDB statement throughput (statements per second) against the storefront's order rate on a shared dual-axis chart over a rolling 15-minute window. The two should move together: more orders means more database work. The dangerous reading is divergence: a statements spike with no matching order spike. That pattern means the database is suddenly doing a lot more work that is not turning into revenue, which usually points at a runaway query loop, a misbehaving cron or backfill, a retry storm, or a bot hammering an endpoint. For a DBA or SRE team this card separates "we are busy because business is good" from "we are busy for no good reason, and it is about to cost us".
+
+| | |
+| --- | --- |
+| **What it tracks** | Two correlated series on one chart: CockroachDB statements per second (left axis) and storefront order rate (right axis), bucketed across a rolling 15-minute window so you can see whether query load and order load rise and fall together. |
+| **Data source** | CockroachDB side: the cluster statement throughput series behind [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live), derived from the `sql.query.count` / executed-statement counters across live nodes. Order side: orders-per-minute from the linked Shopify / BigCommerce / Adobe Commerce connector. |
+| **Metric basis** | Correlation, not a single value. The signal is the relationship between the two series. A proportional rise is healthy; a statements spike without an order spike is the alert condition. |
+| **Time window** | `15m`, a rolling 15-minute window bucketed (typically per minute) so a sudden divergence shows within a bucket or two. |
+| **Alert trigger** | `qps spike with no order spike`: statement throughput jumps sharply while order rate stays flat. The mismatch, not the absolute query rate, is what fires. |
+| **What this distinguishes** | (1) Healthy scaling: statements and orders rise together; (2) Wasted load: statements spike, orders flat (runaway query, bot, retry storm, rogue job); (3) Efficiency change: orders rise but statements rise faster (a query got more expensive per order). |
+| **What does NOT fire** | A proportional rise in both series, a scheduled batch window the engine can attribute to a non-storefront workload, and statement spikes that subside within a single bucket. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card joins two per-minute rates on a shared time axis and renders them on a dual-axis chart:
+
+```text
+left axis  (qps):    CockroachDB statements per second, cluster-wide
+right axis (orders): storefront orders per minute, linked connector
+
+divergence = qps rose sharply (vs its recent baseline)
+             AND order rate stayed flat (no matching rise)
+```
+
+The CockroachDB series is the executed-statement throughput summed across live nodes, the same number the [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live) card reports. The order series is the storefront connector's orders-per-minute. The engine normalises both to a common cadence and compares each series against its own recent baseline.
+
+A healthy cluster shows the two curves tracking each other: a sales burst drives more reads and writes, so statements climb with orders, and a quiet spell relaxes both. The alert opens only on divergence, specifically a sharp statements spike that is not accompanied by a rise in orders. That decoupling is the tell that the extra query work is not customer-driven: a backfill job, an N+1 query loop introduced by a deploy, a transaction retry storm, or automated traffic. The card carries the spike magnitude, the busiest statement fingerprints if available, and the flat order figure so the on-call engineer can immediately see that load is up while revenue is not.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs CockroachDB behind the order and catalogue services for a retailer on BigCommerce. Normal mid-afternoon throughput is roughly 3,000 statements/sec at around 40 orders/min. Snapshot taken on 14 Apr 26 at 15:30 BST, shortly after a routine application deploy.
+
+| Bucket (BST) | Statements/sec | Orders/min | Reading |
+| --- | --- | --- | --- |
+| 15:20 | 3,050 | 41 | baseline, tracking |
+| 15:25 | 3,120 | 43 | baseline, tracking |
+| 15:28 | 7,400 | 42 | **statements spike, orders flat** |
+| 15:30 | 9,100 | 40 | **divergence widening** |
+
+Orders sit steady around 40 to 43 per minute throughout, exactly normal for the time of day. Statement throughput, though, roughly triples from 3,100 to 9,100 per second starting at 15:28, minutes after the deploy. The two curves, which had been moving as one, split apart. The card raises the divergence alert: query load is up sharply and not a single extra order explains it.
+
+What the on-call SRE does with this:
+
+1. **Rule out a legitimate batch.** Confirm no scheduled backfill, reindex, or reporting job is meant to be running. If one is, the engine usually attributes it; if this is unattributed, the spike is unexpected.
+2. **Tie it to the deploy.** The spike began minutes after the 15:30 release. The classic cause is an N+1 query regression: a code path that used to issue one statement per order now issues dozens. Cross-read [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live) for the raw curve and [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) to find which statement fingerprint exploded.
+3. **Contain before it cascades.** Extra query volume with no revenue is pure cost and a risk to everything else on the cluster. Watch [Statement Latency p95 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms) and [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation): if either is climbing, the rogue load is starting to starve real customer traffic. Roll back the deploy or feature-flag off the offending path.
+
+```text
+Why divergence is the signal that matters:
+  - 9,100 qps at 40 orders/min = ~227 statements per order.
+  - Baseline was ~3,100 qps at ~42 orders/min = ~74 statements per order.
+  - The per-order query cost tripled with zero revenue benefit.
+  - If unchecked, this saturates the pool and slows real checkouts: a self-inflicted incident.
+```
+
+Three takeaways for the team:
+
+1. **The mismatch is the alert, not the height.** 9,100 statements/sec during a genuine sales peak with orders also up would be healthy scaling. The same 9,100 with flat orders is waste. Always read both axes.
+2. **Statements-per-order is a deploy regression smoke test.** When the ratio jumps after a release, suspect an N+1 or a missing cache. This card makes that ratio visible in real time.
+3. **Wasted load is borrowed time.** Query work that earns nothing still consumes connections, CPU, and latency budget. Left alone it degrades the paths that do earn, turning a code smell into an outage.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with CRDB Statements Spike vs Ecom Order Rate | What the combination tells you |
+| --- | --- | --- |
+| [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live) | The raw throughput series this card joins to orders. | The raw curve shows the spike; this card shows whether orders explain it. |
+| [Statement Latency p95 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms) | Where excess load first slows real users. | p95 climbing during a divergence means the rogue load is starving customer queries. |
+| [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) | Identifies which statement fingerprint spiked. | A single fingerprint dominating the spike points straight at the offending code path. |
+| [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) | A retry storm can inflate statement counts. | High retries during the spike means the extra statements are retries, not new work. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation) | Excess statements consume connections. | Saturation rising with the spike means the rogue load is filling the pool. |
+| [Statement Error Rate %](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate) | A loop can throw errors at volume. | Error rate climbing with the spike means the runaway path is also failing, compounding the waste. |
+| [CRDB Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/cockroachdb/crdb-pool-saturation-vs-traffic-burst) | The sibling cross-channel card on the connection axis. | Statements and saturation both flat against traffic confirms the cluster is scaling cleanly. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The executive composite a sustained spike feeds. | A divergence with no business cause drags the score down and flags wasted spend. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look natively:**
+
+> **DB Console SQL dashboard** ("SQL Statements" / "Queries Per Second" panels) for the live statement-throughput series the left axis is built on.
+> **DB Console SQL Activity → Statements** to see which statement fingerprints carry the load and rank them by execution count.
+> **`SELECT * FROM crdb_internal.node_statement_statistics ORDER BY count DESC;`** for per-node statement counts to confirm where the spike originates.
+> The order side has no CockroachDB equivalent: confirm orders-per-minute against the linked Shopify / BigCommerce / Adobe Commerce order reports.
+
+**Why our number may legitimately differ from the native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Two-connector join** | N/A | The DB Console shows only statement throughput. The order pairing exists only in Vortex IQ; there is no native panel to reconcile the correlation against. |
+| **Statement vs query definition** | Either way | CockroachDB counts executed SQL statements; some native panels separate reads, writes, and transactions. Confirm you are comparing the same counter. |
+| **Bucket alignment** | Brief lag | The two series are polled independently and snapped to shared buckets. Near a sharp spike they can land a bucket apart before realigning. |
+| **Per-node vs cluster** | Vortex IQ aggregates | This card sums statements cluster-wide; a single-node DB Console view shows only that node's share. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [CRDB Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/cockroachdb/crdb-pool-saturation-vs-traffic-burst) | A real order-driven statements rise usually lifts saturation too. | Statements up with saturation flat can mean a tight read loop reusing existing sessions. |
+| [Slow Statements During Checkout Window (5m)](/nerve-centre/kpi-cards/cockroachdb/slow-statements-during-checkout-window-5m) | A divergence that also slows checkout statements is doubly urgent. | Slow checkout statements during a divergence means the rogue load is now hurting revenue paths. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Statements per second tripled but no alert fired. Why?**
+The alert fires on divergence, statements up while orders stay flat, not on absolute throughput. If orders rose proportionally with statements, the rise is healthy scaling and the card stays quiet. Read both axes: a high statement rate that tracks a high order rate is exactly what you want to see during a peak.
+
+**A scheduled backfill runs every afternoon and spikes statements. Will it alert every day?**
+It should not, if the engine can attribute the workload. Scheduled batch windows that the engine recognises as non-storefront load are excluded so they do not raise daily false alarms. If a known job is still triggering the alert, tag or schedule it in the connector so the engine can attribute it; an unattributed spike is treated as unexpected on purpose.
+
+**Orders rose but statements rose much faster. Is that a divergence?**
+It is an efficiency change worth watching, even though it is not the classic flat-orders divergence. A statements-per-order ratio that climbs means each order now costs more database work, often an N+1 regression or a lost cache. The card surfaces it; pair with [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) to find which statement got more expensive per order.
+
+**The two curves look offset by a minute during a sharp spike. Should I worry?**
+No. The statement and order series are polled independently and snapped to shared buckets, so a steep spike can lead the other series by a single bucket before they realign. The shape over the 15-minute window is what matters, not a one-bucket offset.
+
+**Could a retry storm cause a false statements spike?**
+It causes a real statements spike, because each retry re-executes a statement. If [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) is elevated during the spike, the extra statements are retries on contended rows rather than genuinely new work. The card is correctly reporting more statements; the contention is the upstream cause, and the fix is reducing contention, not throttling traffic.
+
+**Which order series does the card use if I have multiple storefront connectors?**
+It uses the storefront connector linked in the same Nerve Centre profile. If multiple are linked, the engine aggregates their order rates into the right-axis series. If no storefront connector is linked, the card shows the statements series alone and cannot classify spikes as demand vs waste; link an order source to unlock the comparison.
+
+**The divergence is real but small and short. Do I act?**
+A spike that subsides within a single bucket is filtered and will not raise a standing alert. A divergence that persists across several buckets is worth investigating even if modest, because sustained unexplained load tends to grow (a loop running over more data, a job falling behind). Note the timing against your deploy log; persistent small divergences are often early regressions before they become large ones.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*CRDB Statements Spike vs Ecom Order Rate* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

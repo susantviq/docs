@@ -1,0 +1,148 @@
+---
+title: "InnoDB Free Pages, MySQL"
+sidebarTitle: "InnoDB Free Pages"
+description: "InnoDB Free Pages for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [InnoDB Buffer Pool](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of pages in the InnoDB buffer pool that are currently unallocated, that is, neither holding data nor dirty. The free list is the pool of empty pages InnoDB hands out when it needs to bring a new page in from disk. A healthy instance keeps a small free buffer so reads never have to wait for an eviction. When the free list runs near empty, every new page read must first evict an existing page (and flush it first if dirty), which adds latency to the read path. This card is the absolute-count complement to [InnoDB Dirty Pages %](/nerve-centre/kpi-cards/mysql/innodb-dirty-pages) and the read-pressure peer to [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate).
+
+| | |
+| --- | --- |
+| **What it tracks** | `Innodb_buffer_pool_pages_free`: the count of pages on InnoDB's free list at the moment of sampling. Reported as an absolute page count, not a percentage. |
+| **Data source** | `SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_pages_free';`, sampled in real time. Also visible in `SHOW ENGINE INNODB STATUS` BUFFER POOL AND MEMORY as "Free buffers", and on managed services via Performance Insights / Cloud Monitoring. |
+| **Calculation basis** | A point-in-time gauge counter. The card reports the current free-page count; the alert evaluates it relative to `Innodb_buffer_pool_pages_total`. |
+| **Time window** | `RT` (real-time gauge). |
+| **Alert trigger** | `< 1% of total pages`. When free pages fall below one percent of the pool, InnoDB is effectively running with no slack and almost every page read forces an eviction, inflating read latency. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card reports the raw free-page count and evaluates the alert as a ratio against the total:
+
+```text
+free_pages        = Innodb_buffer_pool_pages_free
+free_pages_ratio  = Innodb_buffer_pool_pages_free / Innodb_buffer_pool_pages_total
+alert             = free_pages_ratio < 0.01
+```
+
+Reading the number correctly:
+
+1. **A warm pool runs with very few free pages, and that is fine, up to a point.** After an instance has been up long enough to read its working set into memory, the pool fills and the free list shrinks to a small steady-state buffer maintained by the page-cleaner threads. A low free count is therefore normal; the alert fires only when it drops below the 1% slack that InnoDB needs to absorb read bursts without forcing synchronous evictions.
+2. **Free pages and dirty pages compete for the same space.** `pages_total = pages_data + pages_dirty-overlap + pages_free` (dirty pages are a subset of data pages, modified in place). When dirty pages cannot be flushed fast enough, the page cleaner cannot return pages to the free list, so the free count collapses. A near-zero free count co-timed with a high [InnoDB Dirty Pages %](/nerve-centre/kpi-cards/mysql/innodb-dirty-pages) is the classic flush-can't-keep-up signature.
+3. **Eviction cost.** When the free list is empty and a new page must come in, InnoDB evicts a least-recently-used page; if that victim is dirty it must be flushed to disk first, turning a single read into a read-plus-write. This is why an empty free list shows up as read-latency inflation, not just a write problem.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MySQL 8.0 read-heavy primary with `innodb_buffer_pool_size` of 16 GB, which is roughly 1,000,000 pages at the default 16 KB page size. Snapshot taken on 03 Jun 26 at 13:05 BST during a catalogue-reindex job that is scanning large cold tables.
+
+| Counter | Value |
+| --- | --- |
+| `Innodb_buffer_pool_pages_total` | 1,000,000 |
+| `Innodb_buffer_pool_pages_free` | 6,400 |
+| `Innodb_buffer_pool_pages_dirty` | 720,000 |
+
+```text
+free_pages_ratio = 6,400 / 1,000,000 = 0.0064 = 0.64%   -> below 1% threshold
+```
+
+The card reads **6,400 free pages (0.64% of pool)** and Nerve Centre raises the sensitivity flag. Diagnosis:
+
+1. **The reindex scan is consuming the free list.** A cold-table scan pulls new pages in continuously, draining the free list faster than the page cleaner can replenish it. Because dirty pages are simultaneously at 72%, many evictions require a flush-before-evict, which is why the free list cannot recover on its own.
+2. **Read latency is inflating right now.** With the free list nearly empty, each new page read on the OLTP path is queuing behind an eviction (and possibly a flush). [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) will be rising, and [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) will be dropping as the scan evicts the hot working set.
+3. **The fix is workload placement, not config.** The durable answer is to run the reindex / large scan against a replica so the primary's pool keeps its hot OLTP working set resident. As an immediate stopgap, raising `innodb_io_capacity` lets the page cleaner flush and free pages faster, which restores some free-list headroom, but it does not stop the scan from evicting hot pages.
+
+```text
+Decision trace:
+  - free pages: 0.64% (below 1% floor)
+  - dirty pages: 72% (page cleaner cannot return pages fast enough)
+  - hit rate (sibling card): dropped from 99.9% to 96.1% in same window
+  Conclusion: a cold-table scan on the primary is the single cause.
+  Action: move the reindex to the read replica; primary free list and hit
+  rate recover within minutes once the scan stops evicting hot pages.
+```
+
+Three takeaways:
+
+1. **A low free count is normal on a warm pool; below the 1% floor is the warning.** The alert exists because at that point InnoDB has no slack to absorb read bursts.
+2. **Free pages and dirty pages are two views of the same pressure.** When flushing falls behind, free pages collapse; read them together.
+3. **The cause is almost always a specific scan or job.** Free-list collapse on an otherwise steady instance points at a cold-data scan evicting the hot set, best fixed by moving the job off the primary.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Free Pages | What the combination tells you |
+| --- | --- | --- |
+| [InnoDB Dirty Pages %](/nerve-centre/kpi-cards/mysql/innodb-dirty-pages) | Dirty pages compete with free pages for pool space. | Low free plus high dirty equals the page cleaner cannot keep up; flushing is the bottleneck. |
+| [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) | An empty free list forces evictions that drop the hit rate. | Free collapsing while hit rate falls equals a cold scan evicting the hot working set. |
+| [Memory Usage %](/nerve-centre/kpi-cards/mysql/memory-usage) | Host RAM context behind the pool. | A chronically empty free list with maxed host memory means the pool is genuinely undersized. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) | The user-visible symptom of eviction-bound reads. | p95 rising as free pages collapse confirms reads are queuing behind evictions. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mysql/slow-query-rate) | The scan draining the free list usually logs as slow queries. | A slow-query spike co-timed with free-list collapse identifies the offending job. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | Workload volume context. | Free collapsing with flat QPS means the query mix changed, not the load. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite that weights buffer-pool health. | A sustained sub-1% free list pulls the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL's own tooling:**
+
+> **`SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_pages_free';`** for the raw free-page count, and `Innodb_buffer_pool_pages_total` for the denominator behind the 1% alert.
+> **`SHOW ENGINE INNODB STATUS\G`** , the BUFFER POOL AND MEMORY section, which prints "Free buffers" directly alongside "Database pages" and "Modified db pages".
+> **`SELECT @@innodb_buffer_pool_size, @@innodb_page_size;`** to confirm the pool size in bytes and the page size used to convert pages to bytes.
+> On Amazon RDS / Aurora, **Performance Insights** buffer-pool counters; on Google Cloud SQL, the InnoDB metrics in **Cloud Monitoring**.
+
+**Why our number may legitimately differ from a hand reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sample timing** | Either direction | The free count fluctuates continuously as pages are read and freed; a hand `SHOW STATUS` a moment apart from the card's sample will differ. Both are correct. |
+| **Page count vs bytes** | None for the count | The card reports pages; if you compare against a byte figure remember to multiply by `innodb_page_size` (16 KB by default). |
+| **Multiple buffer-pool instances** | None | With `innodb_buffer_pool_instances > 1` the status counter already sums across instances, matching the card. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [InnoDB Dirty Pages %](/nerve-centre/kpi-cards/mysql/innodb-dirty-pages) | Free and dirty move inversely under flush pressure. | Free low while dirty also low means the pool is simply full of clean hot data, which is healthy, not a flush problem. |
+| [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) | Free-list collapse usually drags the hit rate down. | Free low while hit rate stays high means evictions are of cold pages only; the hot set is still resident. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My free-page count is almost zero. Is that an emergency?**
+Not on its own. A warm buffer pool naturally runs with a small free list because it has filled with your working set, which is exactly what you want. The alert fires only below 1% of total pages, the point at which InnoDB has no slack to absorb a read burst and starts forcing synchronous evictions. Read this card alongside the hit rate and latency cards: a low free count with a healthy hit rate and flat latency is fine.
+
+**Why does the free count drop during a backup or large scan?**
+Operations that read many cold pages (backups, reindexes, analytics scans, large `ALTER TABLE`) pull new pages into the pool continuously, draining the free list. If those pages are dirty when evicted, the page cleaner must flush them first, which slows replenishment further. The durable fix is to run such jobs against a replica so the primary's free list and hot working set are not disturbed.
+
+**Should I increase `innodb_buffer_pool_size` to keep more free pages?**
+Only if the free list is chronically below the floor in steady state (not just during a one-off scan), and only up to the working-set size with OS headroom left. A persistently empty free list with the host's memory maxed is a genuine undersize signal; a transient collapse during a job is a workload-placement problem, not a sizing one.
+
+**How do free pages relate to dirty pages?**
+They draw on the same pool. The page-cleaner threads flush dirty pages and return them to the free list. When the write rate outpaces flushing, dirty pages climb and the free list collapses together. That is why a near-zero free count paired with a high dirty percentage is the textbook "flushing cannot keep up" signature.
+
+**Does an empty free list affect reads or only writes?**
+Reads. When the free list is empty, every new page read must evict a victim first, and if the victim is dirty it must be flushed before the eviction completes. So an empty free list inflates read latency, which is the surprising part: a write-side pressure (slow flushing) manifests as a read-side symptom.
+
+**The free count is high right after a restart. Why?**
+A restart empties the pool, so almost all pages are free until the working set is read back in. The free count then falls as the pool warms. This is expected; the post-restart period is also when the [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) is at its cold-cache low.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*InnoDB Free Pages* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

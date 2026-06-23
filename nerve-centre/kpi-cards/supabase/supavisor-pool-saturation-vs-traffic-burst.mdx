@@ -1,0 +1,159 @@
+---
+title: "Supavisor Pool Saturation vs Traffic Burst, Supabase"
+sidebarTitle: "Supavisor Pool Saturation vs Traffic Burst"
+description: "Supavisor Pool Saturation vs Traffic Burst for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A cross-channel card that overlays Supavisor connection-pool saturation against an inbound traffic burst, so you can see the moment a spike in demand collides with a tier-bound connection ceiling. Supavisor is Supabase's connection pooler, and its pool size is capped by your plan tier. When a marketing send, a flash sale, or an organic spike drives traffic up, the pool can exhaust in seconds on free or pro tiers, at which point new requests queue or fail and the application appears down precisely when the most people are trying to use it. This card is Supabase-distinctive: it ties an infrastructure ceiling directly to a revenue-bearing demand event.
+
+| | |
+| --- | --- |
+| **What it tracks** | Supavisor pool saturation (% of the tier-bound pool in use) plotted against the concurrent traffic burst (request rate to the application/PostgREST layer), aligned on the same timeline so saturation and demand can be read together row by row. |
+| **Data source** | Supabase-distinctive: Supavisor pool caps are tier-bound, and a burst on the free or pro tier exhausts the pool fast. Saturation comes from Supavisor's pooler metrics (active vs maximum client connections); the traffic-burst series comes from the request-rate metrics (PostgREST request rate and/or the connected-clients series) over the same window. |
+| **Time window** | `15m` (rolling 15-minute window, sampled at fine granularity so the burst-and-saturation collision is visible minute by minute). |
+| **Alert trigger** | `> 90% during traffic burst`. Saturation above 90% on its own is concerning; saturation above 90% *while a traffic burst is in progress* is the revenue-at-risk condition this card exists to catch. |
+| **Why it matters** | A saturated pool during a burst means real users hitting connection failures at the worst possible moment. Unlike a quiet-hours saturation blip, a burst-time exhaustion event directly costs sessions, conversions, and revenue downstream. |
+| **What counts** | All client connections through Supavisor against the project's pool cap; all inbound request volume in the window. |
+| **What does NOT count** | Direct (non-pooled) connections that bypass Supavisor; the underlying Postgres max_connections (a separate, larger ceiling); background jobs that do not arrive during the burst. |
+| **Roles** | platform, dba, sre, owner |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+This is a dual-series correlation card. Two time series are sampled over the same 15-minute window and aligned on a shared minute-by-minute axis:
+
+**Series 1, Supavisor pool saturation:**
+
+```text
+saturation_% = (active_client_connections / pool_max_connections) x 100
+```
+
+`active_client_connections` is the count of client connections Supavisor currently holds; `pool_max_connections` is the pool ceiling set by your Supabase tier. Supavisor multiplexes many client connections onto a smaller set of server connections to Postgres, but the *client-side* pool still has a hard cap that scales with tier. When client demand reaches that cap, further clients wait or are refused.
+
+**Series 2, traffic burst:**
+
+```text
+request_rate = inbound_requests / interval_seconds
+```
+
+measured at the application edge (PostgREST request rate, and/or Realtime connected-client growth), expressed as requests per second per sample bucket. A "burst" is detected when request_rate rises sharply above its recent baseline (a fast-moving increase rather than a gradual ramp).
+
+**The correlation:** the card flags when Series 1 crosses 90% *during* a Series 2 burst. Saturation alone is a capacity warning; saturation coincident with a burst is a revenue-at-risk event, because the people being turned away are real, present demand. The engine timestamps the collision (first minute where saturation > 90% while a burst is active) so you can line it up against downstream ecommerce metrics.
+
+Because Supavisor pool caps are tier-bound, the same absolute request rate produces very different saturation depending on plan: a burst that a Team-tier pool absorbs comfortably can fully exhaust a Pro-tier pool, and a free-tier pool earlier still. The card normalises against your actual tier cap, so 90% means 90% of *your* ceiling, not an abstract number.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A direct-to-consumer brand runs its storefront backend on Supabase (Pro tier) with the app talking to the database through Supavisor in transaction mode. The marketing team schedules an email blast to 80,000 subscribers for 10:00 BST on 03 Jun 26 announcing a 24-hour sale. Snapshot of the 15-minute window from 10:00 to 10:15.
+
+| Time | Request rate (req/s) | Pool saturation % | Downstream signal |
+| --- | --- | --- | --- |
+| 09:58 | 110 | 34% | baseline |
+| 10:01 | 640 | 78% | email opens landing |
+| 10:03 | 980 | 94% | **pool saturated, burst active** |
+| 10:05 | 1,120 | 99% | connection refusals begin |
+| 10:08 | 1,050 | 98% | checkout errors reported |
+| 10:13 | 870 | 91% | still saturated |
+
+The Nerve Centre card shows the two lines crossing: request rate climbing steeply while saturation pins to the ceiling from 10:03. The alert trips at 10:03 (saturation > 90% during an active burst).
+
+Reading the situation:
+
+1. **The email landed and demand spiked 9x in three minutes** (110 to 980 req/s). That is exactly the intended outcome of the blast: lots of people arriving to buy.
+2. **The Pro-tier pool exhausted at 10:03.** From that point, new connection attempts queue behind the pool and, once the queue fills, are refused. Users see spinners, failed page loads, and checkout errors. This is the revenue-at-risk moment: maximum demand meeting a hard ceiling.
+
+```text
+Revenue framing (cross-channel):
+  - Burst window with saturation > 90%: 10:03 to ~10:15 (~12 minutes)
+  - Sessions arriving during window: ~1,000 req/s sustained, ~40 checkout attempts/min
+  - Estimated checkout-attempt failures while saturated: ~30%
+  - Lost orders (est.): ~40 x 12 x 0.30 = ~144 orders
+  - At ~£62 average order value: ~£8,900 of sale-day revenue at risk in 12 minutes
+```
+
+What the team should do:
+
+1. **Pre-emptively scale the pool before known bursts.** A scheduled email blast is a predictable burst. Upgrading the tier (or enabling a larger pool) ahead of the send raises the ceiling so the same demand stays under 90%. This is the cleanest fix: match the cap to known demand events.
+2. **Reduce per-request connection hold time.** Slow queries hold pooled connections longer, so the pool exhausts at a lower request rate. Pair with [Slow PostgREST Queries During Checkout Window](/nerve-centre/kpi-cards/supabase/slow-postgrest-queries-during-checkout-window): if slow queries are inflating hold time, fixing them effectively widens the pool without a tier change.
+3. **Coordinate marketing and platform.** The deepest lesson of this card is organisational: the people who schedule the burst (marketing) and the people who own the ceiling (platform) need to talk. A blast scheduled without a heads-up to the platform team is how a successful campaign becomes an outage.
+
+Pair this card with downstream ecommerce revenue: [Supabase QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/supabase/supabase-qps-spike-vs-ecom-order-rate) confirms whether the demand actually converted or was lost to the saturation.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this card | What the combination tells you |
+| --- | --- | --- |
+| [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) | The single-series saturation metric. | This card adds the traffic-burst overlay; the standalone card is the always-on saturation gauge. |
+| [Supavisor Pool at >90% Saturation](/nerve-centre/kpi-cards/supabase/supavisor-pool-at-90-saturation) | The alert-list view of breaches. | The alert fires; this card shows whether a burst caused it. |
+| [Supabase QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/supabase/supabase-qps-spike-vs-ecom-order-rate) | The revenue-conversion overlay. | Confirms whether burst demand converted or was lost to saturation. |
+| [Slow PostgREST Queries During Checkout Window](/nerve-centre/kpi-cards/supabase/slow-postgrest-queries-during-checkout-window) | Connection-hold time during the burst. | Slow queries shrink effective pool capacity, exhausting it at lower demand. |
+| [PostgREST Request Rate (req/sec)](/nerve-centre/kpi-cards/supabase/postgrest-request-rate-reqsec) | The raw demand series. | The traffic-burst line on this card is derived from request rate. |
+| [Connections In Use](/nerve-centre/kpi-cards/supabase/connections-in-use) | Absolute connection count. | Translates saturation % back to raw connection numbers against the cap. |
+| [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) | The user-facing failure symptom. | A saturated pool during a burst drives 5xx errors as requests are refused. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase and Postgres:**
+
+> **Supabase project Reports / Database section** for the connection-pool and client-connection charts, and the request-rate charts on the API report.
+> **Supabase project Settings → Database / Connection pooling** for your tier's pool size (the denominator that turns raw connections into a saturation %).
+> **`SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend';`** on the primary for the live count of active backends behind the pooler.
+> **`SHOW max_connections;`** for the underlying Postgres ceiling (distinct from, and larger than, the Supavisor client pool cap).
+
+**Why our number may legitimately differ from Supabase's own charts:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Pool cap vs Postgres max_connections** | Either | Saturation here is measured against the *Supavisor client pool* cap, which is tier-bound and smaller than Postgres `max_connections`. A chart plotting against `max_connections` will show a lower percentage for the same connection count. |
+| **Burst detection** | Vortex IQ only | Supabase shows request rate and pool usage on separate charts; this card adds the *correlation* (saturation during a detected burst). The collision flag is a Vortex IQ derivation. |
+| **Sampling granularity** | Either | A 15-minute window sampled per minute catches a short collision a coarser chart smooths away. |
+| **Pooler mode** | Either | Transaction-mode and session-mode pooling consume the pool differently; session mode holds a connection for the whole session and saturates faster. The reading reflects your configured mode. |
+| **Direct connections** | Vortex IQ may read lower | Connections that bypass Supavisor (direct to Postgres) do not count toward pool saturation here but do count in `pg_stat_activity`. |
+
+The authoritative reconciliation is pool cap (from Settings) versus live client backends (from `pg_stat_activity`), divided to give saturation, lined up against the request-rate chart for the same minutes.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What exactly is Supavisor and why does it have a smaller cap than Postgres?**
+Supavisor is Supabase's connection pooler, the layer your application connects through instead of talking to Postgres directly. Postgres connections are expensive (each is a process with its own memory), so Supavisor multiplexes many lightweight client connections onto a smaller pool of server connections. The client-side pool has a tier-bound cap that is deliberately smaller than Postgres `max_connections`; that cap is what this card measures saturation against. The whole point of the pooler is to let thousands of clients share a handful of database connections, but the client pool itself still has a ceiling.
+
+**Why does the same traffic burst saturate my pool but not my friend's?**
+Tier. Supavisor pool caps scale with your Supabase plan: free and pro tiers have hard, relatively low caps; team and enterprise tiers have larger pools. The same absolute request rate that sits at 50% on a team-tier pool can pin a pro-tier pool to 100%. If you are seeing burst-time exhaustion, the first question is whether your tier's cap matches your real peak demand.
+
+**Saturation hit 95% but there was no traffic burst. Does this card alert?**
+No. This card's alert is specifically "> 90% during a traffic burst". Saturation without a burst (for example, a slow connection leak, or a batch job grabbing connections) is caught by the standalone [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) card. This card exists to isolate the revenue-bearing case: a ceiling hit while real demand is arriving.
+
+**My pool saturates even though request rate is only moderate. Why?**
+Connection hold time. Each request holds a pooled connection for as long as its query runs. If queries are slow, connections are held longer, and the pool exhausts at a much lower request rate than it should. A pool that saturates under moderate load almost always has a slow-query problem upstream. Check [Slow PostgREST Queries During Checkout Window](/nerve-centre/kpi-cards/supabase/slow-postgrest-queries-during-checkout-window) and [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate); fixing slow queries effectively widens the pool.
+
+**Transaction mode vs session mode: which should I use to avoid this?**
+Transaction mode returns the connection to the pool after each transaction, so connections are reused aggressively and the pool serves far more clients. Session mode holds a connection for the entire client session, which is necessary for some features (prepared statements, advisory locks) but saturates the pool much faster. If you are hitting burst-time exhaustion and do not need session-pinned features, transaction mode dramatically increases the demand your pool can absorb.
+
+**Can I scale the pool fast enough to ride out a burst once it starts?**
+Reactive scaling during a live burst is risky: tier changes and pool resizes take time to take effect, and by then the saturation event has already cost you sessions. The reliable pattern is pre-emptive scaling: for predictable bursts (scheduled email sends, flash sales, known launch times), raise the ceiling before the burst arrives. For unpredictable organic spikes, run with enough headroom that normal peaks stay comfortably under 90%.
+
+**How does this card relate to PostgREST 5xx errors?**
+Directly. When the pool exhausts during a burst, new requests cannot get a connection: they queue until the queue fills, then are refused, surfacing as 5xx errors at the PostgREST layer. So a burst-time saturation event on this card and a spike on [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) are usually the same incident seen from two angles, cause and symptom.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Supavisor Pool Saturation vs Traffic Burst* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

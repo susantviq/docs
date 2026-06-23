@@ -1,0 +1,168 @@
+---
+title: "Avg Index Refresh Time (ms), Elasticsearch"
+sidebarTitle: "Avg Index Refresh Time (ms)"
+description: "Avg Index Refresh Time (ms) for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Indexing](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The average time a single refresh operation takes, in milliseconds, computed as `indices.refresh.total_time_in_millis / indices.refresh.total`. A refresh is what makes newly indexed documents searchable: it flushes the in-memory buffer into a new Lucene segment. A climbing average means refreshes are getting slower, which usually means segments are stacking up faster than merges can consolidate them, or disk I/O is struggling to keep pace. Slow refreshes delay how quickly new or updated documents appear in search results and are an early warning of indexing-side strain.
+
+| | |
+| --- | --- |
+| **API basis** | Index stats, `GET /_stats/refresh` (or `GET /_nodes/stats/indices/refresh`). The two counters are `refresh.total_time_in_millis` (cumulative time spent refreshing) and `refresh.total` (count of refresh operations). |
+| **Metric basis** | A ratio of cumulative time over cumulative count, computed as a delta over the window so it reflects recent refresh cost, not the all-time average since cluster start. |
+| **Aggregation window** | `1h` rolling. The card takes the change in both counters over the last hour and divides, giving the average refresh duration for that hour. |
+| **Alert threshold** | `> 1000ms`. A refresh that averages over one second means segment creation has become expensive, typically from segment proliferation or disk pressure. |
+| **Default refresh interval** | Elasticsearch refreshes every `1s` by default per index (`index.refresh_interval`). This card measures how long each refresh takes, not how often it runs; the two interact (a longer interval means fewer, larger refreshes). |
+| **What counts** | Time spent in the refresh operation itself: opening a new searchable segment from the indexing buffer. Aggregated across all indices unless scoped. |
+| **What does NOT count** | Flush time (fsync of the translog to disk, tracked separately), merge time (background segment consolidation), and the indexing operation itself. Refresh, flush, and merge are three distinct lifecycle stages. |
+| **Time window** | `1h` (rolling, delta-based) |
+| **Alert trigger** | `> 1000ms`, refreshes averaging over a second signal segments stacking up. |
+| **Roles** | platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The metric is a delta ratio over the one-hour window:
+
+```text
+delta_time  = refresh.total_time_in_millis(now) - refresh.total_time_in_millis(1h ago)
+delta_count = refresh.total(now) - refresh.total(1h ago)
+avg_refresh_ms = delta_time / delta_count        # guard: 0 when delta_count == 0
+```
+
+Using deltas rather than the raw cumulative ratio matters: the raw counters accumulate since the node started, so dividing them gives a lifetime average that masks a recent regression. The hourly delta shows what refreshes are costing right now.
+
+Why this number climbs: a refresh opens a new Lucene segment from the in-memory indexing buffer. Each refresh therefore creates a new (usually small) segment. Background merges continuously consolidate small segments into larger ones to keep the segment count manageable. When indexing is heavy and merges cannot keep up, the segment count balloons, every refresh has more existing segments to account for, and the per-refresh time creeps up. Slow disks compound this because both refresh and the merges behind it are I/O-bound. The `> 1000ms` alert is set where the delay starts to be felt in search freshness and where it reliably indicates the merge pipeline is falling behind.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs an Elasticsearch cluster that ingests a product catalogue feed plus a high-volume clickstream into time-based indices. On 03 Jun 26 the Avg Index Refresh Time card has drifted from a baseline of ~120ms to **1,340ms** over the past hour and trips the sensitivity alert.
+
+Pulling `GET /_stats/refresh` deltas for the busiest index:
+
+| index | delta refresh count (1h) | delta refresh time (ms) | avg per refresh |
+| --- | --- | --- | --- |
+| clickstream-2026.06.03 | 3,600 | 4,824,000 | 1,340ms |
+| products | 60 | 4,800 | 80ms |
+
+The `products` index is fine; the regression is entirely in `clickstream-2026.06.03`. The team checks segment counts with `GET /_cat/segments/clickstream-2026.06.03?v` and finds the shard holding 480 segments, far above the healthy double-digit range.
+
+```text
+Root cause chain:
+  - A schema change added a high-cardinality keyword field to clickstream docs.
+  - Ingestion volume doubled after a new event type was instrumented.
+  - The default 1s refresh_interval creates a new tiny segment every second under load.
+  - Merge throttling (indices.store.throttle) capped merge I/O on slow gp2 disks.
+  - Segments accumulated faster than merges could consolidate them.
+  - Each refresh now accounts for 480 segments, so per-refresh time ballooned.
+```
+
+The team applies a two-part fix. For the clickstream index, which does not need one-second freshness, they raise `index.refresh_interval` from `1s` to `30s`, cutting refresh frequency 30-fold and letting merges catch up. They also move the index's data to gp3 volumes with higher provisioned IOPS so the merge pipeline is no longer I/O-starved. Within two hours the segment count falls to 60 and the average refresh time settles back to ~140ms.
+
+```text
+Why raising refresh_interval helped:
+  - Fewer, larger refreshes -> fewer, larger initial segments -> less merge pressure.
+  - Trade-off: new clickstream docs now take up to 30s to appear in search.
+  - Acceptable here: clickstream is analytical, not user-facing search.
+  - The products index keeps 1s freshness because shoppers must see catalogue updates fast.
+```
+
+Three takeaways:
+
+1. **Refresh time is an indexing-health canary.** It climbs before search latency does, because the segment proliferation that slows refreshes also eventually slows queries. Catching it here gives you a head start.
+2. **The lever is usually `refresh_interval`, scoped per index.** Not every index needs one-second freshness. Analytical and log indices tolerate 30s happily; only user-facing search indices need sub-second refresh. Tune per index, not globally.
+3. **Disk I/O is the silent partner.** Refresh and the merges behind it are I/O-bound. A refresh-time regression on slow disks is often really a disk problem wearing an indexing costume.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Avg Index Refresh Time | What the combination tells you |
+| --- | --- | --- |
+| [Indexing Rate (docs/sec)](/nerve-centre/kpi-cards/elasticsearch/indexing-rate-docssec) | The ingestion volume driving segment creation. | A spike in indexing rate followed by rising refresh time is the classic "merges falling behind" pattern. |
+| [Bulk Rejections (24h)](/nerve-centre/kpi-cards/elasticsearch/bulk-rejections-24h) | The next failure stage if indexing back-pressure worsens. | Slow refreshes plus bulk rejections means the write pipeline is genuinely saturated. |
+| [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) | The downstream effect of segment proliferation. | Rising refresh time and rising p95 together confirm too many segments are hurting both write and read. |
+| [Replica Sync Lag](/nerve-centre/kpi-cards/elasticsearch/replica-sync-lag) | Replicas refresh too; lag and slow refresh share causes. | Slow refresh on replicas widens sync lag and delays consistency. |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | Merge pressure consumes heap; heap pressure slows merges. | High heap plus slow refresh is a self-reinforcing merge-pressure loop. |
+| [Storage Usage %](/nerve-centre/kpi-cards/elasticsearch/storage-usage) | Many small segments also waste disk. | Slow refresh with climbing disk usage points at unmerged segment sprawl. |
+| [Elasticsearch Health Score](/nerve-centre/kpi-cards/elasticsearch/elasticsearch-health-score) | The composite that folds indexing health in. | A health dip with no search-side cause often traces back to refresh/merge strain. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch itself:**
+
+> `GET /_stats/refresh` for cluster-wide `refresh.total` and `refresh.total_time_in_millis`; `GET /<index>/_stats/refresh` to scope to one index. The card computes the same ratio over a delta.
+> `GET /_cat/segments/<index>?v` shows the segment count per shard, the usual cause of a rising number. `GET /_cat/shards/<index>?v&h=index,shard,prirep,segments.count` gives a quick per-shard view.
+> `GET /<index>/_settings?filter_path=**.refresh_interval` confirms the configured refresh interval, and `GET /_nodes/stats/indices/merges` shows whether merges are keeping up.
+
+**Why our number may legitimately differ from a manual reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Delta vs cumulative** | Card higher during a regression | We use the hourly delta; dividing the raw lifetime counters gives a smoothed all-time average that hides recent slowdowns. |
+| **Scope** | Either | The card aggregates across all indices by default; a single-index `_stats` call will differ if one index dominates. |
+| **Window boundary** | Marginal | Your manual `now` and the card's last poll bracket slightly different hours. |
+| **Counter reset on restart** | Card dips | A node restart zeroes the cumulative counters; the next delta is computed from the restart, not from before it. |
+| **Managed service sampling** | Either | Elastic Cloud and AWS-managed consoles may surface refresh metrics at their own cadence and granularity. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Indexing Rate (docs/sec)](/nerve-centre/kpi-cards/elasticsearch/indexing-rate-docssec) | Refresh time should rise with sustained high indexing. | Slow refresh while indexing is light points at disk I/O, not volume. |
+| [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) | Both rise together when segment count is the problem. | p95 rising while refresh is fine points at query complexity, not segments. |
+
+<details>
+<summary><em>Same-concept peer on other engines</em></summary>
+
+"How long does it take to make new writes visible to readers" is a near-universal storage concern; only the mechanism differs. This is **not** a reconciliation against a parallel system.
+
+- Lucene/Solr equivalent: soft-commit / hard-commit time and segment count.
+- PostgreSQL equivalent: checkpoint write time and WAL flush latency.
+- Kafka equivalent: log-segment roll and flush latency.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What is the difference between refresh, flush, and merge?**
+Three distinct lifecycle stages. A *refresh* opens the in-memory indexing buffer as a new searchable Lucene segment (default every 1s); this is what makes new docs searchable. A *flush* fsyncs the translog to disk for durability and clears it. A *merge* is a background job that consolidates many small segments into fewer larger ones. This card measures only refresh time. Slow refreshes usually trace back to merges falling behind, but the counters are separate.
+
+**My refresh time climbed but indexing volume did not change. Why?**
+Look at disk I/O first. Refresh and the merges behind it are I/O-bound, so a degraded volume (noisy neighbour on shared storage, exhausted burst credits on gp2, a failing disk) slows refreshes even at constant load. Check `GET /_nodes/stats/fs` and the host's disk-utilisation metrics. A second possibility is a mapping change that added expensive fields (high-cardinality keywords, many sub-fields) which makes each segment more costly to build.
+
+**Can I just raise `refresh_interval` to fix this?**
+Often yes, and it is the most effective lever, but it is a trade-off, not a free win. A longer interval means fewer, larger refreshes (less merge pressure, lower refresh time) at the cost of search freshness: new documents take up to the interval to become searchable. Raise it for analytical and log indices that do not need sub-second freshness; keep it low for user-facing search indices. Set it per index, never blindly cluster-wide.
+
+**Does this card include the replicas?**
+By default the aggregate spans primaries and replicas, since replicas refresh independently to stay searchable. If a regression appears only on replica shards, suspect those nodes' disks specifically. You can scope `GET /<index>/_stats/refresh` and inspect per-shard segment counts to isolate primary-vs-replica behaviour.
+
+**The number dropped to near zero suddenly. Is that good?**
+Check whether a node restarted. The underlying counters are cumulative since node start, so a restart resets them and the next hourly delta is computed from a near-empty base, which can read artificially low for the first hour. It can also mean indexing genuinely stopped (no new docs means few refreshes). Pair with [Indexing Rate (docs/sec)](/nerve-centre/kpi-cards/elasticsearch/indexing-rate-docssec) to tell the two apart.
+
+**How does refresh time relate to search latency?**
+They share a root cause: segment proliferation. Too many segments make every refresh more expensive and also force searches to consult more segments per query, raising latency. So a rising refresh time is often an early warning that search latency will follow if merges do not catch up. If you see refresh time climbing, check [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) and the segment count before it becomes a read-side problem too.
+
+**Is a high refresh time ever expected and acceptable?**
+During a large bulk reindex with `refresh_interval` set to `-1` (refresh disabled), you may see a single very expensive refresh when it is re-enabled, because all the accumulated buffer flushes at once. That is intentional and a known reindex pattern. Outside such deliberate bulk loads, a sustained average over 1,000ms warrants investigation.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Avg Index Refresh Time (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

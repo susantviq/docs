@@ -1,0 +1,158 @@
+---
+title: "PostgREST Request Rate (req/sec), Supabase"
+sidebarTitle: "PostgREST Request Rate (req/sec)"
+description: "PostgREST Request Rate for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [PostgREST API](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This card plots how many requests per second PostgREST is serving over time. PostgREST is the auto-generated REST layer that fronts your Supabase database, so this is the throughput of the API your application actually calls. It is the load axis for every latency and error card in the connector: a latency spike means something very different depending on whether request rate spiked with it. For a platform or SRE team this line chart is the context everything else is read against. It tells you when your busy windows are, whether a slowdown is "more traffic" or "a regression", and when capacity planning is overdue. It carries no fixed alert by design, throughput is neither good nor bad in isolation; it is the denominator that makes the other cards interpretable.
+
+| | |
+| --- | --- |
+| **What it tracks** | The rate of HTTP requests served by PostgREST (Supabase's auto-generated REST API over Postgres), in requests per second, plotted as a time series. |
+| **Data source** | Supabase request logs and edge/PostgREST metrics via the project's Logs & Analytics layer (`api_logs` / Logflare-backed request logs) and the project metrics endpoint. The card counts requests per interval and divides by the interval length. |
+| **Time window** | `RT/5m` (a live rate plus a five-minute rolling view to smooth single-second spikes). |
+| **Alert trigger** | None by default. Throughput is context, not a pass/fail signal. You can add a custom ceiling or floor in the Sensitivity tab if you want to catch traffic surges or a drop to zero. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card counts PostgREST requests per fixed interval and divides by the interval length to produce a rate:
+
+```text
+req_per_sec = count(PostgREST requests in interval) / interval_seconds
+plotted as a time series over the rolling window
+no fixed alert: read as load context for the latency and error cards
+```
+
+Every request PostgREST handles is counted, regardless of outcome: successful 2xx reads and writes, client-error 4xx, and server-error 5xx all increment the count. That is deliberate. The request rate is meant to answer "how much work is arriving?", not "how much succeeded?". To split success from failure you read this alongside [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate); a request rate that holds steady while the error rate climbs is the same load failing more often, not less load.
+
+Two points shape how to read the line:
+
+1. **It is the denominator for everything else.** A rise in p95 latency with a matching rise in request rate is a capacity story (more load, slower responses). The same latency rise with a flat request rate is a regression story (the same load got slower, so something changed). You cannot tell the two apart without this card, which is why it sits in the same category as the latency gauges.
+2. **Shape matters more than the absolute number.** What is "normal" varies hugely by project. The value of the time series is its pattern: the daily peaks and troughs, the weekly rhythm, the step changes after a launch. A sudden cliff to near zero (an outage or a broken deploy) and a sudden vertical wall (a traffic surge, a runaway client, a retry storm) are both far more informative than any single instantaneous reading.
+
+The natural companions are [PostgREST API Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgrest-api-latency-p95-ms) (does latency track load?), [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) (is the load exhausting connections?), and [Database Queries per Second (live)](/nerve-centre/kpi-cards/supabase/database-queries-per-second-live) (how many DB queries does each API request generate?).
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Supabase project behind a consumer mobile app. PostgREST request rate normally peaks around 180 req/sec in the evening. Snapshot taken on 02 May 26 over an afternoon when on-call noticed the rate climbing oddly.
+
+| Window | Request rate | p95 latency | 5xx rate | State |
+| --- | --- | --- | --- | --- |
+| 13:00 (baseline) | 95 req/sec | 72ms | 0.1% | healthy |
+| 14:30 | 410 req/sec | 88ms | 0.2% | elevated, no alert |
+| 15:10 | 980 req/sec | 240ms | 1.4% | latency + errors rising |
+
+The request-rate line shows a steep, sustained climb to roughly 10x baseline, well outside the normal daily peak. There is no alert on this card, but the shape is the lead signal. The team reads it together with the gauges:
+
+1. **The load is real and abnormal.** 980 req/sec at 15:10 is more than five times the usual evening peak, in the early afternoon. This is not a normal busy window; something is driving traffic far above pattern.
+2. **Latency and errors are now following the load.** p95 has climbed from 72ms to 240ms and the 5xx rate has crossed 1%. Cross-referencing [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation), the pool is at 94%: the surge is exhausting connections, which is why latency and errors are rising together. This is a capacity story, not a code regression.
+3. **The cause is a client retry storm.** The shape (a vertical wall rather than organic growth) plus the early-afternoon timing points at a misbehaving client. A recent mobile release shipped an aggressive retry loop that re-fires failed requests without backoff, so as latency rose the clients retried harder, driving the rate up further, the classic self-reinforcing storm.
+
+```text
+Reading load vs regression from this card:
+  - Latency up AND request rate up   -> capacity / load story
+  - Latency up AND request rate flat -> regression (queries got slower)
+  - Request rate up AND error rate up -> load is exceeding a limit
+  - Request rate cliff to ~0          -> outage or broken deploy upstream
+
+Confirm a retry storm:
+  - request rate climbs super-linearly while unique clients stay flat
+  - 5xx rate and request rate rise together (errors trigger more retries)
+  - cross-check Supavisor saturation and the app's retry/backoff config
+```
+
+```text
+Mitigations, in order:
+  1. Ship a client fix with exponential backoff and a retry cap.
+  2. Rate-limit at the edge / API gateway to break the storm now.
+  3. Move clients to the transaction-mode pooler and/or raise the tier
+     pool size so legitimate load is not starved while you fix the client.
+```
+
+The team rate-limited the offending route at the edge to break the storm immediately, then shipped a client patch with backoff. The request-rate line dropped back to its normal evening curve and latency and errors followed it down. The fix was on the client, but this card was what told them the problem was load shaped, not a server regression.
+
+Three takeaways:
+
+1. **Request rate is the lens, not the verdict.** It has no alert because throughput alone is neither good nor bad. Its job is to tell you which story a latency or error spike belongs to: more load, or the same load gone wrong.
+2. **Watch the shape.** Organic growth ramps; a retry storm or runaway client makes a near-vertical wall; an outage makes a cliff. The shape of the line usually names the cause before any other card does.
+3. **A flat request rate during a latency spike is a smoking gun.** It means traffic did not change but responses got slower, so the cause is inside your system (a slow query, a missing index, a pool problem), not your users.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with PostgREST Request Rate | What the combination tells you |
+| --- | --- | --- |
+| [PostgREST API Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgrest-api-latency-p95-ms) | Latency is only interpretable against load. | Latency up with rate up equals capacity; latency up with rate flat equals regression. |
+| [PostgREST API Latency p99 (ms)](/nerve-centre/kpi-cards/supabase/postgrest-api-latency-p99-ms) | The far tail under varying load. | A p99 spike on a low-rate window is noise; on a high-rate window it is a real stall. |
+| [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) | Splits successful from failed throughput. | Rate steady while 5xx climbs equals the same load failing more, often saturation. |
+| [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) | Load eventually exhausts the connection pool. | A rate surge driving saturation toward 90% predicts the next latency breach. |
+| [Database Queries per Second (live)](/nerve-centre/kpi-cards/supabase/database-queries-per-second-live) | Shows query fan-out per API request. | DB QPS rising faster than request rate equals N+1 query patterns or chatty endpoints. |
+| [Supabase QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/supabase/supabase-qps-spike-vs-ecom-order-rate) | Ties API load to downstream business activity. | A request-rate spike with no order spike equals bots, retries, or a runaway client, not real demand. |
+| [Supavisor Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation-vs-traffic-burst) | Correlates a burst directly with pool pressure. | A request-rate burst that drives the pool to its cap is the tier-limit warning. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite that reads load against capacity. | A sustained rate above safe capacity erodes the composite before any single gauge breaches. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase's own tooling:**
+
+> In the Supabase dashboard, open **Reports → API** for the request-count and request-rate charts PostgREST records per route. The dashboard throughput chart and this card draw from the same request-log stream.
+> Count requests yourself in the project's log explorer: the `api_logs` / edge request logs hold one row per request, so a count over a fixed window divided by the window length reproduces the rate.
+> To see how API throughput translates into database work, compare against [Database Queries per Second (live)](/nerve-centre/kpi-cards/supabase/database-queries-per-second-live) and `pg_stat_statements` `calls`; a single PostgREST request can fan out into several queries.
+> The managed-service console exposes equivalent request-rate charts under the project's observability section; confirm the chart's interval matches the card's before comparing instantaneous values.
+
+**Why our number may legitimately differ from Supabase's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Interval length** | Variable | The card divides by a fixed interval; a dashboard chart bucketed differently will smooth or sharpen the same surge, so instantaneous peaks differ. |
+| **What gets counted** | Card may read higher | The card counts all PostgREST requests including 4xx/5xx; a chart filtered to successful requests reads lower. |
+| **Route scope** | Variable | The card sums across routes; a dashboard view filtered to one endpoint shows only that endpoint's slice. |
+| **PostgREST only** | Card excludes other subsystems | Edge Function, Auth, Storage, and Realtime traffic are not in this number; a project-wide "requests" chart that blends them all will read higher. |
+| **Time zone** | Axis shift only | Supabase charts render in the project zone; Vortex IQ renders in your profile zone, shifting the x-axis but not the rate. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does this card have no alert? Surely a traffic spike is worth alerting on.**
+Throughput on its own is neither good nor bad: a 10x spike is a disaster during a retry storm and a triumph during a successful launch. The card stays alert-free so it can serve as neutral context for the latency and error cards, which is where the pass/fail judgement belongs. If you do want to catch a surge or a drop to zero, add a custom ceiling or floor in the Sensitivity tab; just set it to your project's real pattern, not a generic number.
+
+**My request rate looks normal but the app is slow. What now?**
+That is the most useful reading this card gives you. A flat request rate during a latency spike means traffic did not change, so the slowdown is inside your system, a slow query, a missing index, lock contention, or a pool problem, not your users sending more work. Jump straight to [PostgREST API Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgrest-api-latency-p95-ms), [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate), and [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation).
+
+**Does the request rate include failed requests?**
+Yes. Every request PostgREST handles is counted, whether it returned 2xx, 4xx, or 5xx. This is intentional: the card measures arriving load, not successful load. To separate the two, read it alongside [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate); a steady request rate with a rising error rate is the same load failing more often.
+
+**Why is my database QPS much higher than my PostgREST request rate?**
+Because one API request can generate several database queries. A PostgREST call with embedded resources, RLS policies that query other tables, or an endpoint your app calls in a loop all multiply queries per request. If [Database Queries per Second (live)](/nerve-centre/kpi-cards/supabase/database-queries-per-second-live) is climbing far faster than this card, you likely have an N+1 pattern or a chatty endpoint worth flattening.
+
+**The request rate dropped to near zero. Is the card broken?**
+Possibly not, a cliff to near zero usually means a real outage or a broken deploy upstream: the app stopped calling the API, DNS changed, or a gateway is dropping traffic before it reaches PostgREST. On a Free-tier project it can also mean the project paused after a period of inactivity. Confirm with [Project Uptime](/nerve-centre/kpi-cards/supabase/project-uptime) and your application's own health before assuming a card fault.
+
+**Does this card count Edge Functions, Auth, Storage, or Realtime traffic?**
+No. It counts PostgREST requests only, the REST layer over Postgres. Edge Functions, Auth (GoTrue), Storage, and Realtime are separate subsystems with their own metrics, such as [Edge Function Error Rate %](/nerve-centre/kpi-cards/supabase/edge-function-error-rate) and [Realtime Connected Clients](/nerve-centre/kpi-cards/supabase/realtime-connected-clients). A project-wide "requests" figure that blends all subsystems will read higher than this card.
+
+**My dashboard peak is higher than the card's peak. Why?**
+Almost always interval granularity. The card divides counts by a fixed short interval, so it can show a sharper instantaneous peak, or a smoother one, than a dashboard chart bucketed to a different length. Match the interval before comparing peak values; both read from the same underlying request-log stream.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*PostgREST Request Rate (req/sec)* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,123 @@
+---
+title: "Statement Error Rate %, CockroachDB"
+sidebarTitle: "Statement Error Rate %"
+description: "Statement Error Rate % for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Statement Error Rate %** is the share of SQL statements that returned an error instead of completing successfully, measured over a rolling 5-minute window. It is the cluster's quality signal sitting next to the throughput (quantity) signal: throughput tells you how much work the database is doing, error rate tells you how much of it is failing. A rising error rate is one of the earliest, broadest symptoms of trouble, whether the cause is contention forcing transaction aborts, a connection pool refusing new sessions, a node loss, or a bad application deploy pushing malformed SQL. Because errors translate directly into failed user actions (a checkout that would not save, a cart that would not update), this is a card that pages.
+
+| | |
+| --- | --- |
+| **What it tracks** | Statement Error Rate % for the selected period: SQL statements that returned an error as a percentage of all statements executed, over the rolling window. |
+| **Data source** | The errored-statement counters (`sql.failure.count` and the per-error-class counters) measured against total executed statements (`sql.query.count`). The DB Console SQL dashboard surfaces the same as SQL statement errors. |
+| **Time window** | `5m`. A rolling 5-minute window smooths single transient failures while still catching a developing problem within minutes. |
+| **Alert trigger** | `> 1%`. Above roughly 1 in 100 statements failing, the failures are no longer background noise; they represent user-visible breakage at a rate worth paging on. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card divides errored statements by total executed statements over the rolling 5-minute window and expresses the result as a percentage. The numerator is the SQL failure counter (`sql.failure.count`), which increments whenever a statement returns an error to the client; the denominator is the total executed-statement counter (`sql.query.count`). Computing it as a ratio rather than an absolute count is deliberate: 50 errors per minute is alarming at 1,000 statements/sec and negligible at 50,000 statements/sec, so the rate normalises across traffic levels and against a moving baseline.
+
+Not all errors are equal, and reading the error *class* matters as much as the rate. The big categories on CockroachDB are: **retry errors** (most commonly `40001` serialization failures from transaction contention, often retried transparently and sometimes surfaced to the client), **connection errors** (refused or dropped sessions, typically from pool saturation or a node loss), **constraint and syntax errors** (`23505` unique-violation, `42xxx` syntax, usually application or schema problems, not infrastructure), and **unavailability errors** (a range without quorum). The 5-minute window is short enough to surface a developing incident quickly but long enough that one fluky failure does not move the headline. Sustained breach above 1% is the actionable state because it means a meaningful fraction of user actions are failing.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 6-node CockroachDB cluster behind the order, cart, and inventory services. Steady-state error rate sits around 0.05% (almost entirely harmless transient retries). Snapshot taken on 18 Jun 26 at 19:40 BST, mid evening peak.
+
+| Time (5m window) | Statements | Errored | Error rate % | State |
+| --- | --- | --- | --- | --- |
+| 19:25 | 2.7M | 1,400 | 0.05% | healthy |
+| 19:35 | 2.9M | 23,400 | **0.81%** | climbing |
+| 19:40 | 3.0M | 41,200 | **1.37%** | alert |
+
+The card headline reads **1.37%** in the red band, above the 1% trigger and rising. The rate alone says "something is failing"; the error-class breakdown says what. The DBA pulls the breakdown and finds 88% of the errors are `40001` serialization failures, the contention signature, not connection errors or syntax errors.
+
+That points the investigation cleanly. A contention spike means many transactions are fighting over the same rows. The DBA correlates with [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) (retries up sharply in the last 15 minutes) and [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements), which names the offender: an inventory-decrement statement hammering a single hot SKU row during a flash sale on one product.
+
+```text
+Why the error rate spiked:
+  - A flash sale concentrated thousands of orders on one SKU.
+  - Each order runs UPDATE inventory SET qty = qty - 1 WHERE sku = 'X'.
+  - Every transaction contends on the same row; CockroachDB serialises them.
+  - Losers get 40001; the app exhausts its retry budget; some surface as errors.
+  - User impact: a fraction of "add to cart"/"checkout" on that SKU fail.
+=> Root cause is row contention on one key, not a cluster fault.
+```
+
+The cluster is otherwise healthy: nodes all live, no unavailable ranges, capacity has headroom. The fix is at the data-access layer, not the infrastructure: batch the decrements, move to an inventory-reservation pattern that does not serialise on a single counter row, or shard the hot counter. As an immediate mitigation the team caps purchasable quantity per request on that SKU to reduce concurrent writes. Within 5 minutes of the change the rate falls back under 0.1%. Three takeaways:
+
+1. **The rate tells you something is wrong; the error class tells you what.** A 1.37% rate made of `40001` retries (contention) is a completely different incident from 1.37% made of connection refusals (pool saturation) or `42xxx` (a bad deploy). Always read the class before acting.
+2. **A ratio, not a count, is the right alarm.** During peak traffic a large absolute error count can still be a tiny percentage; during a quiet window a handful of errors can be a high percentage. The 1% rate is what reliably maps to user impact.
+3. **Errors are user-visible by definition.** Every counted error is an action that failed for someone. Pair the rate with the business cards (orders, checkout) to size who was affected, then fix at the layer the error class points to.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Statement Error Rate % | What the combination tells you |
+| --- | --- | --- |
+| [Statement Error Rate Spike (>1% in 5m)](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate-spike-1-in-5m) | The alert-list view of breaches. | When this gauge crosses 1%, the alert card records the spike, onset, and dominant error class. |
+| [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) | The contention driver behind retry errors. | Error rate up tracking retries equals a contention-driven spike, not infrastructure. |
+| [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) | Names the statement causing serialization failures. | Identifies the exact hot row or query behind a 40001 spike. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation) | A different error source: refused connections. | Error rate up with saturation up equals connection errors, not contention; fix the pool. |
+| [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges) | The most serious error source: quorum loss. | Errors with unavailable ranges above 0 equals data is offline; this is a top-severity incident. |
+| [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live) | The throughput denominator. | Error rate read against throughput separates "a few errors at high volume" from "broad failure". |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The composite that weights error rate. | A sustained error-rate breach drags the health score down quickly. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+To confirm the figure natively, open the DB Console **SQL** dashboard and read the **SQL Statement Errors** chart, then break errors down by class. Query `crdb_internal.node_metrics` for the `sql.failure.count` and per-error-class counters against `sql.query.count`. The DB Console **SQL Activity → Statements** page shows failure counts per statement fingerprint, and `crdb_internal.cluster_contention_events` confirms whether the errors are contention-driven. On CockroachDB Cloud the SQL errors chart appears on the cluster **Metrics** page.
+
+| Reason our number may differ | Direction | Why |
+| --- | --- | --- |
+| **Retry accounting.** Transparently retried (and eventually succeeding) transactions may or may not be counted as errors. | Variable | The card reflects statements that returned an error to the client; a view counting only final outcomes reads lower. |
+| **Error-class scope.** Some native charts show one class (for example only connection errors). | Vortex IQ usually higher | The card sums all error classes into the headline; a single-class chart reads lower. |
+| **Window length.** The card uses a rolling 5-minute window. | Marginal | A chart smoothed over a longer resolution flattens a short spike the card catches. |
+| **Time zone.** Chart axes render in the cluster locale. | Cosmetic | Axis labels shift; the rate does not. |
+
+For divergence investigations use Vortex Mind to attribute the error spike to a statement fingerprint, an error class, or an upstream deploy.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My error rate spiked but the cluster looks healthy. What is going on?**
+Read the error class. By far the most common cause of a spike on a healthy cluster is `40001` serialization failures from transaction contention, many transactions fighting over the same hot rows. The infrastructure is fine; the fix is in the data-access pattern (batch writes, reservation patterns, sharded counters). Check [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements).
+
+**What is a 40001 error and is it actually a problem?**
+`40001` is a serialization failure: CockroachDB enforces serializable isolation, so when transactions conflict it aborts one and expects a retry. CockroachDB retries many of these transparently, in which case they never reach the user. They become a problem when contention is high enough that retry budgets are exhausted and the failure surfaces to the client. A low background rate is normal; a spike is contention to fix at the source.
+
+**Why a percentage instead of an error count?**
+Because the same count means very different things at different traffic levels. A few hundred errors are trivial at 50,000 statements/sec and a crisis at 500/sec. The ratio normalises against traffic so the 1% threshold maps consistently to real user impact.
+
+**The rate is high but made of syntax errors, not retries. Whose problem is that?**
+Almost certainly an application or schema problem, not the database. A burst of `42xxx` (syntax) or `23505` (unique violation) errors usually means a bad deploy is sending malformed or conflicting SQL. Roll back the deploy or fix the query; the cluster is behaving correctly by rejecting bad statements.
+
+**Does a node loss show up here?**
+It can, as connection errors (sessions on the lost node are dropped) and briefly as unavailability errors if any range lost quorum during the failover. If the error spike coincides with a [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count) drop, the node loss is the cause and the rate should recover as leases transfer and clients reconnect.
+
+**Why a 5-minute window rather than real-time?**
+To balance speed against noise. A single fluky failure should not page anyone, but a developing incident should be caught within minutes. The rolling 5-minute window smooths one-off errors while still surfacing a genuine climb quickly.
+
+**Can I tune the 1% threshold for my cluster?**
+Yes, sensitivity thresholds are configurable per profile in the Sensitivity tab. If your workload runs a higher harmless-retry baseline (some high-contention workloads do), raise the threshold to match your normal so the alert reflects genuine deviation rather than your steady state.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Statement Error Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,164 @@
+---
+title: "Idle Cluster DBU Wasted (24h), Databricks"
+sidebarTitle: "Idle Cluster DBU Wasted (24h)"
+description: "Idle Cluster DBU Wasted (24h) for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [DBU Burn](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The DBU burned over the last 24 hours by clusters that were running but had no active job or query on them. This is pure waste: compute you paid for that did no work. The most common cause is auto-termination set too generously (or off), so an all-purpose cluster sits warm for an hour after the last analyst logs off, or a job cluster lingers after its run completes. The card is the single best signal for auto-termination tuning, and the alert fires when idle waste crosses a tenth of total spend, the point at which it stops being rounding error and starts being a line item.
+
+| | |
+| --- | --- |
+| **Data source** | Databricks billable usage (`system.billing.usage` for the DBU figure) cross-referenced against cluster activity (the Jobs runs API and SQL query history / cluster event timeline) to determine, for each billed interval, whether any workload was actually running on that cluster. |
+| **What it counts** | DBU charged while a cluster was in `RUNNING` state but had zero active job runs and zero active interactive commands or queries for that interval. The result is summed across all clusters over the 24h window. |
+| **What does NOT count** | DBU burned while a job or query was executing (that is productive spend); DBU burned during cluster start-up / spin-down (unavoidable overhead, reported separately); terminated clusters (they burn nothing); and serverless compute, which auto-scales to zero and so cannot be "idle" in this sense. |
+| **Idle definition** | An interval is idle if no Spark job is active and no command has executed on the cluster within the interval. A cluster waiting out its auto-termination countdown is the canonical idle case. |
+| **Aggregation window** | Rolling 24 hours. The headline is total idle DBU; the alert compares it to total DBU for the same window. |
+| **Time window** | `24h` (rolling 24 hours) |
+| **Alert trigger** | `> 10% of total`. When idle DBU exceeds 10% of total DBU burned in the window, the card flags it as a tuning opportunity. |
+| **Roles** | owner, platform engineering, finance / FinOps |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+For each cluster and each billed interval in the last 24 hours, Vortex IQ decides whether the interval was idle (cluster running, no workload active) and, if so, adds that interval's DBU to the waste total:
+
+```text
+IdleDBU(24h) = Σ usage_quantity
+               WHERE cluster_state = 'RUNNING'
+               AND active_job_runs = 0
+               AND active_commands  = 0
+               AND interval within last 24h
+
+IdleShare = IdleDBU(24h) / TotalDBU(24h)
+Alert fires when IdleShare > 0.10
+```
+
+Three things to understand about the method:
+
+1. **Idle is the absence of work, not low utilisation.** A cluster running a small query at 5% CPU is busy, not idle, and its DBU is productive spend (right-sizing is a different conversation, handled by [Avg Cluster CPU Utilisation %](/nerve-centre/kpi-cards/databricks/avg-cluster-cpu-utilisation)). This card counts only intervals with literally no workload.
+2. **Start-up and shutdown overhead is excluded.** Every cluster pays a few minutes of DBU to acquire instances and initialise Spark, and a moment to tear down. That is unavoidable and is not waste; the card carves it out so a workload that spins clusters up and down frequently is not unfairly penalised.
+3. **The alert is a ratio, not an absolute.** Ten DBU of idle on a 2,000 DBU day is noise; ten DBU on an 80 DBU day is 12.5% and worth acting on. Expressing waste as a share of total keeps the signal meaningful for both large and small workspaces.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team supports a shared analytics workspace plus a set of scheduled production jobs. Snapshot taken 17 Apr 26 at 09:00, covering the previous 24 hours.
+
+| Cluster | Total DBU (24h) | Idle DBU | Idle share | Auto-term setting |
+| --- | --- | --- | --- | --- |
+| `analyst-shared-ap` | 560 | 188 | 34% | 120 min |
+| `prod-etl-nightly` | 610 | 22 | 4% | 10 min |
+| `ml-sandbox-ap` | 140 | 96 | 69% | off |
+| `prod-etl-hourly` | 150 | 14 | 9% | 10 min |
+| **Workspace total** | **1,460** | **320** | **22%** | mixed |
+
+The headline reads **320 DBU wasted (22% of total)**, and because 22% is well over the 10% alert threshold the card is flagged. The platform owner works the list by idle share, not by absolute DBU:
+
+1. **`ml-sandbox-ap` is the worst offender at 69% idle with auto-termination off.** A data scientist spun it up to prototype, ran a few cells, and left it running all night. Two thirds of its spend was paid for nothing. The fix is immediate and high-ROI: turn on auto-termination at 30 minutes via a cluster policy so sandbox clusters cannot be left running indefinitely. Estimated saving: roughly 90 DBU/day, every day.
+2. **`analyst-shared-ap` is the biggest absolute waste at 188 DBU, driven by a 120-minute timeout.** Fourteen analysts share it, so it is genuinely useful during the day, but the two-hour idle window means it sits warm long after the last person leaves. Dropping the timeout to 30 minutes would recover most of the 188 DBU without affecting working hours, because nobody needs a cluster to stay warm for two hours of inactivity.
+3. **The two production ETL clusters are healthy (4% and 9% idle).** Their tight 10-minute auto-termination keeps idle near the unavoidable start-up overhead. They are the template: apply the same policy to the interactive clusters.
+
+```text
+Recoverable waste, ranked by ease of fix:
+  ml-sandbox-ap:     ~90 DBU/day   (turn auto-term ON, 30 min)   ← do first
+  analyst-shared-ap: ~150 DBU/day  (cut timeout 120 → 30 min)    ← do second
+  ----------------------------------------------------------------
+  Combined: ~240 DBU/day ≈ 16% of total spend, recovered with two policy changes
+```
+
+The lesson: idle waste is almost always an auto-termination setting, not a workload problem. The two production clusters prove the workspace can run lean; the interactive clusters just need the same policy.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Idle Cluster DBU Wasted | What the combination tells you |
+| --- | --- | --- |
+| [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) | The denominator the 10% alert is measured against. | Idle DBU is only actionable as a share of total; read them together. |
+| [DBU by Cluster (7d)](/nerve-centre/kpi-cards/databricks/dbu-by-cluster-7d) | Identifies which clusters spend the most over the week. | A top spender that is also mostly idle is the highest-ROI fix. |
+| [Avg Cluster CPU Utilisation %](/nerve-centre/kpi-cards/databricks/avg-cluster-cpu-utilisation) | Distinguishes idle (no work) from under-used (some work, oversized). | Low CPU but not idle equals right-sizing; idle equals auto-termination. |
+| [Active Clusters](/nerve-centre/kpi-cards/databricks/active-clusters) | How many clusters are live right now. | A high live count overnight is a leading indicator of idle waste. |
+| [Avg DBU per Job Run](/nerve-centre/kpi-cards/databricks/avg-dbu-per-job-run) | Per-run efficiency for the job clusters. | Idle job clusters inflate per-run DBU even when the job itself is efficient. |
+| [DBU Burn +50% Week-over-Week](/nerve-centre/kpi-cards/databricks/dbu-burn-50-week-over-week) | The anomaly alert idle waste can quietly feed. | A creeping idle share can push total DBU into the WoW anomaly band. |
+| [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume) | The cross-channel efficiency check. | Idle waste is spend that grows DBU without serving any order at all. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **Compute → cluster → Event log** shows `TERMINATING` reasons (`INACTIVITY` is the auto-termination event) and lets you see how long a cluster idled before it shut down.
+> **System tables**: join `system.billing.usage` (DBU per interval) against `system.compute.clusters` / the cluster event timeline to attribute DBU to intervals with no active run. This is the source the card reconstructs.
+> **Cluster settings**: the `autotermination_minutes` field per cluster is the lever that drives this number.
+
+An approximate reconciling query (idle DBU is inferred where no job/query overlaps the usage interval):
+
+```sql
+-- Total and idle DBU sketch over 24h; idle = usage with no concurrent run
+SELECT u.usage_metadata.cluster_id,
+       SUM(u.usage_quantity) AS total_dbu
+FROM   system.billing.usage u
+WHERE  u.usage_date >= current_date() - INTERVAL 1 DAYS
+GROUP  BY u.usage_metadata.cluster_id;
+-- Cross-reference against system.lakeflow.job_run_timeline and query history
+-- to subtract intervals where a run/query was active.
+```
+
+**Why our number may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Start-up overhead handling** | Vortex IQ may read lower | The card excludes spin-up / spin-down DBU as unavoidable; a naive "any DBU with no job" calculation would count it as idle. |
+| **Interactive command detection** | Vortex IQ may read lower | A notebook command keeps a cluster busy even if no Jobs run exists. The card reads command/query activity, not just the Jobs API; a Jobs-only check would overstate idle. |
+| **Billing-interval granularity** | Small drift | Usage rows are bucketed; a cluster that goes idle mid-interval is apportioned, which can differ slightly from the exact second of last activity. |
+| **System-table lag** | Vortex IQ live, table delayed | The latest hour can still be settling in `system.billing.usage`, so a same-minute manual query may read lower than the card. |
+| **Serverless excluded** | Not comparable | Serverless scales to zero, so it never idles; do not expect serverless warehouses in this figure. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) | Idle DBU is always a subset of total DBU; the ratio is the alert. | If idle exceeds productive spend, auto-termination is effectively off across the board. |
+| [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume) | Recovering idle waste should lower DBU without lowering order volume. | If trimming idle hurts a workload, it was not truly idle; recheck the activity signal. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What is the difference between "idle" and "under-utilised"?**
+Idle means no workload at all: the cluster is running but nothing is executing on it. Under-utilised means a workload is running but the cluster is bigger than it needs (low CPU). This card covers idle; right-sizing is the job of [Avg Cluster CPU Utilisation %](/nerve-centre/kpi-cards/databricks/avg-cluster-cpu-utilisation). The fixes differ: idle is an auto-termination setting, under-utilisation is a node-count or instance-type change.
+
+**Why is cluster start-up DBU not counted as waste?**
+Because it is unavoidable. Every cluster pays a few minutes to acquire instances and initialise Spark before it can do any work, and a moment to tear down. Counting that as waste would penalise the very behaviour we want (short-lived job clusters that spin up, run, and terminate). The card carves out start-up and shutdown so the number reflects genuinely recoverable waste.
+
+**Our idle share is high but our clusters are job clusters that terminate after each run. How?**
+Two common causes: a long task timeout that keeps the cluster alive while a final task hangs, and a workflow that holds the cluster between sequential tasks with gaps between them. Check the cluster event log for the gap; if tasks have idle stretches between them, consider splitting the workflow or using a shared job cluster with tighter scheduling.
+
+**We turned auto-termination off deliberately so analysts never wait for a cold start. Is the waste justified?**
+That is a real trade-off, but quantify it. The idle DBU is the price of zero cold-starts. Compare it against how often a cold start actually blocks someone (usually a 3 to 5 minute wait, a handful of times a day). For most teams a 30-minute auto-termination keeps the cluster warm through normal working gaps while still reclaiming overnight and lunchtime idle. The card gives you the number to make that decision with eyes open.
+
+**Serverless SQL never shows up here. Is that a bug?**
+No. Serverless compute auto-scales to zero when there is no query, so by design it cannot sit idle and burn DBU. That is one of its advantages. This card is specifically about classic clusters that hold instances while idle. If you are moving interactive workloads to serverless, expect this number to fall.
+
+**The idle figure jumps around hour to hour. Which reading do I trust?**
+Read the 24-hour total and the share, not a single hour. Idle waste is naturally lumpy: it concentrates overnight, at weekends, and around lunch. The rolling 24h smooths that into an actionable number. For tuning decisions, look at the share trend over a week rather than reacting to one hour.
+
+**If I fix auto-termination, how quickly will I see the saving?**
+Immediately on the next idle window. The change takes effect the moment a cluster next sits idle past the new timeout. You should see the idle share fall on the following day's reading, and the saving flow straight through to [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h).
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Idle Cluster DBU Wasted (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

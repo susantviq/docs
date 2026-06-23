@@ -1,0 +1,148 @@
+---
+title: "SQL Query Error Rate %, Databricks"
+sidebarTitle: "SQL Query Error Rate %"
+description: "SQL Query Error Rate % for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of SQL queries that failed rather than completed successfully, measured over a rolling five-minute window. This is the lakehouse's "are queries working?" gauge. A small baseline of errors is normal (a user typos a column name, an ad-hoc query times out), but a sustained rate above 1% means something systemic is wrong: a table was dropped or renamed, a schema changed under a dashboard, the metastore is unreachable, or a warehouse is failing health checks. For a platform team this is a front-line outage detector, because a rising error rate is often the first thing that moves when an upstream change breaks downstream consumers.
+
+| | |
+| --- | --- |
+| **What it tracks** | Failed queries as a percentage of total queries over the trailing five minutes, as `dbx_query_error_rate`, rendered as a gauge. |
+| **Data source** | Databricks query history (`GET /api/2.0/sql/history/queries`) and `system.query.history`, where the system schema is enabled. The card divides queries with a failed/error status by all terminal queries in the window. |
+| **Why it matters** | A rising error rate is the earliest sign that a schema change, a dropped object, or a metastore problem has broken downstream consumers. It is often the first card to move during a bad deploy. |
+| **Time window** | `5m`: a short rolling window so a spike surfaces within minutes rather than being diluted by a long history. |
+| **Alert trigger** | `> 1%`. Sustained error rate above 1% flags amber/red and pages the platform on-call. |
+| **Sentiment** | Lower is healthier. Zero to 1% is green; 1 to 5% is amber; above 5% is red and usually indicates a broken object or warehouse. |
+| **Roles** | owner, engineering, operations (DBA / platform / SRE) |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Over the trailing five-minute window, Vortex IQ reads the query-history feed for the monitored warehouses and classifies each terminal query as success or failure based on its final status:
+
+```text
+failed_queries = count(queries with status in {FAILED, ERROR, CANCELED-on-error})
+total_queries  = count(all terminal queries in window)
+error_rate_%   = (failed_queries / total_queries) * 100
+```
+
+Only terminal queries count: a query still running has no outcome yet and is excluded from both numerator and denominator, so an in-flight long query does not distort the rate. User-initiated cancellations (someone hits stop on a slow query) are treated as cancellations, not errors, because they reflect intent rather than failure; only cancellations forced by an error condition are counted as failures.
+
+The five-minute window is deliberately short. A schema break tends to fail every query that touches the affected object, so the rate climbs steeply and a short window makes that visible fast. The trade-off is that on a low-traffic warehouse, a handful of failures can produce a high percentage from a small base, so the card surfaces the absolute failed count alongside the percentage. Two failures out of five queries is 40% but is not the same emergency as 200 failures out of 500.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a SQL warehouse serving about 60 analyst and dashboard queries per minute against a gold-layer schema. A data-engineering squad ships a model change at 13:00 UTC that renames `gold.customer_360.lifetime_value` to `ltv_gbp`. Snapshot taken on 23 Apr 26 around the deploy.
+
+| Time (UTC) | Total queries (5m) | Failed | Error rate % | Note |
+| --- | --- | --- | --- | --- |
+| 12:55 | 312 | 2 | 0.6 | Baseline (typos, timeouts) |
+| 13:01 | 305 | 41 | **13.4** | **Alert: spike after deploy** |
+| 13:08 | 298 | 39 | 13.1 | Still failing |
+| 13:20 | 309 | 3 | 1.0 | Recovered after rollback |
+
+At 13:01 the gauge jumps from 0.6% to 13.4% and pages the on-call. The error sample in the drill-down is unambiguous.
+
+```text
+Dominant error in the window:
+  [ANALYSIS_ERROR] Column 'lifetime_value' cannot be resolved on
+  gold.customer_360. Did you mean 'ltv_gbp'?
+  - 38 of 41 failures share this message
+  - All originate from 6 dashboards and 2 scheduled exports
+  - Started within 60s of the 13:00 model deploy
+```
+
+The cause is clear: a backward-incompatible column rename broke every consumer still referencing the old name. The decisions:
+
+1. **Roll back the rename, then migrate forward.** The fastest path to green is to revert the model change so consumers work again, then reintroduce the rename as an additive change (add `ltv_gbp` as a copy, deprecate `lifetime_value`, update consumers, drop the old column later). The error rate returns to baseline by 13:20.
+2. **Identify every broken consumer from the failures.** The drill-down already names the six dashboards and two exports that failed, which is the exact migration checklist. There is no need to guess which downstream objects referenced the column.
+3. **Add a contract check to the deploy.** A pre-deploy test that runs each known consumer query against the proposed schema would have caught this before it shipped. The error rate spike is the symptom; the missing schema-contract test is the root cause.
+
+Two takeaways:
+
+1. **Read the percentage with the absolute count.** 13.4% on 305 queries is a real, broad outage. The same 13.4% on a warehouse doing five queries in five minutes would be a single unlucky ad-hoc query, not an emergency. The card shows both for exactly this reason.
+2. **Error rate is the fastest deploy-regression detector you have.** It moved within 60 seconds of the breaking change, faster than anyone filed a ticket. Pair it with your deploy timeline so a spike immediately points at the change that caused it.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with SQL Query Error Rate | What the combination tells you |
+| --- | --- | --- |
+| [SQL Query Error Rate Spike (>1% in 5m)](/nerve-centre/kpi-cards/databricks/sql-query-error-rate-spike-1-in-5m) | The alert-class companion that fires on the spike. | The gauge shows the level; the spike card is the paging event. |
+| [SQL Queries per Hour (live)](/nerve-centre/kpi-cards/databricks/sql-queries-per-hour-live) | Provides the denominator context for the rate. | A throughput drop with a steady error count inflates the percentage misleadingly. |
+| [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) | Timeouts show up as both slow and failed. | Errors plus rising p95 equals queries failing on timeout, not on schema. |
+| [SQL Warehouse Saturation %](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation) | A saturated warehouse can reject or time out queries. | Errors with high saturation equals capacity-driven failure; errors with low saturation equals a broken object. |
+| [Failed Jobs (24h)](/nerve-centre/kpi-cards/databricks/failed-jobs-24h) | Jobs that run SQL fail for the same schema reasons. | Both rising after a deploy confirms a backward-incompatible change. |
+| [Databricks Health Score](/nerve-centre/kpi-cards/databricks/databricks-health-score) | The composite that weights error rate heavily. | A sustained error spike pulls the composite into red on its own. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/databricks/slow-query-rate) | Distinguishes "slow" from "broken". | High slow-query rate but low error rate equals performance, not correctness. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> Open **SQL → Query History** and filter **Status = Failed** over a five-minute window; the failed count over the total is this card.
+> Run `SELECT execution_status, count(*) FROM system.query.history WHERE start_time >= now() - interval 5 minute GROUP BY execution_status` (where the system schema is enabled) for the success/failure split.
+> Each failed row in Query History exposes the error message and class, the same sample the card's drill-down surfaces.
+
+**Why our number may legitimately differ from the Databricks UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Cancellation handling** | Vortex IQ rate lower | User-initiated cancellations are excluded from our failures; the UI may group them under non-successful statuses. |
+| **Window definition** | Variable | Vortex IQ uses a rolling five-minute window; the UI's status filter often uses a fixed range you select, so the denominator differs. |
+| **Terminal-only counting** | Slight | We count only finished queries; an in-flight query that later fails appears at the next poll, briefly lagging the live UI. |
+| **System-query filtering** | Variable | Metadata/housekeeping queries can be excluded from the denominator, which changes the percentage versus the raw history view. |
+| **Multi-warehouse aggregation** | Variable | The headline blends all monitored warehouses; a single-warehouse UI view will differ. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Slow SQL Queries During Checkout Window](/nerve-centre/kpi-cards/databricks/slow-sql-queries-during-checkout-window) | Errors on a storefront-facing warehouse can break embedded analytics during peak. | Errors off-peak on internal warehouses are not customer-facing. |
+| [Databricks SQL Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/databricks/databricks-sql-spike-vs-ecom-order-rate) | A traffic spike can push a warehouse to time out, raising errors. | Errors with flat traffic point at a schema or object break, not load. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My error rate is 40% but I am not worried. Should I be?**
+Check the absolute count first. On a low-traffic warehouse, two failures out of five queries is 40% and may just be one analyst's mistyped query running twice. The card shows the raw failed count alongside the percentage precisely so you can tell a small-base statistical artefact from a broad outage. A high percentage on a high query volume is the real emergency.
+
+**Are user cancellations counted as errors?**
+No. When a user deliberately stops a slow query, that is intent, not failure, and it is excluded from the error numerator. Only cancellations forced by an error condition (for example, a query killed because its warehouse went unhealthy) count as failures. This keeps the rate focused on genuine problems rather than normal analyst behaviour.
+
+**Why a five-minute window instead of an hour?**
+Schema breaks and object drops fail queries fast and broadly, so a short window makes the spike visible within minutes. A one-hour window would dilute a sharp spike against an hour of healthy queries and delay the alert. The trade-off, more sensitivity to small-base noise on quiet warehouses, is handled by surfacing the absolute count.
+
+**What query failures are most common at baseline?**
+The normal sub-1% baseline is dominated by user errors (mistyped column or table names, permission denials on objects a user cannot access) and the occasional ad-hoc query timing out. These are individual, scattered, and self-correcting. The signal you care about is a *correlated* spike where many queries fail with the *same* error, which points at a shared cause like a schema change.
+
+**The error rate spiked but every query has a different error. What does that mean?**
+Scattered, dissimilar errors usually mean an infrastructure problem rather than a single broken object: the metastore briefly unreachable, the warehouse failing health checks, or a network blip to cloud storage. A single shared error message points at a dropped or renamed object; many different messages point at the platform underneath. Pair with [SQL Warehouse Saturation %](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation) and the warehouse event log.
+
+**Does a timeout count as an error here?**
+Yes, a query that fails because it exceeded its time limit terminates with a failed status and is counted. That is why a rising error rate alongside rising [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) usually means queries are failing on timeout under load, a capacity story, rather than failing on a broken object, a correctness story. The two patterns need different fixes.
+
+**How do I connect a spike to the deploy that caused it?**
+Line the spike's start time up against your deployment timeline; schema-break spikes typically begin within a minute of the offending deploy. The drill-down's shared error message names the broken object, and Query History attributes each failure to its consumer, giving you both the cause and the list of things to fix. For a guided trace, Vortex Mind can correlate the spike with recent change events automatically.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*SQL Query Error Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

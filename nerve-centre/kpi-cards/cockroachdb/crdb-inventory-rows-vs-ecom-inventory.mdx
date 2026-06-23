@@ -1,0 +1,154 @@
+---
+title: "CRDB Inventory Rows vs Ecom Inventory, CockroachDB"
+sidebarTitle: "CRDB Inventory Rows vs Ecom Inventory"
+description: "CRDB Inventory Rows vs Ecom Inventory for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **CRDB Inventory Rows vs Ecom Inventory** compares the stock figures held in your CockroachDB inventory table against the same SKUs as the storefront reports them, and counts how many are drifting apart. This is a data-integrity card, not a performance card. When the database row says 12 units and the storefront says 40, you will oversell; when the database says 40 and the storefront says 0, you will hide sellable stock and lose revenue silently. Any non-zero drift is a problem because the two systems are meant to be a single source of truth. For a DBA or platform team this is the canary for a broken sync job, a stuck replication stream, or a write that committed in CockroachDB but never propagated to the channel.
+
+| | |
+| --- | --- |
+| **What it tracks** | The count of SKUs where the on-hand quantity in the CockroachDB inventory table disagrees with the quantity the storefront connector reports for the same SKU. The headline is the number of drifting SKUs; drill-in shows the per-SKU delta. |
+| **Data source** | CockroachDB side: a `SELECT sku, quantity` read against the cluster's inventory table (the authoritative ledger). Storefront side: the inventory levels exposed by the linked Shopify / BigCommerce / Adobe Commerce connector. The card joins on SKU and flags any non-zero difference. |
+| **Metric basis** | A reconciliation count, not a metric average. Each SKU is either in agreement or drifting; the card sums the drifting ones and surfaces the largest deltas first. |
+| **Time window** | `RT/24h`: the live drift count is evaluated continuously, with a 24-hour view so you can see whether drift is new (a sync just broke) or chronic (a SKU that never reconciles). |
+| **Alert trigger** | `>0 SKUs drifting`: any SKU out of agreement raises the card, because in a single-source-of-truth design the correct number of drifting SKUs is zero. |
+| **What counts as drift** | Any SKU where database quantity and storefront quantity differ beyond the configured tolerance (default zero). Both directions count: database higher (hidden stock) and database lower (oversell risk). |
+| **What does NOT count** | (1) SKUs present in only one system (surfaced separately as orphans, not drift); (2) Differences inside an explicit tolerance band if configured; (3) In-flight rows mid-sync that reconcile within the dedupe window. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card runs a set comparison between two inventory views keyed on SKU:
+
+```text
+drift_count = count of SKUs where
+              abs(crdb.quantity[sku] - storefront.quantity[sku]) > tolerance
+
+per row:  { sku, crdb_qty, storefront_qty, delta, direction, last_synced }
+direction = "oversell risk"  if storefront_qty > crdb_qty
+            "hidden stock"   if crdb_qty > storefront_qty
+```
+
+The CockroachDB figure is read directly from the inventory table (the authoritative ledger that order processing writes to). The storefront figure comes from the linked ecommerce connector's inventory levels. The engine joins the two on SKU, computes the per-SKU delta, and counts every SKU whose delta exceeds the configured tolerance (zero by default, because the two are meant to match exactly).
+
+Direction matters as much as magnitude. A storefront quantity higher than the database is an oversell risk: customers can buy stock you do not have. A database quantity higher than the storefront is hidden stock: sellable units the channel will not offer. The card sorts by absolute delta so the most dangerous mismatches surface first, and carries `last_synced` per row so you can tell a freshly broken sync from a long-standing one. Because the correct state is exact agreement, the alert fires the moment the count leaves zero.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs CockroachDB as the inventory ledger behind a multi-channel retailer whose primary storefront is on Shopify. A sync worker reads committed inventory writes from CockroachDB and pushes levels to the channel. Snapshot taken on 14 Apr 26 at 09:15 BST, the morning after a release to the sync worker.
+
+| SKU | CRDB qty | Storefront qty | Delta | Direction | Last synced |
+| --- | --- | --- | --- | --- | --- |
+| TSHIRT-BLK-M | 12 | 40 | +28 | **oversell risk** | 13 Apr 26 23:50 |
+| MUG-CER-300 | 0 | 6 | +6 | **oversell risk** | 13 Apr 26 23:50 |
+| HOODIE-GRY-L | 85 | 0 | -85 | hidden stock | 13 Apr 26 23:50 |
+| SOCKS-WHT-3PK | 210 | 210 | 0 | in agreement | 14 Apr 26 09:10 |
+
+The card headline reads **3 SKUs drifting**, and the alert is live because the count is non-zero. The shared `last_synced` of 13 Apr 26 23:50 on every drifting row is the tell: the sync worker stopped pushing updates just before midnight, right after the release. SKUs that have transacted since then have moved in CockroachDB but the storefront is frozen at last night's levels.
+
+What the on-call DBA does with this:
+
+1. **Read direction before magnitude.** The two oversell-risk rows are the urgent ones: TSHIRT-BLK-M shows 40 sellable on the storefront but only 12 exist, so the next 28 sales of that SKU are oversells the warehouse cannot fulfil. HOODIE-GRY-L is the inverse: 85 real units the storefront refuses to sell, a quieter revenue leak.
+2. **Confirm it is a sync break, not a database write failure.** Because the database has fresh quantities and the storefront is stale, the ledger is healthy and the propagation path is broken. Cross-read [Statement Error Rate %](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate): if writes to the inventory table are succeeding, the fault is downstream in the sync worker, not in CockroachDB.
+3. **Stop the bleeding, then backfill.** Short term: cap or pause sales on the oversell-risk SKUs at the channel so you stop promising stock you do not have. Then restart or roll back the sync worker and trigger a full reconciliation push so the storefront catches up to the ledger.
+
+```text
+Cost framing of the drift:
+  - Oversell rows (TSHIRT, MUG): every sale above true stock becomes a cancellation,
+    a refund, and a customer-trust hit. 34 phantom units exposed for sale.
+  - Hidden-stock row (HOODIE): 85 sellable units invisible to shoppers. At a £45
+    price point that is up to £3,825 of demand the channel silently turned away.
+  - The longer the sync stays broken, the more SKUs join the drift list as they transact.
+```
+
+Three takeaways for the team:
+
+1. **Zero is the only healthy number.** In a single-source-of-truth design any drift is a defect. The alert fires at the first SKU on purpose; there is no "acceptable" small drift unless you have deliberately configured a tolerance.
+2. **`last_synced` localises the fault in seconds.** A shared, stale timestamp across drifting rows points straight at a stopped sync job. Mixed fresh and stale timestamps point at per-SKU write or mapping problems instead.
+3. **Direction sets priority.** Oversell-risk drift costs you cancellations and trust immediately; hidden-stock drift costs you quiet missed sales. Fix oversell first, then recover the hidden stock.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with CRDB Inventory Rows vs Ecom Inventory | What the combination tells you |
+| --- | --- | --- |
+| [Statement Error Rate %](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate) | Tells you whether the ledger writes themselves are failing. | Drift with a clean error rate means the database is fine and the sync path is broken. |
+| [Raft Quiescent Lag (seconds)](/nerve-centre/kpi-cards/cockroachdb/raft-quiescent-lag-seconds) | Replication lag can make a read see stale rows. | Drift plus high Raft lag means the comparison read may be lagging, not the storefront. |
+| [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) | Contention on the inventory table can stall writes. | High retries on inventory writes can leave the ledger behind reality, feeding drift. |
+| [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) | Surfaces hot rows where inventory writes collide. | A contended inventory update statement is a common root cause of stalled stock writes. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/cockroachdb/last-successful-backup-hours-ago) | The ledger is the source you would restore from. | If drift is large, confirm a recent backup exists before any corrective bulk write. |
+| [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live) | The write workload that moves inventory rows. | Inventory transacting (QPS up) while the storefront stays flat confirms a sync break. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The executive composite this integrity signal feeds. | The cluster can be perfectly healthy while drift is high; this card catches what the score cannot. |
+| [Slow Statements During Checkout Window (5m)](/nerve-centre/kpi-cards/cockroachdb/slow-statements-during-checkout-window-5m) | Slow inventory reads at checkout can show stale stock. | Drift plus slow checkout statements compounds into bad availability at the worst moment. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look natively:**
+
+> **`SELECT sku, quantity FROM inventory WHERE sku IN (...);`** in a `cockroach sql` session for the authoritative ledger quantities the card reads.
+> **DB Console SQL Activity → Statements** to confirm the inventory read and write statements are executing and not erroring.
+> **`SHOW RANGES FROM TABLE inventory;`** if you suspect a replication or availability problem on the inventory table specifically.
+> The storefront side has no CockroachDB equivalent: confirm channel quantities in your Shopify / BigCommerce / Adobe Commerce inventory screens for the same SKUs.
+
+**Why our number may legitimately differ from the native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Read timing** | Transient drift | The database read and the storefront read are taken moments apart. A SKU mid-sale can look drifted for one poll, then reconcile; the dedupe window filters most of these. |
+| **Tolerance band** | Vortex IQ may count fewer | If a non-zero tolerance is configured, small deltas inside the band are not counted as drift even though the raw numbers differ. |
+| **Replication lag** | Database read may trail | A read served by a lagging replica can show a slightly stale quantity; pair with [Raft Quiescent Lag (seconds)](/nerve-centre/kpi-cards/cockroachdb/raft-quiescent-lag-seconds) to rule this out. |
+| **SKU mapping** | Either way | If the channel uses a different SKU or variant key than the ledger, the join can mismatch; orphan SKUs are reported separately rather than as drift. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [CRDB Statements Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/cockroachdb/crdb-statements-spike-vs-ecom-order-rate) | Healthy inventory writes track order rate. | Orders rising with no matching inventory write statements means stock is not being decremented, a precursor to drift. |
+| [CRDB Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/cockroachdb/crdb-pool-saturation-vs-traffic-burst) | Under saturation, inventory writes can queue. | A saturated pool that stalls inventory writes can leave the ledger behind the channel and create drift. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**A SKU showed as drifting on one poll and was clean on the next. Is the count flickering?**
+Briefly, yes, and that is expected. A SKU being sold the instant the two reads are taken can look drifted for one poll before the sync catches up. The dedupe window filters most of these so they do not raise a standing alert. A SKU that stays in the drift list across several polls is a real problem; a single-poll appearance that clears is usually in-flight sale timing.
+
+**Does the card tell me which side is wrong?**
+It tells you the direction and the delta, and the `last_synced` timestamp, which together almost always identify the side at fault. Fresh database quantities with stale storefront quantities point at a broken sync (the storefront is wrong). If the database read itself is stale, [Raft Quiescent Lag (seconds)](/nerve-centre/kpi-cards/cockroachdb/raft-quiescent-lag-seconds) will be elevated and the database read is the suspect. The card flags the discrepancy; you confirm the culprit from those signals.
+
+**Why does the alert fire at a single SKU instead of a percentage?**
+Because the design intent is exact agreement. Inventory is a single source of truth, so one drifting SKU is already an oversell or hidden-stock event waiting to happen. If your operation genuinely tolerates small deltas (for example a slow-moving warehouse feed), configure a tolerance band and the card will respect it.
+
+**A SKU exists in CockroachDB but not on the storefront. Is that drift?**
+No, that is an orphan, and it is reported separately. Drift means the SKU is present in both systems with different quantities. An orphan means the SKU is missing from one side entirely, usually a catalogue-sync or mapping issue rather than a quantity-sync issue, and it needs a different fix.
+
+**We use different SKU keys between the ledger and the channel. Will the comparison work?**
+Only if a mapping exists. The join is on SKU, so a channel using a different variant key than the ledger will mismatch and surface SKUs as orphans rather than reconciling them. Configure the SKU mapping in the connector so the two keys align before relying on the drift count.
+
+**Can high write contention on the inventory table cause false drift?**
+It can cause real drift, not false drift. If inventory updates are retrying heavily ([Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h)) or stuck behind a contended statement ([Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements)), the ledger can genuinely fall behind real-world stock movements, which then shows up here. The card is correctly reporting that the ledger and channel disagree; the contention is the upstream cause to fix.
+
+**The drift count is large after a bulk import. Should I bulk-correct it immediately?**
+Investigate first. A large post-import drift usually means the import wrote to one system and not the other, or wrote with a different SKU key. Confirm a recent backup exists ([Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/cockroachdb/last-successful-backup-hours-ago)) before any corrective bulk write, identify whether the ledger or the channel is authoritative for the imported SKUs, then reconcile in that direction rather than blindly overwriting.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*CRDB Inventory Rows vs Ecom Inventory* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

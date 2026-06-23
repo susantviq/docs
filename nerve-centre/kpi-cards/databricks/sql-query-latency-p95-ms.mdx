@@ -1,0 +1,150 @@
+---
+title: "SQL Query Latency p95 (ms), Databricks"
+sidebarTitle: "SQL Query Latency p95 (ms)"
+description: "SQL Query Latency p95 (ms) for Databricks lakehouses. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **SQL Query Latency p95 (ms)** is the 95th-percentile completion time for SQL statements on your Databricks SQL warehouses: 95% of queries finish faster than this, 5% take longer. For a lakehouse this is the number your dashboards and downstream consumers actually feel, because the slow tail is where timeouts, abandoned BI refreshes, and stalled checkout-analytics joins live. Lakehouse SQL p95 is typically measured in seconds rather than milliseconds; the alert threshold (5000ms) reflects a busy warehouse workload, not a single trivial query.
+
+| | |
+| --- | --- |
+| **What it tracks** | The 95th-percentile total query duration on your Databricks SQL warehouses over the window. Lakehouse SQL p95 measured in seconds typically; the threshold reflects warehouse workload. |
+| **Data source** | Databricks SQL query history (`system.query.history` / Query History API), durations aggregated to the 95th percentile. |
+| **Time window** | `RT/5m` (real-time, evaluated over a rolling 5-minute window) |
+| **Alert trigger** | `> 5000ms`. When the trailing-window p95 exceeds 5 seconds, the tail of your workload is degrading and the on-call data engineer is notified. |
+| **Roles** | owner, engineering |
+| **Card class** | Hero and Sensitivity card: it drives the Performance health signal and is configurable in the Sensitivity tab. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Vortex IQ reads completed statements from your Databricks SQL warehouse query history over the rolling 5-minute window and computes the 95th percentile of total query duration. "Total duration" is the full wall-clock time from submission to result availability, which includes queue wait, compilation/planning, photon/execution time, and result fetch. It is **not** execution time alone, so a query that ran for 800ms but waited 6 seconds in a saturated queue counts as roughly 6.8 seconds toward the percentile.
+
+Because it is the 95th percentile, the value answers "how slow is a bad-but-not-worst-case query right now?". It deliberately ignores the absolute worst 5% (those belong to [SQL Query Latency p99 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p99-ms)) and ignores the median (that is [SQL Query Latency p50 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p50-ms)). The card reports the value in milliseconds for consistency across the Performance category; a reading of 4,200 means 4.2 seconds.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A retail analytics team runs a `Serverless Medium` SQL warehouse backing both the executive Tableau dashboard and a Delta table that feeds the storefront's "recommended for you" widget. Snapshot taken on 14 Apr 26 at 09:35 BST, just as the morning dashboard-refresh wave hits.
+
+| Reading | Value |
+| --- | --- |
+| p50 latency | 480ms |
+| **p95 latency** | **6,300ms** (alert: above 5,000ms) |
+| p99 latency | 11,200ms |
+| Warehouse saturation | 88% |
+| Queued queries (peak) | 14 |
+
+The headline p95 card turns red because 6.3 seconds breaches the 5-second threshold. The p50 is healthy at 480ms, which is the key diagnostic clue: the **typical** query is still fast, so this is a tail problem driven by queueing, not a warehouse-wide collapse. Reading the panel together:
+
+1. **Saturation at 88% plus 14 queued queries explains the tail.** During the 09:30 refresh wave, more queries arrive than the warehouse has slots for. Fast queries that land in an empty slot stay near 480ms (keeping p50 low), but queries that arrive during the burst wait several seconds before execution, inflating p95.
+2. **The business impact is concrete.** The "recommended for you" widget query is in the slow 5%. When its total duration crosses ~5 seconds the storefront falls back to a generic placeholder, so a slow lakehouse tail is quietly degrading on-site personalisation during peak browsing.
+3. **The fix is right-sizing, not query rewriting.** Because p50 is fine, rewriting individual queries will not help much. The lever is concurrency: enable or raise multi-cluster auto-scaling on the warehouse so the 09:30 burst spins up a second cluster, or move the storefront-feeding query to its own dedicated warehouse so dashboard traffic cannot queue behind it.
+
+```text
+Cost / impact framing for the breach window (09:30 to 09:45):
+  - Queries in window: ~1,900
+  - In the slow 5% (above p95): ~95 queries
+  - Storefront widget queries affected: ~40
+  - Personalisation fallbacks served: ~40 sessions with generic content
+  - Action: enable max 2 clusters on the warehouse; p95 expected
+    to fall back below 2,500ms during the next refresh wave.
+```
+
+Three takeaways:
+
+1. **Always read p95 next to p50.** Low p50 with high p95 means a tail/queueing problem (scale concurrency). High p50 *and* high p95 means the whole warehouse is slow (scale size or fix table layout).
+2. **p95 in seconds is normal for a lakehouse.** Unlike a row-store OLTP database, Databricks SQL handles scan-heavy analytical queries; a multi-second p95 is acceptable for heavy aggregations. Tune the Sensitivity threshold to your real workload rather than expecting sub-second tails.
+3. **Pair p95 with saturation to choose the lever.** Saturation high equals scale concurrency; saturation low but p95 high equals optimise table layout (run OPTIMIZE / Z-ORDER, check file sizes).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with p95 Latency | What the combination tells you |
+| --- | --- | --- |
+| [SQL Query Latency p50 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p50-ms) | The median baseline. | Low p50 with high p95 equals a tail/queue problem; high in both equals a warehouse-wide slowdown. |
+| [SQL Query Latency p99 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p99-ms) | The extreme tail. | If p99 dwarfs p95, a few pathological queries (skew, missing pruning) are the cause, not general load. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/databricks/slow-query-rate) | The count-based view of the same tail. | Rising slow-query rate confirms p95 breach is broad, not one outlier. |
+| [SQL Warehouse Saturation %](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation) | The queueing cause. | High saturation explains p95 inflation without any query getting genuinely slower. |
+| [Avg Cluster CPU Utilisation %](/nerve-centre/kpi-cards/databricks/avg-cluster-cpu-utilisation) | The compute-pressure peer. | High CPU plus high p95 equals undersized warehouse; low CPU plus high p95 equals queueing or I/O bound. |
+| [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries) | The named offenders. | Identifies which statements sit in the slow tail so you can rewrite or reschedule them. |
+| [SQL Query Error Rate %](/nerve-centre/kpi-cards/databricks/sql-query-error-rate) | The failure peer. | High p95 plus rising errors equals queries timing out, not just running slowly. |
+| [Slow SQL Queries During Checkout Window](/nerve-centre/kpi-cards/databricks/slow-sql-queries-during-checkout-window) | The revenue cross-channel view. | Confirms whether the slow tail co-occurs with storefront checkout activity. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **Query History** in the Databricks SQL workspace, filtered to the same warehouse and time range, sorted by duration descending, gives you the slow tail to inspect directly.
+> **`system.query.history`** (Unity Catalog system tables) is the system-table source; compute the percentile yourself to match the card exactly.
+> **Warehouse monitoring** on the warehouse's own page shows the live queue depth and running-cluster count that explain a tail spike.
+
+To match the card precisely, query the system table over the same window:
+
+```sql
+SELECT percentile(total_duration_ms, 0.95) AS p95_ms
+FROM system.query.history
+WHERE warehouse_id = '<your_warehouse_id>'
+  AND start_time >= current_timestamp() - INTERVAL 5 MINUTES;
+```
+
+**Why our number may legitimately differ from the Databricks UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Duration definition** | Vortex IQ may read higher | We use total duration (queue + compile + execute + fetch); the Query History UI can show execution time in some columns, which excludes queue wait. |
+| **System-table latency** | Brief lag | `system.query.history` can lag completion by a few seconds, so a very recent burst may not yet be reflected. |
+| **Time zone / window edges** | Marginal | Vortex IQ aligns the 5-minute window to your reporting time zone; the UI defaults to workspace time. |
+| **Warehouse scope** | Variable | If the connector is scoped to specific warehouses, the card excludes others the UI shows. |
+| **Statement-type filtering** | Slight | Metadata-only and cancelled statements may be filtered out of the percentile; the raw UI list includes them. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | A p95 breach during peak browsing can correspond to degraded personalisation and a small conversion dip if the lakehouse feeds storefront features. | Revenue unaffected during a breach means the slow tail is internal-only (BI dashboards), not customer-facing. |
+| [`google_analytics`](/nerve-centre/kpi-cards/google-analytics/ga4-property-health) | Independent measurement of front-end timing. | Lakehouse p95 high but GA4 timings normal equals back-office-only impact. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is the card in milliseconds when my p95 reads in seconds?**
+Lakehouse SQL p95 is typically several seconds for analytical workloads, but the Performance category standardises every latency card on milliseconds so they sort and compare cleanly. A reading of 6,300 means 6.3 seconds. The 5,000ms (5 second) default threshold is set with real warehouse workloads in mind, not sub-second OLTP expectations.
+
+**My p50 is fine but p95 keeps breaching. What does that mean?**
+That is the classic queueing signature. Your typical query is fast, but during bursts queries wait for a warehouse slot, inflating only the tail. The fix is concurrency, not query optimisation: enable multi-cluster auto-scaling on the warehouse, raise the max cluster count, or split heavy dashboard traffic onto a separate warehouse. Confirm with [SQL Warehouse Saturation %](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation).
+
+**Does p95 include queue wait time, or just execution?**
+It includes total duration: queue wait, compilation/planning, execution, and result fetch. This is intentional, because the consumer of a query feels the full wall-clock time, not just the engine's execution slice. If you want execution-only timing, inspect the per-query breakdown in Query History.
+
+**Should I tune the 5000ms threshold?**
+Yes. The default is a sensible starting point, but a warehouse that mostly serves heavy nightly aggregations will have a naturally higher p95 than one serving cached BI extracts. Set the threshold in the Sensitivity tab to roughly 1.5x to 2x your healthy baseline so it alerts on real regressions, not normal heavy load.
+
+**Why does a serverless warehouse show different p95 behaviour from a classic one?**
+Serverless warehouses start fast and scale concurrency quickly, so they tend to absorb bursts with a lower, more stable p95. Classic warehouses incur cold-start time when a new cluster spins up, which can briefly spike p95 right after a scale-up event. If you see periodic short p95 spikes that resolve in a minute, suspect cold starts rather than query problems.
+
+**Can a single huge query push p95 up on its own?**
+Usually no. p95 is robust to a handful of outliers (that is what p99 is for). If p95 moves, at least 5% of your queries are slow, which means a broad cause: load, saturation, or degraded table layout. A single monster query shows up in p99 and in [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries), not in p95.
+
+**Does the card cover all warehouses or just one?**
+It reflects the warehouses in the connector's configured scope. If you run separate warehouses for ETL and BI, scope or stack the card per warehouse so a heavy ETL tail does not mask a healthy BI tail (and vice versa).
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*SQL Query Latency p95 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

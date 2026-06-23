@@ -1,0 +1,163 @@
+---
+title: "Database Query Error Rate %, Supabase"
+sidebarTitle: "Database Query Error Rate %"
+description: "Database Query Error Rate for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This gauge reports the share of SQL statements that failed against your Supabase Postgres database in the window. A query "fails" when Postgres returns an error rather than a result set: a constraint violation, a deadlock abort, a permission denial, a syntax error, a statement timeout, or a connection that could not be served. It is the database-level health signal beneath the API: where [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) tells you the API returned an error to a client, this tells you the query itself errored inside Postgres, which is often the root cause one layer down. For a platform or SRE team this is a primary alert gauge. A query error rate creeping above 1% means a meaningful fraction of database work is being rejected, and users are seeing failures right now.
+
+| | |
+| --- | --- |
+| **What it tracks** | The percentage of SQL statements that returned an error rather than a result in the window: `failed_statements / total_statements`. |
+| **Data source** | Postgres transaction outcome counters (`xact_rollback` relative to `xact_commit + xact_rollback` in `pg_stat_database`) combined with database error log entries (SQLSTATE error codes) from the project's Logs & Analytics layer. The card reads the delta between polls. |
+| **Time window** | `5m` (a five-minute rolling rate, long enough to be meaningful, short enough to catch a fresh failure). |
+| **Alert trigger** | `>1%`. A sustained query error rate above 1% means roughly 1 in 100 statements is failing, which on a busy database is hundreds of rejected operations per minute and a clear user-facing problem. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The gauge is a ratio of failed statements to total statements over the rolling window:
+
+```text
+error_rate = failed_statements / (failed_statements + successful_statements)
+fire when: error_rate > 1% (sustained over the 5m window)
+```
+
+Postgres tracks the outcome of work at the transaction level (`xact_commit` for committed, `xact_rollback` for rolled back) and emits an error log entry with a SQLSTATE code for every statement that fails. The card combines both: rollbacks give the volume signal, and the error log gives the breakdown by error class so you can tell *why* statements are failing. As with the other live counters, the card reads the delta between polls so a fresh spike surfaces promptly rather than being diluted by a healthy lifetime history.
+
+Two points shape how to read the number:
+
+1. **Not every rollback is a fault.** Some applications use `ROLLBACK` deliberately (optimistic-concurrency retries, transactions that test a condition and back out, advisory-lock probes). A low baseline rollback rate is normal and benign. The alert threshold sits at 1% precisely so routine, intentional rollbacks stay below it and only genuine error surges trip it. The error-log breakdown by SQLSTATE is what separates "expected rollback" from "real failure".
+2. **The error class names the cause.** SQLSTATE codes group the failures: class `23` (integrity constraint violation) means duplicate keys or foreign-key breaks, often a bad write path; class `40` (transaction rollback) includes `40P01` deadlocks and serialisation failures, meaning contention; class `42` (syntax / access rule) means a broken query or a missing column, usually a bad deploy; class `53` (insufficient resources) and `57` (operator intervention) include out-of-memory, disk-full, and statement-timeout cancellations, meaning capacity. Reading the dominant class tells you which sibling card to open next.
+
+The natural drill-downs are [Database Query Error Rate Spike (>1% in 5m)](/nerve-centre/kpi-cards/supabase/database-query-error-rate-spike-1-in-5m) (the alert-list view of this gauge), [Deadlocks (last 5m)](/nerve-centre/kpi-cards/supabase/deadlocks-last-5m) (for class-40 contention), and [Database Disk Usage %](/nerve-centre/kpi-cards/supabase/database-disk-usage) (for class-53 resource failures when a project hits its tier cap).
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Supabase Pro project for an events product. Query error rate normally sits around 0.1% (routine optimistic-concurrency rollbacks). Snapshot taken on 08 May 26 at 19:20 BST, during a high-traffic ticket on-sale.
+
+| Window | Total statements | Failed | **Error rate** | Dominant SQLSTATE | State |
+| --- | --- | --- | --- | --- | --- |
+| 19:00 to 19:05 (pre-sale) | 880k | 900 | 0.10% | 40001 (serialisation) | healthy |
+| 19:15 to 19:20 (peak) | 1.41M | 24,500 | **1.74%** | 40P01 (deadlock) | **BREACH** |
+
+The gauge fires. The headline reads **Database Query Error Rate 1.74% (BREACH)**. The team reads:
+
+1. **The error class changed, not just the volume.** At baseline the few failures were `40001` (serialisation failures, normal under optimistic concurrency). At peak the dominant class is `40P01`, deadlocks. The cause is not "more of the same"; a new contention pattern has appeared under load.
+2. **Deadlocks confirm it.** Cross-referencing [Deadlocks (last 5m)](/nerve-centre/kpi-cards/supabase/deadlocks-last-5m), the deadlock count has jumped from 0 to dozens in the window. Two transactions are grabbing the same rows (seat-inventory rows for the hot event) in opposite orders, so under concurrency they lock each other out and Postgres aborts one to break the cycle. Each abort is a failed statement, which is what is driving the gauge.
+3. **It is user-facing right now.** [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) has risen in step: the aborted transactions bubble up as failed API calls, so buyers are seeing "could not reserve seat" errors at the worst possible moment. This is the database error becoming a lost sale.
+
+```text
+Diagnose by error class (SQLSTATE):
+  class 23  integrity violation   -> bad write path / duplicate or FK break
+  class 40  rollback (40P01/40001)-> deadlock / serialisation contention
+  class 42  syntax / undefined    -> broken query, missing column (bad deploy)
+  class 53  insufficient resources-> disk full, out of memory (capacity)
+  class 57  operator intervention -> statement timeout / cancel
+  class 08  connection exception  -> pool exhausted / connection dropped
+
+Find the deadlocking statements:
+  -- from the Postgres error log, deadlock entries name both statements
+  -- and the relation; then confirm the access pattern:
+  SELECT query, calls, rows
+  FROM pg_stat_statements
+  WHERE query ILIKE '%seat_inventory%'
+  ORDER BY calls DESC;
+```
+
+```text
+Fixes, by class:
+  deadlock (40P01): make all writers lock rows in the SAME order;
+                    or take a single SELECT ... FOR UPDATE on a parent row
+                    to serialise access to the contended set.
+  serialisation (40001): add bounded application-level retry with backoff.
+  resources (53): check Database Disk Usage / Memory Usage and tier limits.
+  syntax (42): roll back the offending deploy.
+```
+
+The team enforced a consistent lock order on the seat-inventory write path (all transactions acquire the event row first), the deadlocks stopped, and the error rate fell back to its 0.1% baseline within minutes while the API 5xx rate recovered alongside it. The gauge raised the alarm; the SQLSTATE breakdown turned it into a precise fix.
+
+Three takeaways:
+
+1. **Read the error class, not just the rate.** The same 1.74% means a different action depending on whether it is class 23 (bad writes), class 40 (contention), class 42 (bad deploy), or class 53 (capacity). The breakdown is the diagnosis.
+2. **A low baseline is normal; a spike with a changed class is the signal.** Routine optimistic-concurrency rollbacks keep a small non-zero baseline. What matters is a jump in volume together with a shift in the dominant error class.
+3. **Database errors become lost revenue one layer up.** A query error rate spike almost always shows up as an API 5xx spike and a user-facing failure. Pair this gauge with [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) to size the customer impact.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Database Query Error Rate | What the combination tells you |
+| --- | --- | --- |
+| [Database Query Error Rate Spike (>1% in 5m)](/nerve-centre/kpi-cards/supabase/database-query-error-rate-spike-1-in-5m) | The alert-list view of this gauge. | The gauge shows the level; the spike card flags the moment it crossed the line. |
+| [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) | The API-layer reflection of database failures. | DB error rate up then 5xx up equals query failures surfacing to clients. |
+| [Deadlocks (last 5m)](/nerve-centre/kpi-cards/supabase/deadlocks-last-5m) | Class-40 errors are usually deadlocks. | A deadlock spike aligning with the error rate pinpoints lock-ordering contention. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/supabase/database-disk-usage) | Class-53 resource errors when the tier cap is hit. | Disk near 100% plus a query error spike equals the project entering restricted mode. |
+| [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) | Class-08 connection errors when the pool exhausts. | High saturation plus connection-class errors equals requests rejected for want of a connection. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate) | Statement-timeout cancellations show as errors. | Slow queries plus timeout-class errors equals queries cancelled before completing. |
+| [PostgREST 5xx Error Spike (>1% in 5m)](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-spike-1-in-5m) | The API-side alert that often co-fires. | Both spikes together confirm a real outage path from database to client. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite that weights error rate heavily. | A sustained breach drops the composite sharply, errors carry more weight than latency. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase's own tooling:**
+
+> In the Supabase dashboard, open **Logs → Postgres** and filter to error-severity entries; each carries a SQLSTATE code, which gives you the same class breakdown the card uses. **Reports → Database** shows the rollback/commit trend behind the rate.
+> Compute the rollback ratio directly: `SELECT xact_commit, xact_rollback, round(100.0 * xact_rollback / nullif(xact_commit + xact_rollback, 0), 2) AS rollback_pct FROM pg_stat_database WHERE datname = current_database();`. This is the lifetime ratio since reset, not the recent delta the card shows, and it counts all rollbacks (including intentional ones), so it reads higher than the error-log-filtered rate.
+> Inspect specific failures: deadlock entries in the Postgres log name both statements and the relation; statement-timeout cancellations appear as `57014`; constraint violations as class `23`.
+> The managed-service console exposes equivalent error and rollback charts under the project's observability section; confirm the window and whether it counts statements or transactions before comparing.
+
+**Why our number may legitimately differ from Supabase's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Rollbacks vs true errors** | Source query higher | `xact_rollback` counts intentional rollbacks too; the card cross-references the error log to exclude expected rollbacks, so a raw rollback ratio reads higher than the card. |
+| **Delta vs lifetime** | Card more responsive | The card uses the between-poll delta; a hand-run `pg_stat_database` query shows the lifetime ratio, which moves slowly and hides a fresh spike. |
+| **Statement vs transaction** | Variable | The error log is per statement; `pg_stat_database` is per transaction. One failed transaction may contain several statements, so the two scopes differ. |
+| **Log indexing latency** | Brief lag | Error-log entries can take a moment to index; a very recent spike may show in the rollback counter before the SQLSTATE breakdown catches up. |
+| **Window boundary** | Variable | The card's five-minute rolling rate sharpens a short burst that a longer dashboard bucket averages away. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My error rate is a steady 0.2% and nothing seems broken. Is that a problem?**
+Probably not. Many applications carry a small, benign baseline from intentional rollbacks: optimistic-concurrency retries, advisory-lock probes, or transactions that test a condition and back out. The 1% threshold is set above that normal noise. Check the SQLSTATE breakdown: if the baseline is dominated by serialisation failures (`40001`) that your app retries successfully, it is expected behaviour. Set the threshold to your real baseline in the Sensitivity tab if 0.2% is normal for you.
+
+**How is this different from the PostgREST 5xx error rate?**
+They measure different layers. This card counts SQL statements that errored inside Postgres; [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) counts API responses that returned a 5xx to the client. A database error usually causes an API 5xx, so they often move together, but not always: an API 5xx can come from PostgREST itself (a malformed request, a pool timeout) without a database error, and a database error on a background job never touches the API. Read the database card for root cause and the API card for user impact.
+
+**The rate spiked. How do I find out why fast?**
+Read the dominant SQLSTATE class. Class `23` is a bad write path (duplicate keys, foreign-key breaks); class `40` is contention (deadlocks `40P01`, serialisation `40001`); class `42` is a broken query or missing column, usually a bad deploy; class `53` is resource exhaustion (disk full, out of memory); class `08` is connection failures (pool exhausted). The class points you straight at the right sibling card and fix, rather than guessing.
+
+**Could a bad deploy cause this?**
+Yes, and it is one of the fastest signals you have. A deploy that ships a query referencing a column that no longer exists, or that violates a new constraint, produces a sharp class-`42` or class-`23` spike the moment it goes live. If the error rate jumps right after a release with a syntax or integrity class dominating, roll the deploy back first and diagnose second; the schema and the code are out of step.
+
+**Why does my pg_stat_database rollback ratio read higher than this card?**
+Because `xact_rollback` counts every rollback, including the intentional ones your application issues on purpose. The card cross-references the Postgres error log to exclude expected rollbacks and count genuine failures, so it reads lower than the raw rollback ratio. The raw ratio is still useful as an upper bound, but the card is the closer measure of real errors.
+
+**Do statement timeouts count as errors here?**
+Yes. A statement cancelled for exceeding the timeout returns SQLSTATE `57014` and is counted as a failed statement. A rising error rate dominated by timeouts usually means queries are running too long under load: cross-reference [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate) and [PostgREST API Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgrest-api-latency-p95-ms). The fix is to speed up the query (index, plan) or, rarely, to raise the timeout if the work is legitimately long.
+
+**Does this card include Edge Function or Auth errors?**
+Only the part that reaches Postgres. If an Edge Function runs a query that errors, that statement is counted here; if it fails in its own Deno runtime without touching the database, it is not, see [Edge Function Error Rate %](/nerve-centre/kpi-cards/supabase/edge-function-error-rate). Likewise an Auth failure that involves a failed database write counts, but an Auth flow error (a bad token, an expired link) that never errors a query does not, see [Auth Sign-In Error Rate %](/nerve-centre/kpi-cards/supabase/auth-sign-in-error-rate). This gauge is strictly database-statement outcomes.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Database Query Error Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,163 @@
+---
+title: "Slow Queries During Checkout Window (5m), PostgreSQL"
+sidebarTitle: "Slow Queries During Checkout Window (5m)"
+description: "Slow Queries During Checkout Window (5m) for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Slow Queries During Checkout Window (5m)** lines up two signals that usually live in different teams' dashboards: the count of slow PostgreSQL statements firing right now, and whether the storefront's checkout completion rate has dipped at the same moment. Each row is one slow statement (query text, mean execution time, call count, calling application) captured inside the trailing 5-minute window. The card exists to answer one question a DBA and an ecommerce lead keep arguing about: "is the database the reason orders just stopped completing?" When more than 5 slow queries co-occur with a measurable checkout drop, the card fires and tells you the slowdown is not academic, it is costing orders this minute.
+
+| | |
+| --- | --- |
+| **Data source** | Slow statements come from `pg_stat_statements` (rows where `mean_exec_time` crosses the slow threshold, default 100ms), correlated against the connected storefront connector's checkout-completion signal (Shopify, BigCommerce, or Adobe Commerce order rate). The detail view is a table broken down by row, one row per offending statement. |
+| **Metric basis** | A join across two systems, not a single PostgreSQL counter. Vortex IQ samples the slow-query set every refresh and overlays the storefront's checkout funnel for the same 5-minute clock, so a "co-occurrence" means the two curves moved together, not just that slow queries exist. |
+| **Aggregation window** | Trailing 5 minutes (`5m`), refreshed continuously. The short window is deliberate: checkout abandonment from a database stall happens in seconds, and a 30-minute average would smear the signal until it is invisible. |
+| **What counts as "slow"** | A statement whose `mean_exec_time` in the window exceeds the configured slow threshold (100ms default; raise it for analytics-heavy schemas, lower it for tight OLTP checkout paths). Lock waits and `idle in transaction` blockers that push other statements over the line are surfaced too. |
+| **What does NOT count** | (1) Slow queries from a reporting replica or a background `pg_dump` that never touch the checkout path; (2) Slow statements during a window where checkout completion is flat (logged, not alerted); (3) Statements from a different database/schema than the one feeding the storefront, if the connector scope is set. |
+| **Cross-channel pairing** | This is a Cross-Channel: Revenue at Risk card. It only earns its keep when a storefront connector is attached. Without one, it degrades to a plain slow-query count with no revenue context. |
+| **Time window** | `5m` (trailing, continuously refreshed) |
+| **Alert trigger** | `> 5 slow queries co-occur with a checkout drop`. Five slow statements alone is noise; five slow statements while checkout completion is falling is an incident. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card is computed in two passes and then joined on the clock.
+
+**Pass one, the database side.** Vortex IQ reads `pg_stat_statements` and isolates statements where `mean_exec_time > slow_threshold_ms` within the trailing 5-minute window. Because `pg_stat_statements` accumulates totals since the last `pg_stat_statements_reset()`, the engine works from deltas: it snapshots `calls`, `total_exec_time`, and `mean_exec_time` per `queryid` at the start and end of the window and reports only the statements that were actually slow during those 5 minutes, not statements that were slow last week and have since been fixed. Each surviving statement becomes one row: normalised query text, mean execution time in milliseconds, call count in the window, and the calling `application_name` from `pg_stat_activity` where it can be matched.
+
+**Pass two, the storefront side.** In parallel, the attached commerce connector reports checkout completion for the same 5-minute clock: the ratio of orders created to checkouts initiated, or the raw order rate, depending on what the platform exposes. Vortex IQ compares that ratio against the trailing baseline for that time of day and day of week.
+
+**The join.** The two passes are aligned on the same UTC 5-minute bucket. The alert (`> 5 slow queries co-occur with a checkout drop`) fires only when both conditions hold in the same bucket: the slow-statement count exceeds 5 **and** checkout completion has fallen below its baseline band. A slow-query storm with healthy checkout (a heavy analytics batch, say) is recorded but not escalated. A checkout drop with a clean slow-query set points you away from the database and towards payment gateways, CDN, or front-end JavaScript, which is itself a useful negative result.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK homeware brand runs Shopify for the storefront and a self-managed PostgreSQL 15 cluster behind a custom personalisation and inventory service that checkout calls synchronously. Snapshot taken on 14 Apr 26 at 20:05 BST, during the evening traffic peak.
+
+The card's table for the 20:00 to 20:05 window:
+
+| Query (normalised) | Mean exec time | Calls in window | Calling app |
+| --- | --- | --- | --- |
+| `SELECT ... FROM inventory_levels WHERE sku = $1 FOR UPDATE` | 1,840 ms | 612 | `checkout-svc` |
+| `SELECT ... FROM cart_items JOIN products USING (product_id) WHERE cart_id = $1` | 920 ms | 588 | `checkout-svc` |
+| `UPDATE inventory_levels SET reserved = reserved + $1 WHERE sku = $2` | 1,210 ms | 540 | `checkout-svc` |
+| `SELECT promo_rules WHERE active AND now() BETWEEN starts_at AND ends_at` | 430 ms | 511 | `checkout-svc` |
+| `SELECT ... FROM customer_segments WHERE customer_id = $1` | 380 ms | 470 | `personalisation-svc` |
+| `SELECT count(*) FROM order_events WHERE created_at > now() - interval '1 hour'` | 260 ms | 44 | `analytics-cron` |
+
+Six slow statements, all but one on the checkout path. Over the same window, Shopify checkout completion fell from a baseline of 71% to 38%. Both conditions are met, so the card fires red.
+
+The headline reads **6 slow queries during a checkout drop**, with the `FOR UPDATE` row outlined as the worst offender. Three things are now obvious that neither team would have seen alone:
+
+1. **The root cause is row-level lock contention on `inventory_levels`.** The `SELECT ... FOR UPDATE` and the `UPDATE` on the same table are serialising every concurrent checkout for the same hot SKUs (a flash-sale item). At 600 calls in 5 minutes, backends are queueing on row locks; mean exec time of 1.8s is mostly lock wait, not work. Confirm with [Idle-in-Transaction Backends](/nerve-centre/kpi-cards/postgresql/idle-in-transaction-backends) and [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation).
+2. **It is costing orders right now, not in theory.** A 33-point drop in completion at peak is the difference between roughly £4,100 and £2,200 of orders for these 5 minutes. The owner does not need to read the query plan; they need to know whether to pull the flash-sale SKU from the homepage banner to relieve the contention while engineering fixes it.
+3. **`analytics-cron` is a red herring.** Its 260ms count(*) is slow but unrelated to the checkout path and ran 44 times, not 500. The card surfaces it for completeness, but the join makes clear it is not the driver.
+
+```text
+Revenue framing for this 5-minute window:
+  - Baseline completion: 71%; observed: 38%
+  - Checkouts initiated in window: ~150
+  - Orders lost vs baseline: (0.71 - 0.38) x 150 = ~50 orders
+  - AOV: £38  ->  ~£1,900 of orders not completed in 5 minutes
+  - If the contention runs the full 30-minute peak: ~£11,400 at risk
+```
+
+The takeaways a team should remember:
+
+1. **Co-occurrence is the whole point.** Five slow queries during a flat checkout funnel is a tuning backlog item for next sprint. Five slow queries during a falling funnel is a page-someone-now event. This card refuses to conflate the two.
+2. **Read the calling app column.** It tells you instantly whether the slowdown is on the revenue path (`checkout-svc`) or a bystander (`analytics-cron`). Half of incident triage is deciding what to ignore.
+3. **The mitigation and the fix are different jobs.** Pulling the hot SKU off the banner (mitigation) stops the bleeding in 30 seconds; rewriting the reservation logic to use a skip-locked queue or a shorter transaction (fix) takes a sprint. Do the first now, schedule the second.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow Queries During Checkout Window | What the combination tells you |
+| --- | --- | --- |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/postgresql/slow-query-rate) | The account-wide slow-query percentage, no checkout overlay. | High slow-query rate but this card quiet equals slowness off the checkout path; both high equals revenue-path regression. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/postgresql/top-10-slowest-queries) | The 24-hour leaderboard by total execution time. | If today's offending statement is already a chronic top-10 entry, this was a known risk that finally bit during peak. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p95-ms) | The tail-latency trend across all statements. | p95 spiking in the same window confirms the slowness is broad, not one rogue query. |
+| [Idle-in-Transaction Backends](/nerve-centre/kpi-cards/postgresql/idle-in-transaction-backends) | Stuck transactions holding row locks. | The most common upstream cause of checkout-path slow queries: a backend holding `FOR UPDATE` locks while idle. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) | Whether the pool is full while queries queue. | Slow checkout queries plus a saturated pool equals backends waiting for connections, not just for locks. |
+| [Deadlocks (last 5m)](/nerve-centre/kpi-cards/postgresql/deadlocks-last-5m) | Whether lock contention has tipped into outright deadlock. | Deadlocks in the same window mean some checkouts are erroring outright, not just slow. |
+| [PostgreSQL QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/postgresql/postgresql-qps-spike-vs-ecom-order-rate) | The other cross-channel revenue card: query volume vs orders. | Slow queries with a QPS spike but no order spike points at bots or scrapers hammering the checkout path. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The composite roll-up. | If this card fires while the health score is still green, the composite's weighting needs a look; a checkout-path stall should pull it down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL's own tooling:**
+
+> **`pg_stat_statements`** for the slow-statement set. Order by mean time over the window:
+> `SELECT queryid, calls, mean_exec_time, query FROM pg_stat_statements WHERE mean_exec_time > 100 ORDER BY mean_exec_time DESC LIMIT 20;`
+> Remember it accumulates since the last reset, so a single read shows lifetime averages, not the 5-minute view this card uses; take two snapshots a few minutes apart and diff the `calls` and `total_exec_time` columns to reconstruct the window.
+> **`pg_stat_activity`** for what is running *right now* and why it is waiting:
+> `SELECT pid, state, wait_event_type, wait_event, now() - query_start AS runtime, query FROM pg_stat_activity WHERE state != 'idle' ORDER BY runtime DESC;`
+> A `wait_event_type` of `Lock` confirms the lock-contention story; `IO` points at disk or cache pressure instead.
+> **`pg_locks`** joined to `pg_stat_activity` to find the blocking backend behind a `FOR UPDATE` pile-up.
+> **`log_min_duration_statement`** in `postgresql.conf` to capture slow statements to the server log independently of `pg_stat_statements`.
+
+**On a managed service:** the slow-statement set is the same, but the path differs. On Amazon RDS and Aurora, use **Performance Insights** (the "Top SQL" tab keyed by wait state) and the **Enhanced Monitoring** OS metrics; on Google Cloud SQL, the **Query Insights** panel; on Azure Database for PostgreSQL, **Query Performance Insight**. The checkout-completion half of this card has no PostgreSQL equivalent at all; reconcile that against the storefront platform's own analytics (Shopify Analytics checkout funnel, BigCommerce Analytics, or the Adobe Commerce reports).
+
+**Why our number may legitimately differ from a raw `pg_stat_statements` read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Lifetime vs windowed** | Raw read shows more or fewer | `pg_stat_statements` averages since reset; this card deltas the trailing 5 minutes, so a query that was slow once last week will not appear here but will in a naive `ORDER BY mean_exec_time`. |
+| **Reset events** | Counts drop to zero | A `pg_stat_statements_reset()` or an instance restart clears the table; the card backfills from the next sample, so the window straddling a reset may undercount. |
+| **`pg_stat_statements.max` eviction** | Card may miss a statement | If the extension's tracked-statement cap is hit, low-frequency queries get evicted; raise `pg_stat_statements.max` if checkout queries are being dropped. |
+| **Schema/connector scope** | Card lower | If the connector is scoped to the storefront's database, slow queries in other databases on the same instance are excluded by design. |
+| **Time zone** | Window boundaries shift | PostgreSQL logs in the server time zone; Vortex IQ aligns the join on UTC 5-minute buckets and renders in your profile time zone. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) / [`adobe_commerce.total_revenue`](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | A firing window should show a matching dip in revenue/minute. | Revenue flat while the card fires means checkout reads from a cache or read replica that the slow primary statements do not block; the slowness is real but not yet customer-facing. |
+| [`postgresql.connection-pool-saturation`](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) | Often saturates in the same window as slow checkout queries. | Pool calm while this fires means the bottleneck is lock wait, not connection exhaustion. |
+| [`postgresql.idle-in-transaction-backends`](/nerve-centre/kpi-cards/postgresql/idle-in-transaction-backends) | A spike here frequently precedes the slow-query co-occurrence by a minute or two. | Idle-in-tx flat means the contention is genuine concurrent load, not a leaked transaction. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows slow queries but checkout looks fine. Why no alert?**
+Working as designed. The alert needs both halves: more than 5 slow statements **and** a checkout-completion drop in the same 5-minute bucket. A slow-query storm on a path that checkout does not touch (reporting, a background batch, an analytics cron) is recorded for context but not escalated, because it is not costing orders. Read [Slow-Query Rate %](/nerve-centre/kpi-cards/postgresql/slow-query-rate) for the path-agnostic view.
+
+**Checkout dropped but this card stayed quiet. Doesn't that mean the database was fine?**
+Most likely yes, and that is a useful negative result. A clean slow-query set during a checkout drop steers you away from PostgreSQL and towards the payment gateway, CDN, DNS, or front-end JavaScript. Confirm with the storefront connector's funnel and your payment provider's status. The exception: if checkout reads come from a read replica or an application cache, the primary can be slow without checkout noticing until writes back up, so also glance at [Replication Lag (seconds)](/nerve-centre/kpi-cards/postgresql/replication-lag-seconds).
+
+**Why 5 queries and not some other number?**
+Five is the default co-occurrence floor that separates ordinary peak-traffic jitter (one or two queries occasionally crossing 100ms) from a genuine pile-up. It is a sensitivity setting: tune it per profile in the Sensitivity tab. A high-throughput checkout path may want a higher floor; a low-volume B2B store where any contention is abnormal may want a lower one.
+
+**My `pg_stat_statements` is not installed or not loaded. Does the card work?**
+No. The database half of this card depends on the `pg_stat_statements` extension being in `shared_preload_libraries` and created with `CREATE EXTENSION pg_stat_statements;`. Without it there is no per-statement timing to read. On managed services it is usually enabled by default (RDS/Aurora ship it on); on a self-managed instance you must load it via the preload library list and restart. Until then the card returns no rows.
+
+**Does this count queries against read replicas?**
+By default the card reads the primary's `pg_stat_statements`, since the checkout write path lands there. If your checkout reads are served from replicas and you want those statements included, point the connector at the replica's stats as well; replicas maintain their own `pg_stat_statements` independently. Note that the two are not summed automatically; each instance is its own scope.
+
+**The same query appears with different `queryid` values. Why?**
+`pg_stat_statements` normalises constants but keys on the parse tree, so structurally different forms of "the same" query (a different number of `IN` list elements, a different join order produced by an ORM) get separate `queryid`s. The card shows them as separate rows. If this fragments your view, look at the `query` text rather than counting rows, or raise `pg_stat_statements.max` so none are evicted.
+
+**Can a single very slow query trip the alert?**
+Not on its own; the count threshold is more than 5 distinct slow statements. One pathological 30-second query will show as a single row and, on its own, will not fire this card even if it tanks checkout. For single-query catastrophes lean on [Query Latency p99 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p99-ms) and [Top 10 Slowest Queries](/nerve-centre/kpi-cards/postgresql/top-10-slowest-queries), which are sensitive to one bad statement. This card is built for the many-queries-queueing-on-locks pattern that is typical at checkout.
+
+**How do I stop the bleeding while engineering fixes the root cause?**
+Two levers, both fast. First, on the storefront side, remove the hot SKU or promotion from prominent placement to reduce concurrent contention on the contended rows. Second, on the database side, identify and terminate any leaked `idle in transaction` backend holding the blocking lock (`SELECT pg_terminate_backend(pid)` against the offender from `pg_stat_activity`). The permanent fix (shorter transactions, skip-locked reservation queues, better indexing) is a separate, scheduled piece of work.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow Queries During Checkout Window (5m)* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

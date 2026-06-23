@@ -1,0 +1,150 @@
+---
+title: "Failed Queries (24h), ClickHouse"
+sidebarTitle: "Failed Queries (24h)"
+description: "Failed Queries (24h) for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Failed Queries (24h)** counts every query that ended in an exception over the trailing 24 hours: the rows in `system.query_log` where `type = 'ExceptionWhileProcessing'`. Unlike a slow query, a failed query returned nothing useful to its caller, a dashboard tile broke, an ETL job errored, an API call 500'd. For a DBA, this is the rawest "what broke?" counter on the cluster. A low, flat number is normal background noise (a malformed ad-hoc query here and there); a spike to triple digits means something systemic is failing, and the `> 100` alert exists to catch exactly that.
+
+| | |
+| --- | --- |
+| **What it tracks** | The count of failed query executions in the last 24 hours: `system.query_log` rows where `type = 'ExceptionWhileProcessing'`. |
+| **Data source** | `system.query_log`, filtered on `type = 'ExceptionWhileProcessing'` over a rolling 24-hour window. The `exception_code` and `exception` columns provide the per-error breakdown behind the headline. |
+| **Time window** | `24h`: a rolling 24-hour count, so the number reflects the last full day of failures, not just the current minute. |
+| **Alert trigger** | `> 100`. More than 100 failures in 24 hours is well above normal background noise for most clusters and indicates a systemic fault: a broken client, a bad deploy, an exhausted pool, or a capacity limit being hit repeatedly. |
+| **Roles** | owner, engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+The card runs a count against `system.query_log` over the trailing day:
+
+```sql
+SELECT count()
+FROM system.query_log
+WHERE type = 'ExceptionWhileProcessing'
+  AND event_time > now() - INTERVAL 24 HOUR;
+```
+
+`system.query_log` records a row for each query lifecycle event. The `type` column distinguishes `QueryStart`, `QueryFinish`, `ExceptionBeforeStart` (the query failed to parse or plan, before execution), and `ExceptionWhileProcessing` (the query started executing and then threw). This card counts the latter, the failures that occurred during execution: out-of-memory kills, Too Many Parts halts, timeouts, divide-by-zero, type errors mid-stream, and similar. The per-error drill-down groups by `exception_code` (the numeric ClickHouse error code, for example 241 for `MEMORY_LIMIT_EXCEEDED`, 252 for `TOO_MANY_PARTS`) so you can see whether the spike is one repeated fault or many different ones.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A data team powers an internal BI tool from ClickHouse. Failed Queries (24h) normally sits around 8 to 15 (the occasional analyst typo). On 09 May 26 the on-call sees the card at **214**, well past the `> 100` alert. They open the breakdown grouped by `exception_code`:
+
+| `exception_code` | Error name | Count | Share |
+| --- | --- | --- | --- |
+| 241 | `MEMORY_LIMIT_EXCEEDED` | 168 | 79% |
+| 159 | `TIMEOUT_EXCEEDED` | 31 | 14% |
+| 62 | `SYNTAX_ERROR` | 12 | 6% |
+| 252 | `TOO_MANY_PARTS` | 3 | 1% |
+
+```text
+Reading the breakdown:
+  Dominant fault: 241 MEMORY_LIMIT_EXCEEDED (168 of 214 = 79%)
+  Pattern check:  all 168 came from the same query fingerprint,
+                  a new "cohort retention" dashboard tile shipped at 08:50.
+  Conclusion:     one heavy query, not a cluster-wide problem.
+                  The query scans a year of events with a GROUP BY that
+                  blows past max_memory_usage on every refresh.
+```
+
+The story is clear: a single new dashboard tile, shipped that morning, runs a memory-hungry aggregation that exceeds `max_memory_usage` on every refresh. Each user who opens the dashboard triggers a fresh `MEMORY_LIMIT_EXCEEDED`, and 168 failures accumulated through the morning. The timeouts (159) are a secondary symptom: the same heavy query holds memory and slows neighbours until they time out. The syntax errors (62) are ordinary noise unrelated to the incident.
+
+The fix is not "give the server more memory". It is to fix the offending query: add a date filter, lower its `max_memory_usage` per-query override and let it spill, or pre-aggregate the cohort data into a materialised view. The DBA pairs this with [MEMORY_LIMIT_EXCEEDED (24h)](/nerve-centre/kpi-cards/clickhouse/memory-limit-exceeded-24h) to confirm the 168 count and with [Top 10 Slowest Queries](/nerve-centre/kpi-cards/clickhouse/top-10-slowest-queries) to grab the exact SQL.
+
+Three takeaways:
+
+1. **The headline number is a smoke alarm; the `exception_code` breakdown is the fire.** 214 failures could be 214 different problems or one problem 214 times. Always group by error code before you act. Here, 79% was a single fault.
+2. **One bad query can dominate the whole count.** A single memory-hungry tile generated four-fifths of the failures. Reaching for infrastructure (more RAM) would have masked, not fixed, a query problem.
+3. **Failed is categorically worse than slow.** A slow query eventually returns; a failed query returns an error to a human or a downstream job. A spike here means users and pipelines are seeing broken results right now, which is why it carries a Hero, alert-bearing class.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Failed Queries (24h) | What the combination tells you |
+| --- | --- | --- |
+| [Query Error Rate %](/nerve-centre/kpi-cards/clickhouse/query-error-rate) | The rate view to this card's absolute count. | High count but low rate equals high total query volume; high count and high rate equals a real reliability problem. |
+| [MEMORY_LIMIT_EXCEEDED (24h)](/nerve-centre/kpi-cards/clickhouse/memory-limit-exceeded-24h) | Isolates the single most common cause (error 241). | If this card's spike is mostly 241, the two move together. |
+| [Too Many Parts Errors (24h)](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h) | Isolates error 252, the ingest-halting failure. | Failures dominated by 252 means inserts are broken, not reads. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/clickhouse/top-10-slowest-queries) | Grabs the SQL behind the failures. | Same fingerprint topping both lists equals one query causing both slowness and failures. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p99-ms) | The tail that often precedes timeouts. | p99 climbing then failures spiking equals queries degrading into timeouts. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | Failures are a 15% component of the composite. | Health Score down with failures up equals the failures are the dominant cause. |
+| [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) | The capacity signal behind OOM-class failures. | Memory high plus failures high equals the instance is memory-bound. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Confirm the count** directly against the server:
+
+```sql
+SELECT count()
+FROM system.query_log
+WHERE type = 'ExceptionWhileProcessing'
+  AND event_time > now() - INTERVAL 24 HOUR;
+```
+
+**Break it down by error** to see what is actually failing:
+
+```sql
+SELECT exception_code, any(exception) AS sample_message, count() AS n
+FROM system.query_log
+WHERE type = 'ExceptionWhileProcessing'
+  AND event_time > now() - INTERVAL 24 HOUR
+GROUP BY exception_code
+ORDER BY n DESC;
+```
+
+**On ClickHouse Cloud**, the same `system.query_log` is queryable, and the service Monitoring tab surfaces error counts; reconcile against the SQL above for the authoritative figure.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| `ExceptionBeforeStart` excluded | Our number lower | We count execution-time failures (`ExceptionWhileProcessing`). Parse/plan failures (`ExceptionBeforeStart`) are a separate type and not in this count by default. |
+| `query_log` flush latency | Our number briefly lower | `system.query_log` is buffered and flushed on an interval (default 7.5s); the most recent failures may not be written yet. |
+| Log retention / TTL | Our number lower if TTL < 24h | If `system.query_log` has a TTL shorter than 24 hours, the oldest part of the window is already pruned. |
+| Replica scope | Variable | On a cluster, `system.query_log` is per-node. A whole-cluster count needs `clusterAllReplicas`; the card reports the connected node unless configured otherwise. |
+| Sampling instant | Marginal | The rolling 24h window slides; a hand-run query a minute later sees a slightly different set. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My count is high but the cluster feels fine. Is this a false alarm?**
+Probably not, but check whether the failures are concentrated in one error code and one query fingerprint. A cluster can serve thousands of queries fine while one broken dashboard tile fails repeatedly. The card is surfacing real failures that specific users or jobs are seeing, even if aggregate health looks acceptable. Group by `exception_code` to confirm.
+
+**Does this count parse errors and bad SQL from analysts?**
+It counts execution-time exceptions (`ExceptionWhileProcessing`). A purely malformed query that fails to parse is logged as `ExceptionBeforeStart` and is not in this count. A query that parses but then errors mid-execution (type mismatch, divide by zero, OOM) is counted. So a handful of analyst typos that actually start executing will register; pure syntax rejections largely will not.
+
+**The number dropped to zero after I restarted the server. Did I fix it?**
+No. `system.query_log` is per-node and the rolling 24h window still holds the pre-restart failures unless retention pruned them, but if your query_log has a short TTL or the table was reset, the count can appear to drop. A restart does not fix the underlying cause; confirm by re-running the breakdown query and watching whether new failures resume.
+
+**How do I tell a transient spike from a sustained problem?**
+Look at the time distribution within the 24h window: `GROUP BY toStartOfHour(event_time)`. A single bad hour that recovered is a transient (a deploy that was rolled back); a steady hourly rate is a live, ongoing fault that needs a fix now.
+
+**Why 100 as the threshold? My cluster never exceeds 20.**
+100 is a generic default. If your baseline is single digits, lower the threshold in the Sensitivity tab to something like 40 so a doubling of your normal rate alerts. A high-volume cluster running millions of queries a day may legitimately see more than 100 trivial failures and should raise the threshold and rely more on [Query Error Rate %](/nerve-centre/kpi-cards/clickhouse/query-error-rate) instead.
+
+**On a multi-node cluster, is this the whole cluster or one node?**
+By default it reflects the node Vortex IQ connects to, because `system.query_log` is local to each node. For a cluster-wide figure, the engine can be configured to query `clusterAllReplicas(...)`. If your queries are routed across nodes, a single-node count understates total failures.
+
+**The failures are all timeouts (error 159). Is that a failure or a slowness problem?**
+Both. A `TIMEOUT_EXCEEDED` is a query that ran too long and was killed, so it counts as a failure here, but the root cause is performance, not correctness. Pair with [Query Latency p99 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p99-ms) and [Top 10 Slowest Queries](/nerve-centre/kpi-cards/clickhouse/top-10-slowest-queries) to find and optimise the offending queries rather than just raising the timeout.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Failed Queries (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

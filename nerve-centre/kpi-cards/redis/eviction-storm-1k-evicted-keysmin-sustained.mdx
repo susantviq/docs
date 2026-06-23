@@ -1,0 +1,155 @@
+---
+title: "Eviction Storm (>1k evicted_keys/min sustained), Redis"
+sidebarTitle: "Eviction Storm (>1k evicted_keys/min sustained)"
+description: "Eviction Storm alert for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Redis evicts keys when it runs out of room: once `used_memory` hits `maxmemory`, the configured eviction policy (typically `allkeys-lru` or `volatile-lru`) starts deleting keys to make space for new writes. A trickle of evictions is normal on a cache. A storm, more than 1000 evicted keys per minute sustained, means Redis is shedding data faster than your application expects, and the symptoms downstream are cache misses, recomputation, and database load. For a platform or SRE team this card is the early-warning siren that an instance is memory-bound and the cache hit rate is about to collapse.
+
+| | |
+| --- | --- |
+| **Data source** | `INFO stats`, the `evicted_keys` cumulative counter, sampled each poll. The card computes a per-minute delta and watches the sustained rate. |
+| **Metric basis** | Rate of change of `evicted_keys`, not its absolute value (the counter only resets on restart). A storm is a high derivative held over the window, not a single spike. |
+| **What triggers eviction** | `used_memory` reaching `maxmemory` under a non-`noeviction` policy. With `noeviction` set, Redis returns `OOM` errors on writes instead of evicting, which this card will not see, watch [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) for that case. |
+| **Aggregation window** | `5m`. The rate must stay above threshold across the rolling 5-minute window to fire, so a one-off burst from a bulk load does not page anyone. |
+| **Alert trigger** | `evicted_keys/min > 1000` sustained. The headline shows the current per-minute rate and the active eviction policy. |
+| **What does NOT count** | (1) `expired_keys`, keys removed because their TTL elapsed, that is healthy housekeeping, tracked separately on [Expired Keys / minute](/nerve-centre/kpi-cards/redis/expired-keys-minute); (2) explicit `DEL`/`UNLINK` by the application; (3) a single bulk import that briefly spikes evictions then settles. |
+| **Topology scope** | Per primary node. On a cluster each shard has its own `maxmemory` and its own eviction counter; the card reads the worst-offending shard and can break down per node. |
+| **Time window** | `5m` (sustained rate over a rolling 5-minute window) |
+| **Alert trigger** | `evicted_keys/min > 1000` |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calc */}
+Redis exposes a monotonic counter `evicted_keys` in the `# Stats` section of `INFO`. The card samples it on each poll and derives a per-minute rate from consecutive samples:
+
+```text
+evicted_per_min = (evicted_keys_now - evicted_keys_prev)
+                  / (seconds_between_samples) * 60
+```
+
+That instantaneous rate is then smoothed over the rolling 5-minute window. The alert fires only when the smoothed rate stays above 1000/min for the whole window, which filters out the brief eviction bursts that accompany a legitimate bulk write or a cache warm-up. The headline also reads `maxmemory_policy` from `INFO memory` so the on-call engineer immediately knows which policy is doing the evicting (`allkeys-lru`, `allkeys-lfu`, `volatile-lru`, `volatile-ttl`, `allkeys-random`, `volatile-random`).
+
+Because the counter resets to zero on restart, a delta computed across a restart boundary would be negative; the card detects the reset (current < previous) and skips that interval rather than reporting a nonsensical rate.
+{/* /HUMAN_AUTHORED:calc */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 4 GB Redis primary as a read-through cache for product detail and pricing, with `maxmemory 4gb` and `maxmemory-policy allkeys-lru`. Normal eviction rate sits around 50 to 120 keys/min as cold keys age out. Snapshot taken on 22 May 26 from 19:40 to 19:55 BST during an evening traffic ramp plus a marketing email send.
+
+| Time (BST) | `used_memory` | `evicted_keys/min` | Keyspace hit rate |
+| --- | --- | --- | --- |
+| 19:40 | 3.78 GB | 95 | 97.1% |
+| 19:45 | 3.96 GB | 410 | 95.8% |
+| 19:50 | 4.00 GB (at cap) | **1,840** | 91.2% |
+| 19:55 | 4.00 GB (at cap) | **2,310** | 88.4% |
+
+At 19:50 a marketing email drove a surge of traffic to pages whose product keys had aged out, so the cache filled to its 4 GB cap and `allkeys-lru` began evicting aggressively to admit the new working set. The eviction rate crossed 1000/min and stayed there.
+
+```text
+INFO snapshot at 19:55:
+  maxmemory:4294967296
+  used_memory:4294900000        # at the cap
+  maxmemory_policy:allkeys-lru
+  evicted_keys: 41,210,400      # cumulative
+  -> derived rate: 2,310 / min  # sustained > 1000 for 5m -> ALERT
+  keyspace_hits / (hits+misses) -> 88.4%
+```
+
+The Vortex IQ headline reads **2,310 evicted_keys/min, policy allkeys-lru** in red. What the on-call engineer reads from this:
+
+1. **The working set has outgrown the cache.** At the cap with sustained eviction, Redis is constantly throwing out keys that are about to be requested again. This is a thrashing pattern: evict a key, get a miss seconds later, refetch from the database, re-cache it, evict something else. The hit rate falling from 97% to 88% is the visible cost.
+2. **The database is absorbing the misses.** Every percentage point of hit-rate loss on a busy cache can mean thousands of extra queries per minute hitting the primary database. A storm here often shows up as elevated DB CPU and slow queries minutes later.
+3. **The fix is capacity or TTL, not a Redis restart.** Restarting would only clear the counter and reset the symptom. The durable fixes are: raise `maxmemory` (or scale the node/shard), shorten TTLs on low-value keys so they expire before they have to be evicted, or move large rarely-read values out of the cache.
+
+```text
+Decision framing during the storm:
+  - Headroom: 0 (at the 4 GB cap)
+  - Hit rate trend: 97.1% -> 88.4% over 15 min (falling, costly)
+  - Immediate mitigation: bump maxmemory to 6 GB (buys headroom now)
+  - Durable fix: audit largest keys (redis-cli --bigkeys), shorten product-image-blob TTLs
+  - Cross-check DB: expect a lagging spike in database query rate
+```
+
+Three takeaways for the on-call DBA:
+
+1. **Eviction is not the disease, it is the fever.** The storm tells you memory pressure has hit the cap; the cure is more room or a smaller working set, not silencing the alert.
+2. **Read evictions with hit rate, always.** Evictions only hurt when they cause misses. Pair this card with [Keyspace Hit Rate %](/nerve-centre/kpi-cards/redis/keyspace-hit-rate): a storm with a stable hit rate means you are evicting genuinely cold keys (fine); a storm with a falling hit rate means thrashing (act now).
+3. **Distinguish evicted from expired.** A high `expired_keys` rate is healthy TTL housekeeping; a high `evicted_keys` rate is memory pressure. They look similar on a key-count chart but mean opposite things.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside this one
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Eviction Storm | What the combination tells you |
+| --- | --- | --- |
+| [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) | The cause: evictions start when this hits 100%. | At the cap plus a storm equals a memory-bound instance needing headroom. |
+| [Keyspace Hit Rate %](/nerve-centre/kpi-cards/redis/keyspace-hit-rate) | Tells you whether the storm actually hurts. | Storm with falling hit rate equals thrashing; storm with stable hit rate equals evicting cold keys. |
+| [Evicted Keys / minute](/nerve-centre/kpi-cards/redis/evicted-keys-minute) | The continuous gauge this alert thresholds. | Same `evicted_keys` counter; this card is the sustained-rate alarm. |
+| [Expired Keys / minute](/nerve-centre/kpi-cards/redis/expired-keys-minute) | The healthy cousin to rule out confusion. | High expired plus low evicted equals normal TTL churn, not pressure. |
+| [Total Keys (db0)](/nerve-centre/kpi-cards/redis/total-keys-db0) | Key count falling during a storm confirms shedding. | A dropping keyspace size during the window confirms eviction, not just slow growth. |
+| [Memory Fragmentation Ratio](/nerve-centre/kpi-cards/redis/memory-fragmentation-ratio) | Fragmentation inflates `used_memory` toward the cap. | High fragmentation can trigger evictions before the real dataset fills memory. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis itself:**
+
+> **`INFO stats`** reports the cumulative `evicted_keys` counter. Sample it twice a minute apart and divide to get the rate: `redis-cli INFO stats | grep evicted_keys`.
+> **`INFO memory`** confirms `maxmemory`, `used_memory`, and the active `maxmemory_policy` so you know the cap and the eviction strategy.
+> **`redis-cli --bigkeys`** scans for the largest keys, the usual culprits behind sudden memory pressure.
+> **`MEMORY STATS`** and **`MEMORY USAGE <key>`** break down where the memory is going at the data-structure level.
+
+**Why our number may legitimately differ from a raw counter read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Rate vs total** | We show per-minute; `INFO` shows cumulative | `evicted_keys` only ever grows. Our card differentiates it into a rate, so a casual look at the raw counter will not match our headline. |
+| **Restart reset** | Our rate skips one interval | The counter resets to 0 on restart. We detect the reset and skip that sample rather than report a negative rate. |
+| **Window smoothing** | Our number lags a raw spike | The card requires the rate to hold across a 5-minute window, so a momentary burst you see in a live `INFO` loop may not yet show as a storm. |
+| **Per-shard view** | Cluster totals differ | On a cluster we report the worst shard, not the cluster sum; adding every shard's counter will exceed our headline. |
+
+**Managed-service note:** AWS ElastiCache surfaces an `Evictions` CloudWatch metric per node; Azure Cache for Redis exposes `Evicted Keys` in Azure Monitor; Redis Cloud shows evictions in its metrics panel. Reconcile our per-minute rate against those: CloudWatch's `Evictions` is typically a per-minute sum already, so it should align closely with our headline for the same node. If they diverge, check that you are comparing the same shard and the same minute boundary.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My eviction rate is high but my hit rate is fine. Should I worry?**
+Less so. A high eviction rate with a stable, high hit rate means Redis is correctly evicting genuinely cold keys to admit a hot working set, the cache is doing its job. The dangerous pattern is a high eviction rate alongside a falling hit rate, which signals thrashing: you are evicting keys you are about to need again. Always read this card next to [Keyspace Hit Rate %](/nerve-centre/kpi-cards/redis/keyspace-hit-rate).
+
+**What is the difference between evicted and expired keys?**
+Expired keys are removed because their TTL elapsed, this is intentional, healthy housekeeping. Evicted keys are removed under memory pressure because Redis hit `maxmemory`, regardless of whether they still had time to live. A storm of expirations is normal; a storm of evictions means you are out of room. They are reported as separate counters and on separate cards.
+
+**I set `maxmemory-policy noeviction`. Why does this card stay quiet during memory pressure?**
+With `noeviction`, Redis does not evict at all, it refuses write commands with an `OOM command not allowed` error once at the cap. So `evicted_keys` stays flat and this card stays silent even though the instance is in trouble. For `noeviction` setups, monitor [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) and the error cards instead; a quiet eviction card is not the same as a healthy instance.
+
+**A bulk import spiked evictions for thirty seconds but no alert fired. Why?**
+By design. The card requires the rate to stay above 1000/min across a rolling 5-minute window, so a short burst from a one-off bulk load or cache warm-up is filtered out. This prevents routine maintenance from paging the on-call. A genuine storm sustains the rate; a bulk job tails off.
+
+**Will raising `maxmemory` stop the storm permanently?**
+It stops it until the working set grows to fill the new ceiling. Raising `maxmemory` buys headroom and is the right immediate mitigation, but if the working set keeps growing you will be back at the cap. The durable fixes are shorter TTLs on low-value keys, moving large blobs out of the cache, and right-sizing the node or adding shards. Treat a capacity bump as breathing room, not a cure.
+
+**Does an eviction storm cause data loss?**
+For a pure cache, no, evicted keys can be refetched from the source of truth (slowly, hence the database load). But if you store anything in Redis that is not backed elsewhere (sessions, rate-limit counters, queues) under an `allkeys-*` policy, those can be evicted and genuinely lost. Use `volatile-*` policies and set TTLs only on disposable keys, so non-disposable data is never an eviction candidate.
+
+**On a cluster, the per-shard rates look uneven. Is that a problem?**
+Often, yes, it points to a hot shard. If one shard evicts heavily while others are calm, your key distribution is skewed (a few hot key prefixes hashing to the same slots, or a large key on one shard). Use [Cluster Slots Assigned (of 16384)](/nerve-centre/kpi-cards/redis/cluster-slots-assigned-of-16384) and `redis-cli --bigkeys` per node to find the imbalance. The card reports the worst shard so the hot one surfaces first.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Eviction Storm* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

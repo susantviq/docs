@@ -1,0 +1,141 @@
+---
+title: "Last Snapshot Age (hours), Elasticsearch"
+sidebarTitle: "Last Snapshot Age (hours)"
+description: "Last Snapshot Age (hours) for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Backup](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of hours since the last successful `_snapshot` completed against a registered snapshot repository. This is your recovery-point clock. If a node fails catastrophically, an index is corrupted, or someone runs a bad delete-by-query, the snapshot is what you restore from, and this card tells you how much data sits between your last good backup and now. A green reading means your backup schedule is running; a red reading means snapshots have silently stopped, which is the kind of failure nobody notices until the day they need to restore.
+
+| | |
+| --- | --- |
+| **Metric basis** | The completion timestamp of the most recent snapshot with `state: SUCCESS` (or `PARTIAL`, flagged separately) from `GET /_snapshot/{repository}/_all`, subtracted from now and expressed in hours. |
+| **What it measures** | Age of the newest successful snapshot across the registered repository (or repositories). A snapshot in `IN_PROGRESS` or `FAILED` state does not reset the clock; only a completed success does. |
+| **What it excludes** | Local-disk copies, filesystem backups taken outside Elasticsearch, and replica shards (replicas are high availability, not a backup; they do not protect against a bad delete or a corrupt index). Only repository snapshots count. |
+| **Aggregation window** | `RT`: read live each refresh; the age is computed at read time so it ticks up continuously between snapshots. |
+| **Why it matters** | Snapshots are incremental and usually scheduled via Snapshot Lifecycle Management (SLM). When SLM silently fails (expired repository credentials, a full S3 bucket, a misconfigured policy) the age climbs unnoticed. This card is the smoke alarm. |
+| **Time zone** | Snapshot timestamps are UTC in Elasticsearch; age is duration-based so time zone does not affect the hours figure. Chart axes render in the team's display time zone. |
+| **Time window** | `RT` (real-time age) |
+| **Alert trigger** | `> 72h`: more than three days since the last successful snapshot raises the sensitivity alarm. Tighten this for clusters with an aggressive recovery-point objective. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card finds the most recent successful snapshot and subtracts its end time from the current time:
+
+```text
+last_snapshot_age_hours = (now - max(end_time of snapshots where state == SUCCESS)) / 3600
+```
+
+Elasticsearch records each snapshot's `start_time_in_millis` and `end_time_in_millis`; the engine uses the end time, because a snapshot only protects data once it has finished writing all shard segments to the repository. A snapshot that started two hours ago but is still `IN_PROGRESS` does not reset the clock: it has not completed, so it cannot yet be restored from.
+
+`PARTIAL` snapshots (where some shards succeeded but others failed, typically because a shard was unavailable at snapshot time) are treated cautiously. The engine surfaces the most recent full `SUCCESS` as the headline age and flags any newer `PARTIAL` separately, because restoring from a partial means accepting that some shards will be missing. If the connector is configured with multiple repositories, the headline is the freshest successful snapshot across all of them, on the assumption that any one valid repository satisfies the recovery-point requirement.
+
+The age is computed at read time, not cached, so the gauge ticks upward continuously and crosses the 72-hour threshold the moment the data genuinely ages past it, rather than at the next scheduled poll.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team backs up a production Elasticsearch cluster to an S3 repository via an SLM policy scheduled daily at 01:00 UTC, retaining 14 daily snapshots. The recovery-point objective agreed with the business is 24 hours. Snapshot taken on 20 Apr 26 at 10:00 BST (09:00 UTC):
+
+| Snapshot | State | End time (UTC) | Age at read | Reading |
+| --- | --- | --- | --- | --- |
+| daily-2026.04.20-0100 | (none) | did not run | n/a | SLM policy did not fire. |
+| daily-2026.04.19-0100 | SUCCESS | 19 Apr 01:14 | ~32h | Last good backup. |
+| daily-2026.04.18-0100 | SUCCESS | 18 Apr 01:12 | ~56h | Older. |
+
+The headline reads **32 hours**, amber against the team's 24-hour RPO and approaching the 72-hour hard alarm. The clock should read about 8 hours (last night's 01:00 snapshot plus the morning), so the fact that it reads 32 means last night's snapshot never completed. The on-call DBA's read:
+
+```text
+Stale-snapshot triage:
+  1. GET /_slm/policy/daily-policy -> last_failure shows the most recent error and timestamp.
+  2. The error reads: "repository_exception ... access denied" -> the S3 IAM credentials expired.
+  3. GET /_snapshot/_status -> confirms no snapshot is currently in progress (it failed at start, not mid-run).
+  4. Renew the repository credentials, then POST /_slm/policy/daily-policy/_execute to take an immediate manual snapshot.
+  5. Watch the new snapshot to SUCCESS; the age resets to near zero and the card returns to green.
+```
+
+The root cause was an expired IAM role on the S3 bucket: SLM had been failing silently for two nights, with each failure logged but no one watching the log. The card surfaced the gap before it crossed three days. Had it gone unnoticed for a week, a restore would have rolled the cluster back seven days, an unacceptable data loss for the business.
+
+Three takeaways for an ops team:
+
+1. **Replicas are not a backup.** A three-replica cluster survives node loss but not a bad `delete_by_query`, an index corruption, or an accidental index deletion. Only a repository snapshot protects against those, which is why this card exists separately from cluster-health cards.
+2. **Silent SLM failure is the real risk.** Backups rarely break loudly. They break when credentials expire, a bucket fills, or a policy is edited wrong, and the only symptom is the age quietly climbing. Alerting on age, not on "did the job run", catches every variant.
+3. **Set the threshold to your RPO.** The default 72-hour alarm is generous. If the business expects at most 24 hours of data loss, tighten the sensitivity threshold so the card pages well before three days have passed.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Last Snapshot Age | What the combination tells you |
+| --- | --- | --- |
+| [Cluster Status (green / yellow / red)](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) | The "do I need the backup right now?" signal. | RED status plus a stale snapshot is the worst case: data is unavailable and the recovery point is days old. |
+| [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) | The data-loss-risk partner. | Unassigned primaries with a stale snapshot means a shard could be lost with no recent restore point. |
+| [Storage Usage %](/nerve-centre/kpi-cards/elasticsearch/storage-usage) | A common cause of failed snapshots. | A near-full cluster can fail to snapshot, and a near-full repository (S3 quota) is a frequent silent SLM failure. |
+| [Elasticsearch Health Score](/nerve-centre/kpi-cards/elasticsearch/elasticsearch-health-score) | The composite that weighs backup freshness. | A stale snapshot drags the composite down even when live cluster metrics look healthy. |
+| [Active Node Count](/nerve-centre/kpi-cards/elasticsearch/active-node-count) | The failure scenario the snapshot insures against. | A node lost with no recent snapshot raises the stakes of the recovery. |
+| [Last Snapshot Age threshold via the health alert](/nerve-centre/kpi-cards/elasticsearch/cluster-not-green-yellow-or-red) | The paging layer for cluster-level emergencies. | A stale backup combined with a not-green cluster is the scenario this alert exists to escalate. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> **`GET /_snapshot/{repository}/_all`** lists every snapshot with `state`, `start_time`, and `end_time`; the freshest `SUCCESS` is the headline.
+> **`GET /_snapshot/_status`** shows any snapshot currently in progress and its per-shard completion.
+> **`GET /_slm/policy/{policy_id}`** returns `last_success`, `last_failure`, and `next_execution` for an SLM-managed schedule, the fastest way to see why the clock stopped advancing.
+> **`GET /_slm/stats`** gives policy-level success and failure counts over time.
+> On Elastic Cloud, **Stack Management -> Snapshot and Restore** shows snapshot history and SLM status in Kibana; on AWS OpenSearch, snapshots are managed via the `_snapshot` API the same way, with automated snapshots visible in the console.
+
+**Why our number may legitimately differ from the repository listing:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **End time vs start time** | Vortex IQ may read older | We measure from the snapshot's end time (when it became restorable); a dashboard measuring from start time will report a slightly younger age for a long-running snapshot. |
+| **Partial snapshots** | Vortex IQ may read older | A newer `PARTIAL` snapshot does not reset our headline (we anchor to the last full `SUCCESS`); a tool that counts partials as backups will report a fresher age. |
+| **Multiple repositories** | Vortex IQ may read younger | We take the freshest success across all configured repositories; a single-repository view of a stale repo reads older. |
+| **Automated cloud snapshots** | Variable | On managed services with separate automated snapshots, those may not be in the registered repository the connector reads; confirm the connector points at the repository you rely on for restores. |
+
+**Cross-connector reconciliation:** snapshot freshness has no ecom equivalent, but a stale snapshot raises the stakes of every other risk signal. If [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) is non-zero while this card is red, escalate: you have both an active data-loss risk and a poor recovery point at the same time.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My cluster has three replicas. Do I still need snapshots?**
+Yes. Replicas protect against hardware and node failure, but they faithfully copy logical operations, including a bad `delete_by_query`, an accidental index deletion, or application-level corruption. Those propagate to every replica instantly. Only a point-in-time snapshot lets you roll back to before the mistake. Replicas are availability; snapshots are recoverability.
+
+**The age keeps climbing even though my SLM policy is enabled. Why?**
+"Enabled" is not "succeeding". Check `GET /_slm/policy/{policy_id}` and read `last_failure`. The usual causes are expired repository credentials (S3/GCS/Azure), a full or quota-capped bucket, a repository that became unreachable, or a policy edited so its index pattern matches nothing. The policy can stay enabled and fail every night.
+
+**A snapshot is currently in progress. Why has the age not reset?**
+Because it has not completed. A snapshot only becomes a valid restore point once it finishes writing all shard segments to the repository. The card uses the end time of the last successful snapshot; an `IN_PROGRESS` snapshot resets the clock only when it transitions to `SUCCESS`.
+
+**What is a PARTIAL snapshot and does it count?**
+A `PARTIAL` snapshot completed but some shards failed, usually because a shard was unavailable when the snapshot ran. It is restorable, but the failed shards will be missing on restore. The card anchors the headline age to the last full `SUCCESS` and flags any newer partial separately, so you are not lulled into thinking a partial is a complete backup.
+
+**How do I take an emergency snapshot right now?**
+Run `POST /_snapshot/{repository}/{snapshot_name}?wait_for_completion=true`, or if SLM is configured, `POST /_slm/policy/{policy_id}/_execute` to trigger the policy immediately. Watch it reach `SUCCESS` and the card resets to near zero.
+
+**Are snapshots full copies every time? They seem too fast.**
+No, snapshots are incremental at the segment level. The first snapshot to a repository copies everything; each subsequent snapshot only copies new or changed Lucene segments and references the rest. This is why a daily snapshot of a multi-terabyte index can complete in minutes, and why deleting old snapshots does not always free much space.
+
+**Should I tighten the 72-hour threshold?**
+If your business recovery-point objective is shorter than three days, yes. Set the sensitivity threshold in the Sensitivity tab to slightly above your snapshot interval (for daily snapshots, around 26 to 30 hours) so the card pages on the first missed run rather than waiting three days.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Last Snapshot Age (hours)* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

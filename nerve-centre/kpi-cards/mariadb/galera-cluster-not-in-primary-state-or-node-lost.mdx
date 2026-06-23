@@ -1,0 +1,136 @@
+---
+title: "Galera Cluster Not in Primary State or Node Lost, MariaDB"
+sidebarTitle: "Galera Cluster Not in Primary State or Node Lost"
+description: "Galera Cluster Not in Primary State or Node Lost alerts for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The single most consequential alert for a Galera (MariaDB Galera Cluster) deployment. It fires when the cluster loses its Primary Component, meaning quorum is gone, or when a node disappears from the cluster membership. This is MariaDB-distinctive: Galera quorum loss makes the cluster go *read-only across all nodes* to protect consistency. The cluster does not fail one node and carry on; it deliberately stops accepting writes everywhere until quorum is restored. For a DBA this is an all-hands event: writes are blocked, the storefront cannot place orders, and the only safe recoveries require careful, ordered intervention. There is no "wait and see" with split-brain.
+
+| | |
+| --- | --- |
+| **What it tracks** | An alert list of quorum and membership events: `wsrep_cluster_status` leaving `Primary`, or `wsrep_cluster_size` dropping below its expected value (a node lost). Each entry records the timestamp, the observed status, and the new cluster size. |
+| **Data source** | Galera wsrep status variables: `SHOW GLOBAL STATUS LIKE 'wsrep_cluster_status'`, `wsrep_cluster_size`, `wsrep_local_state_comment`, and `wsrep_ready`, sampled in real time across the connected nodes. |
+| **Time window** | `RT` (real-time). Evaluated on every sample; an alert is raised the moment the condition is observed. |
+| **Alert trigger** | `wsrep_cluster_status != Primary` OR `cluster_size dropped`. Either a non-Primary status (Non-Primary / Disconnected) or a reduction in node count fires the alert. |
+| **Severity** | Critical. This is a Hero card. Non-Primary status means the cluster is read-only and writes are failing right now. |
+| **Roles** | DBA, platform, SRE, on-call |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Galera is a synchronous multi-master replication layer (wsrep). To avoid split-brain, it uses a quorum rule: a partition can only remain Primary (accept writes) if it holds more than half the votes of the last known membership. The card evaluates two conditions on every sample:
+
+```text
+ALERT if wsrep_cluster_status != 'Primary'
+ALERT if wsrep_cluster_size < expected_size  (a node was lost)
+```
+
+`wsrep_cluster_status` takes one of three values: `Primary` (healthy, has quorum, accepts writes), `Non-Primary` (lost quorum, read-only, refuses writes with `WSREP has not yet prepared node for application use`), or `Disconnected` (the node is not part of any component). `wsrep_cluster_size` is the number of nodes currently in the Primary Component. A drop from 3 to 2 in a three-node cluster is a lost node but quorum survives (2 of 3 is still a majority); a drop from 2 to 1 in that same cluster usually means the surviving node *also* goes Non-Primary because 1 of 3 is not a majority. The MariaDB-distinctive consequence: when quorum is lost, *every* node refuses writes, not just the failed one.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a three-node MariaDB 10.6 Galera cluster (`node-a`, `node-b`, `node-c`) across two availability zones, with `node-a` and `node-b` in AZ-1 and `node-c` in AZ-2. Snapshot taken on 18 Apr 26 at 14:20 BST when the inter-AZ network link degraded.
+
+| Node | `wsrep_cluster_status` | `wsrep_cluster_size` | `wsrep_local_state_comment` |
+| --- | --- | --- | --- |
+| node-a (AZ-1) | Primary | 2 | Synced |
+| node-b (AZ-1) | Primary | 2 | Synced |
+| node-c (AZ-2) | **Non-Primary** | 1 | Initialized |
+
+The network partition isolated AZ-2. The AZ-1 partition (node-a + node-b) held 2 of 3 votes, a majority, so it stayed **Primary** and kept accepting writes. The AZ-2 partition (node-c alone) held 1 of 3 votes, a minority, so it correctly went **Non-Primary** and refused writes. This is Galera working as designed: it sacrificed the minority side to keep the majority consistent. The alert fired for `node-c`'s status change and for the cluster-size drop from 3 to 2.
+
+The on-call DBA confirmed the diagnosis on each side:
+
+```sql
+-- Run on each node to see its view of the cluster
+SHOW GLOBAL STATUS WHERE Variable_name IN (
+  'wsrep_cluster_status', 'wsrep_cluster_size',
+  'wsrep_local_state_comment', 'wsrep_ready', 'wsrep_connected');
+```
+
+Because the majority side was still serving writes, the application stayed up (clients on node-c failed over to AZ-1). When the network healed at 14:35, node-c automatically rejoined via IST (Incremental State Transfer), caught up the missed writesets, returned to `Synced`, and cluster size went back to 3. No manual recovery was needed.
+
+The dangerous variant: had the partition been even (a two-node cluster splitting 1/1, or a three-node losing two nodes at once), *no* side would have a majority and the entire cluster would go Non-Primary, blocking all writes. Recovery then requires `SET GLOBAL wsrep_provider_options='pc.bootstrap=YES';` on the most up-to-date node, which is a deliberate, manual override only safe when you are certain the other partition is truly gone.
+
+Three takeaways:
+
+1. **Galera fails closed, not open.** Unlike async replication where a lost replica is invisible to writers, Galera blocks writes cluster-wide on quorum loss. That is a feature (no split-brain, no divergent data) but it means a quorum event is always write-impacting.
+2. **Run an odd number of nodes, or use a Galera Arbitrator (garbd).** Even-sized clusters have no tiebreaker and are prone to total write-block on a clean 1/1 split. Three nodes (or two nodes plus garbd) survive a single failure with quorum intact.
+3. **Never bootstrap blindly.** `pc.bootstrap=YES` forces a partition to become Primary. If you run it on the wrong (stale) node, or on both partitions, you create real split-brain with divergent data that is painful to merge. Bootstrap only the verified-newest node, and only when the other side is confirmed down.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this alert | What the combination tells you |
+| --- | --- | --- |
+| [Galera Cluster Status](/nerve-centre/kpi-cards/mariadb/galera-cluster-status) | The continuous status gauge behind this alert. | The gauge shows current Primary/Non-Primary state; this alert captures the transition event and its timing. |
+| [Galera Cluster Size](/nerve-centre/kpi-cards/mariadb/galera-cluster-size) | The live node count. | Confirms whether a node was lost and whether the remaining nodes still hold a majority. |
+| [Galera Flow Control Paused %](/nerve-centre/kpi-cards/mariadb/galera-flow-control-paused) | Detects a slow node throttling the cluster. | A node falling behind on flow control often precedes it being evicted and triggering this alert. |
+| [Failover Readiness](/nerve-centre/kpi-cards/mariadb/failover-readiness) | Whether the cluster can survive the next failure. | After one node is lost, this tells you if you can afford to lose another before total write-block. |
+| [Active Async Replicas](/nerve-centre/kpi-cards/mariadb/active-async-replicas) | Async replicas attached to the cluster. | During quorum loss, an async replica may be the only readable copy of recent writes. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/mariadb/last-successful-backup-hours-ago) | Your recovery floor. | If recovery from split-brain goes wrong, the backup age is your worst-case data loss. |
+| [InnoDB / XtraDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mariadb/innodb-xtradb-buffer-pool-hit-rate) | Per-node engine health. | After a node rejoins via SST, a cold buffer pool explains temporary slow reads. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite roll-up. | A quorum event collapses the composite immediately; it is the heaviest single driver. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB / Galera's own tooling:**
+
+> `SHOW GLOBAL STATUS LIKE 'wsrep_cluster_status';` for Primary / Non-Primary / Disconnected.
+> `SHOW GLOBAL STATUS LIKE 'wsrep_cluster_size';` for the current node count in the Primary Component.
+> `SHOW GLOBAL STATUS LIKE 'wsrep_local_state_comment';` for this node's join state (Synced, Donor/Desynced, Joiner, Initialized).
+> `SHOW GLOBAL STATUS LIKE 'wsrep_ready';` (`ON` means this node will accept queries).
+> `SHOW GLOBAL STATUS LIKE 'wsrep_incoming_addresses';` for the member list, and the MariaDB error log for `WSREP` state-transition messages.
+
+**Why our view may legitimately differ from a single node's `SHOW STATUS`:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Per-node viewpoint** | Different status per node | Each node reports its *own* partition's view. During a split, the majority side reads Primary and the minority side reads Non-Primary at the same instant. Our card aggregates across the connected nodes. |
+| **Sampling vs transition** | Brief lag | A node passing through Joiner/Donor states during a state transfer is a transient that a single manual `SHOW STATUS` might catch mid-flight. |
+| **Which node the connector polls** | Reachability | If the connector can only reach the partition that went Non-Primary, the cluster as a whole may actually be fine on the other side. Cross-check from another node. |
+| **garbd (arbitrator) presence** | Size off by one | A Galera Arbitrator counts toward quorum votes but does not store data; `wsrep_cluster_size` includes it, which can surprise you when reconciling node inventory. |
+
+**On managed services:** Most managed MariaDB offerings expose the wsrep status variables directly via `SHOW STATUS`. SkySQL surfaces Galera topology and node health in its console; on self-managed clusters the MariaDB error log and `wsrep_notify_cmd` hooks are the authoritative record of membership changes. There is no equivalent in single-node RDS for MariaDB, which uses async replicas rather than Galera; quorum concepts do not apply there.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Q: One node shows Non-Primary but the others show Primary. Is the cluster down?**
+No. That is the normal, healthy outcome of a network partition: the majority side stays Primary and keeps serving, and the minority side correctly goes Non-Primary to avoid split-brain. The cluster is degraded (less redundancy) but writes continue on the majority. The minority node will rejoin automatically when connectivity returns, usually via IST. The alert still fires because you have lost a node and should restore it.
+
+**Q: All nodes show Non-Primary. What now?**
+That means no partition holds a majority (an even split, or too many nodes lost at once), so the whole cluster has gone read-only to protect consistency. First, confirm which node has the most recent committed writeset (`wsrep_last_committed`). Then bootstrap *only* that node with `SET GLOBAL wsrep_provider_options='pc.bootstrap=YES';`, verify it goes Primary, and let the others rejoin. Never bootstrap two partitions, and never bootstrap a stale node, or you create real split-brain.
+
+**Q: Why does Galera block writes everywhere instead of just on the failed node?**
+Because synchronous multi-master replication guarantees all nodes agree on every committed transaction. If a minority partition kept accepting writes, it would diverge from the majority, and merging divergent histories is effectively impossible without data loss. Blocking writes on quorum loss is the price of that strong consistency guarantee. It is a deliberate, correct design choice.
+
+**Q: We run only two Galera nodes. Why is that risky?**
+A two-node cluster has no tiebreaker. A clean 1/1 split leaves neither side with a majority, so *both* go Non-Primary and all writes stop, even though both nodes are alive. Add a third node, or deploy a lightweight Galera Arbitrator (garbd) as a voting-only member, so a single failure leaves a clear majority. Odd vote counts are the rule.
+
+**Q: A node disappeared but cluster_size only dropped by one and status stayed Primary. Why did the alert still fire?**
+Losing a node is itself an alert condition (`cluster_size dropped`), independent of quorum. Even when the survivors keep quorum and stay Primary, you have lost redundancy: you are now one failure away from trouble. The alert prompts you to investigate and restore the missing node. Check [Failover Readiness](/nerve-centre/kpi-cards/mariadb/failover-readiness) to see how much margin you have left.
+
+**Q: After a node rejoins, queries on it are slow. Is something wrong?**
+Usually not. A node that rejoins via SST (full State Snapshot Transfer) starts with a cold InnoDB buffer pool, so its first reads hit disk until the cache warms. Watch [InnoDB / XtraDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mariadb/innodb-xtradb-buffer-pool-hit-rate) recover over a few minutes. If you can, keep traffic off a freshly rejoined node until it reports `Synced` and the hit rate climbs back to normal.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Galera Cluster Not in Primary State or Node Lost* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

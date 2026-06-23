@@ -1,0 +1,154 @@
+---
+title: "Memory Usage %, Supabase"
+sidebarTitle: "Memory Usage %"
+description: "Memory Usage % for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of your Supabase compute instance's RAM currently in use. Each Supabase project runs on a compute add-on (Micro, Small, Medium, and up) with a fixed memory ceiling, and that RAM is shared between Postgres itself (shared buffers, work memory for sorts and joins, per-connection overhead) and the platform processes (PostgREST, Auth, Realtime, Supavisor). When memory runs out, Postgres starts spilling to disk, the OOM killer can terminate the database process, and connection setup slows to a crawl. Above 85% you are in the danger zone: there is no headroom for a traffic spike, a heavy query, or a connection burst.
+
+| | |
+| --- | --- |
+| **What it tracks** | Used RAM as a percentage of the compute instance's total RAM, sampled in real time. Includes Postgres shared memory and work memory, per-connection backends, the OS page cache used by Postgres, and the co-located platform services. |
+| **Data source** | Supabase project infrastructure metrics (the compute instance memory gauge), surfaced on the project Reports → Database / Infrastructure pages. Each compute tier has a known RAM ceiling that forms the denominator. |
+| **Time window** | `RT` (real-time): the gauge reflects the latest sampled memory reading, refreshed continuously. |
+| **Alert trigger** | `>85%`. Past this, the card turns amber/red: sustained high memory risks OOM termination and query slowdowns. Tune per project in the Sensitivity tab. |
+| **Why it matters** | Memory exhaustion is one of the most disruptive Supabase failure modes. An OOM kill restarts Postgres, drops every connection, and causes a brief but total outage. Even short of OOM, high memory forces disk spills that turn fast queries slow. |
+| **Reading the value** | Healthy steady state is often 50 to 75% (Postgres deliberately uses memory for caching). 75 to 85% is a warning to plan capacity. Above 85% sustained means act before the next peak. A sawtooth that spikes near 100% under load means under-provisioned work memory or too many connections. |
+| **Roles** | platform/SRE, engineering, owner |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The gauge is the ratio of used memory to total instance memory:
+
+```text
+Memory Usage % = (used RAM / total instance RAM) × 100
+```
+
+The denominator is fixed by your compute add-on tier: each tier (Micro, Small, Medium, Large, and larger) ships a specific RAM allocation, and that figure does not change unless you resize the instance. The numerator is the live used-memory reading from the instance, which has several contributors:
+
+- **Postgres shared buffers:** a large block reserved at startup for caching table and index pages. This is healthy usage; Postgres is meant to hold hot data in memory.
+- **Per-connection backends:** every open connection consumes a backend process with its own memory. Many idle connections add up; this is why connection pooling matters for memory as well as for connection caps.
+- **Work memory (`work_mem`):** allocated per sort, hash, and join operation. A single complex query with several sort nodes can allocate `work_mem` multiple times; a flood of such queries multiplies it across connections.
+- **Co-located platform services:** PostgREST, GoTrue (Auth), the Realtime server, and Supavisor all run on the same instance on smaller tiers and consume their share.
+- **OS page cache:** the operating system caches recently-read disk pages; this is reclaimable but counts toward used memory in most readings.
+
+A subtlety: a high reading is not automatically bad. Postgres and the OS deliberately fill memory with cache because empty RAM is wasted RAM. The danger is not the absolute level but the lack of *headroom*: when a spike arrives and there is no reclaimable slack, the OOM killer steps in. That is why the alert sits at 85%, leaving roughly 15% headroom for a burst. The card reads the live sample, so a momentary spike from one heavy query is visible immediately and decays as the query finishes.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs an analytics-heavy Supabase project on the Small compute tier (2 GB RAM). Their app serves a dashboard that runs several large aggregation queries on every page load. Snapshot reviewed on 21 Apr 26 at 13:15 BST during the lunchtime traffic peak.
+
+| Time | Memory % | Active connections | Notable activity |
+| --- | --- | --- | --- |
+| 12:00 | 62% | 18 | baseline browsing |
+| 12:45 | 74% | 31 | dashboard traffic building |
+| 13:05 | 88% | 47 | peak: many concurrent aggregations |
+| 13:12 | **96%** | 52 | spill to disk, queries slowing |
+| 13:15 | 71% (after restart) | 9 | **OOM kill, Postgres restarted** |
+
+At 13:12 the card read **96%** and the team's pinned panel was deep red. Each dashboard load fired three aggregation queries, each allocating `work_mem` for its sort nodes, and at 52 concurrent connections the multiplied work memory plus the per-connection backends exceeded the 2 GB ceiling. At 13:13 the OOM killer terminated Postgres; it restarted, dropping all 52 connections, and the card briefly read 71% on a cold cache before climbing again as traffic resumed.
+
+```text
+Why the Small tier hit the ceiling:
+  - Total RAM:                       2,048 MB
+  - Shared buffers + base:           ~700 MB
+  - 52 backends × ~6 MB each:        ~312 MB
+  - 3 aggregations × work_mem × concurrency: ~900 MB peak
+  - Platform services (PostgREST, Auth, Realtime): ~250 MB
+  - Sum at peak:                     ~2,162 MB  → over ceiling → OOM
+
+The fix options, cheapest first:
+  - Lower per-query work_mem and add a LIMIT / pre-aggregate the dashboard data
+  - Pool connections through Supavisor to cut backend count
+  - Resize to Medium (4 GB) for headroom
+```
+
+What the team did:
+
+1. **Immediate:** routed dashboard reads through the Supavisor pooler to cap backend count, and added a materialised view for the heaviest aggregation so each page load ran one cheap indexed read instead of three full scans.
+2. **Short term:** reduced `work_mem` so a single runaway query could not allocate hundreds of megabytes, trading a little sort speed for crash safety.
+3. **Capacity:** scheduled a resize to the Medium tier for the next maintenance window, giving roughly double the headroom so the next traffic peak does not flirt with the ceiling.
+
+Three takeaways:
+
+1. **High memory is fine; no headroom is not.** Postgres caching to 70% is healthy. The risk is the gap between steady state and the ceiling when a spike lands. Provision so peak stays under 85%.
+2. **Connections multiply memory.** Every backend costs memory, and `work_mem` is allocated per operation per connection. Pooling cuts both connection caps and memory pressure at once.
+3. **An OOM kill is a full outage.** Unlike a slow query, OOM restarts Postgres and drops every session. The cost of one OOM event (dropped transactions, cold cache, angry users) dwarfs the cost of a tier upgrade.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Memory Usage | What the combination tells you |
+| --- | --- | --- |
+| [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) | Connection count is a primary memory driver. | High memory plus high pool saturation means too many backends; pooling harder relieves both at once. |
+| [Buffer Cache Hit Rate %](/nerve-centre/kpi-cards/supabase/buffer-cache-hit-rate) | Memory feeds the buffer cache. | If memory is high but cache hit rate is low, the working set no longer fits in RAM; you need a bigger tier. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/supabase/database-disk-usage) | Memory exhaustion forces disk spills. | High memory plus rising disk during peaks shows queries spilling sorts to disk; cut work memory or scale up. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate) | Disk spills from memory pressure slow queries. | Memory near the ceiling correlated with a slow-query spike confirms spilling, not bad query plans. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite that takes capacity metrics as inputs. | High memory drags the score; use the score for the headline and this card for the cause. |
+| [Database Queries per Second (live)](/nerve-centre/kpi-cards/supabase/database-queries-per-second-live) | Query volume drives memory demand. | A QPS spike that lifts memory toward the ceiling is your early warning to scale before the next peak. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase's own tooling:**
+
+> **Project Dashboard → Reports → Database** (and the Infrastructure/Compute report) for the memory usage chart over time, the same gauge the card aggregates.
+> **Project Settings → Compute and Disk** to confirm your compute tier and therefore the total-RAM denominator the percentage is calculated against.
+> **SQL Editor** with a query against `pg_stat_activity` to count active backends, and `pg_settings` to read `shared_buffers` and `work_mem`, when you want to attribute the usage to its contributors.
+
+**Why our number may legitimately differ from the Supabase UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sample timing** | Variable | The card reads the latest sample; the Supabase chart averages over its bucket. A momentary spike shows higher on our real-time gauge than on a 5-minute averaged chart. |
+| **Page cache inclusion** | Vortex IQ may read higher | Depending on the metric source, reclaimable OS page cache may be counted as used. A reading that looks alarmingly high can include cache that Postgres would release under pressure. |
+| **Tier denominator** | Must match | If you recently resized the instance, confirm both views use the new total RAM; a stale denominator skews the percentage. |
+| **Window** | Variable | Vortex IQ is real-time; if you are looking at a 24h Supabase chart, match the range before comparing peaks. |
+| **Co-located services** | Tier-dependent | On smaller tiers PostgREST, Auth, and Realtime share the instance and count toward usage; on isolated setups they may not, changing the baseline. |
+
+**Cross-connector reconciliation:** if memory climbs in lockstep with request volume from your app tier, pair this card with your application's own APM memory and request metrics. A memory spike on Supabase that matches an app-side traffic burst is expected capacity behaviour; a memory climb with flat app traffic points at a leak or an unbounded query rather than load.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My memory sits at 70% all the time. Should I worry?**
+Usually no. Postgres deliberately uses memory for the buffer cache and the OS caches disk pages, so a steady 60 to 75% is healthy on a busy database. The question is headroom: does it stay under 85% during your traffic peaks? A flat 70% that never spikes is fine; a 70% baseline that jumps to 98% at lunchtime is a capacity problem waiting to happen.
+
+**The database restarted on its own and dropped all connections. Was that memory?**
+Very likely an OOM (out-of-memory) kill. When used memory exceeds the instance ceiling, the OS terminates Postgres to reclaim RAM, which restarts the database and drops every session. Check whether this card hit or approached 100% just before the restart. If so, reduce per-query `work_mem`, pool connections to cut backend count, or resize to a larger tier.
+
+**Why does memory spike when I run a big analytical query?**
+Sorts, hashes, and joins each allocate `work_mem`, and a single complex query can have several such operations, allocating `work_mem` multiple times. Run that query across many connections at once and the total multiplies fast. Either lower `work_mem` so one query cannot grab too much, pre-aggregate with a materialised view, or run heavy analytics on a read replica so they do not threaten the primary.
+
+**Reducing memory by closing connections did not help much. Why?**
+Idle connections cost memory but the bulk of pressure usually comes from active work memory and shared buffers, not idle backends. Pooling helps by capping concurrency, but if your queries each allocate large sorts, you also need to address `work_mem` and query design. Look at what is actually consuming the RAM (`pg_stat_activity` for active backends, query plans for sort/hash nodes) before assuming connections are the whole story.
+
+**The card and the Supabase chart show different numbers. Which is right?**
+Both, measuring slightly differently. The card is a real-time sample; the dashboard chart is averaged over its bucket, so it smooths spikes. Also confirm both use the same total-RAM denominator (especially after a resize) and whether reclaimable page cache is counted. Match the window and the denominator before treating a difference as a fault.
+
+**Can I tune the 85% alert threshold?**
+Yes, in the Sensitivity tab. A spiky workload might alert earlier (say 80%) to give more lead time before a peak hits the ceiling. A very steady workload with reliable headroom can sit closer to 85%. Avoid pushing the threshold near 95%: by then there is too little time to react before an OOM.
+
+**Does memory usage include the platform services like Auth and Realtime?**
+On smaller compute tiers, yes: PostgREST, GoTrue (Auth), Realtime, and Supavisor are co-located with Postgres and share the instance RAM, so their usage is part of the reading. This means a surge in Realtime connections or Auth traffic can lift memory even if database query load is flat. Cross-reference the Realtime and Auth cards if memory climbs without an obvious query-side cause.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Memory Usage %* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

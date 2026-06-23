@@ -1,0 +1,135 @@
+---
+title: "Query Latency p95 (ms), MariaDB"
+sidebarTitle: "Query Latency p95 (ms)"
+description: "Query Latency p95 (ms) for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The 95th-percentile statement execution time on the MariaDB instance, in milliseconds, computed over a real-time 5-minute window. Ninety-five percent of statements finished at or below this number; the slowest 5% took longer. For a DBA, p95 is the honest read on the experience most requests get: the median (p50) hides the tail, and p99 can be dominated by a handful of pathological queries, but p95 tracks the body of the distribution the application actually feels. When p95 climbs past 200ms the card turns amber, because at that point a meaningful slice of every page render, API call, and checkout step is waiting on the database.
+
+| | |
+| --- | --- |
+| **What it tracks** | Query Latency p95 (ms): the 95th-percentile statement execution time across all statements seen in the window. The detail line is *Query Latency p95 (ms) for the selected period.* |
+| **Data source** | MariaDB `performance_schema.events_statements_summary_by_digest` (and the live `events_statements_*` tables), where per-statement timers are summarised in picoseconds and converted to milliseconds. The percentile is derived from the statement-time histogram (`events_statements_histogram_global`) where available, otherwise from sampled statement events. |
+| **Time window** | `RT/5m`: a real-time reading recomputed every poll over the trailing 5-minute window. |
+| **Alert trigger** | `> 200ms`. Above this the card turns amber and surfaces in the Sensitivity feed. |
+| **Distinct from** | p50 (the median, typical request) and p99 (the tail, worst 1%). p95 is the workhorse SLO percentile: tight enough to catch real degradation, robust enough not to flap on one slow analytic query. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The percentile is built from MariaDB's statement-time distribution, not from a simple average. The Performance Schema records every statement's wall-clock execution time (`TIMER_WAIT`, in picoseconds) and buckets them into a latency histogram. The card reads the histogram for the trailing 5 minutes and finds the bucket boundary below which 95% of the recorded statement time falls, then converts to milliseconds.
+
+```text
+p95_ms = percentile(statement_execution_time, 0.95) over the trailing 5m
+       = histogram_bucket_at(cumulative_fraction >= 0.95) / 1e9   (ps to ms)
+```
+
+Two important properties follow from this. First, p95 is a *latency* percentile, not a throughput number: doubling the query rate does not move p95 if each query stays equally fast. Second, the percentile is weighted by how MariaDB samples, so a workload dominated by fast point lookups will show a low p95 even if a few reporting queries take seconds, because those slow queries are a tiny fraction of the count. When `performance_schema` is disabled the engine falls back to an estimate derived from `Slow_queries` rate and `long_query_time`, which is coarser; the At a glance source line tells you which path produced the reading.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MariaDB 10.11 primary serving a catalogue-heavy application tier. Snapshot taken on 12 Mar 26 at 13:20 GMT, during the lunchtime traffic peak.
+
+| Percentile | Value | Card state |
+| --- | --- | --- |
+| p50 (median) | 11 ms | green |
+| **p95** | **240 ms** | **amber (threshold `> 200ms`)** |
+| p99 | 470 ms | green (threshold `> 500ms`) |
+
+The median is healthy at 11ms, so the typical request is fine, but p95 has crossed 200ms. That gap between p50 and p95 is the tell: one in twenty statements is now 20x slower than the median. The DBA pulls the digest table to find which statements moved:
+
+```sql
+SELECT DIGEST_TEXT,
+       COUNT_STAR,
+       ROUND(AVG_TIMER_WAIT/1e9, 1)  AS avg_ms,
+       ROUND(MAX_TIMER_WAIT/1e9, 1)  AS max_ms,
+       SUM_ROWS_EXAMINED
+FROM   performance_schema.events_statements_summary_by_digest
+ORDER BY AVG_TIMER_WAIT DESC
+LIMIT 5;
+```
+
+The top row is a `SELECT ... FROM product_search WHERE category = ? AND status = ?` averaging 230ms with `SUM_ROWS_EXAMINED` far higher than `SUM_ROWS_SENT`, a classic full-scan signature. `EXPLAIN` confirms the optimiser dropped to a full table scan after a recent data load skewed the statistics. The fix is not server tuning; it is a composite index on `(category, status)` plus an `ANALYZE TABLE product_search` to refresh the statistics. After deploying the index, p95 falls back to 35ms on the next window.
+
+Three takeaways:
+
+1. **Read p95 next to p50.** A small gap means uniform performance; a large gap means a tail problem affecting a real fraction of requests. The gap, not the absolute number, points at the cause.
+2. **p95 degradation is almost always a query or index problem, not a hardware problem.** Hardware saturation tends to lift the whole distribution (p50 rises too). When only p95 and p99 move, look at the digest table for a query whose plan changed.
+3. **One bad plan can dominate.** A single high-frequency statement that flips to a full scan will drag p95 across the threshold even while everything else is fast. The digest table attributes it; the slow query log confirms it.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Latency p95 | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p50 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p50-ms) | The median, typical-request latency. | A wide p50-to-p95 gap means a tail problem; both rising together means whole-distribution degradation (often hardware or contention). |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p99-ms) | The worst 1% tail. | p99 spiking while p95 holds means a few pathological queries; both rising means the slowdown is spreading into the body. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mariadb/slow-query-rate) | The proportion of queries over `long_query_time`. | Rising p95 with a rising slow-query rate confirms the tail is real volume, not a single outlier. |
+| [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mariadb/top-10-slowest-queries-digest) | The named statements behind the latency. | This is where you find the specific digest dragging p95 up. |
+| [InnoDB Deadlocks (last 5m)](/nerve-centre/kpi-cards/mariadb/innodb-deadlocks-last-5m) | Lock contention that stalls statements. | Latency spikes that coincide with deadlocks point at contention, not bad plans. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mariadb/queries-per-second-live) | The throughput context. | High p95 at high QPS may be load-driven; high p95 at normal QPS is a plan or index regression. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite that weights latency. | A sustained p95 breach pulls the composite down even when availability is fine. |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/mariadb/slow-queries-during-checkout-window-5m) | The revenue-at-risk cross-channel view. | High p95 that lands inside the checkout window is the version that costs money. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> `SELECT * FROM performance_schema.events_statements_summary_by_digest ORDER BY AVG_TIMER_WAIT DESC;` for per-statement average and max times (divide `*_TIMER_WAIT` by 1e9 for milliseconds).
+> `SELECT * FROM performance_schema.events_statements_histogram_global;` for the raw latency histogram the percentile is read from.
+> The slow query log (with `slow_query_log = ON` and a sensible `long_query_time`) for the actual statement text and `EXPLAIN`-able offenders.
+> `pt-query-digest` (Percona Toolkit) over the slow log produces its own percentile breakdown you can compare against.
+
+**Why our number may legitimately differ from a manual digest query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Windowing** | Variable | The digest tables accumulate since the last `TRUNCATE` or restart; our card recomputes over a trailing 5 minutes, so a long-lived digest average will not match a fresh 5-minute percentile. |
+| **Percentile vs average** | Ours higher than `AVG_TIMER_WAIT` | The digest table exposes averages and a max, not a true p95. Our histogram-derived p95 sits between the average and the max. |
+| **Sampling** | Marginal | When `performance_schema` instrumentation is partially disabled, both the histogram and our reading sample fewer events; coverage gaps shift the percentile slightly. |
+| **Fallback path** | Coarser | With `performance_schema` off, we estimate from slow-query rate and `long_query_time`, which is less precise than the histogram path. |
+
+**On managed services:** Amazon RDS / Aurora for MariaDB surfaces statement latency through Performance Insights (top SQL by average active sessions) and the same `performance_schema` tables; SkySQL and Azure Database for MariaDB expose latency in their own monitoring consoles. Percentile definitions vary by vendor, so align the window and confirm whether their figure is an average or a true percentile before treating a gap as real.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Q: Why use p95 rather than an average response time?**
+Averages are dominated by the bulk of fast queries and hide the tail almost completely. A workload can average 8ms while one request in twenty takes 400ms, and the average never tells you. p95 names the experience of the slowest 5% of statements, which is the slice users actually notice and the slice that breaks SLOs. Read p95 as the body of the tail and p99 as the extreme tail.
+
+**Q: p95 is amber but p50 looks fine. Is the database healthy?**
+The typical query is fine but a real fraction (one in twenty) is slow. That is usually a single statement whose plan regressed, an index that stopped being used after a data load, or intermittent lock contention. Pull [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mariadb/top-10-slowest-queries-digest) and the digest table to find the offender; do not assume the instance is healthy just because the median is low.
+
+**Q: Both p50 and p95 are rising together. What changed?**
+When the whole distribution lifts, the cause is usually shared resource pressure rather than one bad query: buffer pool too small (low hit rate, more disk reads), CPU saturation, I/O contention from a backup or a noisy neighbour, or replication apply stealing I/O. Check [InnoDB / XtraDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mariadb/innodb-xtradb-buffer-pool-hit-rate) and [Memory Usage %](/nerve-centre/kpi-cards/mariadb/memory-usage) before chasing individual queries.
+
+**Q: The card shows a fallback estimate, not the histogram value. Why?**
+`performance_schema` is disabled or its statement instrumentation is off on this instance, so the precise histogram is unavailable. The engine estimates p95 from the slow-query rate and `long_query_time`. To get the accurate reading, enable `performance_schema = ON` and the `events_statements_*` consumers, then restart. The At a glance source line will switch to the histogram path on the next poll.
+
+**Q: Does p95 include replication apply or background threads?**
+No. The card measures client statement execution times from the statement instrumentation. Replica SQL-thread apply time, purge, and other background work are not client statements and are excluded. If replicas are lagging, look at [Async Replication Lag (seconds)](/nerve-centre/kpi-cards/mariadb/async-replication-lag-seconds) instead.
+
+**Q: Can a 5-minute window flap on a single slow analytic query?**
+p95 is fairly robust because, by definition, the slowest 5% has to be sizeable to move it, but on a low-traffic instance where 5 minutes holds only a few hundred statements, a burst of slow reports can move it briefly. If your instance is low-volume, widen the comparison by reading p95 next to [Slow-Query Rate %](/nerve-centre/kpi-cards/mariadb/slow-query-rate) and raise the threshold in the Sensitivity tab to suit your baseline.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Latency p95 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

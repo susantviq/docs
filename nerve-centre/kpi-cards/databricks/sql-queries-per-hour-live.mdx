@@ -1,0 +1,146 @@
+---
+title: "SQL Queries per Hour (live), Databricks"
+sidebarTitle: "SQL Queries per Hour (live)"
+description: "SQL Queries per Hour (live) for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The live throughput of your Databricks SQL warehouses, expressed as queries executed per hour. This is the heartbeat metric of the lakehouse's analytics layer: it tells a platform team how much demand the warehouses are serving right now, and it is the denominator behind almost every other SQL card. A healthy reading is one that tracks your business rhythm: rising through the morning, peaking with the reporting window, quiet overnight. A sudden drop can mean an outage upstream (no one can query because the warehouse is down or a dashboard is broken); a sudden surge can mean a runaway dashboard, a misconfigured polling loop, or genuine demand that is about to saturate capacity.
+
+| | |
+| --- | --- |
+| **What it tracks** | The count of SQL queries executed across the monitored warehouses in the trailing hour, projected to an hourly rate, as `dbx_qps`. |
+| **Data source** | Databricks query history (`GET /api/2.0/sql/history/queries`) and, where the system schema is enabled, `system.query.history`. Vortex IQ counts completed and in-flight query starts in the rolling window. |
+| **Why it matters** | Throughput is the context for every other SQL metric. A latency or error reading means nothing without knowing whether the warehouse is serving 50 or 50,000 queries per hour. It is also the earliest sign of demand-driven capacity pressure. |
+| **Time window** | `RT` (real-time): a rolling trailing-hour rate, refreshed each poll. |
+| **Alert trigger** | None by default. This is an Executive Overview throughput gauge, not a threshold card; act on it via the cards it feeds (saturation, latency, error rate). |
+| **Sentiment** | Neutral. Higher is not inherently better or worse; the signal is in the shape and in sudden deviations from the normal curve. |
+| **Roles** | owner, engineering, operations (DBA / platform / SRE) |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Vortex IQ reads the query-history feed for the monitored warehouses and counts query executions whose start time falls within the trailing 60-minute window, then reports that count as the live per-hour rate:
+
+```text
+queries_per_hour = count(queries where start_time within last 60 minutes)
+```
+
+Because the window is rolling rather than a fixed clock hour, the number updates continuously and reflects the most recent demand rather than waiting for an hour boundary. Both completed and currently-running queries are counted by their start, so a long-running query is included from the moment it begins, not only when it finishes.
+
+System-generated and metadata queries can optionally be filtered out so the rate reflects genuine analytical load rather than the warehouse's own housekeeping (catalogue lookups, schema introspection from BI tools). Where the connector is configured to exclude these, the headline tracks user-driven demand, which is the more useful executive signal. The card aggregates across all monitored warehouses by default; the drill-down splits the rate per warehouse so a team can see which warehouse carries the load.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs three SQL warehouses: `bi-interactive` (analyst dashboards), `embedded-storefront` (a customer-facing analytics widget) and `etl-adhoc` (engineers' manual queries). The normal weekday curve peaks around 4,000 queries/hour mid-morning. Snapshot taken on 21 Apr 26 across the morning.
+
+| Time (UTC) | bi-interactive | embedded-storefront | etl-adhoc | Total q/h | Note |
+| --- | --- | --- | --- | --- | --- |
+| 07:00 | 600 | 900 | 40 | 1,540 | Pre-peak |
+| 09:30 | 2,800 | 1,050 | 120 | 3,970 | Normal peak |
+| 10:15 | 2,750 | **9,400** | 110 | 12,260 | **Anomaly** |
+| 10:40 | 2,800 | 1,020 | 130 | 3,950 | Recovered |
+
+At 10:15 the live rate jumps to 12,260 q/h, more than 3x the normal peak, driven almost entirely by `embedded-storefront`. The platform engineer investigates.
+
+```text
+What changed at 10:15:
+  - embedded-storefront query rate: 1,050 -> 9,400 q/h (9x)
+  - The widget normally polls every 30s; a frontend deploy changed it to every 3s
+  - SQL Warehouse Saturation on embedded-storefront: 45% -> 92%
+  - p95 latency on that warehouse: 280ms -> 2,100ms
+  - DBU rate on embedded-storefront roughly doubled as it autoscaled
+```
+
+The surge is not real demand: a storefront deploy accidentally set the analytics widget to poll ten times more often, multiplying identical queries. The decisions:
+
+1. **Trace the surge to its source.** The throughput card flagged *that* demand jumped; the per-warehouse drill-down said *where* (embedded-storefront); the storefront deploy log said *why* (poll interval change). Roll back or hotfix the poll interval.
+2. **Contain the cost while fixing.** The runaway polling doubled DBU on that warehouse and pushed saturation to 92%. A short-term mitigation is to cap the widget's query rate or add a result cache so identical polls do not re-execute.
+3. **Add a guard rail.** A polling widget should never query the warehouse directly at high frequency; a 30 to 60 second materialised cache in front of it would make a future mis-config harmless.
+
+Two takeaways:
+
+1. **Throughput is the alarm; the other SQL cards are the diagnosis.** This card has no threshold of its own because the right response depends entirely on *why* it moved. It pointed the team at the right warehouse; [SQL Warehouse Saturation %](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation) and [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) sized the impact.
+2. **A surge of identical queries is a cost problem before it is a capacity problem.** The warehouse autoscaled to cope, so users barely noticed, but the DBU bill doubled silently. Watch this card alongside [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) so demand surges do not turn into surprise spend.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with SQL Queries per Hour | What the combination tells you |
+| --- | --- | --- |
+| [SQL Warehouse Saturation %](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation) | Throughput is the demand; saturation is whether capacity can absorb it. | Rising q/h with rising saturation equals a real capacity decision is due. |
+| [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) | Latency per query at a given throughput tells you efficiency. | q/h flat but latency rising equals queries getting heavier, not more numerous. |
+| [SQL Query Error Rate %](/nerve-centre/kpi-cards/databricks/sql-query-error-rate) | Error *rate* needs throughput as its denominator. | A throughput drop with a constant error count spikes the error rate artificially. |
+| [Active SQL Sessions](/nerve-centre/kpi-cards/databricks/active-sql-sessions) | Sessions are the clients generating the queries. | Many queries from few sessions equals automated polling, not human analysts. |
+| [Active SQL Warehouses](/nerve-centre/kpi-cards/databricks/active-sql-warehouses) | Tells you how the throughput is spread. | All q/h on one warehouse equals a routing imbalance. |
+| [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) | Throughput surges drive autoscaling and cost. | A throughput surge that doubles DBU is a cost event even if users are unaffected. |
+| [Databricks Health Score](/nerve-centre/kpi-cards/databricks/databricks-health-score) | The composite that uses throughput as a load context. | A sudden throughput collapse can drag the composite down as an outage signal. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> Open **SQL → Query History** and filter to the warehouse and a one-hour window; the row count is the direct equivalent of this card.
+> Run `SELECT count(*) FROM system.query.history WHERE start_time >= now() - interval 1 hour` (where the system schema is enabled) for an account-level count.
+> Each warehouse's **Monitoring** tab shows a "Completed queries" series over time, the visual form of the same throughput.
+
+**Why our number may legitimately differ from the Databricks UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Rolling vs clock hour** | Variable | Vortex IQ uses a trailing 60-minute window; the UI often shows fixed clock-hour buckets, so mid-hour the two will differ. |
+| **System-query filtering** | Vortex IQ count lower | Metadata and housekeeping queries can be excluded from our headline but are counted in the raw history view. |
+| **Started vs completed** | Vortex IQ slightly higher | We count by query start (including in-flight runs); a "completed queries" chart counts only finished ones. |
+| **Multi-warehouse aggregation** | Vortex IQ higher | The headline sums all monitored warehouses; a single-warehouse UI view will be lower. |
+| **Refresh latency** | Brief | Query history can lag real execution by a few seconds, so the live rate trails actual demand by the poll interval. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Databricks SQL Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/databricks/databricks-sql-spike-vs-ecom-order-rate) | Storefront-driven query throughput should track order/traffic rate. | A query surge with flat orders points at internal tooling or a polling bug, not demand. |
+| [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume) | More queries usually mean more DBU. | Throughput up but DBU flat equals queries hitting cache; both up equals genuine load growth. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does this card have no alert threshold?**
+Because there is no universally "bad" throughput. A drop could be an overnight lull or an outage; a surge could be a successful campaign or a runaway dashboard. The right response depends entirely on the cause, so the card surfaces the signal and the sibling cards (saturation, latency, error rate, DBU) tell you whether to act. Treat a sharp deviation from your normal curve as the prompt to investigate, not the number itself.
+
+**Is a higher queries-per-hour better?**
+Not inherently. More queries can mean more analysts getting value from the lakehouse, or it can mean an inefficient dashboard re-running the same query a hundred times. Read throughput alongside latency and DBU: high throughput at low cost and latency is healthy; high throughput driving cost and queuing is a problem to investigate.
+
+**The card shows zero but I know people are querying. Why?**
+Two common causes: the query-history feed has lagged or paused (a transient API issue that resolves at the next poll), or the queries are running on a warehouse that is not in the monitored set. Confirm which warehouses the connector is scoped to. A genuine zero during business hours, with sessions still active, is itself a signal worth investigating as a possible warehouse stall.
+
+**Does this count queries run from notebooks and jobs, or only SQL warehouses?**
+This card counts queries executed through SQL warehouses (the query-history feed). Spark SQL run inside notebooks on all-purpose or job clusters is a different execution path and is not included here; monitor that compute through the cluster and job cards instead.
+
+**How does the rolling window affect what I see during a spike?**
+Because the window is the trailing 60 minutes, a sharp one-minute burst takes a full hour to fully age out of the count, so the elevated rate decays gradually after the burst ends rather than dropping instantly. This is intentional, it reflects the load the warehouse genuinely carried, but it means the live rate can look elevated for a while after the underlying spike has passed.
+
+**Can I see which user or dashboard is generating the queries?**
+The headline is an aggregate rate, but the per-warehouse drill-down narrows the source, and Databricks Query History itself attributes each query to a user, source, and statement. When a surge appears, the workflow is: this card tells you the rate jumped, the drill-down tells you which warehouse, and Query History tells you which client. For deeper attribution, ask Ask Viq to break the surge down by source.
+
+**Why count by query start rather than completion?**
+Counting by start means a long-running query is reflected in throughput the moment demand arrives, not an hour later when it finishes. For a live throughput gauge, that is the honest reading: the warehouse is carrying that work now. A completion-based count would understate live demand whenever queries are slow.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*SQL Queries per Hour (live)* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

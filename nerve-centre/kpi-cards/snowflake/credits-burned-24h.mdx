@@ -1,0 +1,168 @@
+---
+title: "Credits Burned (24h), Snowflake"
+sidebarTitle: "Credits Burned (24h)"
+description: "Credits Burned over the last 24 hours for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Credit Burn](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The single most Snowflake-defining number on the dashboard: total compute credits consumed across the account in the last 24 hours, compared against the prior 24 hours. In Snowflake, credits are dollars. Every second a warehouse runs, it accrues credits at a rate set by its size, and those credits convert directly to your invoice. So this card is not an abstract usage metric; it is the daily spend meter. A flat line is a controlled account. A sudden step up, with no matching rise in work done, is money leaving the building: a runaway query, a scheduled job stuck in a retry loop, an auto-suspend setting that quietly stopped working, or a warehouse someone resized up and forgot. The `+50% vsP` alert exists because a doubled daily burn caught the same day is a saved bill; caught at month end it is a finance conversation.
+
+| | |
+| --- | --- |
+| **Data source** | `SNOWFLAKE.ACCOUNT_USAGE.METERING_HISTORY`, summed over the trailing 24 hours across all warehouses in the connector's scope. This is the authoritative billing view; the same source Snowflake meters your invoice from. |
+| **Metric basis** | Total `credits_used` (compute plus cloud-services credits where billed) over 24 hours, NOT a rate or an average. The headline is the raw credit total; the dollar equivalent uses the connector's contracted `$/credit` rate. |
+| **What it includes** | Warehouse compute credits (the dominant term), plus cloud-services credits beyond the 10%-of-compute daily free allowance Snowflake grants. Serverless features (Snowpipe, automatic clustering, materialised-view maintenance, search optimisation) accrue their own credits and are included where the connector reads them. |
+| **What it does not include** | Storage cost (billed separately per TB; see [Storage Used (TB)](/nerve-centre/kpi-cards/snowflake/storage-used-tb)) and data-transfer egress. This card is compute only, because compute is where sudden, controllable spikes happen. |
+| **Aggregation window** | `24h`, a trailing 24-hour total compared against the prior 24 hours (`vsP`) so a day-on-day step change is the headline. |
+| **Latency** | `METERING_HISTORY` updates within minutes of consumption, so this card is close to real-time; it is the lowest-latency credit source Snowflake exposes. |
+| **Time window** | `24h` (trailing 24 hours, compared to the prior 24 hours) |
+| **Alert trigger** | `+50% vsP`, a 50% or greater rise against the prior 24 hours raises the sensitivity alert. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card sums credits over the window and compares to the prior window:
+
+```text
+credits_24h  = sum(credits_used) from METERING_HISTORY
+               where start_time >= now − 24h
+credits_prior = sum(credits_used) from METERING_HISTORY
+               where start_time in [now − 48h, now − 24h)
+delta_vsp    = (credits_24h − credits_prior) / credits_prior
+dollars_24h  = credits_24h × dollar_per_credit
+```
+
+What a platform team needs to know about how Snowflake accrues these credits:
+
+- **Per-second billing with a 60-second floor.** A warehouse bills per second while running, but every resume carries a 60-second minimum charge. Many tiny queries that each spin a warehouse up and down can therefore burn far more credits than their runtime suggests, because each pays the floor.
+- **Size doubles the rate.** Credit consumption per hour doubles with each warehouse size step: X-Small burns 1 credit/hour, Small 2, Medium 4, Large 8, X-Large 16, and so on. Resizing a warehouse up one step doubles its burn rate instantly, which is the single most common cause of a sudden `+50%` jump.
+- **Idle-but-running counts.** A warehouse that is on but processing nothing still accrues credits until `AUTO_SUSPEND` kicks in. This idle burn lands in the total even though no query ran; see [Idle Warehouse Credits Wasted (24h)](/nerve-centre/kpi-cards/snowflake/idle-warehouse-credits-wasted-24h).
+- **Serverless credits are separate line items.** Snowpipe, automatic clustering, and materialised-view maintenance run on Snowflake-managed compute and accrue credits independently of your warehouses. A clustering job kicked off by a large reorganisation can spike the total with no warehouse activity at all.
+- **Cloud-services credits have a free tier.** Cloud-services compute (query compilation, metadata) is free up to 10% of daily warehouse credits; only the excess is billed and included here. A workload of many tiny metadata-heavy queries can push past that 10% line.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs Snowflake at an ecommerce retailer with three warehouses on Enterprise edition at $3.00 per credit. Their controlled daily baseline is around 240 credits ($720/day). Two readings, taken on 14 Apr 26.
+
+**Yesterday (baseline, 12 to 13 Apr 26):**
+
+| Warehouse | Size | Credits (24h) |
+| --- | --- | --- |
+| `LOAD_WH` | Small | 48 |
+| `BI_WH` | Medium | 96 |
+| `AD_HOC_WH` | Large | 96 |
+| **Total** | | **240** ($720) |
+
+**Today (13 to 14 Apr 26):**
+
+| Warehouse | Size | Credits (24h) |
+| --- | --- | --- |
+| `LOAD_WH` | Small | 50 |
+| `BI_WH` | **X-Large** | 384 |
+| `AD_HOC_WH` | Large | 102 |
+| **Total** | | **536** ($1,608) |
+
+Day-on-day delta: (536 - 240) / 240 = **+123%**. The `+50% vsP` alert fires hard.
+
+The breakdown localises it instantly: `LOAD_WH` and `AD_HOC_WH` are normal, but `BI_WH` jumped from 96 to 384 credits, exactly 4x. A 4x jump on a single warehouse with no change in query count is the fingerprint of a two-step resize: someone (or an auto-scaling policy, or a Terraform apply) moved `BI_WH` from Medium to X-Large. Medium burns 4 credits/hour; X-Large burns 16. The warehouse did the same Looker-refresh work it always does, but every running second now costs 4x.
+
+The team's response, in order:
+
+1. **Confirm the resize.** Open [Credits by Warehouse (7d)](/nerve-centre/kpi-cards/snowflake/credits-by-warehouse-7d) and look at `BI_WH` over the week; the step is obvious and dated. Cross-check `WAREHOUSE_EVENTS_HISTORY` for the `ALTER WAREHOUSE ... SET WAREHOUSE_SIZE` event and who ran it.
+2. **Decide if the size was justified.** Was `BI_WH` queueing? Check [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) and [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse). If saturation was comfortable and the queue was empty, the X-Large is pure waste: resize back to Medium and reclaim ~$865/day.
+3. **If the resize was deliberate but excessive,** a multi-cluster Medium (scale-out for concurrency) is usually cheaper than a single X-Large (scale-up for one big query) when the problem is concurrency rather than single-query size.
+
+```text
+Cost of leaving it unfixed:
+  Extra burn:  384 − 96 = 288 credits/day
+  Dollar cost: 288 × $3.00 = $864/day
+  Over a 30-day month if unnoticed: ~$25,900
+Caught same-day by the alert: one ALTER WAREHOUSE statement, ~$865 saved per day.
+```
+
+Three things worth remembering:
+
+1. **A doubling on one warehouse is almost always a resize.** Credit burn scales linearly with size, so clean multiples (2x, 4x) point at `WAREHOUSE_SIZE` changes, not query behaviour. Ragged increases point at query inefficiency or volume.
+2. **The alert pays for itself on day one.** A `+50%` burn left until month-end is the classic Snowflake bill-shock story. The whole point of the 24-hour window is to catch it while a single `ALTER` statement fixes it.
+3. **Storage is not in this number.** A growing bill with flat credit burn means storage, not compute; read [Storage Used (TB)](/nerve-centre/kpi-cards/snowflake/storage-used-tb) for that axis.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Credits Burned (24h) | What the combination tells you |
+| --- | --- | --- |
+| [Credits by Warehouse (7d)](/nerve-centre/kpi-cards/snowflake/credits-by-warehouse-7d) | Localises the total to a single warehouse. | The first drill-down after a spike: which warehouse moved. |
+| [Avg Cost per Query ($)](/nerve-centre/kpi-cards/snowflake/avg-cost-per-query) | The unit-economics view of the same spend. | Burn up with cost per query flat = more work; burn up with cost per query up = inefficiency. |
+| [Idle Warehouse Credits Wasted (24h)](/nerve-centre/kpi-cards/snowflake/idle-warehouse-credits-wasted-24h) | Isolates the waste portion of the burn. | A spike here means an auto-suspend regression, not real work. |
+| [Credit Burn +50% Week-over-Week](/nerve-centre/kpi-cards/snowflake/credit-burn-50-week-over-week) | The weekly alert sibling of this daily card. | A fired weekly alert confirms a sustained step, not a one-day blip. |
+| [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) | Tells you whether a resize was justified. | High burn with high saturation = the size is earning its keep; high burn with low saturation = waste. |
+| [Storage Used (TB)](/nerve-centre/kpi-cards/snowflake/storage-used-tb) | The other half of the bill, not in this card. | A rising bill with flat credits points here instead. |
+| [Credit Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/snowflake/credit-burn-vs-ecom-order-volume) | The cross-channel divergence check. | Credits up with orders flat is the clearest inefficiency signal. |
+| [Snowflake Health Score](/nerve-centre/kpi-cards/snowflake/snowflake-health-score) | The composite this feeds. | A cost-driven score drop traces back here. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake's own tooling:**
+
+> **Total credits, last 24h:** `SELECT SUM(credits_used) AS credits FROM SNOWFLAKE.ACCOUNT_USAGE.METERING_HISTORY WHERE start_time >= DATEADD('hour', -24, CURRENT_TIMESTAMP());`
+> **Per-warehouse split:** `SELECT name, SUM(credits_used) FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY WHERE start_time >= DATEADD('hour', -24, CURRENT_TIMESTAMP()) GROUP BY name ORDER BY 2 DESC;`
+> **Serverless credits:** `AUTOMATIC_CLUSTERING_HISTORY`, `PIPE_USAGE_HISTORY`, and `MATERIALIZED_VIEW_REFRESH_HISTORY` each carry their own `credits_used`.
+> **Managed console:** Snowsight under **Admin -> Cost Management -> Consumption** shows daily credit totals with a warehouse and service breakdown. This is the closest native equivalent and is what your account team reconciles the invoice against. Multiply by your contracted rate to match the dollar figure.
+
+**Why our number may legitimately differ from a native query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Rolling vs calendar day** | Variable | We use a trailing 24 hours; Snowsight's default chart buckets by calendar UTC day. A spike straddling midnight splits differently. Match the window. |
+| **Warehouse scope** | Our total lower | If the connector is scoped to specific warehouses, account-wide native totals will be higher. |
+| **Serverless inclusion** | Variable | Whether clustering / Snowpipe credits are folded in depends on the connector reading those views; confirm in the connector settings if a spike has no matching warehouse activity. |
+| **Cloud-services free tier** | Marginal | The 10%-of-compute free allowance is reconciled daily by Snowflake; intra-day a native ad-hoc sum can show a slightly different cloud-services figure than the daily-settled invoice. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`snow_cost_per_query`](/nerve-centre/kpi-cards/snowflake/avg-cost-per-query) | Burn is the numerator behind cost per query; they usually move together. | Burn up but cost per query flat = query count rose proportionally (benign). |
+| [Ecom order volume](/nerve-centre/kpi-cards/snowflake/credit-burn-vs-ecom-order-volume) | Credit burn should roughly track the volume of data the business generates. | Burn spiking while orders are flat = inefficiency or a runaway job, not demand. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Credits doubled on one warehouse but query count is unchanged. What happened?**
+Almost certainly a warehouse resize. Credit consumption per hour doubles with each size step (X-Small 1, Small 2, Medium 4, Large 8, X-Large 16), so a clean 2x or 4x on a single warehouse with no change in work points straight at an `ALTER WAREHOUSE ... SET WAREHOUSE_SIZE`. Check `WAREHOUSE_EVENTS_HISTORY` for the change and who made it, then decide via [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) whether the larger size was actually needed.
+
+**Does this card include storage cost?**
+No. This is compute credits only. Storage is billed separately per terabyte per month and tracked on [Storage Used (TB)](/nerve-centre/kpi-cards/snowflake/storage-used-tb). If your invoice is rising but credit burn is flat, the growth is in storage (or data egress), not compute, and you should look there instead.
+
+**Our burn spiked but no warehouse shows extra activity. Where did the credits go?**
+Look at serverless features. Snowpipe ingest, automatic clustering, materialised-view refresh, and search-optimisation maintenance all run on Snowflake-managed compute and accrue credits without touching your named warehouses. A large table reorganisation or a backfill can trigger an expensive automatic-clustering pass. Query `AUTOMATIC_CLUSTERING_HISTORY` and `PIPE_USAGE_HISTORY` to find it.
+
+**Why is a trailing 24-hour window better than a calendar-day total?**
+A trailing window catches a spike the moment it has been running for a day, regardless of when in the day it started, so a runaway job that kicks off at 22:00 is flagged by 22:00 the next day rather than waiting for two partial calendar days to roll up. The trade-off is that our number will not match a calendar-day chart in Snowsight exactly; align the windows when reconciling.
+
+**Lots of tiny queries are burning more credits than I expect. Why?**
+The 60-second minimum on warehouse resume. Every time a suspended warehouse wakes to run a query, it is billed for at least 60 seconds even if the query finishes in two. A flood of small queries that each resume a cold warehouse pays the floor repeatedly. The fix is usually to lower `AUTO_SUSPEND` more aggressively is the wrong instinct here; instead keep the warehouse warm for the burst, or batch the small queries so they share one resume.
+
+**Can the alert threshold be tuned for a spiky-but-normal workload?**
+Yes. Some accounts have legitimately bursty days (a weekly heavy reporting run, a monthly close). If a recurring `+50%` is expected, raise the sensitivity threshold for this profile, or rely on [Credit Burn +50% Week-over-Week](/nerve-centre/kpi-cards/snowflake/credit-burn-50-week-over-week) which smooths daily spikes into a weekly trend and is less prone to firing on known burst days.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Credits Burned (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

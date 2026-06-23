@@ -1,0 +1,148 @@
+---
+title: "MySQL Pool Saturation vs Traffic Burst, MySQL"
+sidebarTitle: "MySQL Pool Saturation vs Traffic Burst"
+description: "MySQL Pool Saturation vs Traffic Burst for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Connection-pool saturation on the MySQL instance, plotted against the storefront traffic burst happening at the same moment. Saturation is `Threads_connected / max_connections`. The card asks one question: when traffic surged, did the database run out of connection headroom? If saturation crosses 90% during a burst, the next wave of shoppers gets `ER_CON_COUNT_ERROR` ("Too many connections") and their page loads or checkouts fail. This is the database-side early warning for a traffic-driven outage, correlated with the ecom connector's live session and order rate so a platform team can see cause and effect on one chart.
+
+| | |
+| --- | --- |
+| **What it tracks** | MySQL connection-pool saturation (`Threads_connected / max_connections`) overlaid against the live storefront traffic burst (concurrent sessions / requests) from the linked ecom connector, broken down by row per sampled interval. |
+| **Data source** | MySQL side: `Threads_connected` and `Max_used_connections` from `SHOW GLOBAL STATUS`, divided by the `max_connections` system variable. Traffic side: live session / request rate from the linked Shopify, BigCommerce, or Adobe Commerce connector. |
+| **Why it matters** | A connection-pool exhaustion event during peak traffic is a direct revenue loss: shoppers in the funnel get connection-refused errors. Seeing saturation rise in lockstep with traffic tells you whether the database is the bottleneck or whether the burst is comfortably within headroom. |
+| **Reading the value** | Each row pairs a timestamp with pool saturation % and the concurrent traffic figure. Saturation tracking traffic linearly is normal; saturation climbing faster than traffic (connection leak, slow queries holding connections open) is the danger signal. |
+| **Time window** | `15m` (rolling, real-time sampled) |
+| **Alert trigger** | `>90% during traffic burst`: saturation above 90% while the linked connector reports an active traffic surge. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The MySQL side is a straight ratio. `Threads_connected` (the count of currently open client connections, threads in use plus idle-but-held) is read from `SHOW GLOBAL STATUS` and divided by the `max_connections` server variable:
+
+```text
+pool_saturation_pct = Threads_connected / max_connections × 100
+```
+
+For example, 540 connected threads against a `max_connections` of 600 is 90% saturation. The card also surfaces `Max_used_connections` (the high-water mark since start) so you can see how close the instance has ever come to the ceiling.
+
+The traffic side comes from the linked ecom connector's live concurrency signal (active sessions or request rate). The card joins the two series on a shared 15-minute rolling window, sampled in real time, and emits one row per interval so the correlation is visible row by row rather than as two disconnected charts.
+
+The alert fires only on the *conjunction*: saturation above 90% AND a concurrent traffic burst. This is deliberate. Saturation at 90% during a quiet hour is a connection leak or a runaway batch job, a different problem handled by the standalone [Connection Pool Saturation %](/nerve-centre/kpi-cards/mysql/connection-pool-saturation) card. This cross-channel card is specifically about traffic-driven exhaustion, the kind that turns a marketing-driven surge into a wave of failed checkouts.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs the storefront on a single primary MySQL instance with `max_connections = 600` and a PHP-FPM application tier behind it. On 14 Apr 26 at 19:00 BST an email campaign and a paid-social push land within minutes of each other. Snapshot of the 15-minute rolling window:
+
+| Time (BST) | Concurrent sessions | Threads_connected | max_connections | Pool saturation |
+| --- | --- | --- | --- | --- |
+| 18:58 | 1,200 | 210 | 600 | 35% |
+| 19:02 | 3,400 | 395 | 600 | 66% |
+| 19:05 | 5,900 | 528 | 600 | 88% |
+| 19:07 | 7,100 | 561 | 600 | **94%** |
+| 19:09 | 7,400 | 600 | 600 | **100%** |
+
+At 19:07 the card breaches the `>90% during traffic burst` alert. At 19:09 the pool is fully exhausted: new connection attempts return `ER_CON_COUNT_ERROR (1040): Too many connections`. The application tier starts throwing 500s, and shoppers mid-checkout see an error page.
+
+```text
+Revenue framing for the exhaustion window (19:07 to 19:14, 7 minutes):
+  - Normal order rate at this traffic level: ~9 orders/min
+  - Order rate during exhaustion: ~2 orders/min (only requests that grabbed a connection succeeded)
+  - Lost orders: ~7/min × 7 min = ~49 orders
+  - Average order value: £64
+  - Estimated lost revenue: ~£3,100
+  Plus the soft cost: shoppers who hit an error during a campaign rarely return.
+```
+
+What the platform team learns from the correlation: saturation tracked traffic almost linearly up to 88%, then the last 1,200 sessions pushed it over the edge. The fix is not just "raise `max_connections`" (that risks OOM if each connection's per-thread buffers add up beyond available RAM). The durable fix is a connection pooler (ProxySQL or the application framework's persistent-pool settings) so that 7,400 sessions multiplex over a far smaller number of backend connections, plus right-sizing `max_connections` against measured per-connection memory. Pair with [Memory Usage %](/nerve-centre/kpi-cards/mysql/memory-usage) before raising the ceiling.
+
+Three takeaways:
+
+1. **The conjunction is the signal.** Saturation alone is ambiguous; saturation during a known traffic burst is a clear, actionable, revenue-linked event.
+2. **Linear is fine, super-linear is not.** If saturation rises faster than traffic, connections are being held open too long (slow queries, missing pooling, leaked handles). Pair with [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms).
+3. **The ceiling is not free to raise.** Each connection costs memory; raising `max_connections` without checking RAM headroom trades a connection error for an OOM-kill, which is worse.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Pool Saturation vs Traffic Burst | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mysql/connection-pool-saturation) | The standalone database-only saturation gauge. | This card adds the traffic overlay; the standalone version catches saturation during quiet hours (leaks, batch jobs). |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/mysql/connection-pool-at-90-saturation) | The real-time alert list for exhaustion events. | When this card breaches, the alert card is the actionable feed your on-call sees. |
+| [MySQL QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mysql/mysql-qps-spike-vs-ecom-order-rate) | The query-volume sibling of the same traffic burst. | Saturation plus a QPS spike with no order spike points at a bot or scraper, not real shoppers. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) | Slow queries hold connections open longer. | Rising p95 plus rising saturation means slow queries are the cause, not raw connection count. |
+| [Memory Usage %](/nerve-centre/kpi-cards/mysql/memory-usage) | Each connection consumes per-thread memory. | Check this before raising `max_connections`, or you trade a connection error for an OOM-kill. |
+| [Aborted Connects (24h)](/nerve-centre/kpi-cards/mysql/aborted-connects-24h) | Counts connection attempts that failed. | A spike here during the burst confirms shoppers were turned away at the door. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mysql/connection-errors-24h) | The 24h tally of connection-level failures. | Confirms the exhaustion event left a measurable error footprint. |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/mysql/slow-queries-during-checkout-window-5m) | The checkout-specific impact of database stress. | Saturation plus slow checkout queries quantifies the revenue at risk in the funnel. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL directly:**
+
+> `SHOW GLOBAL STATUS LIKE 'Threads_connected';` for the live connection count.
+> `SHOW GLOBAL STATUS LIKE 'Max_used_connections';` for the high-water mark since start.
+> `SHOW VARIABLES LIKE 'max_connections';` for the ceiling.
+> `SELECT * FROM performance_schema.processlist;` (or `SHOW PROCESSLIST`) to see who holds each connection.
+> `SHOW GLOBAL STATUS LIKE 'Connection_errors_max_connections';` counts attempts rejected because the pool was full.
+
+On managed services, RDS and Aurora expose `DatabaseConnections` in CloudWatch (compare against the `max_connections` derived from the instance class), and Cloud SQL exposes connection count in Cloud Monitoring. Performance Insights and Query Insights both chart connection counts over the burst window.
+
+**Why our number may legitimately differ from the native tooling:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sampling interval** | Brief peaks missed | The card samples the 15-minute rolling window at a fixed cadence; an instantaneous `SHOW GLOBAL STATUS` may catch a momentary spike between our samples. |
+| **`max_connections` runtime change** | Saturation % shifts | If `max_connections` is changed at runtime (`SET GLOBAL`), the denominator changes; the card reads the current value, native one-off queries may predate the change. |
+| **Time zone** | Row timestamps shift | The card renders in the merchant's display timezone; native tooling uses the server / account timezone. |
+| **Reserved super-user slot** | Off by one | MySQL reserves one extra connection above `max_connections` for `SUPER` users; the effective shopper-facing ceiling is `max_connections`, which the card uses as the denominator. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.live_visitors`](/nerve-centre/kpi-cards/shopify/total-revenue) / linked ecom connector | The traffic-burst series should match the ecom connector's concurrency. | A mismatch means the connector link is stale or the storefront has caching that absorbs traffic before it reaches the database. |
+| [`mysql_qps`](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | QPS should rise with both traffic and saturation. | QPS flat while saturation rises means connections are idle-but-held (a pooling or leak problem), not query load. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Saturation hit 95% but no shoppers reported errors. Why?**
+You had headroom in the application tier's own pooling, or the burst was brief enough that connections were recycled before the ceiling was hit. Saturation at 95% is a warning, not a guaranteed outage. The outage happens at 100%, when `max_connections` is fully consumed and the next attempt gets error 1040. Treat the 90% breach as the moment to act, not the moment shoppers feel it.
+
+**Should I just raise `max_connections` to stop this happening?**
+Cautiously. Each connection reserves per-thread memory (sort buffers, join buffers, read buffers). On an instance with thousands of connections this adds up fast and can trigger an OOM-kill, which takes the whole database down rather than refusing one connection. Check [Memory Usage %](/nerve-centre/kpi-cards/mysql/memory-usage) first, and prefer a connection pooler (ProxySQL, or your framework's persistent pool) so the application multiplexes many sessions over few backend connections.
+
+**Why correlate with traffic at all instead of just alerting on saturation?**
+Because the same 90% reading means very different things at different times. At peak traffic it is a capacity problem you may need to fix with pooling or scaling. At 3am it is a connection leak or a runaway batch job. The traffic overlay tells you which conversation to have, and lets you size the revenue impact directly against shopper concurrency.
+
+**The chart shows saturation rising faster than traffic. What does that mean?**
+Connections are being held open longer than they should be. The usual causes: slow queries occupying a connection for seconds instead of milliseconds (check [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms)), missing connection pooling so each request opens a fresh connection, or leaked handles the application never closes. Fixing query latency or adding pooling flattens the curve.
+
+**Does this work on a read-replica topology?**
+The card reads the instance it is connected to. If reads are routed to replicas and writes to the primary, point the connector at the node that actually receives shopper traffic, usually the primary for checkout writes. Saturation on a replica that only serves a reporting tool is not shopper-facing and should not be confused with checkout-path saturation.
+
+**On RDS / Aurora the `max_connections` value looks like a formula, not a number.**
+RDS derives `max_connections` from a parameter-group formula based on instance memory (for example `{DBInstanceClassMemory/12582880}`). The card reads the resolved runtime value via `SHOW VARIABLES`, so the denominator is the actual effective ceiling, not the formula text. If you change the instance class, the ceiling changes and so does the saturation percentage.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*MySQL Pool Saturation vs Traffic Burst* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

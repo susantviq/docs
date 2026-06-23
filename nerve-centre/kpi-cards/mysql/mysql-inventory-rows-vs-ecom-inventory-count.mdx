@@ -1,0 +1,150 @@
+---
+title: "MySQL Inventory Rows vs Ecom Inventory Count, MySQL"
+sidebarTitle: "MySQL Inventory Rows vs Ecom Inventory Count"
+description: "MySQL Inventory Rows vs Ecom Inventory Count for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A consistency check between the inventory stored in your MySQL database and the inventory the storefront platform reports. The card counts SKUs in the MySQL inventory table and compares them against the ecom connector's published inventory count, then reports how many SKUs have drifted apart. Any non-zero drift means the source of truth and the shopper-facing catalogue disagree, which leads directly to overselling (selling stock you do not have) or phantom out-of-stocks (hiding stock you do have). Both cost money; the first costs trust and refunds, the second costs sales.
+
+| | |
+| --- | --- |
+| **What it tracks** | The count of SKUs whose stock level in the MySQL inventory table does not match the same SKU's published inventory in the linked ecom connector (Shopify, BigCommerce, Adobe Commerce). |
+| **Data source** | MySQL side: a `COUNT`/`SUM` over the inventory table (typically `cataloginventory_stock_item` on Magento, a custom `inventory`/`stock` table, or the platform's local mirror), read in real time. Ecom side: the connector's published inventory count, refreshed on its standard cadence (24h baseline with real-time deltas). |
+| **Why it matters** | The database is usually the system of record; the storefront is a cache of it. When they drift, shoppers buy stock that is not really there (oversell, refund, apology) or the store hides stock it actually has (lost sale). Drift is the silent failure mode of any inventory-sync pipeline. |
+| **Reading the value** | A reading of 0 SKUs drifting is healthy. Any positive number is the count of SKUs to investigate. The card surfaces the count; drill into the linked sync logs to see which SKUs and by how much. |
+| **Time window** | `RT/24h`: real-time database read reconciled against the 24-hour ecom inventory baseline. |
+| **Alert trigger** | `>0 SKUs drifting`: any drift at all trips the card, because even one drifting high-velocity SKU can oversell quickly. |
+| **Roles** | owner, operations, engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card runs two counts and compares them per SKU. On the MySQL side it reads the live inventory table, for example:
+
+```sql
+SELECT sku, qty FROM inventory_stock;   -- or cataloginventory_stock_item on Magento
+```
+
+On the ecom side it reads the connector's published inventory snapshot (the quantity the storefront would show a shopper). It then joins the two sets on SKU and counts the rows where the quantities disagree beyond a tolerance:
+
+```text
+drift_count = number of SKUs where ABS(mysql_qty − ecom_qty) > tolerance
+```
+
+The default tolerance is zero (exact match), because for most catalogues the database and storefront should agree to the unit. A non-zero tolerance can be configured where the platform applies a safety buffer (for example, reserving stock for in-flight carts).
+
+Two edge categories also count as drift: a SKU present in MySQL but missing from the ecom feed (failed to publish) and a SKU present in the ecom feed but missing from MySQL (orphaned listing, often a deleted product still live on the storefront). Both are surfaced because both mislead shoppers.
+
+The real-time MySQL read against a 24-hour ecom baseline is intentional: the database changes continuously as orders deduct stock, while the storefront catalogue is republished on a slower cadence. The card measures the gap between "what the database knows right now" and "what shoppers can currently see", which is exactly the window in which overselling happens.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A team runs the catalogue in MySQL and syncs inventory to the storefront every 30 minutes via a scheduled job. On 14 Apr 26 the sync job silently fails at 09:00 (an expired API token) but the scheduler keeps reporting "success" because it caught the wrong exit code. By 13:00 the card reads:
+
+| Metric | Value |
+| --- | --- |
+| SKUs in MySQL inventory table | 12,480 |
+| SKUs in ecom published feed | 12,480 |
+| SKUs with matching quantity | 12,461 |
+| **SKUs drifting** | **19** |
+
+The 19 drifting SKUs are the high-velocity lines that sold through the morning. The database correctly shows them low or at zero; the storefront still shows the 09:00 quantities. The alert (`>0 SKUs drifting`) fired at 09:32 on the first divergence.
+
+```text
+Oversell exposure on the worst SKU:
+  - SKU GLTC-204, a popular line
+  - MySQL qty now: 0 (sold out at 11:40)
+  - Storefront still showing: 14 available
+  - Orders taken for unavailable stock between 11:40 and 13:00: 11 units
+  - Average order value: £42  ->  ~£460 of orders that must now be cancelled or back-ordered
+  - Plus 11 customer-service contacts and 11 apology emails
+```
+
+The platform team's response: fix the token, force a sync, and confirm the card returns to 0. The deeper fix is to make the scheduler fail loudly (correct exit-code handling) and to add this card as the canary, because the scheduler lied but the drift count did not.
+
+Three takeaways:
+
+1. **The database is the truth; the storefront is a cache.** When they disagree, trust the database and republish. The card tells you the cache is stale before shoppers do.
+2. **Zero tolerance is the right default for inventory.** A drift of one unit on a one-of-a-kind item is a guaranteed oversell. Only widen tolerance if the platform deliberately reserves a safety buffer.
+3. **A "successful" sync job is not proof of correctness.** Jobs can report success while doing nothing. This card measures the outcome (do the numbers match?) rather than the process (did the job run?), which is why it catches silent failures.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Inventory Rows vs Ecom Count | What the combination tells you |
+| --- | --- | --- |
+| [MySQL QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mysql/mysql-qps-spike-vs-ecom-order-rate) | The query-volume cross-channel peer. | A sync job hammering the database (QPS spike) with drift still present means the job is running but failing to write. |
+| [MySQL Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/mysql/mysql-pool-saturation-vs-traffic-burst) | Sync jobs compete for connections during peak. | Drift appearing during a burst can mean the sync job was starved of connections. |
+| [Replication Lag (Seconds_Behind_Source)](/nerve-centre/kpi-cards/mysql/replication-lag-seconds-behind-source) | If the ecom feed reads a replica, lag causes apparent drift. | Drift that clears when lag clears is a replication artefact, not a real sync failure. |
+| [Replication Thread Health (IO/SQL)](/nerve-centre/kpi-cards/mysql/replication-thread-health-iosql) | A stopped replica thread freezes the inventory a reader sees. | Broken replication plus drift means the storefront is reading a stale frozen replica. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mysql/query-error-rate) | Failed writes during sync leave inventory unchanged. | An error-rate spike during the sync window explains why the database did not update. |
+| [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest) | A slow inventory-update query can time out mid-sync. | A slow inventory `UPDATE` in the top-10 list points at the drift cause. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite that summarises overall instance health. | Drift with a healthy score means the database is fine and the sync pipeline is the fault. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL directly:**
+
+> `SELECT COUNT(*) FROM inventory_stock WHERE qty > 0;` for the count of in-stock SKUs in the database (substitute your real inventory table, for example `cataloginventory_stock_item` on Magento).
+> `SELECT sku, qty FROM inventory_stock WHERE sku IN (...);` to inspect the specific drifting SKUs the card flags.
+> Cross-check against the storefront's own inventory export or API: pull the published quantity for the same SKUs and diff. The numbers should match unit for unit.
+
+On managed services the table-level read is identical; the database engine does not change the calculation. What changes is where the ecom feed reads from: if the storefront reads a read-replica, confirm the replica is current (see the replication cards below) before treating drift as a sync failure.
+
+**Why our number may legitimately differ from a manual diff:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **In-flight carts / reservations** | Apparent drift | If the platform reserves stock for active carts, the storefront-visible quantity is lower than the raw database row. Configure the tolerance to account for the reservation buffer. |
+| **Sync cadence lag** | Transient drift | Between two sync runs the database moves but the storefront does not; a small drift is expected and clears on the next sync. Persistent drift across multiple cycles is the real alert. |
+| **Replica read lag** | Apparent drift | If the ecom feed reads a lagging replica, the storefront reflects a past database state. Reconcile against the primary, not the replica. |
+| **SKU mapping** | Phantom drift | A SKU naming mismatch between systems (case, prefix, leading zeros) makes matching rows look like drift. The card normalises common cases; unusual mappings may need configuration. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.inventory`](/nerve-centre/kpi-cards/shopify/total-revenue) / linked ecom connector | The ecom inventory count should equal the MySQL count to within the reservation tolerance. | A persistent gap is a sync-pipeline failure; a transient gap is cadence lag. |
+| [`mysql_replication_lag_seconds`](/nerve-centre/kpi-cards/mysql/replication-lag-seconds-behind-source) | If reads come from a replica, drift should track lag. | Drift that does not clear when lag clears is a genuine sync failure, not replication. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows drift but my sync job reports success. Which do I trust?**
+Trust the card. Sync jobs frequently report success while doing nothing: wrong exit-code handling, a swallowed exception, a partial batch that committed the count but not the rows. This card measures the outcome (do the numbers match?) rather than the process (did the job run?). When the two disagree, the outcome is the truth and the job's status is the bug.
+
+**A small drift appears every 30 minutes then clears. Is that a problem?**
+Probably not, that is sync cadence lag. Between two scheduled sync runs the database moves as orders deduct stock, but the storefront only updates on the next run. The drift you should worry about is the kind that does not clear: it grows or persists across multiple sync cycles, which means the pipeline has actually broken rather than simply being mid-cycle.
+
+**How do I tell overselling drift from phantom-out-of-stock drift?**
+Drill into the flagged SKUs. If MySQL quantity is lower than the storefront quantity, you are at risk of overselling (shoppers can buy stock that is gone). If MySQL is higher than the storefront, you have phantom out-of-stocks (real stock hidden from shoppers, lost sales). Both count as drift; the direction tells you which revenue risk you are carrying right now.
+
+**Could replication lag make this card cry wolf?**
+Yes, if the ecom feed reads a read-replica that is behind the primary. The storefront then reflects a past database state and the card reports drift that is really lag. Pair with [Replication Lag (Seconds_Behind_Source)](/nerve-centre/kpi-cards/mysql/replication-lag-seconds-behind-source): if the drift clears exactly when the lag clears, it was a replication artefact. If it persists with zero lag, it is a genuine sync failure. The durable fix is to reconcile against the primary.
+
+**My platform reserves stock for active carts, so the numbers never match exactly.**
+Set a tolerance equal to your reservation buffer, or point the card at the post-reservation "available to sell" figure rather than the raw row count. A fixed reservation policy produces a predictable, constant offset; configure for it once and genuine drift stands out clearly above the baseline.
+
+**Does this catch products that exist on the storefront but were deleted in the database?**
+Yes. A SKU present in the ecom feed but missing from MySQL counts as drift (an orphaned listing). These are shoppers being shown products that no longer exist in the system of record, which usually ends in a failed order. Likewise a SKU in MySQL but missing from the feed (failed to publish) is counted, because it is sellable stock the storefront is hiding.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*MySQL Inventory Rows vs Ecom Inventory Count* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

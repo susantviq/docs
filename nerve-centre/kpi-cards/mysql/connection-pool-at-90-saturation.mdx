@@ -1,0 +1,149 @@
+---
+title: "Connection Pool at >90% Saturation, MySQL"
+sidebarTitle: "Connection Pool at >90% Saturation"
+description: "Connection Pool at >90% Saturation for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The alert that fires when `Threads_connected` reaches more than 90% of `max_connections` and stays there for a sustained minute. This is the single most important capacity alarm on a MySQL instance: once the pool fills, the very next connection attempt gets `ERROR 1040: Too many connections`, and for an application that means the storefront, the checkout, or the admin all start throwing 500s at once. This card is the hero pulse that turns "the database is slow" into "the database is about to stop accepting work".
+
+| | |
+| --- | --- |
+| **Status source** | `Threads_connected` and `Max_used_connections` from `SHOW GLOBAL STATUS`, divided by the `max_connections` system variable. The alert fires on the ratio. |
+| **Metric basis** | Live saturation ratio: `Threads_connected / max_connections`. This counts every open client thread, active *and* idle (sleeping) sessions both occupy a slot. |
+| **Aggregation window** | Real-time, evaluated continuously; the alert requires the ratio to hold above 90% for a sustained 1 minute to avoid firing on a momentary burst. |
+| **Alert threshold** | `> 90%` sustained for 1 minute. Below this it is informational; at or above it the card raises a hero alert into the Nerve Centre feed. |
+| **What counts as "in the pool"** | All threads in `Threads_connected`: queries actively running, transactions waiting on locks, and idle sessions held open by an application connection pool. |
+| **What does NOT count** | (1) The reserved `SUPER`/`CONNECTION_ADMIN` slot MySQL keeps for an admin even at the cap; (2) connections already refused (those increment `Connection_errors_max_connections`, a separate signal); (3) replica IO/SQL threads, which do not consume a client slot. |
+| **Why it goes critical** | A traffic surge, a connection leak in the application (sessions opened but never returned to the pool), long-running queries holding slots, or `max_connections` set too low for the real concurrency. |
+| **Time zone** | Ratio is time-zone independent; chart axes render in the merchant display time zone set in the Vortex IQ profile. |
+| **Time window** | `RT` (real-time, sustained 1-minute evaluation). |
+| **Alert trigger** | `> 90%` saturation sustained for 1 minute. |
+| **Roles** | dba, platform, sre, owner |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine evaluates, on each real-time sample:
+
+```text
+saturation_pct = Threads_connected / max_connections * 100
+```
+
+`Threads_connected` comes from `SHOW GLOBAL STATUS LIKE 'Threads_connected'` and `max_connections` from `SHOW VARIABLES LIKE 'max_connections'`. The alert is *stateful*: the engine requires `saturation_pct > 90` across consecutive samples spanning at least 60 seconds before it fires, so a single spiky reading (for example a batch job opening 30 connections for two seconds) does not page anyone. Once it fires, the alert clears only when saturation drops back below 90% and stays there.
+
+The card also surfaces `Max_used_connections` (the high-water mark since server start) and `Max_used_connections_time` so you can see whether you have *ever* been close to the cap, even if you are calm right now. A `Max_used_connections` that already equals `max_connections` is a tell that you have hit the wall before and refused real traffic.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs MySQL 8.0 with `max_connections = 500` behind an application fleet that auto-scales under load. Snapshot taken during an evening traffic peak on 19 May 26 at 20:05.
+
+| Sample time | `Threads_connected` | Saturation | State |
+| --- | --- | --- | --- |
+| 19:58 | 372 | 74% | OK |
+| 20:00 | 421 | 84% | OK |
+| 20:02 | 459 | 92% | breach started |
+| 20:03 | 471 | 94% | sustained |
+| 20:04 | 478 | 96% | sustained |
+| 20:05 | 483 | 97% | **alert firing** |
+
+The hero card fires at 20:03 (90% first crossed at 20:02, sustained one minute) and is screaming red by 20:05 at **97% saturation, 483 of 500 connections in use**. The next ~17 connections are all that stand between the application and `ERROR 1040`.
+
+The on-call read:
+
+1. **Is this real traffic or a leak?** Cross-reference [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live). If QPS scaled up proportionally, this is genuine load. Here QPS rose only 20% while connections rose 60%, the classic signature of a connection *leak*: an app deploy at 19:55 stopped returning sessions to the pool, so idle sessions are piling up.
+2. **Triage the immediate risk.** With 17 slots left, the priority is to stop new leaks and reclaim idle ones. `SELECT * FROM performance_schema.processlist WHERE command = 'Sleep' AND time > 60` reveals 140 sessions sleeping for over a minute, dead weight from the leaking pods.
+3. **Two mitigations, in order.** Short term: roll back the 19:55 deploy or restart the leaking pods to drop their idle sessions. Emergency relief: an admin can still connect on the reserved slot and `KILL` the oldest sleeping sessions, or temporarily raise `max_connections` with `SET GLOBAL max_connections = 700` to buy headroom (memory permitting, each connection costs RAM).
+
+```text
+Why this is a hero alert, not a warning:
+  - At 90% you have minutes, not hours, before ERROR 1040.
+  - ERROR 1040 is total: it does not slow the app, it stops new work entirely.
+  - The reserved admin slot is the only way back in once the cap is hit.
+  - A leak gets worse on its own; it will reach 100% even if traffic is flat.
+```
+
+Three takeaways:
+
+1. **Saturation is a cliff, not a slope.** 89% is fine; 100% is an outage. There is no graceful degradation, the pool either has a slot or it returns `ERROR 1040`. That binary failure mode is exactly why this is a hero card.
+2. **Distinguish load from leak.** Rising connections *with* rising QPS is honest growth (scale the cap or the read replicas). Rising connections with flat QPS is a leak (fix the app). The two demand opposite responses.
+3. **Keep the admin slot sacred.** MySQL reserves one slot above `max_connections` for an account with `CONNECTION_ADMIN`. If your monitoring and your humans all use that, you have no way in during an incident. Make sure at least one break-glass admin account exists.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this alert | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mysql/connection-pool-saturation) | The continuous gauge this alert is built on. | The gauge shows the trend; this card is the threshold breach. Read them together to see how fast you approached the cliff. |
+| [Connections In Use](/nerve-centre/kpi-cards/mysql/connections-in-use) | The raw `Threads_connected` count. | Translates the percentage into "how many slots are actually free right now". |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mysql/connection-errors-24h) | Counts refusals once the cap is hit. | If this card has fired recently, connection errors will show the `max_connections` refusals that resulted. |
+| [Aborted Connects (24h)](/nerve-centre/kpi-cards/mysql/aborted-connects-24h) | Handshake-stage failures. | Helps separate "pool full" (capacity) from "auth failing" (credentials) when connections are being rejected. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | The load signal. | QPS flat while saturation climbs equals a leak; QPS up with saturation equals real demand. |
+| [Memory Usage %](/nerve-centre/kpi-cards/mysql/memory-usage) | The constraint on raising `max_connections`. | Each connection costs RAM; check headroom before bumping the cap as an emergency fix. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite that this alert dominates. | An active pool-saturation alert drops the health score sharply because it is a near-outage condition. |
+| [MySQL Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/mysql/mysql-pool-saturation-vs-traffic-burst) | The cross-channel view against storefront traffic. | Confirms whether saturation tracks a real demand burst on the ecommerce side. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL itself:**
+
+> `SHOW GLOBAL STATUS LIKE 'Threads_connected';` for the live in-use count.
+> `SHOW GLOBAL STATUS LIKE 'Max_used_connections';` for the high-water mark, and `Max_used_connections_time` for when it occurred.
+> `SHOW VARIABLES LIKE 'max_connections';` for the configured cap.
+> `SHOW GLOBAL STATUS LIKE 'Connection_errors_max_connections';` to count how many connections have actually been refused.
+> `SELECT command, count(*) FROM performance_schema.processlist GROUP BY command;` to split active work from idle `Sleep` sessions eating slots.
+
+**Why our number may legitimately differ from a raw `SHOW STATUS`:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sampling moment** | Marginal | The card samples at intervals; a sub-second spike between samples can be missed, though the sustained-1-minute rule means real breaches are caught. |
+| **Proxy pooling** | Card may read lower | RDS Proxy, ProxySQL, or a connection multiplexer keeps `Threads_connected` lower than the app's apparent connection count; the card sees the server side, which is the one that matters for `ERROR 1040`. |
+| **Reserved admin slot** | Card excludes it | The `+1` super slot is not part of `max_connections`; the card computes against the configured cap, not cap-plus-one. |
+| **Dynamic cap change** | Step change | If `max_connections` is changed at runtime with `SET GLOBAL`, the denominator shifts and the percentage jumps even though the connection count did not. |
+
+**Managed-service note:** On Amazon RDS and Aurora the live count is the `DatabaseConnections` CloudWatch metric, and the cap is governed by the `max_connections` parameter (which Aurora derives from instance memory by formula unless overridden). On Google Cloud SQL use `database/mysql/connections` (active) against the configured `max_connections` flag. Align the window to real-time when comparing.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why 90% and not 100%? By 100% it is already an outage.**
+Exactly, which is the point. The alert fires at 90% so you have a few minutes of runway before `ERROR 1040` rather than learning about it from customer reports. The sustained-1-minute rule prevents false alarms from momentary bursts while still giving early warning of a genuine climb toward the cap.
+
+**Connections are pinned high but my application is barely busy. What is happening?**
+This is the connection-leak signature. The application opens sessions and fails to return them to the pool (often after an unhandled exception or a missing `finally`/`close`). They sit in `Sleep` state forever, occupying slots. Find them with `SELECT * FROM performance_schema.processlist WHERE command='Sleep' AND time > 300`. Fix the app's connection handling; lowering `wait_timeout` is a stopgap that reaps idle sessions but masks the real bug.
+
+**Can I just raise max_connections and move on?**
+As an emergency, yes: `SET GLOBAL max_connections = N` buys headroom immediately. But each connection consumes per-thread memory (sort buffers, join buffers, the connection itself), so a very high cap on a memory-constrained instance trades a connection-exhaustion outage for an out-of-memory crash. Check [Memory Usage %](/nerve-centre/kpi-cards/mysql/memory-usage) first, and treat the bump as a bridge while you fix the underlying load or leak.
+
+**Does the alert count idle (sleeping) connections?**
+Yes. `Threads_connected` is every open thread, active or idle. An idle session still holds a slot, so a pool full of sleeping connections is just as dangerous as one full of running queries. That is why leaks (which produce idle sessions) trip this alert even when the server has spare CPU.
+
+**I got ERROR 1040 but this card never fired. How?**
+Two possibilities. First, the climb was faster than the sustained-1-minute window, a sudden thundering-herd reconnect (for example after a brief network blip) can fill the pool in seconds. Second, a proxy layer is masking the true count from the card's sampling. In both cases cross-reference [Connection Errors (24h)](/nerve-centre/kpi-cards/mysql/connection-errors-24h), which counts the actual `max_connections` refusals regardless of timing.
+
+**How do I get in when the pool is already full?**
+MySQL reserves one extra connection above `max_connections` for an account holding `SUPER` (legacy) or `CONNECTION_ADMIN` (8.0+). Connect with that account, then `KILL` the oldest sleeping sessions or raise the cap. The hard rule: never let your monitoring or your routine app account be the only thing holding that reserved slot, keep a break-glass admin login for exactly this moment.
+
+**Can I tune the threshold or the sustain period?**
+Yes, both are configurable per profile in the Sensitivity tab. Instances with very spiky-but-safe workloads may want a slightly higher percentage or a longer sustain window; instances where the cost of an outage is extreme may want to fire earlier at 85%. Tune to your own headroom and recovery time.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connection Pool at >90% Saturation* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

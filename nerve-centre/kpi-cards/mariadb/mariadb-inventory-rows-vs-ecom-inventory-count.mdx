@@ -1,0 +1,136 @@
+---
+title: "MariaDB Inventory Rows vs Ecom Inventory Count, MariaDB"
+sidebarTitle: "MariaDB Inventory Rows vs Ecom Inventory Count"
+description: "MariaDB Inventory Rows vs Ecom Inventory Count for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A drift detector that compares the inventory count held in your MariaDB tables against the inventory count the storefront is actually showing shoppers. When these two numbers diverge, something in the sync pipeline has broken: the database says one thing, the ecommerce platform says another, and shoppers are buying against the wrong figure. The headline is the number of SKUs where the two counts disagree. Any non-zero reading is a revenue-and-trust event: oversell (sell what you do not have) or phantom out-of-stock (hide what you could sell).
+
+| | |
+| --- | --- |
+| **What it tracks** | The count of SKUs where the inventory quantity stored in MariaDB differs from the quantity reported by the connected ecommerce platform, evaluated in real time and reconciled over 24 hours. |
+| **Data source** | A `SELECT sku, quantity FROM` your inventory table on MariaDB, diffed against the storefront inventory levels pulled from the Shopify, BigCommerce or Adobe Commerce connector. |
+| **Time window** | `RT/24h`, a live drift count plus a 24-hour reconciliation pass to catch slow leaks. |
+| **Alert trigger** | `>0 SKUs drifting`, any disagreement at all is surfaced; there is no "acceptable" drift. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+The card runs a set-difference between two sources of truth. From MariaDB it reads the authoritative stock quantity per SKU (the row your fulfilment, ERP or WMS writes to). From the linked storefront connector it reads the quantity the platform is currently advertising to shoppers. For each SKU it computes `mariadb_qty - storefront_qty`; any SKU where that delta is non-zero counts as drifting. The headline is the count of drifting SKUs, with the per-SKU deltas available on drill-down so you can see direction (positive = storefront under-reporting, negative = storefront over-reporting). Per the card's alert rule, the trigger is `>0 SKUs drifting`: the threshold is zero because in a healthy sync pipeline the database and the storefront must agree exactly. The 24-hour reconciliation pass exists because some drift is transient (a sync job mid-flight) and some is persistent (a stuck or failed sync); the longer window separates a momentary blip from a genuine break.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A BigCommerce store sells limited-run trainers; stock is authoritative in MariaDB, written by the warehouse system, and pushed to BigCommerce by an hourly sync job. Snapshot taken 14 Apr 26, 10:15 BST.
+
+| SKU | MariaDB qty | Storefront qty | Delta | Reading |
+| --- | --- | --- | --- | --- |
+| TRN-AIR-42 | 0 | 6 | **+6** | **Oversell risk**: storefront still selling stock that is gone |
+| TRN-AIR-43 | 0 | 4 | **+4** | **Oversell risk** |
+| TRN-RUN-39 | 18 | 0 | **-18** | **Phantom out-of-stock**: real stock hidden from shoppers |
+| TRN-RUN-40 | 0 | 0 | 0 | In sync |
+
+The headline reads **3 SKUs drifting**, outlined in red. The sync job last ran at 09:00 and has not completed its 10:00 pass, so the storefront is an hour stale. Two distinct failures are visible:
+
+1. **Oversell on TRN-AIR-42 and -43.** The warehouse sold the last pairs in-store and zeroed the MariaDB row, but BigCommerce still advertises 6 and 4. Every online order placed now is a sale the brand cannot fulfil, leading to refunds, apology emails and a damaged reputation on a hype product.
+2. **Phantom out-of-stock on TRN-RUN-39.** The reverse: 18 pairs sit in MariaDB but the storefront shows zero, so the product page reads "Sold out" and shoppers bounce. That is 18 sales (at £95 each) silently lost.
+
+```text
+Revenue framing for this snapshot:
+  Oversell exposure (refunds + ops cost):
+    (6 + 4) units × £95 AOV = £950 of orders that must be cancelled
+  Phantom out-of-stock (lost sales):
+    18 units × £95 = £1,710 of demand hidden from shoppers
+  Combined revenue-at-risk this window: £2,660
+```
+
+The on-call response: force an immediate sync (do not wait for the 11:00 job), then investigate *why* the 10:00 sync did not land. Common causes are a failed sync job, an API rate-limit rejection from the storefront, or a schema mismatch after a catalogue change. Until the root cause is fixed, the alert will re-fire every window.
+
+Three takeaways:
+
+1. **Zero is the only healthy reading.** Unlike performance cards where a small percentage is tolerable, any inventory drift is a real customer-facing fault. The alert threshold is `>0` by design.
+2. **Direction tells you the failure mode.** Positive delta (storefront higher than MariaDB) is oversell, the more damaging one because it breaks promises already made. Negative delta is lost sales, painful but invisible to the customer. Always read direction, not just count.
+3. **Drift is a symptom; the sync pipeline is the disease.** Forcing a manual sync clears the card but does not fix the broken job. Pair this card with your sync-job monitoring so a recurring drift count points you at the failing integration, not just the symptom.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Inventory Rows vs Ecom Count | What the combination tells you |
+| --- | --- | --- |
+| [MariaDB QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mariadb/mariadb-qps-spike-vs-ecom-order-rate) | The query-side cross-channel twin. | A QPS spike with no order spike during drift can indicate a sync job hammering the database without reconciling. |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/mariadb/slow-queries-during-checkout-window-5m) | Slow inventory reads can stale the storefront. | If inventory queries are slow, the sync job may time out, producing drift. |
+| [Async Replication Lag (seconds)](/nerve-centre/kpi-cards/mariadb/async-replication-lag-seconds) | If the sync reads from a lagging replica, it reads stale stock. | High replication lag plus drift means the sync is reading old data, not that fulfilment is wrong. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mariadb/query-error-rate) | Failed writes to the inventory table cause drift. | A spike in query errors coinciding with drift points at write failures, not sync failures. |
+| [Galera Cluster Status](/nerve-centre/kpi-cards/mariadb/galera-cluster-status) | A non-Primary node refuses writes, freezing inventory updates. | Drift plus non-Primary status means stock writes are being rejected at the cluster. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The executive roll-up. | Drift is a customer-facing fault even when the health score is green, so read both. |
+| [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mariadb/top-10-slowest-queries-digest) | The sync job's reconciliation query may be one of the slowest. | If the inventory diff query tops the list, optimise it to let syncs finish in time. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> Query the authoritative side directly: `SELECT sku, quantity FROM inventory WHERE quantity <> 0 ORDER BY sku;` (substitute your real table and column names).
+> To find rows changed in the last day, join against your audit/updated_at column: `SELECT sku, quantity, updated_at FROM inventory WHERE updated_at >= NOW() - INTERVAL 24 HOUR;`.
+> Confirm writes are landing on a Galera cluster with `SHOW STATUS LIKE 'wsrep_last_committed';` across nodes.
+> On managed platforms, the table contents are identical regardless of host; reconcile against your WMS/ERP export to confirm MariaDB itself is the true source.
+
+To verify the storefront side, compare against the platform's own inventory screen: Shopify Inventory, BigCommerce Products → Inventory, or Adobe Commerce Catalog → Products stock quantity. The drift count is exactly `count(SKUs where MariaDB qty != storefront qty)`.
+
+**Why our number may legitimately differ from a manual count:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sync in flight** | Transient drift | If you snapshot mid-sync, some SKUs are updated and some not; the 24h pass smooths this. |
+| **Storefront API caching** | Storefront stale | Some platforms cache inventory at the edge; the API value can lag the admin screen by minutes. |
+| **Replica read** | MariaDB side stale | If the sync or the card reads from a lagging replica rather than the primary, the database figure may trail the true value. |
+| **Reserved/committed stock** | Apparent drift | Stock reserved for in-flight orders may be deducted on one side but not the other depending on your reservation model. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) / [`adobe_commerce.total_revenue`](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | Oversell drift produces orders that later cancel, showing as refunds against revenue. | A spike in refunds following a positive-delta drift confirms the oversell hit real orders. |
+| Platform inventory / out-of-stock report | Phantom out-of-stock drift correlates with products showing "sold out" while MariaDB holds stock. | If the storefront shows in-stock but MariaDB is zero, the oversell direction is confirmed. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows drift but my last sync ran successfully. How?**
+A sync reporting "success" can still skip rows: API rate limits cause partial pushes, a SKU absent from the storefront catalogue cannot be updated, and a sync reading from a lagging replica pushes stale numbers it believes are current. "Success" means the job ran, not that every SKU reconciled. Drill into the per-SKU deltas to see which rows the sync missed.
+
+**Which side is the source of truth, MariaDB or the storefront?**
+MariaDB, in the standard topology, because that is where your warehouse, ERP or WMS writes the authoritative stock figure and the sync job pushes it outward to the storefront. The card treats the database as truth and the storefront as the value to be corrected. If your architecture is inverted (storefront authoritative, database mirroring it), interpret the direction accordingly and configure the connector's source-of-truth setting.
+
+**A positive delta and a negative delta, which is worse?**
+A positive delta (storefront higher than MariaDB) is worse because it is oversell: you have advertised and possibly sold stock that does not exist, breaking a promise to a paying customer. A negative delta (storefront lower) is lost sales, painful but it does not damage trust. Triage positive-delta SKUs first.
+
+**Can I set a tolerance so tiny drifts do not alert?**
+The default threshold is `>0` because for most catalogues any drift is a real fault. You can set a per-SKU tolerance in the Sensitivity tab if your reservation model legitimately produces small, self-clearing offsets (for example a few units held for in-flight baskets). Use this sparingly; a tolerance can hide a genuine slow leak.
+
+**Drift clears on its own every hour. Is that a problem?**
+It depends on the window. If drift appears just after a sale and clears at the next sync, that is the expected lag between a warehouse write and the next push; consider increasing sync frequency. If drift persists across multiple sync cycles, the sync is failing and needs investigation, not patience.
+
+**Does this work without an ecommerce connector linked?**
+No. This is a cross-channel card by design: it needs both the MariaDB inventory table and a connected storefront to diff against. Without a Shopify, BigCommerce or Adobe Commerce link it has nothing to compare, so the card stays empty. Link the storefront connector to activate it.
+
+**My catalogue has 200,000 SKUs. Does the diff scan all of them every poll?**
+The live pass diffs recently changed SKUs (using your updated_at column where available) to stay fast; the full reconciliation runs on the 24-hour pass to catch anything the incremental pass missed. If the diff query itself is heavy, it can appear in [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mariadb/top-10-slowest-queries-digest), in which case index the inventory table on `updated_at` and `sku`.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*MariaDB Inventory Rows vs Ecom Inventory Count* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

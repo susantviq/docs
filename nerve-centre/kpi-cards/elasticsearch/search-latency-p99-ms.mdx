@@ -1,0 +1,134 @@
+---
+title: "Search Latency p99 (ms), Elasticsearch"
+sidebarTitle: "Search Latency p99 (ms)"
+description: "Search Latency p99 (ms) for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Search Latency p99 (ms)** is the time below which 99% of search queries complete: only the worst 1% take longer. This is the extreme tail, the experience of your unluckiest shoppers and the canary for cluster stress. p99 is volatile by nature, so it carries a higher 500ms threshold than p95. When p99 spikes while p95 stays calm, a small number of pathological queries are to blame; when p99 and p95 climb together, the whole cluster is under pressure.
+
+| | |
+| --- | --- |
+| **What it tracks** | The 99th-percentile query service time across all search shards for the selected period. The worst 1% of queries take longer than this value. |
+| **Data source** | Reconstructed from `indices.search.query_time_in_millis` divided by `query_total` delta, read from the Elasticsearch node stats API (`GET /_nodes/stats/indices/search`). Vortex IQ builds a percentile distribution across the window. |
+| **Time window** | `RT/5m` (real-time, rolling 5-minute window, refreshed continuously). |
+| **Alert trigger** | `> 500ms`. A sustained p99 above 500ms means even the worst-case search is crossing into clearly painful territory and the tail is at risk of widening further. |
+| **Why it matters** | p99 is the early-warning canary. Tail latency degrades before the median does, so a rising p99 buys a DBA time to act before p95 (and conversion) follow it up. |
+| **What counts** | Query-phase service time on the data nodes for search and `_search`-type requests, including heavy aggregations on in-scope indices. |
+| **What does NOT count** | Browser-to-app network time, application-tier overhead, the fetch phase measured separately, and queries on indices excluded by the connector scope. |
+| **Roles** | engineering, operations, owner |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The two source counters are the same as the other latency cards: `query_total` (query-phase operations completed) and `query_time_in_millis` (cumulative query-phase milliseconds), exposed per node in the search index stats. Vortex IQ samples both on each poll, takes consecutive deltas, and assembles the per-shard service times into a distribution across the rolling 5-minute window. The 99th percentile is read from that distribution and reported in milliseconds.
+
+The 99th percentile is far more sensitive to individual slow operations than p95 or p50. A single deep-pagination request, an unbounded wildcard, a cold-cache query after a segment merge, or a GC pause on one node can push p99 up sharply while leaving the median untouched. That sensitivity is the point: p99 is meant to surface the worst case so it can be caught before it spreads. Like its siblings, the value is cluster-wide unless the connector is scoped to a specific index pattern, in which case only those shards contribute, isolating the storefront-facing path from background workloads.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+The same 6-node cluster behind a high-traffic storefront. Snapshot taken on 22 Apr 26 at 02:10 BST, during an overnight batch reindex.
+
+| Percentile | Reading | Window |
+| --- | --- | --- |
+| p50 | 41ms | RT/5m |
+| p95 | 180ms | RT/5m |
+| **p99** | **740ms** | **RT/5m** |
+
+The p99 card has breached its 500ms threshold, but p95 is still under its own 200ms line and p50 is healthy. This is the classic "tail-only" signature. The team reads it as follows:
+
+1. **Only the worst 1% is affected.** p95 holding at 180ms means 95% of shoppers are fine; the pain is concentrated in a thin tail. With p99 at 740ms against p95 at 180ms, that tail is steep, pointing at a handful of expensive operations rather than a saturated cluster.
+2. **It coincides with the reindex.** A nightly batch reindex is running, generating large segment merges. [Indexing Rate (docs/sec)](/nerve-centre/kpi-cards/elasticsearch/indexing-rate-docssec) is elevated, and merges compete for I/O and heap with search. Cold-cache queries hitting freshly merged segments land in the tail.
+3. **Heap is the multiplier.** [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) sits at 78%, above the 75% GC-pressure line, and [GC Pause Time (5m total ms)](/nerve-centre/kpi-cards/elasticsearch/gc-pause-time-5m-total-ms) shows 1,200ms of cumulative pause. A 300ms stop-the-world pause lands directly in p99 for any query unlucky enough to overlap it.
+
+```text
+Why p99 is the canary here:
+  - 02:10  p99 = 740ms, p95 = 180ms  (tail only; reindex + GC)
+  - 02:35  p99 = 1,050ms, p95 = 240ms (p95 now breaching too)
+  - 03:00  p99 = 1,400ms, p95 = 310ms (broad slowdown, conversion at risk)
+  The 25-minute lead time between p99 breaching and p95 following is the window
+  to act: throttle the reindex, or let it finish off-peak before the morning rush.
+```
+
+Action order: (1) confirm the cause is the reindex by correlating with [Avg Index Refresh Time (ms)](/nerve-centre/kpi-cards/elasticsearch/avg-index-refresh-time-ms) and merge activity; (2) throttle indexing or reschedule the batch outside peak; (3) if heap-driven, treat the GC pressure as the root cause. The takeaway: p99 gives you lead time. A breach here with a calm p95 is a chance to fix the tail before it becomes a median problem.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Search Latency p99 | What the combination tells you |
+| --- | --- | --- |
+| [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) | The broad storefront-facing tail. | p99 up with p95 calm equals a few pathological queries; both up equals systemic pressure spreading. |
+| [Search Latency p50 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p50-ms) | The median baseline. | A huge p50-to-p99 gap confirms the problem is purely tail; a rising p50 means the whole distribution is shifting. |
+| [GC Pause Time (5m total ms)](/nerve-centre/kpi-cards/elasticsearch/gc-pause-time-5m-total-ms) | GC pauses land directly in the tail. | High GC pause with a p99 spike means stop-the-world pauses are the cause. |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | Heap pressure drives the GC pauses. | Heap above 75% with p99 climbing means heap is the multiplier. |
+| [Top 10 Slow Searches](/nerve-centre/kpi-cards/elasticsearch/top-10-slow-searches) | The actual queries in the tail. | Names the pathological query shapes feeding p99. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/elasticsearch/slow-query-rate) | The share of all searches over the slowlog threshold. | A p99 spike with a flat slow-query rate confirms it is the thin 1%, not a growing fraction. |
+| [Indexing Rate (docs/sec)](/nerve-centre/kpi-cards/elasticsearch/indexing-rate-docssec) | Heavy indexing and merges compete with search. | p99 spiking alongside an indexing surge points at merge contention. |
+| [Search Error Rate %](/nerve-centre/kpi-cards/elasticsearch/search-error-rate) | The failure peer. | p99 climbing then errors appearing means queries are timing out, not just slowing. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> **`GET /_nodes/stats/indices/search`** for the raw `query_total` and `query_time_in_millis` counters per node; the lifetime ratio is an average, not a percentile.
+> **`GET /<index>/_stats/search`** for the same counters scoped to one index pattern.
+> **Kibana Stack Monitoring → Overview → Search** for the latency series over time, and the **search-slowlog** for the queries feeding the tail.
+> On **Elastic Cloud** or **AWS OpenSearch Service**, the search-latency chart in the cluster monitoring dashboard.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Percentile vs counter average** | Our value higher | The node stats ratio is a window average; the 99th percentile sits well above the average, especially with a steep tail. |
+| **Window length** | Either | The rolling 5-minute window resolves spikes that a coarser Kibana bucket would smooth away. |
+| **Sample density** | Either | At low QPS the tail is built from fewer samples, so p99 is noisier; high QPS gives a more stable estimate. |
+| **Index scope** | Usually lower | A connector scoped to the storefront index excludes background analytics queries. |
+| **Phase boundary** | Usually lower | Query phase only; end-to-end request time adds the fetch phase and coordinating-node overhead. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ES Search Pool Saturation vs Ecom Burst](/nerve-centre/kpi-cards/elasticsearch/es-search-pool-saturation-vs-ecom-burst) | p99 tends to lead pool saturation during a burst. | p99 spiking with low pool saturation means a query-shape or GC cause, not capacity. |
+| [Slow Searches During Checkout Window (5m)](/nerve-centre/kpi-cards/elasticsearch/slow-searches-during-checkout-window-5m) | Tail-latency queries should appear in the slow-search list when they land near checkout. | A p99 spike with no checkout-window slow searches means the tail is on non-purchase paths. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**p99 is jumpy and breaches for a single window all the time. Is it broken?**
+No, that volatility is expected. The 99th percentile is built from the worst 1% of queries, so a single deep-pagination request or a one-off GC pause moves it. The signal is in sustained or recurring breaches, not isolated single-window spikes. If the noise is distracting, raise the threshold for your profile in the Sensitivity tab, or lean on [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) as the steadier storefront indicator.
+
+**Why is the p99 threshold 500ms when p95 is 200ms?**
+Tail latency is inherently higher and more variable than the broad percentile, so holding p99 to the same line as p95 would generate constant false alarms. 500ms reflects the point at which even the worst-case query is clearly painful. Both thresholds are configurable per profile.
+
+**p99 breached but p95 and p50 are fine. What does that mean?**
+A thin, steep tail: a small number of pathological queries (deep pagination, leading wildcards, heavy aggregations) or a transient cause (GC pause, cold cache after a merge). Use [Top 10 Slow Searches](/nerve-centre/kpi-cards/elasticsearch/top-10-slow-searches) to name the queries and [GC Pause Time (5m total ms)](/nerve-centre/kpi-cards/elasticsearch/gc-pause-time-5m-total-ms) to rule out garbage collection. This is the best time to act, before the tail widens into p95.
+
+**Does low query volume make p99 unreliable?**
+Yes. With few queries per window, the 99th percentile is estimated from a handful of samples and becomes noisy. At low QPS, treat single-window p99 spikes with caution and prefer the trend. At high QPS the estimate is stable.
+
+**My managed-service dashboard shows a lower p99. Why?**
+Most likely the managed dashboard reports a window average or a coarser bucket, and it may measure a different scope (whole cluster vs your storefront index). Vortex IQ reconstructs a true percentile over a 5-minute window on the in-scope shards, which sits above an average. Match the window and scope before assuming a real divergence.
+
+**Should p99 ever be in the headline for capacity planning?**
+For capacity planning use p50 and p95; they describe the bulk of traffic you must serve. Use p99 as the canary and the worst-case guardrail. A cluster sized only to keep p99 down is usually over-provisioned; one that ignores p99 entirely loses its early warning.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Search Latency p99 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

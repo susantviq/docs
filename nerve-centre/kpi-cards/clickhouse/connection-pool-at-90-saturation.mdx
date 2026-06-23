@@ -1,0 +1,158 @@
+---
+title: "Connection Pool at >90% Saturation, ClickHouse"
+sidebarTitle: "Connection Pool at >90% Saturation"
+description: "Connection Pool at >90% Saturation alerts for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The alert feed for moments when the ClickHouse connection pool runs hot: concurrent connections sit above 90% of the configured `max_connections` ceiling for a sustained minute. When the pool saturates, new client connections are refused (you see `Too many simultaneous queries` or connection timeouts), so dashboards stall and ingest jobs back up. This card lists each saturation event with its start time, peak utilisation, and duration, so the on-call DBA can see whether the cause was a query storm, a connection leak, or genuine capacity demand.
+
+| | |
+| --- | --- |
+| **Data source** | Concurrent connection count from `system.metrics` (the `TCPConnection` and `HTTPConnection` gauges) and `system.asynchronous_metrics`, compared against the server's `max_connections` setting. Each breach of the 90% ratio sustained for one minute is recorded as one alert row. |
+| **What it tracks** | Saturation events, not a continuous gauge. The live percentage lives on [Connection Pool Saturation %](/nerve-centre/kpi-cards/clickhouse/connection-pool-saturation); this card is the incident history of when that gauge crossed the danger line. |
+| **Why it matters** | At >90% the pool has almost no headroom. The next connection burst (a deploy, a BI tool refreshing every panel at once, a retry loop) tips it to 100% and ClickHouse begins refusing connections. Refused connections are invisible to ClickHouse's own query metrics because the query never starts, so this card is often the only place the event is visible. |
+| **Time window** | `RT` (real-time; the detector evaluates the live ratio every cycle). |
+| **Alert trigger** | `>90% sustained 1m`. Utilisation must hold above 90% of `max_connections` for a full minute to fire, which filters out harmless one-second spikes. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The detector computes pool utilisation as live concurrent connections over the configured ceiling:
+
+```text
+saturation_pct = (TCPConnection + HTTPConnection + MySQLConnection + PostgreSQLConnection)
+                 / max_connections * 100
+```
+
+The connection gauges come from `system.metrics`:
+
+```sql
+SELECT metric, value
+FROM system.metrics
+WHERE metric IN ('TCPConnection','HTTPConnection','MySQLConnection','PostgreSQLConnection')
+```
+
+and the ceiling from the server configuration:
+
+```sql
+SELECT value FROM system.server_settings WHERE name = 'max_connections'
+```
+
+An alert row is created when `saturation_pct > 90` holds continuously for 60 seconds. The "sustained 1 minute" gate is deliberate: connection counts are spiky by nature (every client connect/disconnect moves the gauge), and a momentary touch of 91% is not an incident. A full minute above the line means the pool is genuinely starved of headroom, not just briefly busy. Each row records the start time, the peak utilisation reached, and the duration until utilisation fell back below 90%.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a ClickHouse instance with `max_connections = 1000` serving both an ingest pipeline and a fleet of BI dashboards. Snapshot of the alert feed on 22 Apr 26.
+
+| Started | Peak utilisation | Duration | Trigger |
+| --- | --- | --- | --- |
+| 22 Apr 26 08:31 BST | **97%** (974 / 1000) | 6m 12s | Monday 08:30 dashboard refresh storm |
+| 21 Apr 26 14:02 BST | 93% (931 / 1000) | 2m 40s | BI tool retry loop after a slow query |
+| 19 Apr 26 23:48 BST | 99% (994 / 1000) | 11m 30s | Connection leak in a reporting service |
+
+The Nerve Centre headline reads **1 active saturation alert, peak 97%**, outlined red. The DBA reads the feed:
+
+1. **The 08:31 event is a recurring pattern.** It lands every weekday at the same minute. This is the classic "everyone opens their dashboard at the start of the day" storm: dozens of BI panels each opening a connection simultaneously. It self-resolves in minutes but each occurrence risks refused connections at the peak.
+2. **The 19 Apr event is the dangerous one.** It ran for 11.5 minutes and peaked at 99%. A duration that long with no obvious traffic trigger points to a connection leak: a service opening connections and not closing them. Left unchecked, the next one hits 100% and starts refusing connections.
+3. **None of these show up in query latency.** A refused connection never becomes a query, so [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) can look perfectly healthy while clients are being turned away. This card is the only place the impact is visible.
+
+```text
+Triaging the 19 Apr leak:
+  - Confirm live connection sources:
+      SELECT client_name, count() FROM system.processes GROUP BY client_name ORDER BY count() DESC
+  - A single client holding hundreds of idle connections = leak
+  - Short-term: raise max_connections to add headroom (buys time, not a fix)
+  - Real fix: enable connection pooling / reuse in the offending client,
+              or set an idle-connection timeout so leaked connections drop
+```
+
+For the recurring 08:31 storm the fix is on the client side: stagger dashboard auto-refresh schedules or put a connection pool in front of the BI tools so panels share connections instead of each opening their own. Raising `max_connections` adds headroom but does not stop a genuine leak from eventually exhausting any ceiling.
+
+Three takeaways:
+
+1. **Saturation is invisible in query metrics.** Refused connections never become queries, so latency and error-rate cards can look green while clients are locked out. Trust this card as the canonical view of pool starvation.
+2. **Duration distinguishes traffic from leaks.** A short spike at a predictable time is a refresh storm; a long, slowly climbing event with no traffic trigger is a leak. Read the duration column, not just the peak.
+3. **Headroom is the real metric.** A pool living at 88% is one burst away from refusing connections. Pair this alert with [Connection Pool Saturation %](/nerve-centre/kpi-cards/clickhouse/connection-pool-saturation) and keep steady-state utilisation well below 70%.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this alert | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/clickhouse/connection-pool-saturation) | The live gauge this alert watches. | The gauge shows current headroom; this card shows when headroom ran out. |
+| [Connections In Use](/nerve-centre/kpi-cards/clickhouse/connections-in-use) | The raw concurrent-connection count. | Connections climbing with no query growth equals a leak, not load. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/clickhouse/queries-per-second-live) | The query throughput driving connections. | Saturation with flat QPS equals connections held open without doing work. |
+| [ClickHouse Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/clickhouse/clickhouse-pool-saturation-vs-traffic-burst) | The cross-channel view tying saturation to storefront traffic. | Saturation during a traffic burst equals genuine demand; saturation without one equals an internal problem. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/clickhouse/query-error-rate) | Errors from queries that did start. | Saturation plus rising errors equals the pool refusing some clients while others time out mid-query. |
+| [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h) | The 24-hour failure tally. | Spikes here aligned with saturation windows confirm the pool is the cause. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that weights pool saturation. | A sustained saturation event drags the composite below 70. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> Check live connection counts against the ceiling in `clickhouse-client`:
+> ```sql
+> SELECT metric, value FROM system.metrics WHERE metric LIKE '%Connection';
+> SELECT value FROM system.server_settings WHERE name = 'max_connections';
+> ```
+> See who is connected and what they are running in `system.processes` (one row per active query/connection), grouped by `client_name` or `user` to find a leak.
+> On **ClickHouse Cloud**, `max_connections` is managed per service tier; the same `system.metrics` query works in the SQL console, and the managed monitoring view shows connection utilisation over time.
+
+**Why our number may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Snapshot timing** | Either | Connection gauges move every connect/disconnect. A manual query a few seconds after the alert peak will read lower as the burst clears. |
+| **Sustained-minute gate** | Card lower (fewer events) | The card only records breaches held for a full minute; a manual `watch` will catch sub-minute spikes the card intentionally ignores. |
+| **Protocol mix** | Card may be higher | The card sums TCP, HTTP, MySQL, and PostgreSQL connection gauges; checking only `TCPConnection` understates the total. |
+| **max_connections source** | Either | The card reads the live `system.server_settings` value; a stale config file on disk may show a different ceiling than what the server is actually running. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ClickHouse Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/clickhouse/clickhouse-pool-saturation-vs-traffic-burst) | Saturation events should align with storefront traffic peaks. | Saturation with no matching traffic burst points to an internal cause (leak, retry loop, dashboard storm) rather than genuine demand. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My query latency looks fine but this card is red. How can both be true?**
+Easily, and it is the most important thing to understand about pool saturation. When the pool is full, ClickHouse refuses *new* connections before any query runs. Those refused clients never produce a query, so they never appear in latency or query-error metrics. The queries that did get in run normally. So latency stays green while a portion of your clients are locked out entirely. This card is the only place the lockout is visible.
+
+**Why does it need a full minute above 90%? I want to catch every spike.**
+Connection counts are inherently spiky: every client connect and disconnect moves the gauge, and a healthy server touches high utilisation briefly all the time. Firing on every momentary spike would bury you in noise. The one-minute sustain gate means the pool was genuinely starved of headroom, not just briefly busy. If you need finer sensitivity, the threshold is configurable in the Sensitivity tab.
+
+**Should I just raise `max_connections` to make the alerts stop?**
+Only as a stopgap. Raising the ceiling adds headroom and will silence storm-driven alerts, but it does nothing for a connection leak: a leaking client will eventually exhaust any ceiling, just more slowly. Diagnose first. If `system.processes` shows one client holding hundreds of idle connections, fix the client's pooling or set an idle timeout. If it is genuine concurrent demand, then raising the ceiling (and the underlying instance size) is the right call.
+
+**What is the difference between this and Connection Pool Saturation %?**
+[Connection Pool Saturation %](/nerve-centre/kpi-cards/clickhouse/connection-pool-saturation) is the live gauge: where utilisation sits right now. This card is the incident log: the list of times utilisation crossed 90% and stayed there. Use the gauge for current state and this card for history and root-cause timing.
+
+**Does this count connections from all protocols?**
+Yes. The detector sums the native TCP protocol plus HTTP, and the MySQL and PostgreSQL wire-protocol gauges if those interfaces are enabled. They all draw from the same `max_connections` ceiling, so counting only one protocol would understate true saturation.
+
+**On ClickHouse Cloud I do not set `max_connections` myself. Does this still apply?**
+Yes. ClickHouse Cloud sets `max_connections` per service tier, and you can still saturate it with too many concurrent clients or a leak. The card reads the live limit and live connection counts the same way, and the same diagnosis (find the offending client in `system.processes`, fix pooling, or scale the service) applies.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connection Pool at >90% Saturation* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

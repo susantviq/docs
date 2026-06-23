@@ -1,0 +1,163 @@
+---
+title: "MongoDB OPS Spike vs Ecom Order Rate, MongoDB"
+sidebarTitle: "MongoDB OPS Spike vs Ecom Order Rate"
+description: "MongoDB OPS Spike vs Ecom Order Rate for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A dual-axis chart that plots MongoDB operations per second against your storefront order rate over the same window, so you can tell whether a surge in database load is being paid for by real commerce. When orders climb, database operations should climb with them: that is healthy demand. When database operations spike but orders stay flat, something other than shoppers is hammering the database, most often a bot, a scraper, a misbehaving integration, or a runaway background job. The card raises an alert on exactly that divergence: an `ops spike with no order spike`, which it flags as likely bot or scraper activity.
+
+| | |
+| --- | --- |
+| **What it tracks** | MongoDB throughput (operations per second) on one axis and storefront order rate on the other, charted together so their correlation, or lack of it, is visible at a glance. |
+| **Data source** | MongoDB side: the live operation counters from `serverStatus.opcounters` (query, insert, update, delete, getmore, command), summed into ops/sec. Ecom side: the order rate from the connected commerce connector (Shopify, BigCommerce or Adobe Commerce). |
+| **Time window** | `15m` (rolling 15-minute correlation window, refreshed live). Tight enough to catch a bot burst as it starts, wide enough to smooth single-poll noise. |
+| **Alert trigger** | `ops spike with no order spike (= bot / scraper)`. A material rise in database operations that is not matched by a corresponding rise in orders raises this cross-channel alert as a likely automated-traffic or runaway-job signature. |
+| **What counts** | All operations counted in `opcounters` against the polled `mongod`, joined to storefront orders from the connected commerce platform for the same window. |
+| **What does NOT count** | Operations on members not polled, and orders from channels not wired into a Vortex IQ commerce connector. Replication-internal traffic is reflected in `opcountersRepl`, not the primary `opcounters` used here. |
+| **Roles** | owner, platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+This is a cross-channel correlation card: two series, one per axis, joined on time.
+
+```text
+Database axis (ops/sec):
+  ops_per_sec = delta( opcounters.query + insert + update
+                       + delete + getmore + command ) / interval_seconds
+                ( from serverStatus.opcounters )
+
+Storefront axis (orders/window):
+  order_rate = orders from the linked ecommerce connector per window
+
+Alert condition:
+  ops_per_sec spiking  AND  order_rate NOT spiking
+```
+
+What the inputs mean:
+
+- **`opcounters`** is a cumulative-since-startup counter of each operation type the `mongod` has served. The card differences it between polls to get a live rate, then sums the operation types into a single ops/sec figure (the same basis as [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live)).
+- **`order_rate`** is the storefront's order throughput from the connected commerce platform: the business activity the database load is supposed to be serving.
+- **A "spike"** on either axis is a value running materially above its recent baseline for the window, using the same surge definition the connectors apply elsewhere.
+
+Important framing points:
+
+- **Correlation is the whole signal.** In a healthy store the two lines move together: more shoppers, more orders, more database work. The diagnostic value is in the gap. Ops up with orders flat is the classic non-human-traffic signature; ops flat with orders up can mean an over-cached or even broken read path.
+- **`opcounters` counts all operations, not just order-related ones.** A scraper crawling product pages drives `query` and `getmore` heavily while generating zero orders, which is precisely the divergence the card is built to expose.
+- **Per-member.** The ops side reflects the polled member (normally the primary). A read-heavy secondary scraped directly would show its own ops spike.
+
+The output is a dual-axis chart with the two series overlaid, and the underlying ops/sec and order-rate values available on drill-down.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MongoDB 6.0 primary behind an Adobe Commerce storefront. The chart, read on 15 Jun 26, overlays ops/sec against orders for the afternoon.
+
+| Window (UTC) | Ops/sec | Orders (per 15m) | Reading |
+| --- | --- | --- | --- |
+| 12:00 | 3,200 | 41 | Baseline, lines tracking |
+| 13:30 | 6,900 | 88 | Both up: real promo traffic |
+| 15:10 | 18,400 | 39 | **Red: ops spike, orders flat** |
+| 15:40 | 17,800 | 42 | Divergence persisting |
+| 16:30 | 3,400 | 44 | Recovered after IP block |
+
+At 12:00 the two lines track each other at baseline. At 13:30 a promotional email lands and both lines rise together: ops up to 6,900/sec, orders up to 88. This is healthy, the database is busy because shoppers are buying. At 15:10 the picture breaks: ops jump to 18,400/sec, nearly triple baseline, but orders are flat at 39, actually below the promo level. The two axes have diverged sharply and the alert fires.
+
+The DBA pulls the operation profile and finds a single client subnet issuing a flood of `find` queries against the product collection, paging through the entire catalogue: a price scraper. It generates enormous read load and zero orders. By 15:40 the divergence is still open and the scraper is now degrading [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) for genuine shoppers. The team blocks the offending subnet at the edge, and by 16:30 ops fall back to baseline and the two lines are tracking again.
+
+```text
+Reading the two axes:
+  ops UP   + orders UP    =  healthy demand        (provision if sustained)
+  ops UP   + orders FLAT  =  non-human traffic      (bot / scraper / runaway job)
+  ops FLAT + orders UP    =  read path bypassed     (cache hiding load, or broken telemetry)
+```
+
+The DBA's response depends on which divergence appears:
+
+1. **Ops up, orders flat (the alerted case):** identify the source. A scraper or bot shows as a narrow set of clients issuing repetitive reads; a runaway background job shows as a single internal service. Block the external source at the edge / rate-limit it, or pause the internal job. The urgency is that the parasitic load degrades latency for real shoppers, turning a non-revenue event into a revenue-losing one.
+2. **Ops flat, orders up:** rarer and usually benign (a cache is absorbing reads) but occasionally a warning that order events are not reaching the database as expected. Worth a glance to confirm the order pipeline is healthy.
+
+Three takeaways:
+
+1. **Database load only matters relative to the revenue it serves.** 18,000 ops/sec is fine if it is buying you 800 orders and alarming if it is buying you 40. This card supplies the denominator that raw throughput lacks.
+2. **The alerted divergence is a cost-and-latency event, not just an anomaly.** Parasitic traffic consumes capacity that real shoppers need, so an unaddressed scraper degrades genuine conversion even though it generates no orders itself.
+3. **Use the shape of the ops spike to find the source fast.** A scraper is repetitive reads from a few clients; a runaway job is one internal service; a real surge is broad and matched by orders. Pair with [Top 10 Slow Operations](/nerve-centre/kpi-cards/mongodb/top-10-slow-operations) to fingerprint it.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with OPS Spike vs Order Rate | What the combination tells you |
+| --- | --- | --- |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | The database axis of this card as a standalone gauge. | The gauge shows throughput; this card adds the order context that explains whether it is justified. |
+| [MongoDB Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/mongodb/mongodb-pool-saturation-vs-traffic-burst) | The connection-side cross-channel companion. | Together they show whether a load event is driving operations, connections, or both. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) | The latency real shoppers feel while a scraper runs. | An ops-vs-orders divergence dragging p95 up confirms parasitic load is hurting genuine traffic. |
+| [Top 10 Slow Operations](/nerve-centre/kpi-cards/mongodb/top-10-slow-operations) | Fingerprints the queries behind an unexplained ops spike. | Repetitive identical reads from one source is the scraper signature. |
+| [COLLSCAN Operations (24h)](/nerve-centre/kpi-cards/mongodb/collscan-operations-24h) | Scrapers paging a catalogue often trigger collection scans. | A scan spike coinciding with the divergence pinpoints the parasitic query pattern. |
+| [Slow Ops During Checkout Window (5m)](/nerve-centre/kpi-cards/mongodb/slow-ops-during-checkout-window-5m) | Quantifies whether the parasitic load reached checkout. | Confirms whether a scraper is now costing real conversions, not just capacity. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to confirm the number in MongoDB's own tooling:**
+
+> **`mongosh`:** `db.serverStatus().opcounters` returns the cumulative per-type counters; sample twice and difference over the interval to reproduce the ops/sec on the database axis.
+> **`mongostat`:** the `query`, `insert`, `update`, `delete`, `getmore` and `command` columns show live per-second rates by type, which is the quickest confirmation of the ops axis.
+> **`mongotop`:** breaks activity down by collection and read/write time, useful for spotting which collection a scraper is hammering.
+> **Atlas:** the **Metrics** tab **Opcounters** chart shows the same per-type operation rates; the storefront order axis comes from the connected commerce platform's own analytics.
+
+**Why our number may legitimately differ from the native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Operation types summed** | Either | The card sums all `opcounters` types into one ops/sec; a hand reading of a single `mongostat` column reads lower. Confirm which types you are comparing. |
+| **Replication traffic** | Vortex IQ on primary | This card uses `opcounters` (client ops), not `opcountersRepl` (replication apply). A secondary's apply load will not appear on the primary's ops axis. |
+| **Member polled** | Either | The ops side reads one `mongod` (normally the primary). A scraper hitting a secondary directly shows on that member. |
+| **Window alignment** | Either | Ops/sec is a windowed rate; comparing a 1-second `mongostat` spike against a 15-minute order count will not line up exactly. |
+| **Order definition** | Either | The order axis uses the commerce connector's order basis; the platform UI may count draft or cancelled orders differently. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) / [`adobe_commerce.total_revenue`](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | A healthy ops rise should coincide with rising orders and revenue. | Ops up with revenue flat is the bot / scraper signature this card alerts on. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | The standalone gauge should match this card's ops axis for the same window. | A mismatch usually means the gauge and the join are reading different members or summing different operation types. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does an ops spike with flat orders mean a bot or scraper?**
+Because real shoppers generate database work in proportion to what they buy: browsing, adding to basket, and checking out all touch the database, and a rise in genuine activity shows up as a rise in orders too. When operations triple but orders do not move, the extra load is coming from clients that read heavily and buy nothing. The textbook example is a price scraper paging through the entire product catalogue, but the same signature appears for aggressive bots, broken retry loops, and runaway internal jobs. The card cannot name the source by itself, but the divergence reliably says "this load is not shoppers".
+
+**Could an ops spike with flat orders ever be legitimate?**
+Yes, occasionally, which is why it is an alert to investigate rather than an automatic block. Legitimate causes include a scheduled analytics or reporting job that reads heavily, a one-off bulk import or migration, or a cache flush that briefly forces many reads through to the database. The difference from a scraper is usually the source (an internal, known service rather than external clients) and the shape (a defined start and end rather than a sustained crawl). Investigate the source before acting; the point of the card is to make you look.
+
+**The ops axis looks high but `mongostat` shows a lower number. Why?**
+This card sums all operation types in `opcounters` (query, insert, update, delete, getmore, command) into a single ops/sec figure, whereas a single `mongostat` column shows just one type. Add the relevant `mongostat` columns to compare like for like. Also confirm you are reading the same member: this card normally polls the primary, and a scraper could be hitting a secondary you are not looking at.
+
+**A scraper generates no orders, so why is it urgent?**
+Because the parasitic load is not free: it consumes connection slots, cache space, and query capacity that genuine shoppers need. A heavy scraper drives up [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) and can push [Connection Pool Saturation %](/nerve-centre/kpi-cards/mongodb/connection-pool-saturation) toward its ceiling, at which point real checkouts slow down or fail. An event that earns zero revenue while degrading the experience for paying customers is exactly the kind of revenue-at-risk surface this category exists to catch.
+
+**Does this card distinguish reads from writes?**
+The headline ops/sec sums all operation types, but the drill-down preserves the per-type breakdown from `opcounters`, which is where the diagnosis happens. A scraper shows as a `query` and `getmore` spike with writes flat; a runaway sync job shows as an `insert` or `update` spike. Reading the per-type split tells you not just that load diverged from orders but what kind of load it was, which points at the likely source.
+
+**What if I have no commerce connector linked?**
+Without a connected Shopify, BigCommerce or Adobe Commerce connector there is no order series for the second axis, so the card cannot perform the correlation and the divergence alert will not fire. You still have the database side via the standalone [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) gauge, but it cannot tell you whether the load is justified by orders. Linking the commerce platform is what turns raw throughput into a revenue-aware signal.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*MongoDB OPS Spike vs Ecom Order Rate* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

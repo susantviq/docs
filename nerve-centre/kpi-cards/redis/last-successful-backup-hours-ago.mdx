@@ -1,0 +1,150 @@
+---
+title: "Last Successful Backup (hours ago), Redis"
+sidebarTitle: "Last Successful Backup (hours ago)"
+description: "Last Successful Backup for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Backup](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The age, in hours, of the most recent Redis backup that was successfully shipped offsite. This is not "did Redis save to local disk", it is "do we have a durable copy somewhere we could restore from if this node burned down right now". For a DBA, this is the single most important durability number on the board: every hour this value grows is an hour of writes you cannot get back if the instance is lost. Redis is often run as a cache and treated as disposable, but the moment it holds sessions, rate-limit counters, queues, or any source-of-truth data, a stale backup is a silent data-loss incident waiting to happen.
+
+| | |
+| --- | --- |
+| **What it tracks** | Hours elapsed since the last RDB snapshot or AOF copy was successfully shipped offsite (object storage, snapshot vault, or managed-service backup). It tracks the offsite copy, not the local `dump.rdb` on the data node. |
+| **Data source** | For self-managed Redis: the timestamp of the last backup artefact landed in the offsite target (for example S3 / GCS object `LastModified`), reconciled against `rdb_last_save_time` and `aof_last_bgrewrite_status` from `INFO persistence`. For ElastiCache / MemoryDB: CloudWatch backup events and the `SnapshotComplete` event timestamp. |
+| **Time window** | `RT` (real-time, re-evaluated on every Nerve Centre poll, typically every 60 seconds). |
+| **Alert trigger** | `> 72h`. If the newest offsite backup is older than 72 hours, the card turns red and pages the on-call DBA. |
+| **Units** | Hours (integer, rounded down). A reading of `0` means a backup completed within the last hour. |
+| **What counts as "successful"** | The backup process exited cleanly AND the artefact is present and non-zero-byte at the offsite destination. A `bgsave` that finished but never uploaded does NOT reset this clock. |
+| **What does NOT count** | (1) A local `SAVE` / `BGSAVE` that wrote `dump.rdb` to the node's own disk but was never copied offsite; (2) a failed or partial upload; (3) an AOF file that exists locally but is not part of the offsite backup set; (4) a snapshot still in progress. |
+| **Roles** | owner, dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card resolves the timestamp of the newest valid offsite backup artefact, then subtracts it from "now":
+
+```text
+last_backup_age_hours = floor( (now_utc - last_offsite_backup_timestamp_utc) / 3600 )
+```
+
+How `last_offsite_backup_timestamp_utc` is resolved depends on deployment:
+
+- **Self-managed Redis with a shipping job.** The engine reads the `LastModified` timestamp of the newest object in the configured backup bucket / prefix. It cross-checks `rdb_last_save_time` (Unix epoch of the last successful local save, from `INFO persistence`) so that a local save with no upload is visibly distinguished from a healthy offsite copy. If the local save is fresh but the offsite object is stale, the card uses the offsite timestamp (the durable one) and flags the gap.
+- **AOF-based durability.** Where Append Only File is the durability mechanism, the engine treats the last successful AOF rewrite (`aof_last_bgrewrite_status = ok` plus the rewrite completion time) plus the offsite copy of the AOF as the backup point. A pure local AOF with `appendfsync everysec` is durable on the node but is not an offsite backup; only the shipped copy resets this card.
+- **ElastiCache / MemoryDB.** The engine reads the most recent automatic or manual snapshot's completion time from the CloudWatch `SnapshotComplete` backup event (or the snapshot list via the managed-service API). Self-managed local-disk saves are irrelevant here because AWS manages the snapshot lifecycle.
+
+The clock only resets on a confirmed, complete, offsite artefact. A backup that started 90 minutes ago and is still uploading does not reset it until the upload lands.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a self-managed Redis 7.2 primary on a VM, holding user sessions and a job queue for an order-processing service. Their cron-driven shipping job is meant to run `BGSAVE`, then upload the resulting `dump.rdb` to an S3 bucket every 6 hours. Snapshot taken on 14 Apr 26 at 09:00 UTC.
+
+| Signal | Value | Source |
+| --- | --- | --- |
+| `rdb_last_save_time` | 14 Apr 26 08:02 UTC | `INFO persistence` |
+| Newest object in S3 backup prefix | 12 Apr 26 02:10 UTC | S3 `LastModified` |
+| `aof_last_bgrewrite_status` | `ok` | `INFO persistence` |
+| Card headline | **55 hours ago** | offsite timestamp |
+
+At first glance the DBA might relax: `rdb_last_save_time` is under an hour old, so Redis is clearly saving. But the card reads **55 hours**, derived from the offsite copy, not the local save. The story it tells:
+
+1. **Local saving is healthy, offsite shipping is broken.** Redis has been writing `dump.rdb` to its own disk every 6 hours as designed, but the upload step has not landed a new object since 12 Apr. Something downstream of `BGSAVE` failed: an expired IAM credential, a full local disk, a changed bucket policy, or a cron job that silently errored.
+2. **The durability window is 55 hours wide.** If the VM is lost right now (host failure, region issue, accidental termination), the team can only restore to 12 Apr 02:10. Every session, every queued job, and every write since then is gone. For a session store that is mass logout; for the order queue that is lost or duplicated work.
+3. **The 72h alert has not fired yet, but it is 17 hours away.** This is the value of a Hero card: the team can see the slow bleed and fix the shipping job before the alert ever pages them at 3am.
+
+```text
+Durability exposure if the node is lost at 09:00 UTC on 14 Apr 26:
+  - Last durable offsite copy:        12 Apr 26 02:10 UTC
+  - Unrecoverable write window:       ~55 hours
+  - Sessions written since:           ~41,000 (would be force-logged-out on restore)
+  - Queue jobs enqueued since:        ~6,300 (lost or needing replay from upstream)
+  - Time until 72h red alert:         ~17 hours
+```
+
+The fix is operational, not a Redis tuning change: repair the shipping job, confirm a fresh object lands in S3, and watch the card drop back to `0`. Three takeaways:
+
+1. **A fresh `rdb_last_save_time` is reassuring but not sufficient.** Local saves protect against a Redis process restart; only offsite copies protect against losing the whole node. This card deliberately measures the offsite copy because that is the one that survives a disaster.
+2. **The alert threshold should match your RPO.** 72 hours is a safe default for cache-like workloads. If Redis holds source-of-truth data, lower the alert in the Sensitivity tab to match your recovery-point objective: a 6-hour backup cadence usually wants a 12h to 24h alert so a single missed run is visible before the gap compounds.
+3. **Test the restore, not just the backup.** A backup that exists but cannot be restored (corrupt RDB, wrong Redis version, missing AOF segment) is worse than no backup because it creates false confidence. Pair this card with a periodic restore drill into a throwaway instance.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards DBAs should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Last Successful Backup | What the combination tells you |
+| --- | --- | --- |
+| [Last RDB Save (minutes ago)](/nerve-centre/kpi-cards/redis/last-rdb-save-minutes-ago) | The local-save companion. This card is offsite; that one is on-node. | Fresh local save plus stale offsite backup equals a broken shipping job, exactly the worked example above. |
+| [Last AOF Rewrite Status](/nerve-centre/kpi-cards/redis/last-aof-rewrite-status) | AOF is the other durability mechanism. | An `err` rewrite status means your AOF-based recovery point is unreliable, narrowing your durability options to RDB only. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The composite that folds backup age into overall health. | A stale backup drags the health score even when memory and latency look perfect. |
+| [Connected Replicas](/nerve-centre/kpi-cards/redis/connected-replicas) | Replicas are availability, backups are durability. Different risks. | Zero replicas plus stale backup equals no failover AND no recovery point: the worst durability posture. |
+| [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) | A near-full instance makes `BGSAVE` riskier (fork copy-on-write needs headroom). | High memory plus failing saves often equals fork failing for lack of RAM, a common root cause of a stale backup. |
+| [Replica Lag (seconds)](/nerve-centre/kpi-cards/redis/replica-lag-seconds) | If you back up from a replica, lag defines how stale that backup's data is. | High replica lag means a replica-sourced backup is already behind the primary before it even ships. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis's own tooling:**
+
+> **`INFO persistence`** on the data node. Read `rdb_last_save_time` (Unix epoch of the last local save), `rdb_last_bgsave_status`, `aof_last_bgrewrite_status`, and `aof_last_write_status`. These tell you whether Redis itself is saving cleanly; they do NOT tell you whether the copy reached offsite.
+> **`redis-cli LASTSAVE`** returns the Unix timestamp of the last successful local save, the quickest one-liner check.
+> **Your offsite store's object listing.** For S3: `aws s3 ls s3://your-backup-bucket/prefix/ --recursive` and read the newest `LastModified`. This is the number this card actually reports.
+> **ElastiCache / MemoryDB console → Backups tab**, or `aws elasticache describe-snapshots`, for the managed snapshot completion time and the CloudWatch `SnapshotComplete` event.
+
+**Why our number may legitimately differ from what you see:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Local save vs offsite copy** | Vortex IQ shows older | `LASTSAVE` / `rdb_last_save_time` reflect the on-node save; this card reflects the offsite artefact, which is the durable one. A gap is a finding, not a bug. |
+| **Time zone** | Timestamps shift | Redis epoch values and CloudWatch are UTC; Vortex IQ renders the age in your profile time zone for chart axes but computes the gap in UTC. |
+| **In-flight upload** | Vortex IQ shows older briefly | An upload that is mid-flight has not landed; the clock resets only when the object is complete. |
+| **Backup from a replica** | Data is staler than it looks | If you snapshot a replica, the data point is the replica's state, which may lag the primary. Pair with Replica Lag. |
+| **Managed snapshot retention** | Object disappears | If a managed service rotates out the snapshot you measured against, the next newest one defines the age. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`redis.last-rdb-save-minutes-ago`](/nerve-centre/kpi-cards/redis/last-rdb-save-minutes-ago) | Local save should be much fresher than offsite backup. | If both are stale, Redis itself stopped saving (fork failure, disk full). If only offsite is stale, the shipping job is broken. |
+| CloudWatch `SnapshotComplete` events | For ElastiCache, 1:1 with this card's reset. | A gap means the automatic backup window failed or was disabled. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Redis says it saved 10 minutes ago, but this card reads 50 hours. Which is right?**
+Both are right; they measure different things. `LASTSAVE` / `rdb_last_save_time` report the last local save to the node's own disk. This card reports the last copy that reached offsite storage. A local save protects you from a Redis process crash; only an offsite copy protects you from losing the whole node or region. A 50-hour reading with a fresh local save almost always means your upload / shipping step is broken while Redis itself is healthy. Fix the shipping job.
+
+**We run AOF with `appendfsync everysec`, isn't that already durable?**
+AOF makes the node durable against a process crash because writes are flushed to the local append-only file roughly every second. It does NOT make you durable against losing the node, the disk, or the availability zone. This card measures the offsite copy precisely because AOF alone does not survive a host failure. Keep AOF for fast local recovery and still ship a periodic copy offsite.
+
+**Why 72 hours as the default alert? That seems generous.**
+72 hours is a conservative default chosen so that a single missed daily backup, or a weekend with a stuck job, surfaces before it becomes a multi-day gap. It is intentionally generous so it does not page teams for transient blips. If Redis holds source-of-truth data with a tighter recovery-point objective, lower the alert in the Sensitivity tab. A common pattern is to set the alert to roughly 2x your backup cadence.
+
+**Does a backup that exists but is corrupt reset the clock?**
+The card cannot validate the internal integrity of a remote artefact; it trusts that a complete, non-zero-byte object at the offsite destination is a backup. This is a known limitation. The mitigation is a periodic restore drill: load the newest backup into a throwaway instance and confirm it starts and serves keys. A backup you have never restored is a hypothesis, not a guarantee.
+
+**We back up from a read replica to avoid load on the primary. Does that affect this card?**
+It affects the data point, not the card logic. The card still measures the age of the offsite artefact, but that artefact reflects the replica's state at save time, which may lag the primary by the current replication delay. Pair this card with [Replica Lag (seconds)](/nerve-centre/kpi-cards/redis/replica-lag-seconds): a replica-sourced backup is effectively "backup age plus replica lag" behind the primary's true state.
+
+**Our ElastiCache cluster shows automatic backups in the console but this card reads stale. Why?**
+Two common causes. First, automatic snapshots may be disabled or have a zero-day retention on this node group (check the backup retention setting). Second, the snapshot window may overlap a high-write period and AWS skipped or delayed it. Confirm via `aws elasticache describe-snapshots` and the CloudWatch `SnapshotComplete` event timestamp; if the newest snapshot genuinely is old, the card is correct and you have a real durability gap.
+
+**Is this card relevant if we use Redis purely as a disposable cache?**
+Less so, but do not assume "purely a cache" is permanent. Many teams start with a cache and quietly add session storage, rate-limit counters, or a queue without revisiting durability. If Redis genuinely holds only recomputable cache data, you can raise the alert threshold or disable it for that instance in the Sensitivity tab. Revisit that decision whenever the workload changes.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Last Successful Backup (hours ago)* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

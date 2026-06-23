@@ -1,0 +1,127 @@
+---
+title: "Top Contended Statements, CockroachDB"
+sidebarTitle: "Top Contended Statements"
+description: "Top Contended Statements for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Top Contended Statements** is the CockroachDB-distinctive card that turns "the cluster feels slow" into "these specific statements are fighting over the same rows". In a distributed SQL database, transactions that touch the same keys block one another, and that contention is the single most common cause of latency spikes and retry storms that a node-count or capacity view will never explain. This card ranks the statements involved in the most contention events over the last 24 hours, so a DBA can go straight to the offending query and the hot key it is competing for, rather than guessing. An empty or low list is a healthy, well-distributed workload; a list with one statement dominating means a hotspot; more than 10 contention events fires an alert.
+
+| | |
+| --- | --- |
+| **What it tracks** | The SQL statements involved in the most contention (lock-wait / transaction-conflict) events over the trailing 24 hours, ranked by contention time or event count. |
+| **Data source** | CockroachDB-distinctive: distributed transactions surface contention via `crdb_internal.cluster_contention_events`. Vortex IQ reads that view (joined with `crdb_internal.statement_statistics` for the readable statement fingerprint and with `crdb_internal.transaction_contention_events` where available) to rank the statements and the contended keys / indexes. On CockroachDB Cloud the same data is surfaced on the SQL Activity "Insights" page, which flags high-contention statements. |
+| **Time window** | `24h` (a trailing 24-hour view, so a contention hotspot that occurred overnight is still visible in the morning). |
+| **Alert trigger** | `> 10 contention events`. More than ten contention events in the window means a real hotspot, not incidental cross-talk. |
+| **Roles** | DBA, platform, SRE, application engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+This is a ranked table, not a single scalar. The engine builds it from CockroachDB's native contention instrumentation:
+
+- **The source of truth is `crdb_internal.cluster_contention_events`.** Every time a transaction waits on a lock held by another transaction, CockroachDB records a contention event: the contended key (and therefore the table and index it belongs to), the blocking and blocked transaction fingerprints, and the cumulative contention duration. The card aggregates these events over the 24-hour window.
+- **Grouping.** Events are grouped by the blocked statement's fingerprint (the parameterised statement text, with literals replaced by placeholders) so that the same logical query appears as one row regardless of its bound values.
+- **Ranking.** Rows are ordered by total contention time (or event count, configurable), so the statement that spent the most time waiting on conflicts sits at the top.
+- **The contended key / index.** For each top statement the card surfaces the most-contended key range, which usually maps to a single hot row or a narrow index range. This is the actionable detail: it tells you which data, not just which query, is the bottleneck.
+- **Internal traffic excluded.** Contention from internal CockroachDB jobs is filtered out so the list reflects application transactions.
+
+Because the underlying view records cumulative contention, the ranking is naturally biased toward sustained hotspots rather than one-off collisions, which is what you want: a single isolated conflict is normal in a busy OLTP system; the same key being contended hundreds of times is a design problem.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 6-node CockroachDB cluster (v23.2) backing an ecommerce order and inventory stack. On the morning of 14 Apr 26 latency alerts fired overnight and the on-call SRE opens this card with the 24-hour window.
+
+| Rank | Statement fingerprint | Contention events (24h) | Total contention time | Most-contended key |
+| --- | --- | --- | --- | --- |
+| 1 | `UPDATE inventory SET qty = qty - $1 WHERE sku = $2` | 1,840 | 41m 12s | `inventory` PK, sku = a single hot SKU |
+| 2 | `INSERT INTO order_seq ... ON CONFLICT ...` | 612 | 9m 50s | `order_seq` PK, a monotonic counter row |
+| 3 | `UPDATE carts SET updated_at = now() WHERE id = $1` | 144 | 1m 30s | `carts` PK, scattered |
+| 4 | `UPDATE customers SET last_seen = $1 WHERE id = $2` | 31 | 0m 22s | `customers` PK, scattered |
+
+The list reads like a diagnosis. Rows 3 and 4 are scattered low-event contention, normal OLTP cross-talk and well under the 10-event line per hotspot. Rows 1 and 2 are the problem and both blow past the alert trigger:
+
+1. **Row 1 is a hot-SKU inventory decrement.** A flash sale concentrated thousands of decrements on one SKU, all serialising on the same primary-key row. This is the classic CockroachDB write hotspot, and it accounts for the bulk of the overnight latency. The fix is application-level (move the counter to a sharded or batched pattern) or schema-level (split the range), not capacity.
+2. **Row 2 is a monotonic sequence counter.** Every order increments the same `order_seq` row, so under load every insert queues behind the previous one. The standard remedy is to switch to `unordered_unique_rowid()` or a UUID primary key so writes spread across ranges instead of stacking on one.
+
+```text
+Overnight diagnosis (24h window)
+  Top hotspot:       UPDATE inventory ... hot SKU  (1,840 events, 41m contention)
+  Second hotspot:    order_seq monotonic counter  (612 events, ~10m contention)
+  Alert trigger:     > 10 contention events  (both far above)
+  Root cause:        two single-row write hotspots, not capacity
+  Action:            split/shard the hot SKU range; move order_seq to a non-monotonic key
+```
+
+Pairing with [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) confirms the picture: retries spiked in lockstep with the contention, because conflicting transactions in CockroachDB retry rather than deadlock. After the team shards the hot SKU counter, both the contention list and the retry count fall back to baseline within an hour.
+
+Two takeaways:
+
+1. **Contention is a design signal, not a capacity signal.** Adding nodes will not help a single hot row; you have to spread the writes. This card points you at the exact row so you can fix the schema or the access pattern.
+2. **Read it with retries and latency.** Contention, retries, and tail latency move together. The contention list tells you which statement, [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) tells you how badly it is forcing reruns, and [Statement Latency p99 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p99-ms) tells you what users felt.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Top Contended Statements | What the combination tells you |
+| --- | --- | --- |
+| [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) | Retries are the downstream effect of contention. | A hot statement here plus a retry spike there confirms the contention is forcing reruns, not just waiting. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/cockroachdb/slow-query-rate) | The "how much of my workload is slow" view. | Contention on one row often drives the slow rate up without any capacity shortfall. |
+| [Statement Latency p99 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p99-ms) | The tail latency users actually feel. | A contention hotspot is the most common cause of a blown-out p99. |
+| [Statement Latency p95 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms) | The broader latency view. | If p95 moves with the contention, the hotspot is affecting a wide slice of traffic. |
+| [Range Lease Balance Skew %](/nerve-centre/kpi-cards/cockroachdb/range-lease-balance-skew) | A hot range often shows up as lease skew. | High skew plus a top contended statement on the same table points to one overloaded range. |
+| [Statement Error Rate %](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate) | Severe contention can surface as serialisation errors. | Rising errors alongside contention means transactions are exhausting their retry budget. |
+| [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live) | The load context. | A small number of hot statements dominating contention at high QPS is the textbook hotspot shape. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The composite that absorbs latency and error inputs. | Sustained contention pulls latency and errors down, dragging the overall health score. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+This card is a near-direct read of CockroachDB's own contention instrumentation, so reconciliation is straightforward:
+
+- **`crdb_internal.cluster_contention_events`.** This is the source view. Querying it directly, grouped by the contended index and ordered by `cumulative_contention_time`, reproduces the ranking. `crdb_internal.transaction_contention_events` (on versions that expose it) adds the blocking and blocked transaction fingerprints.
+- **DB Console Insights.** The SQL Activity → Insights page flags "High Contention" statements and shows the contended keys and the blocking transaction, which is the same information rendered as a UI. CockroachDB Cloud surfaces the identical Insights view.
+- **`SHOW STATEMENTS` / `crdb_internal.cluster_queries`.** For live, in-flight contention you can see currently-blocked statements, which is useful for confirming a hotspot that is happening right now rather than over the trailing day.
+- **Statement statistics.** Joining the contention events to `crdb_internal.statement_statistics` yields the readable statement fingerprint, which is what the card displays.
+
+If the Vortex IQ list differs from a direct query, the usual reasons are window alignment (the card uses a trailing 24 hours; an ad-hoc query may use a different range) and the ranking key (the card defaults to total contention time, while the Insights page sometimes orders by event count). On Cloud, note that the contention view is reset on cluster restart, so a recent restart can shorten the effective window.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What exactly is a "contention event"?**
+It is recorded whenever one transaction has to wait because another transaction holds a lock (or an intent) on a key it needs. In CockroachDB's distributed, serialisable model, conflicting transactions wait and then retry rather than deadlocking, so contention shows up as wait time and retries rather than as classic database deadlocks. Each wait is one event in `crdb_internal.cluster_contention_events`.
+
+**The list is empty but latency is high. Why?**
+High latency without contention means the slowness is not conflict-driven. Look elsewhere: capacity pressure ([Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation), [Memory Usage %](/nerve-centre/kpi-cards/cockroachdb/memory-usage)), a hot range without lock contention (full-scan queries), or replication lag. Contention is one cause of slowness, not the only one.
+
+**Why does the same statement appear once even though it ran millions of times?**
+Rows are grouped by statement fingerprint, the parameterised text with literals replaced by placeholders. So `WHERE sku = 'A1'` and `WHERE sku = 'B2'` collapse to one row. The most-contended-key column tells you which specific values are hot underneath that single fingerprint.
+
+**How do I fix a hot single-row write like a counter?**
+Spread the writes. Common patterns: shard the counter across N rows and sum on read, switch a monotonic primary key to a non-sequential one (UUID or `unordered_unique_rowid()`) so inserts scatter across ranges, batch the decrements, or split the hot range manually. Adding nodes does not help, because the contention is on one key, not on cluster capacity.
+
+**Does the 24-hour window mean I cannot see contention happening right now?**
+The card aggregates over 24 hours, which is ideal for catching overnight or recurring hotspots. For live, in-flight contention use `SHOW STATEMENTS` or `crdb_internal.cluster_queries` in the cluster, or watch [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) and [Statement Latency p99 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p99-ms) move in real time.
+
+**Is this available on CockroachDB Cloud as well as self-hosted?**
+Yes. `crdb_internal.cluster_contention_events` and the SQL Activity Insights page exist on both. On Cloud the Insights page is the native equivalent; Vortex IQ reads the same underlying data via the Cloud metrics and statement APIs. Note that the contention view is in-memory and resets on a node restart, so a recent restart shortens the effective history on either deployment.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Top Contended Statements* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

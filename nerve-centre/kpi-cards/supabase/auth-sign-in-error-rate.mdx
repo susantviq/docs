@@ -1,0 +1,162 @@
+---
+title: "Auth Sign-In Error Rate %, Supabase"
+sidebarTitle: "Auth Sign-In Error Rate %"
+description: "Auth Sign-In Error Rate % for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Realtime & Auth](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of sign-in attempts through Supabase Auth (GoTrue) that fail server-side over the trailing hour. This card is Supabase-distinctive: Supabase Auth is the gatekeeper to the storefront. When sign-in fails, users cannot log in, cannot reach their account, and in many storefront designs cannot check out. A rising auth error rate is not a back-office metric; it is customers being locked out at the door. The alert fires above 5%, because a sustained sign-in failure rate at that level means a meaningful slice of returning users are being turned away.
+
+| | |
+| --- | --- |
+| **Data source** | Supabase Auth (GoTrue) service logs and the project metrics endpoint. The card counts failed sign-in / token-grant attempts against total sign-in attempts on the Auth endpoints (`/auth/v1/token`, `/auth/v1/verify`, and related sign-in routes). |
+| **Metric basis** | Sign-in error rate = failed sign-in attempts divided by total sign-in attempts, as a percentage, over the window. Server-side and provider-side failures, distinguished from expected user-side rejections where possible. |
+| **Aggregation window** | `1h` rolling. The rate is evaluated over the trailing hour, which smooths the natural minute-to-minute variance in login volume. |
+| **Alert threshold** | `> 5%`. Below 5% is treated as the normal background of mistyped passwords and expired links; above 5% sustained signals a systemic fault. |
+| **Why it matters** | Auth failures lock users out of the storefront. A misconfigured OAuth provider, an expired SMTP credential blocking magic links, a rate limit being hit, or a GoTrue fault all present here, and all of them stop returning customers from logging in and converting. |
+| **What counts** | Failed sign-in and token-grant attempts: invalid-grant responses, provider callback failures, magic-link / OTP delivery or verification failures, and server errors from the Auth service. |
+| **What does NOT count** | Sign-up attempts (a separate flow), session refreshes that succeed, and sign-outs. Pure user error such as a single mistyped password is part of the baseline, not an alert condition on its own. |
+| **Time window** | `1h` (rolling 1-hour window) |
+| **Alert trigger** | `> 5%` |
+| **Roles** | owner, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card divides failed sign-in attempts by total sign-in attempts on the Supabase Auth endpoints over the trailing hour:
+
+```text
+signin_error_rate = (auth_signin_attempts_failed / auth_signin_attempts_total) * 100
+                    over a rolling 1-hour window
+```
+
+Both counts are read from the Supabase Auth (GoTrue) service logs and the project metrics endpoint. A failed attempt is one where the Auth service did not issue a valid session: an `invalid_grant` (wrong credentials), a failed OAuth provider callback, a magic-link or OTP that could not be delivered or verified, a rate-limit rejection, or a server error from the Auth service itself.
+
+The window is one hour rather than five minutes because login volume is naturally bursty and uneven: a quiet midnight minute might see two attempts, one of which is a typo, which is a meaningless 50% rate. Averaging over the hour gives a stable denominator so the rate reflects a genuine pattern rather than small-sample noise. The 5% threshold is set above the normal background rate of mistyped passwords and lapsed magic links, so the alert fires on systemic faults (a broken provider, expired SMTP credentials, a rate-limit ceiling) rather than on everyday user error.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a storefront where returning customers sign in with Google OAuth and email magic links. Snapshot taken on 18 Apr 26 at 10:00 BST, an hour after a routine credential rotation.
+
+| Window (BST) | Sign-in attempts | Failed | Error rate |
+| --- | --- | --- | --- |
+| 08:00 to 09:00 | 4,210 | 88 | 2.1% |
+| 09:00 to 10:00 | 3,980 | 740 | 18.6% |
+
+The error rate jumped from a healthy 2.1% to 18.6% over the 09:00 to 10:00 window, well past the 5% threshold, so the alert fired. The Nerve Centre gauge shows **Auth Sign-In Error Rate at 18.6%** in the red band.
+
+What the platform team should read into this:
+
+1. **Nearly one in five returning customers cannot log in.** At 18.6%, a large slice of the storefront's returning audience is being turned away at the door. For a storefront that gates checkout behind login, that is a direct, ongoing conversion loss for the duration of the fault.
+2. **The credential rotation is the prime suspect.** The spike began within the hour after a rotation. The two classic post-rotation auth failures are: an OAuth client secret that was rotated on the provider side but not updated in the Supabase Auth provider config (every Google sign-in callback then fails), or an SMTP credential that was rotated so magic-link emails can no longer be sent (every magic-link sign-in then fails to deliver). Splitting the failures by method tells you which.
+3. **The fix is configuration, not capacity.** Unlike a connection or query fault, an auth spike of this shape is almost never solved by scaling. It is solved by restoring the correct credential: update the OAuth client secret in the Auth provider settings, or fix the SMTP credentials for magic-link delivery. The moment the right secret is in place, the rate falls back to baseline.
+
+```text
+Impact framing for this event:
+  - 1-hour window: 3,980 sign-in attempts
+  - Failed: 740 (18.6%)
+  - ~740 returning customers blocked from logging in this hour
+  - If checkout is login-gated, that is ~740 stalled sessions/hour
+  - Likely cause: stale OAuth secret or broken SMTP after rotation
+```
+
+The most useful pairing is [Auth Active Users (24h)](/nerve-centre/kpi-cards/supabase/auth-active-users-24h): if the error rate spikes while active users flatten or fall, the failures are translating directly into lost logged-in sessions, which confirms real customer impact rather than a measurement artefact. Pairing with [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) helps separate an Auth-specific fault (PostgREST clean, Auth spiking) from a broader project outage (both spiking together).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Auth Sign-In Error Rate | What the combination tells you |
+| --- | --- | --- |
+| [Auth Active Users (24h)](/nerve-centre/kpi-cards/supabase/auth-active-users-24h) | The volume of users successfully signed in. | A rising error rate while active users fall confirms real lost logins, not noise. |
+| [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) | The data-API surface alongside the Auth surface. | Both spiking equals a project-wide outage; Auth alone equals an Auth-specific fault. |
+| [Edge Function Error Rate %](/nerve-centre/kpi-cards/supabase/edge-function-error-rate) | Custom auth hooks often run as Edge Functions. | An Edge Function error spike can be the root cause of auth-hook failures showing here. |
+| [Realtime Connected Clients](/nerve-centre/kpi-cards/supabase/realtime-connected-clients) | Realtime auth depends on valid sessions. | Auth failures can drag down connected clients as sessions fail to establish. |
+| [Realtime Disconnect Rate (per min)](/nerve-centre/kpi-cards/supabase/realtime-disconnect-rate-per-min) | Expired or rejected tokens force Realtime disconnects. | An auth spike with a disconnect spike points at token validity problems. |
+| [Database Query Error Rate %](/nerve-centre/kpi-cards/supabase/database-query-error-rate) | Auth writes user and session rows to the database. | A database error spike can cascade into auth failures if session writes fail. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite this signal feeds. | A sustained auth error rate pulls the composite down, flagging a user-access problem. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase's own tooling:**
+
+> **Logs → Auth (GoTrue)** in the managed-service console for the per-request sign-in log stream; the error bodies distinguish `invalid_grant`, provider callback failures, and delivery failures.
+> **Authentication → Providers** to confirm OAuth client IDs and secrets are current, the most common cause of a provider-driven spike.
+> **Authentication → Email / SMTP settings** to confirm magic-link and OTP delivery credentials are valid.
+> **Authentication → Rate limits** to check whether a rate-limit ceiling is being hit during traffic peaks.
+> **Project metrics endpoint** (`/customer/v1/privileged/metrics`, Prometheus format) for the auth request and error series Vortex IQ reads.
+
+**Confirm successful session creation with native SQL (the `auth` schema):**
+
+```sql
+-- Distinct users with a session created in the last hour, a proxy for
+-- successful sign-ins to compare against the failure side:
+SELECT count(DISTINCT user_id) AS users_with_recent_session
+FROM auth.sessions
+WHERE created_at >= now() - interval '1 hour';
+
+-- Recent identity rows by provider, to see which provider is in use when
+-- isolating a provider-specific failure:
+SELECT provider, count(*)
+FROM auth.identities
+GROUP BY provider;
+```
+
+**Why our number may legitimately differ from the console log view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **User-error inclusion** | Variable | A single mistyped password is a real failed attempt and counts; a console filter that shows only server errors will read lower. |
+| **Window alignment** | Variable | The card uses a rolling 1-hour window; a console graph on calendar buckets can split a spike across two bars. |
+| **Flow scope** | Card narrower | This card is sign-in only; a combined "Auth errors" console view may fold in sign-ups, recoveries, and token refreshes. |
+| **Sampling cadence** | Brief lag | The metrics endpoint is scraped on an interval; a value at the exact moment of a spike may lag the live console graph by one scrape. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Auth Active Users (24h)](/nerve-centre/kpi-cards/supabase/auth-active-users-24h) | A sustained error spike should depress active users. | Active users holding steady while errors spike suggests the failures are retried successfully. |
+| [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) | Independent service surfaces. | Auth spiking with PostgREST clean isolates the fault to the Auth service or its provider config. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Does a user typing the wrong password count as an error?**
+Yes, a failed sign-in attempt is a failed sign-in attempt, including a mistyped password. That is deliberate: there is no reliable way to distinguish "wrong password" from "credential genuinely rejected by a broken provider" without the user's intent, so all failures count toward the rate. This is exactly why the threshold sits at 5% and the window is an hour: it accepts a healthy background of user error and fires only when failures climb well above it.
+
+**My rate spiked right after rotating a secret. Why?**
+This is the single most common cause of a sudden auth spike. Two patterns: an OAuth client secret rotated on the provider side but not updated in the Supabase Auth provider config, which fails every social sign-in callback; or SMTP credentials rotated so magic-link and OTP emails can no longer be delivered, which fails every passwordless sign-in. Split the failures by method to see which, then restore the correct credential in the Authentication settings.
+
+**Could a rate limit cause this?**
+Yes. Supabase Auth enforces rate limits on sign-in and token endpoints. During a traffic peak, or under a credential-stuffing attempt, legitimate sign-ins can be rejected once the limit is hit, pushing the error rate up. Check the Authentication rate-limit settings; if genuine users are being throttled at peak, the limit may need raising, and if a bot is driving the volume, the spike is the rate limiter doing its job.
+
+**Why one hour rather than five minutes like the 5xx alerts?**
+Login volume is far burstier and lower than API request volume. A five-minute window at a quiet hour might contain only a handful of attempts, where a single typo is a misleading double-digit rate. The one-hour window keeps the denominator large enough that the rate reflects a real pattern, not small-sample noise.
+
+**Auth is failing but my database and PostgREST are clean. Where do I look?**
+At the Auth service and its external dependencies, not the database. The usual suspects are the OAuth provider configuration (client ID/secret, redirect URLs), the SMTP / email provider for passwordless flows, and any custom auth hook (often an Edge Function, so check [Edge Function Error Rate %](/nerve-centre/kpi-cards/supabase/edge-function-error-rate)). A clean database and PostgREST tells you the fault is isolated to Auth.
+
+**Does this include sign-ups or only sign-ins?**
+Sign-ins only. New-account creation is a separate flow with different failure modes (email already registered, weak password, confirmation pending) and would muddy the lock-out signal this card is meant to give. This card answers one question: are returning users able to get back in?
+
+**Can I tune the 5% threshold?**
+Yes, it is configurable per project in the Sensitivity tab. Stores with a high proportion of passwordless sign-ins, where delivery hiccups raise the natural baseline, sometimes set it a little higher; stores where login is strictly gating revenue may lower it to catch faults sooner. Set it above your normal background failure rate so it fires on systemic problems rather than on everyday user error.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Auth Sign-In Error Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,147 @@
+---
+title: "Shard Balance Skew %, MongoDB"
+sidebarTitle: "Shard Balance Skew %"
+description: "Shard Balance Skew % for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication & Sharding](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How unevenly data is spread across the shards of a sharded cluster, expressed as a percentage. In a healthy cluster the balancer keeps roughly the same number of chunks on every shard, so any one shard carries a fair share of the read and write load. This gauge measures the gap between the busiest shard and the quietest one: it takes the shard with the most chunks, subtracts the shard with the fewest, and divides by the total chunk count. A low value means data is evenly distributed; a high value means one shard is carrying far more than its share and has become a hot shard. The card turns red at `>20%`: at that point a single shard is doing disproportionate work, which shows up as uneven latency, one over-loaded `mongod`, and wasted capacity on the idle shards.
+
+| | |
+| --- | --- |
+| **What it tracks** | The distribution imbalance of chunks across all shards in a sharded cluster, as a live gauge from 0% (perfectly even) upward. Only relevant to sharded clusters; a single replica set has no shards to compare. |
+| **Data source** | `(max chunks per shard - min chunks per shard) / total chunks`. Chunk counts are read from the `config.chunks` collection on the config servers, grouped by `shard`. `max` is the chunk count on the busiest shard, `min` is the count on the quietest, and `total` is the sum across all shards. |
+| **Time window** | `RT` (real-time). The gauge reflects the current chunk distribution as last reported by the config servers; chunk metadata changes only when the balancer moves a chunk or a split occurs, so the value is stable between balancer rounds. |
+| **Alert trigger** | `>20%`. A skew above 20% raises a sensitivity alert: one shard holds enough of an excess that it has effectively become a hot shard and the cluster is no longer balanced. |
+| **What counts** | All shards listed in `config.shards`, including drained or draining shards until they leave the cluster. The figure is computed over every sharded collection's chunks combined, so a per-shard total reflects all the data that shard owns. |
+| **What does NOT count** | Unsharded collections (these live entirely on the primary shard and are not part of chunk balancing), jumbo chunks that cannot be split or moved (they inflate one shard but are flagged separately), and zones / tag ranges that intentionally pin data to specific shards. |
+| **Roles** | owner, platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The gauge is a single ratio computed from chunk counts held on the config servers:
+
+```text
+shard_balance_skew_pct = ( max_chunks_per_shard - min_chunks_per_shard )
+                         / total_chunks
+                         x 100
+```
+
+The inputs come from `config.chunks`, the authoritative metadata that the config servers maintain for every chunk in the cluster. Vortex IQ groups that collection by `shard`, counts the chunks on each, then takes the highest count (`max_chunks_per_shard`), the lowest count (`min_chunks_per_shard`), and the sum (`total_chunks`).
+
+A worked sense of the scale:
+
+- Three shards holding 100 / 100 / 100 chunks: skew is `(100 - 100) / 300 = 0%`. Perfectly balanced.
+- Three shards holding 140 / 90 / 70 chunks: skew is `(140 - 70) / 300 = 23.3%`. Above the 20% threshold; shard A is hot.
+- Two shards holding 250 / 50 chunks: skew is `(250 - 50) / 300 = 66.7%`. Severely skewed; the cluster is barely sharding at all.
+
+Note that the metric is deliberately based on chunk count, not byte size or operation count. Chunk count is what the balancer itself optimises for, so it is the cleanest like-for-like signal of whether the balancer is keeping up. A shard can still be hot for reasons chunk count does not capture (a poor shard key concentrating writes into one range), which is why this card pairs with the operation-rate and latency cards below.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a four-shard cluster behind a high-traffic catalogue and session service. Snapshot taken on 14 Apr 26 at 09:20 BST during the morning ramp.
+
+| Shard | Chunks owned | Share of total | Notes |
+| --- | --- | --- | --- |
+| shard-rs-A | 612 | 41% | Primary shard, also holds the unsharded collections |
+| shard-rs-B | 318 | 21% | Healthy |
+| shard-rs-C | 296 | 20% | Healthy |
+| shard-rs-D | 264 | 18% | Newest shard, still filling |
+| **Total** | **1,490** | **100%** | |
+
+Skew is `(612 - 264) / 1,490 = 23.4%`. The gauge reads **23.4%** and turns red, just over the 20% threshold.
+
+The team reads three things from this:
+
+1. **Shard A is hot.** At 612 chunks it carries more than twice what shard D carries. Because shard A is also the primary shard (where unsharded collections live), it is absorbing both its fair share of sharded data and all the unsharded traffic. Its `mongod` CPU and WiredTiger cache pressure will be the highest of the four, and any query that fans out across shards will be gated by shard A's response time.
+
+2. **Shard D was added recently and is still filling.** The balancer moves chunks gradually (one at a time per shard pair, by default), so a freshly added shard takes hours to days to reach parity depending on chunk size and the balancing window. Some of this skew is therefore expected and self-correcting: the question is whether it is trending down.
+
+3. **The action depends on the trend, not the snapshot.** A single 23% reading the day after adding a shard is normal. The same 23% reading that has not moved in a week means the balancer is stuck (see [Chunks Pending Migration](/nerve-centre/kpi-cards/mongodb/chunks-pending-migration)) or the balancing window is too narrow to catch up. The team checks whether the balancer is enabled and whether the migration queue is draining.
+
+```text
+Reading the action threshold:
+  - Skew 23.4%, shard D added 18 hours ago, chunks pending = 11 and falling
+  - Verdict: balancer is working, leave it. Re-check in 6 hours.
+  - If after 48 hours skew is still > 20% with chunks pending near zero:
+      the shard key is concentrating data, not the balancer lagging.
+      That is a schema problem, not an operations problem.
+```
+
+The practical takeaway: a high skew tells you the cluster is uneven, but it does not tell you why. Pair it with [Chunks Pending Migration](/nerve-centre/kpi-cards/mongodb/chunks-pending-migration) to separate "balancer is catching up" from "balancer is stuck", and with [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) to confirm whether the hot shard is actually translating into a load problem or is merely a cosmetic count imbalance.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Shard Balance Skew | What the combination tells you |
+| --- | --- | --- |
+| [Chunks Pending Migration](/nerve-centre/kpi-cards/mongodb/chunks-pending-migration) | The balancer's work queue. | High skew with a large pending queue equals "balancer is overloaded and catching up". High skew with an empty queue equals "balancer thinks it is done; the skew is structural (shard key or jumbo chunks)". |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | The actual load on the cluster. | Confirms whether the chunk imbalance is causing a real load imbalance or is just a cosmetic count gap on a lightly used cluster. |
+| [Replica Set Members (state)](/nerve-centre/kpi-cards/mongodb/replica-set-members-state) | Per-shard health, since each shard is itself a replica set. | A hot shard whose primary is also under election pressure is a compounding risk; check both. |
+| [Replica Lag (seconds)](/nerve-centre/kpi-cards/mongodb/replica-lag-seconds) | Replication health on the busiest shard. | A hot shard's secondaries are the first to fall behind under write pressure. |
+| [WiredTiger Cache Hit Rate %](/nerve-centre/kpi-cards/mongodb/wiredtiger-cache-hit-rate) | Cache pressure on the over-loaded shard. | The hot shard's cache hit rate drops first because it is serving more working set than its peers. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) | Tail latency, which a hot shard inflates. | Scatter-gather queries are gated by the slowest shard, so skew shows up as p95 latency before it shows up in the average. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | The composite that takes sharding balance as an input. | A sustained skew above 20% drags the composite health score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MongoDB's own tooling:**
+
+> **`sh.status()`** in `mongosh` against a `mongos` router prints the full sharding summary, including the per-shard chunk distribution for every sharded collection. This is the canonical view of what the gauge is computing.
+> **`db.getSiblingDB("config").chunks.aggregate([{$group:{_id:"$shard",n:{$sum:1}}}])`** against the config database gives you the exact per-shard chunk counts Vortex IQ uses, so you can reproduce the max, min, and total by hand.
+> **`sh.getBalancerState()`** and **`sh.isBalancerRunning()`** confirm whether the balancer is enabled and currently moving chunks, which explains whether a high skew is being actively corrected.
+
+On **MongoDB Atlas**, the cluster's Metrics tab does not surface chunk skew as a single number, but the per-shard breakdown of operations, connections, and disk usage will show the same imbalance from the load side. Atlas also exposes the balancer state in the cluster configuration.
+
+**Why our number may legitimately differ from `sh.status()`:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Balancer round in progress** | Brief discrepancy | If a chunk migration commits between our read of `config.chunks` and your `sh.status()`, the counts shift by one chunk per migration. |
+| **Per-collection vs cluster-wide** | Variable | `sh.status()` prints skew per collection; our gauge aggregates all sharded collections into one cluster-wide figure. A single noisy collection can dominate. |
+| **Jumbo chunks** | Our value may read higher | Jumbo chunks cannot be moved, so they pin count to one shard. They count toward the skew but the balancer will never resolve them; `sh.status()` flags them with a `jumbo` marker. |
+| **Draining shards** | Transient spike | A shard being removed shows a falling count as its chunks evacuate; the skew temporarily widens then collapses to the remaining shards. |
+
+**Cross-connector reconciliation:** pair with the ecommerce catalogue and order-rate cards. A genuine hot shard often correlates with a specific high-cardinality access pattern (for example a session collection sharded on a low-entropy key); the [MongoDB OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mongodb/mongodb-ops-spike-vs-ecom-order-rate) card helps confirm whether traffic, not just chunk count, is concentrated.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My cluster is a single replica set, not sharded. What does this card show?**
+Nothing meaningful. Shard balance skew only applies to sharded clusters with two or more shards. On a single replica set there is one data-bearing topology and no chunks to compare, so the card reports zero or is hidden. If you expect this card to populate, confirm the connector is pointed at a `mongos` router and that the cluster actually has more than one shard via `sh.status()`.
+
+**The skew jumped to 25% right after I added a new shard. Is something wrong?**
+No, that is expected and self-correcting. A newly added shard starts with zero chunks, so the gap between the fullest and emptiest shard is at its widest the moment the shard joins. The balancer then migrates chunks to it gradually, and the skew falls over the following hours. Watch the trend: if it is dropping, leave it alone. Only worry if it has not moved for a day or more.
+
+**Skew is high but [Chunks Pending Migration](/nerve-centre/kpi-cards/mongodb/chunks-pending-migration) is zero. Why is the balancer not fixing it?**
+This is the signature of a structural problem rather than a balancer lag. The balancer balances chunk count, and if the chunk counts are already even but one shard's chunks are far larger or far busier, the balancer considers its job done. The usual causes are jumbo chunks (chunks too large to split or move), a poor shard key that concentrates data into a few ranges, or zones / tag ranges that intentionally pin data. Check for jumbo chunks in `sh.status()` and review the shard key cardinality.
+
+**Does the skew account for how busy each shard is, or only how much data it holds?**
+Only how much data, measured in chunk count. A shard can be perfectly balanced by chunk count yet hot by traffic if a small number of chunks receive most of the operations (a hot range). That is why this card is paired with [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) and the latency cards: chunk skew is the structural signal, operation rate is the load signal, and you need both to diagnose a hot shard fully.
+
+**Can I change the 20% alert threshold?**
+Yes. The 20% trigger is the generic default for a hot-shard warning. Sensitivity thresholds are configurable per profile in the Sensitivity tab. Clusters that run intentionally lopsided (for example zone-pinned data for regional compliance) may want a higher threshold so the alert does not fire on a deliberate imbalance.
+
+**Is the balancing window affecting my skew?**
+It can. If you have configured a balancing window (a time range during which the balancer is allowed to run), the cluster only rebalances inside that window. A high skew during business hours that only corrects overnight is the expected behaviour of a narrow window. If skew routinely breaches 20% during the day and only resolves at night, either widen the window or accept the daytime imbalance as a known trade-off.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Shard Balance Skew %* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

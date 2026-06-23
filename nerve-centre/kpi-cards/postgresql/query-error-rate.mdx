@@ -1,0 +1,150 @@
+---
+title: "Query Error Rate %, gauge"
+sidebarTitle: "Query Error Rate %"
+description: "Query Error Rate % for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The share of statements that failed instead of completing, over the last five minutes. A healthy production PostgreSQL instance runs at effectively 0%: well-behaved applications do not send statements that error. Any sustained reading above noise floor means something is broken, a bad deploy shipping malformed SQL, a migration half-applied, a permission revoked, a constraint being violated, or the server itself refusing connections because it is out of slots. This is the fastest way to catch a deploy that broke the database contract.
+
+| | |
+| --- | --- |
+| **What it tracks** | Failed statements as a percentage of all statements attempted in the window. A "failure" is any statement the server rejected or aborted with an error, from syntax errors to constraint violations to lock timeouts. |
+| **Data source** | Errors are counted from server-side error events (`xact_rollback` from `pg_stat_database` as a baseline, refined by the error and deadlock counters and, where available, log-derived `ERROR`/`FATAL` events). The denominator is total statements (`pg_stat_statements.calls`) or transactions (`xact_commit + xact_rollback`) over the same window. |
+| **Time window** | `5m` (rolling five-minute window, so a single failed statement does not dominate the percentage and a sustained problem shows clearly). |
+| **Alert trigger** | `> 1%`. On a production OLTP workload, 1% of statements failing is a serious, customer-visible problem. |
+| **Roles** | owner, engineering, operations |
+| **What counts as an error** | Statement-level `ERROR` and `FATAL` events: syntax errors, undefined columns/tables, constraint violations (unique, foreign key, check, not-null), permission denials, lock timeouts, deadlock victims, serialization failures, and connection refusals (`too many clients`). |
+| **What does NOT count** | A query returning zero rows (that is success), a slow but successful query (see the latency cards), a `WARNING` or `NOTICE`, or a client-side timeout where the server actually completed the work. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The gauge is the ratio of failed statements to attempted statements over the rolling five-minute window:
+
+```text
+error_rate_pct = 100 * errors_5m / attempts_5m
+```
+
+Both terms are deltas between two cumulative-counter samples taken five minutes apart:
+
+- **`attempts_5m`** is the change in `pg_stat_statements.calls` (preferred) or, as a fallback, the change in `xact_commit + xact_rollback` from `pg_stat_database`.
+- **`errors_5m`** is built from several signals, most reliable first: log-derived `ERROR` and `FATAL` line counts where log access is available; the change in `xact_rollback` (a rolled-back transaction usually, though not always, indicates an error); and the `deadlocks` counter from `pg_stat_database` for the deadlock contribution.
+
+The `xact_rollback` signal needs care. Not every rollback is an error: an application can deliberately `ROLLBACK` a transaction it no longer needs. To avoid overcounting, Vortex IQ treats `xact_rollback` as an upper-bound estimate and, where log access is configured, prefers the precise `ERROR`/`FATAL` counts from the server log. Without log access the card still works but reads a slightly conservative (higher) error rate, which is the safe direction for an alerting card.
+
+Connection refusals deserve special mention. When the connection pool saturates and PostgreSQL returns `FATAL: sorry, too many clients already`, those refusals surface here as errors, which is why an error-rate spike and a saturation spike so often arrive together. See [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation).
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team ships a schema migration to a PostgreSQL 15 primary at 14:20 BST on 18 Apr 26. The migration adds a `NOT NULL` column to the `orders` table but the application deploy that populates the column lags ten minutes behind. In that gap, every insert that omits the new column fails.
+
+| Window (5m) | Attempts | Errors | Error rate |
+| --- | --- | --- | --- |
+| 14:10 to 14:15 | 612,400 | 38 | 0.006% |
+| 14:15 to 14:20 | 598,210 | 41 | 0.007% |
+| 14:20 to 14:25 | 574,900 | 11,930 | **2.07%** |
+
+The baseline is essentially zero (a handful of incidental errors per five minutes is normal). At 14:20 the migration lands and the rate jumps to 2.07%, well over the 1% alert threshold. The gauge turns red and pages on-call.
+
+The DBA's first move is to find out *which* error, because the percentage alone does not name the cause:
+
+```text
+Top error classes in the window (from the log):
+  23502  not_null_violation       11,640   <- the smoking gun
+  40P01  deadlock_detected            210
+  23505  unique_violation              80
+```
+
+The dominant class is `23502 not_null_violation`, pointing straight at the new `NOT NULL` column. The cause is now obvious: the column was made `NOT NULL` before the code that fills it shipped, a classic migration-ordering mistake. Every order placed in the gap is failing at the database layer, which means real customers are seeing checkout errors.
+
+```text
+Customer impact while the rate sits at 2%:
+  orders attempted in the window   ~ 4,800
+  failing on not_null_violation    ~   100
+  each failure = an abandoned checkout the customer must retry
+```
+
+The fix is fast once the cause is named: either roll back the migration's `NOT NULL` constraint (`ALTER TABLE orders ALTER COLUMN x DROP NOT NULL;`) to stop the bleeding immediately, or fast-forward the lagging application deploy. The team drops the constraint, the rate falls back to baseline within one window, and they re-apply `NOT NULL` only after the populating code is live.
+
+Two takeaways the team writes into their runbook:
+
+1. **A non-zero error rate on production PostgreSQL is never normal.** Unlike latency (which has a healthy non-zero range), a healthy error rate is approximately 0%. Any sustained reading above the noise floor is a defect to be explained, not a number to be tuned.
+2. **The percentage tells you something is wrong; the SQLSTATE class tells you what.** Always follow an error-rate alert with a look at the dominant error class. `23xxx` is a constraint or data problem (often a deploy), `40xxx` is concurrency (deadlock or serialization), `42xxx` is a SQL or schema problem (bad query or missing object), `53300` is `too_many_connections` (a saturation event in disguise).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Error Rate | What the combination tells you |
+| --- | --- | --- |
+| [Query Error Rate Spike (>1% in 5m)](/nerve-centre/kpi-cards/postgresql/query-error-rate-spike-1-in-5m) | The alert-feed view of this same threshold. | Confirms whether a breach is a one-off blip or a sustained event worth paging on. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/postgresql/connection-errors-24h) | Isolates the connection-refusal subset of errors. | An error-rate spike that is mostly connection errors is a saturation event, not a query defect. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) | The capacity cause of `too many clients` errors. | Error spike plus saturation spike equals refusals; fix the pool, not the queries. |
+| [Deadlocks (last 5m)](/nerve-centre/kpi-cards/postgresql/deadlocks-last-5m) | Isolates the `40P01` concurrency contribution. | A rising error rate driven by deadlocks is a locking-order problem in the application. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/postgresql/queries-per-second-live) | The denominator behind the percentage. | A QPS spike that is mostly errors is a retry storm; high QPS with flat errors is healthy load. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p95-ms) | Errors and latency often move together under stress. | Latency climbing with errors points to lock timeouts; errors without latency points to a logic or schema fault. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The composite that weights error-free operation. | Any sustained error rate above the floor pulls the composite down on its own. |
+| [PostgreSQL QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/postgresql/postgresql-qps-spike-vs-ecom-order-rate) | Ties failures to revenue events. | Errors during the checkout window are abandoned carts, not just log noise. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL itself:**
+
+> The ground truth for errors is the server log. With `log_min_messages = error` (or finer) and `log_min_error_statement = error`, every `ERROR` and `FATAL` is logged with its SQLSTATE and the offending statement. Grep the log for the alert window and group by SQLSTATE to see the dominant class.
+> For the rollback-based baseline, run `SELECT xact_commit, xact_rollback, deadlocks FROM pg_stat_database WHERE datname = current_database();` twice across the window and difference it.
+> For the deadlock contribution specifically, the `deadlocks` counter in the same view is exact.
+> On a managed service, the console exposes errors through logs and metrics: AWS RDS publishes PostgreSQL logs to CloudWatch Logs and exposes Performance Insights, Google Cloud SQL surfaces `ERROR` log entries in Cloud Logging, and Azure Database for PostgreSQL exposes server logs and the `pg_stat_database` counters.
+
+**Why our number may legitimately differ from a hand count:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Rollback proxy** | Vortex IQ may read higher | Without log access, `xact_rollback` is used as an upper bound; deliberate application rollbacks inflate it above the true error count. |
+| **Log access** | Vortex IQ more accurate with logs | With log-derived `ERROR`/`FATAL` counts the rate is precise; without them it is conservative. |
+| **Window alignment** | Either way | The console may bucket errors by minute or by calendar window; Vortex IQ uses a rolling 5-minute window. |
+| **Statement vs transaction denominator** | Either way | Without `pg_stat_statements`, the denominator counts transactions, shifting the percentage relative to a statement-level hand count. |
+| **Connection refusals** | Vortex IQ includes | `too many clients` `FATAL`s count as errors here; a query-only error count in the console may exclude them. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What is a normal error rate?**
+On a healthy production OLTP instance, effectively 0%, a handful of incidental errors per five minutes from edge cases. Unlike latency, there is no healthy non-zero band: any sustained reading above the noise floor is a defect to be explained. That is why the alert sits at 1% rather than at some multiple of a baseline.
+
+**The rate spiked but my queries look fine. What else could it be?**
+Connection refusals. When the pool saturates, PostgreSQL returns `FATAL: sorry, too many clients already`, and those count as errors here. An error-rate spike that arrives alongside a [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) spike is almost always refusals, not bad SQL. Fix the pool and the error rate clears.
+
+**How do I find out which error is driving the percentage?**
+The card gives you the rate; the server log gives you the cause. Grep the log for the alert window and group by SQLSTATE class. `23xxx` is constraints or data (usually a deploy), `40xxx` is concurrency (deadlock or serialization), `42xxx` is a SQL or schema fault, `53300` is too many connections. The class names the fix far faster than the percentage alone.
+
+**Does a query that returns zero rows count as an error?**
+No. Returning zero rows is a successful query that happened to match nothing. Only statements the server actively rejected or aborted with an `ERROR` or `FATAL` count. Likewise a `WARNING` or `NOTICE` is not an error and does not affect this card.
+
+**Why might Vortex IQ read a higher error rate than my log shows?**
+If Vortex IQ does not have log access, it falls back to `xact_rollback` as an upper-bound estimate, and deliberate application rollbacks (transactions the app chose to abandon, not failures) inflate it. Granting the connector log access lets it use precise `ERROR`/`FATAL` counts and the two numbers converge.
+
+**A client-side timeout fired but the server completed the query. Does that count?**
+No, not on this card. If the server actually executed the statement successfully, it is a success from PostgreSQL's point of view even though the client gave up waiting. That scenario shows up on the latency cards ([Query Latency p95 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p95-ms) and p99), not here. Server-side `statement_timeout` cancellations, by contrast, do count, because the server aborted the statement.
+
+**Can I change the 1% threshold?**
+Yes, in the Sensitivity tab per profile. Most teams should tighten it, not loosen it: for a critical OLTP primary, 1% is already a lot of failed customer actions, and alerting at 0.1% or even on any sustained non-zero reading is reasonable. A batch or analytics database that tolerates occasional expected failures might justify a higher floor.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Error Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,157 @@
+---
+title: "Slow Analytics Queries During Checkout Window, Snowflake"
+sidebarTitle: "Slow Analytics Queries During Checkout Window"
+description: "Slow Analytics Queries During Checkout Window for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A live table that lists individual slow Snowflake queries running during an active checkout window, time-aligned against a dip in storefront conversion. Most Snowflake performance cards look at the warehouse in isolation. This one asks a sharper, revenue-shaped question: are heavy analytics queries running right now, on the same compute path, at the exact moment shoppers are trying to check out, and is checkout suffering because of it? Each row is one slow query (its text, warehouse, duration, queue time, and the user or job that ran it), surfaced only when slow queries cluster inside a checkout-conversion drop. The classic culprit is a heavy ad-hoc analytics query or a scheduled report sharing a warehouse (or a real-time feature lookup) that the live storefront also depends on: the report queues the lookups, the lookups time out, the checkout page stalls, conversion falls. The `>5 slow queries co-occur with checkout drop` alert fires when at least five slow queries land inside a checkout-conversion dip in the same five-minute window, the signature of analytics load directly stealing from sales.
+
+| | |
+| --- | --- |
+| **What it tracks** | A per-row table of slow queries (those exceeding the slow-query duration threshold) executing during the trailing five-minute window, joined to the storefront's live conversion rate. Rows surface when slow queries co-occur with a conversion drop. |
+| **Data source** | Snowflake side: `SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY` and live `INFORMATION_SCHEMA.QUERY_HISTORY` for query text, `total_elapsed_time`, `queued_overload_time`, `queued_provisioning_time`, warehouse, and user. Ecom side: the live conversion-rate and checkout feed from the linked Shopify, BigCommerce, or Adobe Commerce connector. Slow Analytics Queries During Checkout Window, broken down by row. |
+| **Why it matters** | This is the most direct line between a warehouse choice and lost revenue. When analytics and the live storefront share compute, a heavy query does not just run slowly, it can drag down checkout. The card makes that contention visible at the moment it costs money. |
+| **Aggregation window** | `5m` trailing, refreshed continuously, because checkout contention is a short, sharp event that a longer window would average away. |
+| **Time window** | `5m` |
+| **Alert trigger** | `>5 slow queries co-occur with checkout drop`, more than five slow queries inside the window while storefront conversion is dipping below its baseline. |
+| **Roles** | owner, engineering, operations, data |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card correlates slow-query incidence with a live conversion dip inside the same short window:
+
+```text
+slow_queries(window) = queries where total_elapsed_time > slow_threshold
+                       in the trailing 5 minutes
+checkout_drop        = current conversion_rate < baseline conversion_rate
+alert fires when COUNT(slow_queries) > 5 AND checkout_drop is true
+```
+
+What a data and platform team needs to know about how Snowflake creates this contention, and why the checkout join matters:
+
+- **Slow is measured by total elapsed time, and queue time is part of it.** A query's `total_elapsed_time` includes compilation, queueing, and execution. A query that is fast to execute but spent thirty seconds queued behind a heavy report still counts as slow here, because from the storefront's point of view the wait is what hurts. The card reads `queued_overload_time` and `queued_provisioning_time` so you can see when the delay is contention, not the query itself.
+- **Shared warehouses are where checkout and analytics collide.** If a real-time feature lookup, a personalisation call, or a checkout-time inventory check runs on the same warehouse as ad-hoc BI, a heavy analyst query consumes the warehouse's concurrency slots and the live lookups queue behind it. The fix is architectural: isolate the live path on its own warehouse.
+- **Snowflake is built for analytics, not single-digit-millisecond OLTP.** Using a Snowflake warehouse directly in a synchronous checkout path is risky by design. This card exists partly to catch accounts that have drifted into that pattern, where a perfectly normal analytics query becomes a checkout hazard.
+- **The five-minute window is deliberate.** Checkout contention is bursty: a report kicks off, the queue forms, conversion dips, the report finishes, recovery follows, often inside ten minutes. A 30-day or even 1-hour view would smooth this into invisibility. The short window keeps each contention event sharp and individually inspectable.
+- **The conversion join is what turns a perf signal into a revenue signal.** Five slow queries on their own are an ops curiosity. Five slow queries during a measured conversion dip are money leaving. The card only escalates when both are true, which keeps it quiet during heavy-but-harmless overnight reporting.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs Snowflake behind an ecommerce retailer on Adobe Commerce. A `LIVE_WH` warehouse serves a real-time stock-availability lookup that the checkout page calls before confirming an order. An analyst, unaware of that dependency, points a heavy cohort-analysis query at the same `LIVE_WH`. Snapshot taken on 03 Jun 26 at 13:05 UTC, during the lunchtime checkout peak.
+
+The card surfaces this table for the 13:00 to 13:05 window, with conversion already dipping:
+
+| Query ID | Warehouse | User | Duration | Queue time | Statement (truncated) |
+| --- | --- | --- | --- | --- | --- |
+| 01b4f2 | `LIVE_WH` | analyst_jo | 41.8s | 0.4s | `SELECT customer_id, ... FROM orders o JOIN line_items ... GROUP BY ...` |
+| 01b4f7 | `LIVE_WH` | checkout_svc | 11.2s | 10.9s | `SELECT qty_available FROM inventory WHERE sku = ?` |
+| 01b4f9 | `LIVE_WH` | checkout_svc | 9.7s | 9.5s | `SELECT qty_available FROM inventory WHERE sku = ?` |
+| 01b4fc | `LIVE_WH` | checkout_svc | 12.4s | 12.1s | `SELECT qty_available FROM inventory WHERE sku = ?` |
+| 01b4fe | `LIVE_WH` | checkout_svc | 10.1s | 9.8s | `SELECT qty_available FROM inventory WHERE sku = ?` |
+| 01b502 | `LIVE_WH` | checkout_svc | 13.0s | 12.7s | `SELECT qty_available FROM inventory WHERE sku = ?` |
+| 01b505 | `LIVE_WH` | checkout_svc | 8.9s | 8.6s | `SELECT qty_available FROM inventory WHERE sku = ?` |
+
+Seven slow queries in five minutes, so the `>5` alert fires. The shape is unmistakable: one heavy analyst query (01b4f2) is executing for 42 seconds, and six normally instant inventory lookups are now slow, but their slowness is almost entirely queue time (~10s each, execution near zero). They are not slow; they are stuck waiting for `LIVE_WH`'s concurrency slots. Storefront conversion has dropped from a baseline of 3.1% to 1.9% across the same five minutes, because shoppers are hitting a checkout page that spins for ten seconds and some abandon.
+
+The team's response, in order:
+
+1. **Confirm the contention, not a slow query.** The queue-time column is the tell: the checkout lookups spent ~10s queued and milliseconds executing. That is concurrency starvation on a shared warehouse, not bad SQL. Cross-check [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) and [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse) for `LIVE_WH`, both will be pinned.
+2. **Clear the immediate contention.** Cancel the analyst query if it is non-urgent (`SELECT SYSTEM$CANCEL_QUERY('01b4f2')`). The checkout lookups drain their queue within seconds and conversion recovers.
+3. **Fix the architecture so it cannot recur.** Move the analyst workload onto a separate `BI_WH`, and protect the live path: enable multi-cluster (scale-out) on `LIVE_WH` so concurrency bursts get extra clusters instead of a queue, and set a `STATEMENT_QUEUED_TIMEOUT_IN_SECONDS` on the checkout role so a lookup fails fast and falls back rather than spinning for ten seconds. The real lesson is that a synchronous checkout dependency should never share a warehouse with ad-hoc analytics.
+
+```text
+Revenue framing of the five-minute event:
+  Conversion baseline 3.1%, observed 1.9% during the window
+  Checkout sessions in the window: ~260
+  Orders expected at baseline: ~8.1; orders observed: ~4.9
+  Lost orders: ~3.2; average order value £74 -> ~£237 lost in five minutes
+  If the analyst's report ran 30 minutes unspotted: ~£1,400 lost
+Caught by the alert at 13:05: one CANCEL_QUERY, conversion recovers in under a minute.
+```
+
+Three things worth remembering:
+
+1. **Read the queue-time column first.** It separates a genuinely slow query from a fast query starved of capacity. When the live lookups are slow purely because of queue time, the problem is the warehouse it shares, not the query itself.
+2. **A synchronous checkout dependency on a shared analytics warehouse is the root cause, not the symptom.** Cancelling the heavy query buys time; isolating the live path on its own (ideally multi-cluster) warehouse is the fix that stops this card ever firing again.
+3. **The conversion join is what makes this urgent.** The same seven slow queries at 02:00 with no shoppers present would be a non-event. The card escalates only when slow queries and a real conversion dip coincide, which is exactly the moment that costs orders.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow Analytics Queries During Checkout Window | What the combination tells you |
+| --- | --- | --- |
+| [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) | Confirms the slow queries are concurrency starvation, not bad SQL. | A pinned warehouse during the window proves the live path is being queued out. |
+| [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse) | Quantifies how many queries are waiting behind the heavy one. | A queue forming exactly in the window is the contention fingerprint. |
+| [Snowflake QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/snowflake/snowflake-qps-spike-vs-ecom-order-rate) | The volume-side cross-channel sibling. | A query storm during the checkout window is how five slow queries become fifty. |
+| [Snowflake Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/snowflake/snowflake-event-ingest-vs-ecom-orders) | The ingest-side cross-channel sibling. | Slow queries plus stale data means the analytics layer is both contended and behind. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/snowflake/query-latency-p95-ms) | The account-wide latency trend behind individual slow rows. | A rising p95 across the day predicts more checkout-window contention events. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/snowflake/slow-query-rate) | The proportion of all queries that are slow. | A high slow-query rate means contention events like this are frequent, not isolated. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/snowflake/top-10-slowest-queries) | The 24h leaderboard of offenders. | If the same statement appears here repeatedly, it is a recurring checkout hazard. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake's own tooling:**
+
+> **Slow queries with queue breakdown (live, low latency):** `SELECT query_id, warehouse_name, user_name, total_elapsed_time/1000 AS secs, (queued_overload_time + queued_provisioning_time)/1000 AS queue_secs, LEFT(query_text, 80) FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(END_TIME_RANGE_START=>DATEADD('minute', -5, CURRENT_TIMESTAMP()))) WHERE total_elapsed_time > 5000 ORDER BY secs DESC;`
+> **Account-wide slow-query history (complete, some latency):** the same fields from `SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY` filtered on `total_elapsed_time` and `start_time`.
+> **Cancel a runaway:** `SELECT SYSTEM$CANCEL_QUERY('<query_id>');` or `SYSTEM$CANCEL_ALL_QUERIES(<session_id>)` for a whole session.
+> **Managed console:** Snowsight under **Monitoring -> Query History** lets you filter by warehouse, duration, and time, and each query's profile shows the queue-versus-execution split visually. **Admin -> Warehouses** shows live running and queued counts per warehouse. The checkout-side conversion dip is confirmed in the commerce platform's own analytics, not in Snowflake.
+
+**Why our number may legitimately differ from a native query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Slow-threshold definition** | Variable | The card's slow threshold is profile-configurable; a native `WHERE total_elapsed_time > X` with a different X will count a different set of rows. |
+| **Account Usage latency** | Our list can lag | `ACCOUNT_USAGE.QUERY_HISTORY` lags up to ~45 minutes; the live information-schema view is current, so the two sources will not list identical rows for the most recent minutes. |
+| **Warehouse scope** | Our list shorter | If the connector is scoped to specific warehouses, an account-wide native query returns more rows. |
+| **Conversion join** | No native equivalent | Snowflake has no view of storefront conversion. The co-occurrence condition is computed by joining the ecom connector, so a pure Snowflake query lists slow queries but cannot reproduce the alert's checkout-drop gate. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| `adobe_commerce.conversion_rate` / `shopify.conversion_rate` | The conversion dip on this card should match the storefront connector's own conversion reading for the window. | If conversion is flat in the commerce connector, the slow queries are not actually hurting checkout; re-check the join window. |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`adobe_commerce.total_revenue`](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | A confirmed contention event should leave a small dent in revenue for the window. | No revenue dent despite a conversion dip can mean the dip was measurement noise on very low session counts. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The slow queries are checkout lookups themselves, not analytics. Is the card mislabelled?**
+No, that is the most important case it catches. The card lists every slow query in the window, including the live lookups. When those lookups are slow purely because of queue time (high `queued_overload_time`, near-zero execution), they are the victims, and the heavy analytics query sharing the warehouse is the cause. Read the queue-time column: the long-execution row is the offender, the long-queue rows are the casualties.
+
+**Why a five-minute window? I would rather see a daily summary.**
+Checkout contention is a short, bursty event. A report starts, a queue forms, conversion dips, the report finishes, recovery follows, often inside ten minutes. A daily or hourly window averages that spike into nothing and you would never see it. For the daily leaderboard of slow statements, use [Top 10 Slowest Queries](/nerve-centre/kpi-cards/snowflake/top-10-slowest-queries) instead; this card is deliberately the real-time, revenue-aligned view.
+
+**Should I really be running checkout-critical lookups on Snowflake at all?**
+Generally no. Snowflake is an analytics warehouse, optimised for scanning large datasets, not for single-digit-millisecond transactional lookups in a synchronous checkout path. If this card fires regularly, the durable fix is to move the live lookup to a low-latency store (a cache, a key-value store, or the commerce platform's own inventory API) and keep Snowflake for analytics. At minimum, isolate the live path on its own multi-cluster warehouse.
+
+**The alert fired but conversion did not actually drop. Why?**
+Two common reasons. First, on very low session counts a conversion rate is noisy: one abandoned cart can read as a large percentage dip with no real cause. Second, the slow queries may share a warehouse name with the live path in config but not actually contend (separate clusters). Check the queue-time column; if the live lookups show no queue time, there was no real contention and the threshold can be tuned for that warehouse.
+
+**How do I stop this happening rather than just reacting to it?**
+Three structural moves, in order of durability: (1) put analytics and the live path on separate warehouses so they cannot contend; (2) enable multi-cluster scale-out on the live warehouse so concurrency bursts get extra clusters instead of a queue; (3) set `STATEMENT_QUEUED_TIMEOUT_IN_SECONDS` on the checkout role so a starved lookup fails fast and the app falls back, rather than the shopper watching a ten-second spinner. The alert then becomes a rare backstop instead of a daily event.
+
+**Can a single very heavy query trigger this, or does it need five separate ones?**
+It needs more than five slow queries in the window, but one heavy query usually creates the other four-plus by queueing the live lookups behind it. So a single misplaced analytics query is typically what tips the count over five, by making several normally fast queries slow. The count threshold is about confirming real contention (multiple queries affected), not about needing five independent heavy queries.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow Analytics Queries During Checkout Window* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

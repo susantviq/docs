@@ -1,0 +1,157 @@
+---
+title: "Redis Health Score, Redis"
+sidebarTitle: "Redis Health Score"
+description: "Redis Health Score for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The **Redis Health Score** is a single 0 to 100 composite that rolls up the signals a DBA or SRE would otherwise check across a dozen `INFO` fields: keyspace hit rate, memory headroom against `maxmemory`, eviction pressure, replication lag, persistence freshness, command latency, and connection saturation. It answers one question for a platform team at a glance: "is this Redis instance healthy enough to keep serving production right now, or does someone need to look?" A score of 90+ is a calm instance; 70 to 89 is "watch it"; below 70 means at least one subsystem is degraded and the headline drops to red.
+
+| | |
+| --- | --- |
+| **Data source** | `Redis Health Score for the selected period.` Computed by Vortex IQ from a weighted blend of `INFO` sections (`stats`, `memory`, `replication`, `persistence`, `clients`) and `LATENCY`/`SLOWLOG` samples pulled on each poll. For ElastiCache or MemoryDB, the same fields are read via the engine endpoint or supplemented by CloudWatch where `INFO` is restricted. |
+| **Metric basis** | Composite index, NOT a single Redis field. No native `redis_health_score` exists; the number is Vortex IQ's own weighting of the underlying primitives. |
+| **Aggregation window** | `RT/7D`: a live real-time reading plus a 7-day trend so you can see whether health is drifting down over the week or just had one bad hour. |
+| **Weighting (default)** | Keyspace hit rate 20%, memory used vs `maxmemory` 20%, eviction pressure 15%, replication/cluster health 15%, command latency (p95/p99) 15%, persistence freshness 10%, connection saturation 5%. Weights are configurable per profile. |
+| **What pulls the score down** | Hit rate under 80%, memory over 90% of `maxmemory`, sustained evictions, replica lag over 10s, a slot-coverage gap on cluster, p95 over 10ms, a stale RDB/AOF, or clients approaching `maxclients`. |
+| **What does NOT count** | One-off latency spikes shorter than the poll window, `DEBUG`/admin commands, and replica nodes scored separately from the primary (each node has its own score; this card shows the selected node). |
+| **Time window** | `RT/7D` (live value, plus a 7-day trend line) |
+| **Alert trigger** | `<70`. Any score below 70 means a weighted subsystem is degraded; the card turns red and pages the on-call rotation. |
+| **Roles** | owner, platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:worked_example */}
+The score is a weighted average of normalised sub-scores. Each input is mapped to a 0 to 100 band, then multiplied by its weight, then summed. The mapping is deliberately non-linear at the edges so that a single critical breach (for example memory at 99% of `maxmemory`, or a cluster slot gap) can dominate and force the composite under 70 even when everything else is green.
+
+```text
+health_score = round(
+    0.20 * norm(keyspace_hit_rate)        # 100% hit -> 100; 80% -> ~70; 50% -> ~20
+  + 0.20 * norm(1 - used_memory/maxmemory) # 50% used -> 100; 90% used -> ~40; 99% -> ~5
+  + 0.15 * norm_inverse(evicted_keys/min)  # 0/min -> 100; 100/min -> ~50; 1000/min -> ~5
+  + 0.15 * norm(replication_ok)            # replica in sync, lag<1s -> 100; lag>10s -> low
+  + 0.15 * norm_inverse(cmd_latency_p95)   # <1ms -> 100; 10ms -> ~50; 50ms -> ~5
+  + 0.10 * norm(persistence_fresh)         # RDB/AOF recent + status ok -> 100
+  + 0.05 * norm(1 - connected/maxclients)  # plenty of headroom -> 100
+)
+```
+
+`norm()` clamps to the 0 to 100 range. A subsystem with no data (for example persistence on a cache-only instance with `save ""` and AOF off) is excluded and its weight redistributed across the remaining inputs, so a pure cache node is not penalised for having no backups.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 3-node Redis 7.2 cluster behind a B2C storefront. Redis holds the session store, the catalogue cache, and a rate-limiter. Snapshot taken on 14 Apr 26 at 09:40 BST on the primary of shard 1.
+
+| Sub-metric | Reading | Normalised | Weight | Contribution |
+| --- | --- | --- | --- | --- |
+| Keyspace hit rate | 96.4% | 95 | 0.20 | 19.0 |
+| Memory used vs maxmemory | 71% (4.55 GB / 6.4 GB) | 78 | 0.20 | 15.6 |
+| Eviction pressure | 0 evicted_keys/min | 100 | 0.15 | 15.0 |
+| Replication health | replica in sync, lag 0.3s | 98 | 0.15 | 14.7 |
+| Command latency p95 | 0.8 ms | 96 | 0.15 | 14.4 |
+| Persistence freshness | RDB 4 min ago, status ok | 100 | 0.10 | 10.0 |
+| Connection saturation | 240 / 10000 clients | 99 | 0.05 | 5.0 |
+| **Composite** | | | | **93.7 -> 94** |
+
+The headline reads **94**, green. The team does nothing. Now fast-forward to a flash-sale at 19:05 the same evening:
+
+```text
+Memory climbs to 6.21 GB / 6.4 GB  -> 97% used  -> norm 12  -> contributes 2.4
+Evictions begin: 640 evicted_keys/min sustained -> norm 18 -> contributes 2.7
+Hit rate falls to 82% (cold keys re-fetched) -> norm 72 -> contributes 14.4
+p95 latency rises to 6 ms (fork + eviction churn) -> norm 64 -> contributes 9.6
+Replication, persistence, connections still healthy.
+
+New composite ~= 2.4 + 2.7 + 14.4 + 14.7 + 9.6 + 10.0 + 5.0 = 58.8 -> 59
+```
+
+The score drops from 94 to **59**, well under the 70 alert line, and the card turns red and pages the on-call. The DBA looks at the breakdown, sees memory and evictions as the two collapsed contributions, and acts: either raise `maxmemory`, switch the eviction policy from `noeviction` to `allkeys-lru` if appropriate, or shed load. Three things this example shows:
+
+1. **The composite degrades gracefully but one breach can dominate.** A single subsystem cannot drag a healthy instance below 70 unless it is genuinely critical, because no single weight exceeds 0.20. It took two collapsed subsystems (memory and evictions) plus a hit-rate dip to cross the line. That is the design intent: avoid false pages, fire on real degradation.
+2. **The score points you at the cause, not just the symptom.** Always open the breakdown. "59" tells you to look; the contribution column tells you where.
+3. **Read the 7-day trend, not just the live value.** A score that sits at 88 all week and dips to 59 for one flash-sale hour is a capacity-planning signal, not an emergency. A score that has drifted from 94 to 78 to 71 over three days is a slow leak (often memory fragmentation or an unbounded key set) that will breach soon.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Redis Health Score | What the combination tells you |
+| --- | --- | --- |
+| [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) | The single biggest weight when an instance is under pressure. | Health drop plus memory over 90% equals the classic eviction spiral; raise `maxmemory` or shed keys. |
+| [Keyspace Hit Rate %](/nerve-centre/kpi-cards/redis/keyspace-hit-rate) | The 20%-weight cache-efficiency input. | Health drop with hit rate falling equals cache cold or under-sized; the cache is doing less work. |
+| [Evicted Keys / minute](/nerve-centre/kpi-cards/redis/evicted-keys-minute) | The eviction-pressure input. | Sustained evictions are the leading indicator of the next health drop. |
+| [Command Latency p95 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p95-ms) | The latency input; the customer-felt signal. | Health drop with p95 over 10ms equals a pathological command (big key, slow Lua, swap). |
+| [Replica Lag (seconds)](/nerve-centre/kpi-cards/redis/replica-lag-seconds) | The replication-health input. | Lag over 10s pulls the score down and means failover would lose recent writes. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live) | The throughput context for any health move. | A health drop with flat ops equals an internal problem; with rising ops equals a load problem. |
+| [Clients vs maxclients %](/nerve-centre/kpi-cards/redis/clients-vs-maxclients) | The connection-saturation input. | Saturation near 90% pulls the score down and risks rejected connections. |
+| [Cluster Slots Assigned (of 16384)](/nerve-centre/kpi-cards/redis/cluster-slots-assigned-of-16384) | The cluster-integrity input. | A slot gap forces the score down hard because some keys are unreachable. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+There is no native "health score" in Redis to reconcile against directly, the number is Vortex IQ's composite. What you can reconcile is each input, so when the score moves you can confirm the cause against Redis's own tooling.
+
+**Where to look in Redis:**
+
+> `INFO` (or `INFO stats`, `INFO memory`, `INFO replication`, `INFO persistence`, `INFO clients`) for every primitive that feeds the score. `redis-cli INFO` dumps the lot.
+> `LATENCY HISTORY <event>` and `LATENCY LATEST` (Redis 7+) for the command-latency input.
+> `SLOWLOG GET 10` for the slow-command picture behind a latency-driven drop.
+> `CLUSTER INFO` and `CLUSTER SHARDS` for the cluster-integrity input on a clustered deployment.
+
+**Why our number may legitimately differ from a manual reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Poll cadence.** Vortex IQ samples on its refresh interval; a manual `INFO` is a single instant. | Either | A transient spike between polls may not be in the score yet, or may have already passed. |
+| **Weight configuration.** The composite uses your profile's weights. | Either | If you changed the weights in the Sensitivity tab, your mental "what should this be" will differ from the default. |
+| **Subsystem exclusion.** Inputs with no data are dropped and re-weighted. | Score higher than expected | A cache-only node with persistence off is not penalised for having no backups. |
+| **Managed-service masking.** ElastiCache/MemoryDB restrict some `INFO` fields. | Either | Where a field is unavailable, the score falls back to the CloudWatch equivalent, which has its own latency. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Redis OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/redis/redis-ops-spike-vs-ecom-order-rate) | A health drop during a real traffic surge correlates with rising orders. | A health drop with ops up but orders flat equals a cache stampede or bot, not genuine demand. |
+| [Connected Clients Saturation vs Traffic Burst](/nerve-centre/kpi-cards/redis/connected-clients-saturation-vs-traffic-burst) | Connection-driven health drops line up with burst windows. | Saturation outside a burst equals a connection leak in an app pool, not load. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The score is 88 but everything looks fine in `INFO`. Why is it not 100?**
+A perfect 100 is rare and usually means a freshly restarted, idle instance. A busy production node almost always carries some memory utilisation, some normal latency, and some connection count, each of which trims a few points off its weighted band. 88 to 95 is the healthy steady state for a working instance, not a problem.
+
+**My cache-only node has no persistence. Is it being marked down for that?**
+No. If the instance has `save ""` and AOF disabled, the persistence input is excluded and its 10% weight is redistributed across the remaining subsystems. A pure cache node is scored only on the things that matter to a cache (hit rate, memory, evictions, latency, connections).
+
+**The score dropped to 59 for one hour during a sale, then recovered to 92. Do I need to act?**
+That is a capacity-planning signal, not an incident to chase after the fact. The instance was genuinely degraded during the sale (likely memory plus evictions). The action is preventative: size `maxmemory` for peak, confirm the eviction policy is appropriate, and consider a read replica or a bigger node for the next sale. Use the 7-day trend to see how often it happens.
+
+**Can I change the weights?**
+Yes. Open the Sensitivity tab for the Redis profile and adjust the per-subsystem weights and the alert threshold. A team that does not use Redis for persistence might zero the persistence weight; a team whose Redis is latency-critical might raise the latency weight. The default weighting is tuned for a general session-plus-cache workload.
+
+**Why does my replica show a different score from my primary?**
+Each node is scored independently from its own `INFO`. A replica typically shows lower throughput, different memory, and (by definition) the replication input measures its own lag from the primary. They are different instances doing different work, so different scores are expected. This card shows the node you selected.
+
+**The score is below 70 but the alert did not page anyone.**
+Check three things: (1) the alert threshold has not been raised above 70 in the Sensitivity tab; (2) the on-call routing for the Redis profile is configured; (3) the dip lasted at least one full poll interval, sub-poll transients can show on the live gauge without crossing the alert's sustain check. If all three are correct and it still did not page, the routing integration needs attention.
+
+**Does the score include the cluster bus or just the data plane?**
+For a clustered deployment, cluster integrity (slot coverage and node reachability from `CLUSTER INFO`) is folded into the replication/cluster input. A slot-coverage gap is treated as critical and forces the score down hard, because a gap means some keys are unreachable and commands on those slots fail. See [Cluster Slot Coverage Gap](/nerve-centre/kpi-cards/redis/cluster-slot-coverage-gap-16384-slots-assigned).
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Redis Health Score* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

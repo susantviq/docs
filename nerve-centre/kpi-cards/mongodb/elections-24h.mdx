@@ -1,0 +1,140 @@
+---
+title: "Elections (24h), MongoDB"
+sidebarTitle: "Elections (24h)"
+description: "Elections (24h) for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication & Sharding](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Elections (24h)** counts how many primary elections your replica set has held in the trailing 24 hours. An election happens when the set loses or replaces its primary and the remaining members vote on who takes over. One election after a planned maintenance is fine. Repeated, unplanned elections mean the primary is flapping, and a flapping primary is the single most disruptive thing a replica set can do, because every election causes a brief write outage while no primary exists. This is a MongoDB-distinctive signal: frequent elections almost always trace back to network instability or hardware trouble underneath the database.
+
+| | |
+| --- | --- |
+| **What it tracks** | The number of primary elections held across the replica set in the trailing 24 hours. Frequent elections equal primary flapping equal network or hardware instability. |
+| **Data source** | `rs.status()` member `stateStr` transitions and the election metrics in `serverStatus().electionMetrics` (notably `numStepDownsCausedByHigherTerm`, `stepUpCmd`, and the election term counter). Each term increment corresponds to an election. |
+| **Time window** | `24h` rolling. The headline is the count of elections observed across the window. |
+| **Alert trigger** | `> 1`. More than one election in 24 hours escalates, because beyond a single planned event, repeated elections signal an unstable set. |
+| **Why it matters** | Every election is a short write outage: for a few seconds to tens of seconds there is no primary, so writes are rejected or queued. Repeated elections multiply that outage and destabilise the application. |
+| **Reading the value** | 0 is steady state. 1 is usually a planned maintenance, failover drill, or routine config change. 2 or more unplanned is flapping that needs root-cause investigation now. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+A replica set always has exactly one primary (the member that accepts writes) and one or more secondaries. An **election** is the protocol by which the members choose a new primary. It is triggered when:
+
+- The current primary becomes unreachable (the secondaries stop receiving heartbeats within the configured timeout).
+- The primary voluntarily steps down (a planned `rs.stepDown()`, a config change, or a rolling upgrade).
+- A higher-priority member becomes available and forces a re-election.
+- A network partition isolates the primary from a majority of voters.
+
+Each election advances the replica set's **term**, a monotonic counter in the replication protocol. The engine counts elections by observing term increments and `stateStr` transitions in `rs.status()`, corroborated by `serverStatus().electionMetrics`. The 24-hour headline is the number of distinct elections (term advances) observed across the window.
+
+The alert fires above **1** because a single election in 24 hours is almost always benign: a planned maintenance, a deliberate step-down, or a brief blip that the set recovered from cleanly. Two or more, especially unplanned, is the signature of flapping. The cause is rarely MongoDB itself; it is usually one layer down. Network jitter or packet loss between members makes heartbeats time out intermittently. An overloaded or swapping primary cannot service heartbeats in time. A failing disk or a noisy-neighbour VM causes pauses long enough to look like a dead node. Each apparent death triggers an election, the "dead" node recovers, and the cycle repeats. That is why this card is framed as a stability and infrastructure signal, not just a replication statistic.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 3-node replica set (`rs0`) across two availability zones backing a checkout and session store. The Elections (24h) card normally reads 0. Snapshot taken on 18 Mar 26 at 14:50 GMT: it reads **5**, well past the `> 1` line, and the application team has been reporting intermittent "not master" write errors all afternoon.
+
+The DBA pulls the election timeline from `rs.status()` and `electionMetrics`:
+
+| Time (GMT) | Event | New primary |
+| --- | --- | --- |
+| 12:10 | Election (term +1) | node-b |
+| 12:38 | Election (term +1) | node-a |
+| 13:05 | Election (term +1) | node-b |
+| 13:41 | Election (term +1) | node-a |
+| 14:22 | Election (term +1) | node-b |
+
+The primary is bouncing between node-a and node-b roughly every half hour. Each bounce is a 5 to 15 second window with no primary, during which the application's writes fail with "not master" and either retry or surface as 5xx to the shopper.
+
+```text
+Impact of flapping over the afternoon:
+  - 5 elections in ~2h 12m
+  - each election: ~10s with no primary
+  - total write-unavailable time ~ 50s
+  - plus per-election connection storms as drivers rediscover the primary
+  - shopper-visible: intermittent checkout failures, retried sessions
+```
+
+The root cause is not in MongoDB. Checking the host metrics, node-a sits in a zone whose cross-AZ network link has been dropping packets since a provider event at 12:00. Heartbeats between node-a and node-b time out intermittently, each side concludes the other is gone, and an election fires; the link recovers, the demoted node rejoins, and the cycle repeats. The fix is at the infrastructure layer: the team raises the heartbeat timeout slightly to ride out the jitter as an immediate mitigation, opens a ticket with the cloud provider for the packet loss, and confirms via [Replica Set Members (state)](/nerve-centre/kpi-cards/mongodb/replica-set-members-state) that no member is stuck in `RECOVERING`.
+
+Two takeaways:
+
+1. **Elections are an infrastructure signal wearing a database costume.** The count is reported by MongoDB, but two or more unplanned elections almost always mean network or hardware instability underneath. Do not start by debugging queries; start by checking the links and the hosts.
+2. **One election is not a problem; a cadence is.** A single election after a deploy or a node reboot is normal and self-heals. What this card is really watching for is a rhythm, the same set electing repeatedly, which is the fingerprint of flapping.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Elections (24h) | What the combination tells you |
+| --- | --- | --- |
+| [Replica Set Members (state)](/nerve-centre/kpi-cards/mongodb/replica-set-members-state) | Shows which member holds which role right now. | Elections plus a member stuck in `RECOVERING` equals a node that cannot stably rejoin. |
+| [Replica Lag (seconds)](/nerve-centre/kpi-cards/mongodb/replica-lag-seconds) | Lag often spikes around each election. | Elections plus high lag equals a secondary that keeps falling behind then triggering re-election. |
+| [Replica Set Member Lag >10s or in RECOVERING State](/nerve-centre/kpi-cards/mongodb/replica-set-member-lag-10s-or-in-recovering-state) | The real-time alert for an unhealthy member. | The alert flags the symptom; this card counts the resulting elections. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | Elections drag the replication domain of the composite. | A health-score dip driven by elections equals a stability problem, not a load one. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mongodb/connection-errors-24h) | Each election causes a driver reconnection storm. | Elections plus connection-error spikes equals clients rediscovering the primary. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | Write throughput dips during each no-primary window. | Periodic ops dips aligned with election times confirm the write-outage impact. |
+| [Instance Uptime](/nerve-centre/kpi-cards/mongodb/instance-uptime) | A short uptime explains a recent election. | A node that restarted recently legitimately caused one election. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MongoDB's own tooling:**
+
+> **`rs.status()`** is the canonical view. Read the `members` array for current `stateStr` per node and the top-level `term`; each term increment is one election. The `electionDate` and `electionId` on the primary show when the current term began.
+> **`db.serverStatus().electionMetrics`** exposes election counters directly, including step-down causes, which helps distinguish a higher-priority takeover from a heartbeat-timeout failover.
+> **`rs.printReplicationInfo()`** and **`rs.printSecondaryReplicationInfo()`** show the oplog window and per-secondary lag, useful for confirming whether a struggling secondary is provoking elections.
+> The **mongod log** records each election with the reason (heartbeat timeout, step-down, priority takeover); grepping for election lines gives the exact timeline. **Atlas** users see failover events on the cluster's Activity feed and Alerts page.
+
+**Why our number may legitimately differ from a manual read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Term vs election count** | Usually equal | The engine counts term advances; a rare protocol edge case can advance the term without a full primary change, which we reconcile against `stateStr` transitions. |
+| **Window boundary** | Edge cases shift | An election right on the 24h boundary may sit inside or outside our window depending on poll timing. |
+| **Restart-induced elections** | Both count them | A planned rolling restart legitimately produces elections; the card counts them the same as unplanned ones, so cross-check with your maintenance log. |
+| **Time zone** | Timeline shifts | The mongod log and `rs.status()` render in node-local time; this card aligns the window to your reporting time zone. |
+| **Per-set scope** | Card aggregates the set | `rs.status()` is run from one member's view; the card reports the set-level election count. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows 1 election but nothing seemed to break. Is that a problem?**
+Usually not. A single election in 24 hours is the expected outcome of any planned event: a rolling upgrade, a deliberate `rs.stepDown()`, a node reboot, or a priority change. The set elects a new primary cleanly in a few seconds and carries on. The alert is set at more than 1 precisely so a single planned election does not page anyone. If you cannot tie the one election to a known event, note it and watch for a pattern.
+
+**We had several elections but the application barely noticed. How?**
+Modern MongoDB drivers are retryable-writes aware: when an election briefly removes the primary, the driver waits, rediscovers the new primary, and retries the write transparently. If your application enables retryable writes and uses sensible timeouts, short elections can be largely invisible at the application layer. That is good engineering, but it does not make the elections harmless: the underlying instability is still there and will eventually produce an election long enough to break through. Treat the count as the real signal, not the application's tolerance of it.
+
+**Why does the card frame this as a network or hardware problem rather than a database problem?**
+Because that is almost always where the cause lives. MongoDB holds an election when members stop hearing each other's heartbeats. The most common reasons are network jitter or packet loss between members, an overloaded or swapping primary that cannot answer heartbeats in time, or a failing disk or noisy-neighbour VM causing pauses long enough to look like death. The database is reporting the symptom faithfully; the root cause is in the layer beneath it.
+
+**Can a single slow or lagging secondary cause elections?**
+Indirectly, yes. A secondary that keeps falling behind and entering `RECOVERING` can churn the set's view of who is eligible to vote, and on some configurations a struggling member contributes to instability that culminates in re-elections. Pair this card with [Replica Lag (seconds)](/nerve-centre/kpi-cards/mongodb/replica-lag-seconds) and [Replica Set Members (state)](/nerve-centre/kpi-cards/mongodb/replica-set-members-state); if one member is consistently the troublemaker, fix or replace that node.
+
+**Does raising the heartbeat timeout fix flapping?**
+It can mask it, which is sometimes the right immediate mitigation. Increasing the election heartbeat timeout makes the set more tolerant of transient network jitter, so it stops electing on brief blips. But it also slows down genuine failover when a node really does die, so it is a trade-off, not a cure. Use it to buy time while you fix the underlying network or hardware problem, then reconsider whether the higher timeout should stay.
+
+**On a sharded cluster, which elections does this count?**
+Each shard is its own replica set with its own elections, and the config servers form a replica set too. By default the card reflects the deployment the connector is scoped to. For a full sharded cluster, scope per shard to see which shard's replica set is unstable, because one flapping shard can degrade the whole cluster while the others are perfectly healthy.
+
+**The count went up right after a planned maintenance. Should I worry?**
+No. Rolling maintenance (upgrades, restarts, config changes that step the primary down) legitimately produces elections, often one per member touched. Cross-reference the timeline with your change log and [Instance Uptime](/nerve-centre/kpi-cards/mongodb/instance-uptime). Elections that line up exactly with planned work are expected; the ones to investigate are the unplanned ones with no corresponding change.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Elections (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

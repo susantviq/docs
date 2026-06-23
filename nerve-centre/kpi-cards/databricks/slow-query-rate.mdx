@@ -1,0 +1,161 @@
+---
+title: "Slow-Query Rate %, Databricks"
+sidebarTitle: "Slow-Query Rate %"
+description: "Slow-Query Rate % for Databricks SQL warehouses. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Slow-Query Rate %** is the share of SQL statements on your Databricks SQL warehouses that exceed a "slow" duration threshold, measured over a rolling 15-minute window. Where the latency-percentile cards tell you *how slow* the tail is, this card tells you *how broad* the slowness is. A p99 spike caused by one monster query barely moves the slow-query rate; a warehouse-wide slowdown pushes it up sharply. It is the single best "is this affecting lots of people or just one query?" signal in the Performance category.
+
+| | |
+| --- | --- |
+| **What it tracks** | The percentage of completed SQL statements classified as slow (duration above the slow threshold) over the window, for the warehouses in scope. |
+| **Data source** | Databricks SQL query history (`system.query.history` / Query History API): count of statements over the slow threshold divided by total completed statements. |
+| **Time window** | `15m` (rolling 15-minute window) |
+| **Alert trigger** | `> 5%`. When more than 5% of queries are slow over the window, the on-call data engineer is notified. |
+| **Roles** | owner, engineering |
+| **Card class** | Hero and Sensitivity card: it drives the Performance health signal and both the slow threshold and the 5% alert level are configurable in the Sensitivity tab. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Over the rolling 15-minute window, Vortex IQ reads completed statements from the warehouse query history, counts how many had a total duration above the configured "slow" threshold, and divides by the total number of completed statements:
+
+```text
+Slow-Query Rate % = (queries with total_duration > slow_threshold)
+                    / (total completed queries) * 100
+```
+
+"Total duration" is the same full wall-clock measure used by the latency-percentile cards: queue wait plus compilation plus execution plus result fetch. The slow threshold is a duration (for example 5 seconds) set in the Sensitivity tab; it defines what "slow" means for your workload and is independent of the 5% alert level, which defines how many slow queries you tolerate.
+
+This is a rate, not a latency, so it is robust to a single very slow query. One 60-second outlier in a window of 2,000 fast queries is a slow-query rate of 0.05%, well below threshold, even though it would dominate p99. That separation is the point: the percentile cards catch *severity*, this card catches *prevalence*.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+An online grocer runs a shared `Serverless Small` SQL warehouse serving operational dashboards across merchandising, supply chain, and finance. The slow threshold is set to 5 seconds. Snapshot taken on 28 May 26 at 16:20 BST.
+
+| Reading | Value |
+| --- | --- |
+| Total queries in window | 1,640 |
+| Queries over 5s | 138 |
+| **Slow-Query Rate** | **8.4%** (alert: above 5%) |
+| p50 latency | 1,900ms |
+| p95 latency | 7,100ms |
+| Warehouse saturation | 84% |
+
+The card is red at 8.4%, well over the 5% threshold, and the picture across the panel tells a coherent story. Unlike the isolated-p99 case, here the rate, p50, p95, and saturation all moved together.
+
+1. **The slowness is broad, not a single offender.** 138 of 1,640 queries are slow. That is not one bad query; a meaningful chunk of the whole workload is degraded. p50 has risen to 1.9s (the typical query is now slow-ish too), confirming the problem is system-wide.
+2. **Saturation at 84% points to the cause.** The warehouse is near capacity. With many teams hitting the same small warehouse at 16:20 (end-of-day reporting crunch), queries queue and a growing fraction tip over the 5-second line.
+3. **The lever is capacity allocation.** Because the cause is load on a shared warehouse, the fix is structural: enable multi-cluster auto-scaling so the warehouse adds a cluster during the end-of-day crunch, or split the heaviest team (finance's large aggregations) onto its own warehouse so it stops crowding out lightweight merchandising dashboards.
+
+```text
+Prevalence vs severity, side by side:
+  - Slow-Query Rate 8.4%  -> BROAD slowness (many users affected)
+  - p95 7.1s             -> the slow ones are genuinely slow
+  - p50 1.9s             -> even typical queries are degraded
+  - Saturation 84%       -> capacity is the bottleneck
+  -> Diagnosis: shared warehouse overloaded at peak.
+     Fix: multi-cluster auto-scale OR split heavy team to own warehouse.
+```
+
+Three takeaways:
+
+1. **Slow-Query Rate measures breadth; percentiles measure depth.** A high rate means many users are affected. Always read it alongside [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) and [SQL Query Latency p99 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p99-ms) to know both how widespread and how severe the slowness is.
+2. **High rate plus high saturation equals a capacity problem.** High rate with *low* saturation, by contrast, points to degraded table layout or missing data pruning, which is a query/data fix, not a scaling one.
+3. **The threshold is two numbers, set both.** The slow-duration threshold defines "slow" for your workload, and the 5% alert defines your tolerance. A warehouse of heavy aggregations may use a higher slow threshold; a latency-sensitive BI warehouse may use a tighter one.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow-Query Rate | What the combination tells you |
+| --- | --- | --- |
+| [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) | The severity of the tail. | High rate plus high p95 equals broad and deep slowness; high rate alone means many queries just over the line. |
+| [SQL Query Latency p99 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p99-ms) | The extreme tail. | Low rate plus high p99 equals one or two pathological queries, not a broad problem. |
+| [SQL Query Latency p50 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p50-ms) | The median baseline. | A rising p50 alongside the rate confirms even typical queries are now slow. |
+| [SQL Warehouse Saturation %](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation) | The capacity cause. | High rate plus high saturation equals overload; high rate plus low saturation equals table-layout/query problems. |
+| [Avg Cluster CPU Utilisation %](/nerve-centre/kpi-cards/databricks/avg-cluster-cpu-utilisation) | The compute-pressure peer. | Confirms whether the warehouse is CPU-bound during the slow window. |
+| [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries) | The named offenders. | Identifies the statements making up the slow fraction so you can rewrite or reschedule them. |
+| [SQL Query Error Rate %](/nerve-centre/kpi-cards/databricks/sql-query-error-rate) | The failure peer. | A rising error rate alongside slow-query rate means queries are starting to time out, not just run slowly. |
+| [Slow SQL Queries During Checkout Window](/nerve-centre/kpi-cards/databricks/slow-sql-queries-during-checkout-window) | The revenue cross-channel view. | Tells you whether the slow fraction overlaps live checkout traffic. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **Query History** in the Databricks SQL workspace, filtered to the same warehouse and 15-minute range: count the statements with duration above your slow threshold against the total to reproduce the rate.
+> **`system.query.history`** (Unity Catalog system tables) is the exact source; a single query reproduces the card.
+> **Warehouse monitoring** on the warehouse page shows live queue depth and cluster count, which explain a load-driven rate spike.
+
+To match the card precisely:
+
+```sql
+SELECT
+  100.0 * COUNT_IF(total_duration_ms > 5000) / COUNT(*) AS slow_query_pct
+FROM system.query.history
+WHERE warehouse_id = '<your_warehouse_id>'
+  AND start_time >= current_timestamp() - INTERVAL 15 MINUTES;
+```
+
+(Replace `5000` with whatever slow threshold you have configured in the Sensitivity tab.)
+
+**Why our number may legitimately differ from the Databricks UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Slow-threshold definition** | Variable | The rate depends entirely on your configured slow threshold; if you compare against a different cut-off in the UI, the percentages will not match. |
+| **Duration definition** | Vortex IQ may read more queries as slow | We use total duration including queue wait; an execution-time-only comparison classifies fewer queries as slow. |
+| **System-table latency** | Brief lag | `system.query.history` can lag completion by a few seconds, so the most recent statements may be missing from a live reading. |
+| **Denominator scope** | Variable | We divide by completed statements; if you include cancelled/failed statements or metadata-only commands, the denominator (and the rate) shift. |
+| **Time zone / window edges** | Marginal | Vortex IQ aligns the 15-minute window to your reporting time zone. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | A broad slow-query rate spike during peak browsing can correspond to degraded storefront features if the lakehouse feeds them synchronously. | Revenue steady during a rate spike means the slowness is internal-only (BI/reporting), not customer-facing. |
+| [`google_analytics`](/nerve-centre/kpi-cards/google-analytics/ga4-property-health) | Independent front-end timing measurement. | Lakehouse rate high but GA4 timings normal equals back-office-only impact. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**How is "slow" defined? Is 5 seconds the threshold?**
+"Slow" is a duration threshold you set in the Sensitivity tab; a common default is 5 seconds. It is separate from the 5% alert level. The 5% governs how many slow queries you tolerate; the slow-duration threshold governs what counts as slow in the first place. Tune both to your workload: a heavy-aggregation warehouse may use a higher slow threshold than a latency-sensitive BI one.
+
+**My p99 spiked but the slow-query rate barely moved. Why?**
+Because they measure different things. p99 is severity (how slow the worst 1% is), and one extreme query can dominate it. Slow-query rate is prevalence (what fraction is slow), and one outlier in thousands of queries is a negligible fraction. A high p99 with a low slow rate is the signature of a small number of pathological queries; investigate via [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries) rather than scaling.
+
+**The rate is high but warehouse saturation is low. What does that mean?**
+That rules out load as the cause. When many queries are slow but the warehouse is not busy, the usual culprits are data-side: tables with too many small files, missing partition pruning, stale statistics, or absent Z-ORDER on common filter columns. The fix is OPTIMIZE / Z-ORDER and better table layout, not a bigger warehouse.
+
+**Does a single user running lots of bad queries skew the rate?**
+It can. If one analyst fires fifty unfiltered full-table-scan queries in the window, they alone can push the rate over 5% even on a healthy warehouse. Use Query History grouped by user to spot this; the fix is to coach the user or move ad-hoc exploration onto a separate warehouse so it does not affect the shared rate.
+
+**Why a 15-minute window rather than real-time?**
+A rate needs enough queries to be statistically meaningful. Over a few seconds, a quiet warehouse might run only three queries; one slow query would read as a 33% rate and constant false alarms. The 15-minute window gives a stable denominator while still being responsive enough to catch a developing slowdown.
+
+**Can the rate be misleadingly low during an outage?**
+Yes. If queries are failing or being cancelled before completion, they may drop out of the completed-statement denominator and instead appear as errors. A suspiciously low slow rate alongside a rising [SQL Query Error Rate %](/nerve-centre/kpi-cards/databricks/sql-query-error-rate) is a sign that queries are failing rather than finishing slowly. Always read the two together during an incident.
+
+**Should ETL and BI traffic share one Slow-Query Rate card?**
+Ideally no. Heavy ETL transformations are legitimately slow and will inflate the rate, masking genuine BI degradation. Stack the card per warehouse, or scope the connector so a high-throughput interactive warehouse is measured separately from a batch-ETL one, and set an appropriate slow threshold for each.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow-Query Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

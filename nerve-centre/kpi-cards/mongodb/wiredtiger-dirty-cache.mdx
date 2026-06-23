@@ -1,0 +1,155 @@
+---
+title: "WiredTiger Dirty Cache %, MongoDB"
+sidebarTitle: "WiredTiger Dirty Cache %"
+description: "WiredTiger Dirty Cache % for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [WiredTiger](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The fraction of WiredTiger's cache that holds modified ("dirty") pages waiting to be written to disk by a checkpoint or eviction. Every write in MongoDB first lands in the in-memory cache and is marked dirty; the storage engine then flushes those pages to disk in the background. This gauge shows how much of the cache is currently dirty. A small dirty fraction is healthy and normal; a large one means writes are arriving faster than WiredTiger can flush them. The card turns red at `>20%` because once dirty content climbs past the engine's eviction trigger, MongoDB starts forcing application threads to help evict, which stalls writes and spikes latency.
+
+| | |
+| --- | --- |
+| **What it tracks** | The proportion of the WiredTiger cache occupied by dirty (modified, not yet written to disk) pages, shown as a live gauge from 0% to 100%. |
+| **Data source** | Derived from the `wiredTiger.cache` sub-document of `serverStatus`: `cache."tracked dirty bytes in the cache" / cache."maximum bytes configured"`. This is the MongoDB-distinctive write-pressure surface inside the storage engine. |
+| **Time window** | `RT` (real-time gauge). The value reflects the live dirty fraction at each poll; sustained elevation, not a momentary blip, is the signal that matters. |
+| **Alert trigger** | `>20%`. A dirty fraction above 20% raises a sensitivity alert because it is the point at which WiredTiger's eviction machinery begins working hard and write throttling becomes likely. |
+| **What counts** | Modified collection and index pages held in the WiredTiger cache that have not yet been persisted to disk by a checkpoint or eviction. |
+| **What does NOT count** | Clean (unmodified) cached pages, which are tracked by the read-side hit-rate metric instead. The figure is per-`mongod`; a secondary applying its own writes has its own dirty fraction. |
+| **Roles** | owner, platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The gauge is a ratio of two fields in the `wiredTiger.cache` sub-document of `serverStatus`:
+
+```text
+dirty_cache_pct = cache."tracked dirty bytes in the cache"
+                  / cache."maximum bytes configured"
+                  x 100
+```
+
+What the inputs mean:
+
+- **`tracked dirty bytes in the cache`** is the volume of modified pages currently held in the cache that still need to be flushed to disk. Writes increase it; checkpoints and eviction decrease it.
+- **`maximum bytes configured`** is the configured WiredTiger cache size (by default roughly 50% of RAM minus 1 GB, or 256 MB, whichever is larger). Using the configured maximum as the denominator, rather than the currently used bytes, gives a stable ceiling so the gauge is comparable over time.
+
+Important framing points:
+
+- **WiredTiger has its own internal dirty thresholds.** By default the engine begins background eviction of dirty pages at roughly 5% dirty and starts forcing application threads to participate in eviction at roughly 20% dirty. The card's `>20%` alert is aligned with that second threshold, the point where writes start paying an eviction tax.
+- **A high dirty fraction is a write-flush problem, not a write-volume problem in isolation.** It rises when incoming write rate outpaces the engine's ability to flush, which can be caused by slow disk, an oversized write burst, an infrequent checkpoint cadence, or contention from background eviction.
+- **Per-member.** On a replica set the primary carries the write load and usually shows the highest dirty fraction; secondaries dirty their cache as they apply the oplog.
+
+The output is a single live percentage rendered on a gauge, with the raw dirty-byte and configured-maximum counters available on drill-down.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MongoDB 6.0 primary with a 15 GB WiredTiger cache, backing an orders and events-ingest workload. A bulk event-replay job is launched to backfill a new collection. Readings taken on 12 Jun 26.
+
+| Time (UTC) | dirty bytes | dirty % | Eviction behaviour | State |
+| --- | --- | --- | --- | --- |
+| 10:00 | 0.45 GB | **3.0%** | Background eviction idle | Normal write load |
+| 11:20 | 1.35 GB | **9.0%** | Background eviction active | Replay ramping |
+| 11:45 | 3.00 GB | **20.0%** | Forced app-thread eviction begins | Red, alert fires |
+| 12:05 | 4.05 GB | **27.0%** | App threads stalling on eviction | Write latency spiking |
+
+At 10:00 the deployment is at a comfortable 3% dirty: writes arrive and flush in the background without application threads ever noticing. As the bulk replay floods the cache with modified pages faster than checkpoints can flush them, the dirty fraction climbs. At 11:45 it reaches 20% and WiredTiger starts forcing the application's own write threads to do eviction work before they can proceed: the alert fires. By 12:05 the deployment is at 27% dirty, write threads are spending measurable time evicting instead of writing, and p95 write latency has roughly tripled.
+
+```text
+Why it climbed:
+  Incoming write rate (replay)  >  flush rate to disk
+  Background eviction trigger   ~  5%  dirty  (engine starts flushing harder)
+  App-thread eviction trigger   ~ 20%  dirty  (writes now pay the eviction tax)
+  Conclusion: writes are arriving faster than the engine can persist them,
+              so dirty content accumulates until app threads are conscripted
+              into eviction, which is what stalls write latency.
+```
+
+The DBA's response has an immediate lever and a structural fix:
+
+1. **Immediate:** throttle or pause the bulk replay so the incoming write rate drops below the flush rate; the dirty fraction drains as checkpoints catch up, usually within a checkpoint interval or two (default checkpoints run roughly every 60 seconds).
+2. **Structural:** if dirty pressure recurs under normal load, the flush path is the bottleneck. Move to faster disk (dirty cache is acutely sensitive to write IOPS and latency), increase cache size so there is more room to absorb bursts, or reshape the workload to spread writes rather than batching them into spikes.
+
+Three takeaways:
+
+1. **Dirty cache is the write-side mirror of cache hit rate.** [WiredTiger Cache Hit Rate %](/nerve-centre/kpi-cards/mongodb/wiredtiger-cache-hit-rate) tells you whether reads fit in memory; this card tells you whether writes can be flushed fast enough. Read them together to understand total cache pressure.
+2. **The 20% line maps to a real engine behaviour, not an arbitrary number.** Below it, eviction is a quiet background activity; above it, your application's own threads are forced to evict, which is exactly when users feel write latency. That is why it is a "fix it now" line.
+3. **Slow disk is the usual root cause.** A dirty fraction that climbs under ordinary write load almost always points to the storage layer not keeping up. Check disk write latency and IOPS before assuming the workload is at fault.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with WiredTiger Dirty Cache | What the combination tells you |
+| --- | --- | --- |
+| [WiredTiger Cache Hit Rate %](/nerve-centre/kpi-cards/mongodb/wiredtiger-cache-hit-rate) | The read-side companion to this write-side gauge. | Low hit rate plus high dirty fraction means the cache is squeezed from both directions and needs more headroom. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) | The user-facing symptom of forced eviction. | A dirty fraction past 20% rising in step with p95 confirms writes are stalling on eviction. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | Separates a write burst from a flush bottleneck. | High dirty with high write ops is a flush-rate problem; high dirty with modest ops points to slow disk. |
+| [Slow Ops (15m, >100ms)](/nerve-centre/kpi-cards/mongodb/slow-ops-15m-100ms) | Catches the writes that turn slow when eviction stalls them. | A jump in slow ops coinciding with a dirty-cache breach pinpoints the affected operations. |
+| [Memory Resident (MB)](/nerve-centre/kpi-cards/mongodb/memory-resident-mb) | The RAM available to the cache. | A capped resident set alongside high dirty means the cache cannot grow to buffer write bursts. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | The composite that weights cache and write health. | A sustained dirty-cache breach should pull the health score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to confirm the number in MongoDB's own tooling:**
+
+> **`mongosh`:** `db.serverStatus().wiredTiger.cache` returns `"tracked dirty bytes in the cache"`, `"maximum bytes configured"`, `"bytes currently in the cache"`, and the eviction counters. Divide tracked dirty bytes by the configured maximum to reproduce this gauge.
+> **`mongostat`:** the `dirty` column shows the dirty-cache percentage directly, refreshed each interval, and the `used` column shows total cache usage; these are the quickest live confirmation.
+> **Atlas:** the **Metrics** tab has a **Cache Activity** chart, and the **Cache Dirty Bytes** / cache-fill series track the same pressure this card reports.
+> **`db.serverStatus().wiredTiger`:** the broader document exposes `eviction` counters (pages evicted by application threads vs background workers) that explain why a high dirty fraction is hurting latency.
+
+**Why our number may legitimately differ from the native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Denominator choice** | Either | Vortex IQ divides by `maximum bytes configured` for a stable ceiling; `mongostat`'s `dirty` column divides by currently used bytes, so the two read slightly differently when the cache is not full. |
+| **Member polled** | Either | The gauge reads one `mongod` (normally the primary). A native tool pointed at a secondary shows that member's separate dirty fraction. |
+| **Sampling instant** | Either | Dirty content swings between checkpoints; a sample taken just before a checkpoint reads higher than one just after, so two tools sampling at different instants can disagree. |
+| **Cache size changes** | Either | If the configured cache size changed recently, the denominator shifts; confirm `"maximum bytes configured"` matches expectations. |
+| **Time zone** | Axis only | Chart axes use your profile zone; the ratio itself is zone-independent. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [MongoDB OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mongodb/mongodb-ops-spike-vs-ecom-order-rate) | A genuine write-heavy traffic spike can raise the dirty fraction. | A dirty-cache climb with no matching ecom write activity points to a background job (import, replay, migration) flooding writes rather than real demand. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | A sustained dirty-cache breach should pull the health score down. | If the score stays green during a breach, check its write-health weighting in the sensitivity profile. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Is some dirty cache normal, or should it always be near zero?**
+A small, steady dirty fraction is completely normal and healthy: every write lands in the cache as a dirty page before it is flushed, so a busy write workload always carries some dirty content. WiredTiger deliberately holds dirty pages briefly so it can batch writes efficiently. The concern is not the presence of dirty pages but a fraction that climbs and stays above 20%, which means flushing is no longer keeping up with writes.
+
+**Why does WiredTiger force my application threads to do eviction?**
+When the dirty fraction crosses the engine's app-thread eviction threshold (roughly 20% by default), WiredTiger decides background eviction alone cannot keep the cache safe, so it makes the threads doing writes pause and help evict dirty pages before continuing. This is a protective back-pressure mechanism: it prevents the cache from filling entirely with un-flushable content, but the side effect is that write latency spikes. The alert fires at this threshold precisely because it marks the transition from invisible background work to user-visible stalling.
+
+**The dirty fraction is high but my write volume looks normal. What is wrong?**
+The flush path, not the write rate, is the likely bottleneck. Dirty cache is acutely sensitive to disk write latency and IOPS: if the underlying storage cannot persist pages fast enough, dirty content accumulates even under modest write load. Check disk write latency and queue depth at the host level. Slow or contended storage (noisy-neighbour volumes, throttled cloud disks, degraded RAID) is the most common cause of a high dirty fraction without an obvious workload spike.
+
+**How quickly does the dirty fraction drain after I stop the write spike?**
+Usually within one or two checkpoint intervals. WiredTiger runs a checkpoint roughly every 60 seconds by default, and each checkpoint flushes dirty pages to disk, so once the incoming write rate drops below the flush rate the dirty fraction falls back toward baseline within a couple of minutes. If it stays elevated long after the write spike ends, the disk is the constraint and the engine is flushing as fast as it can.
+
+**Does a secondary have its own dirty cache?**
+Yes. Secondaries apply writes from the oplog, which dirties their cache just as primary writes dirty the primary's cache. A secondary under heavy oplog-apply load (catching up after lag, or replicating a write burst) can show a high dirty fraction independently of the primary. The card is per-member, so monitor each member you care about; a struggling secondary can fall behind precisely because its dirty cache is saturated.
+
+**Can increasing the cache size fix a high dirty fraction?**
+Sometimes, but it treats the symptom rather than the cause. A larger cache gives more room to absorb write bursts, so transient spikes are less likely to cross the threshold. But if writes consistently outpace the disk's flush capacity, a bigger cache only delays the problem: the dirty bytes still have to reach disk eventually. The durable fixes are faster storage and a write pattern that spreads load rather than batching it into spikes.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*WiredTiger Dirty Cache %* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

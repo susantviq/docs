@@ -1,0 +1,161 @@
+---
+title: "Oldest Autovacuum Age (hours), PostgreSQL"
+sidebarTitle: "Oldest Autovacuum Age (hours)"
+description: "Oldest Autovacuum Age for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Autovacuum & Bloat](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This card reports how long it has been, in hours, since your most overdue busy table was last vacuumed. PostgreSQL relies on autovacuum to clean up dead row versions and, critically, to advance the transaction-ID horizon that keeps the database from hitting wraparound. When a hot table has not been vacuumed in more than 24 hours, autovacuum is starved: it is not keeping up, has been disabled, or is being blocked. This is a PostgreSQL-distinctive risk with no exact equivalent in other databases, and at its extreme it ends in the single scariest PostgreSQL failure mode: transaction-ID wraparound, where the database forces itself into a read-only shutdown to protect your data. For a DBA this is a slow-burning, high-consequence alarm.
+
+| | |
+| --- | --- |
+| **What it tracks** | The maximum time since last (auto)vacuum across the instance's busy tables, expressed in hours. The "hottest table not vacuumed in >24h" is the headline. |
+| **Data source** | `last_autovacuum` and `last_vacuum` from `pg_stat_user_tables`, weighted by write activity (`n_tup_ins + n_tup_upd + n_tup_del`) so the "hottest" table is the one that both changes a lot and has gone longest without a vacuum. TXID horizon is read from `age(relfrozenxid)` in `pg_class`. |
+| **Time window** | `RT` (real-time, evaluated on each poll, roughly every 60 seconds). |
+| **Alert trigger** | `>24h`. A busy table that has gone more than 24 hours without a vacuum fires the card; a rarely-written table that legitimately does not need vacuuming does not, because it carries no autovacuum debt. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card finds the busy table that has gone longest without a vacuum:
+
+```text
+for each user table:
+   age_hours = now() - greatest(last_autovacuum, last_vacuum)
+   is_busy   = (n_tup_ins + n_tup_upd + n_tup_del) since last vacuum > 0
+oldest_autovacuum_age = max(age_hours) over busy tables
+fire when: oldest_autovacuum_age > 24
+```
+
+The "busy" filter matters. A static lookup table that nobody writes to may show a `last_autovacuum` of "never" or weeks ago, and that is perfectly fine: with no dead tuples accumulating, it does not need a vacuum. The card weights by write activity so it surfaces the table that is both changing fast and not being cleaned, which is the table that is accumulating dead tuples and, separately, letting its frozen-XID horizon drift.
+
+There are two distinct dangers the age signals, and they share a cause:
+
+1. **Bloat.** Every `UPDATE` and `DELETE` leaves a dead row version behind. Vacuum reclaims that space for reuse. Without it, the table and its indexes grow, sequential scans read more pages, and the buffer cache holds more dead weight. This shows up next in [Top Tables by Dead Tuples](/nerve-centre/kpi-cards/postgresql/top-tables-by-dead-tuples).
+2. **Transaction-ID wraparound.** PostgreSQL uses a 32-bit transaction counter. Vacuum "freezes" old rows so their transaction IDs can be safely reused. If freezing falls far enough behind (`age(relfrozenxid)` approaching `autovacuum_freeze_max_age`, default 200 million), PostgreSQL escalates to an aggressive anti-wraparound autovacuum, and if that still cannot keep up, it shuts the database into read-only mode to prevent data loss. The age-in-hours is the early, human-readable warning that this process is not keeping pace.
+
+The card's job is to catch the starvation long before either consequence becomes an incident.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs PostgreSQL 14 backing an order-processing service. The `order_events` table is append-and-update heavy: roughly 4 million writes a day. Snapshot taken on 18 Apr 26 at 06:00 BST.
+
+| Table | Writes/day | last_autovacuum | Age (h) | age(relfrozenxid) | State |
+| --- | --- | --- | --- | --- | --- |
+| order_events | 4.0M | 16 Apr, 03:12 | **50.8** | 121M | **BREACH** |
+| order_line_items | 3.6M | 18 Apr, 04:55 | 1.1 | 18M | healthy |
+| customers | 40k | 17 Apr, 22:30 | 7.5 | 31M | healthy |
+| country_codes (static) | 0 | never | n/a | 0.2M | ignored (not busy) |
+
+The card fires on `order_events`. The headline reads **Oldest Autovacuum Age 50.8h (BREACH)**. The DBA reads:
+
+1. **The hottest table is the starved one.** `order_events` takes 4 million writes a day and has not been vacuumed in over two days. Every one of those updates and deletes left a dead tuple behind that has not been reclaimed. That is a lot of bloat building quietly.
+2. **The frozen-XID horizon is drifting.** `age(relfrozenxid)` of 121 million is over half of the 200-million default `autovacuum_freeze_max_age`. It is not an emergency yet, but it is heading the wrong way, and on the busiest table. Left alone, an anti-wraparound autovacuum will eventually kick in hard.
+3. **Autovacuum is not disabled globally, just losing on this table.** Other busy tables (`order_line_items` at 1.1h) are being vacuumed fine. So the cause is table-specific: either `order_events` exceeds the cost-limit budget autovacuum will spend per run, or something is blocking it.
+
+```text
+Diagnosis:
+  1. Is autovacuum even running on it?
+     SELECT relname, last_autovacuum, autovacuum_count, n_dead_tup
+     FROM pg_stat_user_tables WHERE relname = 'order_events';
+  2. Is a long transaction holding back the cleanup horizon?
+     SELECT pid, state, now() - xact_start AS tx_age, query
+     FROM pg_stat_activity
+     WHERE xact_start IS NOT NULL
+     ORDER BY xact_start ASC LIMIT 5;
+     -> a transaction open for hours pins the XID horizon for the WHOLE DB,
+        so vacuum cannot remove dead tuples newer than that snapshot.
+  3. Is the cost limit throttling it on a big table?
+     Check autovacuum_vacuum_cost_limit / cost_delay.
+  4. Per-table tuning to make autovacuum trigger sooner and run harder:
+     ALTER TABLE order_events SET (
+        autovacuum_vacuum_scale_factor = 0.02,
+        autovacuum_vacuum_cost_limit  = 2000
+     );
+  5. If urgent, run a manual VACUUM (VERBOSE) order_events now.
+```
+
+The most common root cause on a single starved table is point 2: a long-running transaction (often an idle-in-transaction session, or a forgotten analytics query, or a stuck batch job) holds a snapshot open, and vacuum cannot reclaim any dead tuple newer than that snapshot anywhere in the database. The hottest table feels it first because it generates dead tuples fastest. Cross-reference [Idle-in-Transaction Backends](/nerve-centre/kpi-cards/postgresql/idle-in-transaction-backends).
+
+Three takeaways:
+
+1. **Age-in-hours is the early warning; wraparound is the catastrophe.** You will never want to read this card at the wraparound stage. 24 hours on a busy table is the nudge to look now, while the fix is a one-line `ALTER TABLE` and not an emergency single-user-mode `VACUUM`.
+2. **A single starved table usually points to a single blocker.** When one busy table lags while others are clean, suspect a long-lived transaction pinning the snapshot, or per-table autovacuum settings that are too conservative for that table's write rate.
+3. **This is PostgreSQL-specific.** Engines without PostgreSQL's MVCC-plus-32-bit-XID design do not have this exact failure mode. Treat autovacuum health as a first-class operational signal, not an afterthought.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Oldest Autovacuum Age | What the combination tells you |
+| --- | --- | --- |
+| [Top Tables by Dead Tuples](/nerve-centre/kpi-cards/postgresql/top-tables-by-dead-tuples) | The bloat consequence of a starved vacuum. | Old age plus high dead tuples on the same table confirms real accumulation. |
+| [Idle-in-Transaction Backends](/nerve-centre/kpi-cards/postgresql/idle-in-transaction-backends) | The most common reason vacuum cannot reclaim. | A long idle-in-tx session pins the snapshot and starves vacuum database-wide. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/postgresql/database-disk-usage) | Bloat from un-vacuumed tables consumes disk. | Rising age plus rising disk equals dead tuples eating storage. |
+| [Buffer Cache Hit Rate %](/nerve-centre/kpi-cards/postgresql/buffer-cache-hit-rate) | Bloated tables waste cache on dead pages. | A falling hit rate alongside high bloat suggests dead weight in the cache. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p95-ms) | Bloat slows scans and index lookups. | Latency creeping up on a bloated table is the performance tax of starved vacuum. |
+| [WAL Lag Bytes (primary -> standby)](/nerve-centre/kpi-cards/postgresql/wal-lag-bytes-primary-standby) | Aggressive catch-up vacuums generate WAL. | A vacuum storm clearing backlog can briefly push WAL lag up. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The composite includes autovacuum-current as a factor. | A starved table pulls the composite down before any query feels it. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL's own tooling:**
+
+> Run `SELECT relname, last_autovacuum, last_vacuum, n_dead_tup, n_live_tup, autovacuum_count FROM pg_stat_user_tables ORDER BY last_autovacuum ASC NULLS FIRST;`. The top rows are your oldest vacuums; ignore the static tables with no dead tuples.
+> Check the wraparound horizon with `SELECT relname, age(relfrozenxid) AS xid_age FROM pg_class WHERE relkind = 'r' ORDER BY xid_age DESC LIMIT 10;` and compare against `SHOW autovacuum_freeze_max_age;`.
+> See whether an autovacuum is running right now with `SELECT pid, query, now() - xact_start AS running_for FROM pg_stat_activity WHERE query LIKE 'autovacuum:%';`.
+> On a managed service, the provider surfaces a `MaximumUsedTransactionIDs` metric (RDS / Aurora) or an equivalent XID-age chart (Cloud SQL, Azure), which is the same wraparound horizon the card watches.
+
+**Why our number may legitimately differ from PostgreSQL's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Busy-table weighting** | Card ignores some old timestamps | A static table with an ancient `last_autovacuum` is excluded because it carries no autovacuum debt; a raw query sorted by timestamp would list it first. |
+| **last_autovacuum vs last_vacuum** | Card uses the more recent | A manual `VACUUM` you ran resets `last_vacuum`, not `last_autovacuum`; the card takes the greater of the two, so a recent manual run clears the age. |
+| **Stats reset** | Card may read "fresh" after a reset | `pg_stat_reset()` or a stats-file loss blanks `last_autovacuum`; the card then has no history until the next vacuum runs. |
+| **Poll timing** | Brief skew | An autovacuum completing between polls updates the timestamp; the card reflects it on the next cycle. |
+| **Managed-service abstraction** | Different framing | RDS / Cloud SQL headline the wraparound horizon (XID age) rather than hours-since-vacuum; both describe the same starvation, just on different axes. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My static lookup table shows last_autovacuum of "never". Why isn't the card firing?**
+Because that table is not busy. A table with no inserts, updates, or deletes accumulates no dead tuples and does not need vacuuming, so "never vacuumed" is correct and harmless. The card weights by write activity and only fires on tables that are both changing and overdue. A "never" on a static table is expected, not a problem.
+
+**Autovacuum is enabled and other tables are fine, but one busy table keeps ageing. Why?**
+Two usual suspects. First, a long-running transaction (often idle-in-transaction) holds an old snapshot open, and vacuum cannot reclaim any dead tuple newer than that snapshot anywhere in the database; the hottest table notices first. Second, the table is large enough that autovacuum's cost limit throttles each run before it finishes. Check for long transactions first, then tune the table's per-table autovacuum settings to trigger sooner and spend more cost budget.
+
+**What is transaction-ID wraparound and should I worry now at 24 hours?**
+At 24 hours of vacuum age you are not at wraparound; you are at the early-warning stage where fixing it is cheap. Wraparound is the end state where the 32-bit transaction counter cannot safely advance because too many old rows are unfrozen; PostgreSQL protects your data by forcing the database read-only until an emergency vacuum completes. The whole point of this card is to keep you so far from that cliff that you never see it.
+
+**Can I just disable autovacuum and run VACUUM on a schedule instead?**
+You can, but it is rarely a good idea, and it makes this card more important, not less. Autovacuum exists precisely so freezing keeps pace with write rate automatically. A fixed schedule cannot adapt to traffic spikes, and a missed scheduled run is exactly how wraparound incidents happen. If you do run manual vacuums, the card credits `last_vacuum`, so it will reflect your scheduled runs.
+
+**Does a manual VACUUM clear this card?**
+Yes. The card uses the more recent of `last_autovacuum` and `last_vacuum`, so a manual `VACUUM` on the offending table resets the age to near zero immediately. For a persistent breach, the manual vacuum is the short-term relief and per-table autovacuum tuning is the durable fix.
+
+**Why does the age sometimes jump back up right after a vacuum finishes?**
+If a long-running transaction is still open, the vacuum runs but cannot remove the newest dead tuples (those visible to the old snapshot), so on a very hot table the dead-tuple count and effective debt climb again quickly. The age timestamp resets, but the underlying starvation returns until the blocking transaction ends. This is why the card pairs so tightly with [Idle-in-Transaction Backends](/nerve-centre/kpi-cards/postgresql/idle-in-transaction-backends).
+
+**On a managed service, does the provider handle vacuum for me?**
+The provider runs standard autovacuum with sensible defaults, but it does not tune per-table settings for your workload, and it cannot remove the long-transaction blocker that is the most common cause of starvation. Managed services still suffer autovacuum starvation and wraparound risk; the provider exposes the XID-age metric for exactly this reason. Treat this card as your in-context view of a risk the managed service does not solve on its own.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Oldest Autovacuum Age (hours)* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

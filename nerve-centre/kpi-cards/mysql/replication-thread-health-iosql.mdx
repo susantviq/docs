@@ -1,0 +1,157 @@
+---
+title: "Replication Thread Health (IO/SQL), MySQL"
+sidebarTitle: "Replication Thread Health (IO/SQL)"
+description: "Replication Thread Health (IO/SQL) for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Replication Thread Health (IO/SQL)** is the binary "is replication actually running?" check. A MySQL replica runs two threads: the IO (receiver) thread that pulls binlog events from the source into a local relay log, and the SQL (applier) thread that replays those events into the replica's data. Both must report `Yes`. If either is `No`, replication is broken: the replica stops receiving or stops applying changes, and from that moment it drifts further from the source with every write. This is the card that catches replication failure the instant it happens, before lag has time to balloon.
+
+| | |
+| --- | --- |
+| **What it tracks** | The running state of both replication threads on each replica: `Replica_IO_Running` and `Replica_SQL_Running` (named `Slave_IO_Running` / `Slave_SQL_Running` before MySQL 8.0.22). Both must be `Yes` for the card to read healthy. |
+| **Data source** | `SHOW REPLICA STATUS` on each replica, or `performance_schema.replication_connection_status` (IO thread) and `replication_applier_status` (SQL thread). The engine reports the worst node. |
+| **Time window** | `RT` (real-time, sampled every refresh so a stopped thread surfaces within one cycle). |
+| **Alert trigger** | `IO_THREAD or SQL_THREAD stopped`. If either thread on any replica is not `Yes`, the card turns red and a Nerve Centre alert is raised. |
+| **Why it matters** | This is MySQL-distinctive: either thread stopping means replication is broken, full stop. A stopped IO thread means no new events arrive; a stopped SQL thread means events arrive but are never applied. Both lead to silent, growing data divergence and an unsafe failover target. |
+| **Reading the value** | Read with [Replication Lag](/nerve-centre/kpi-cards/mysql/replication-lag-seconds-behind-source). A stopped thread makes lag report `NULL`; the thread card tells you *which* thread and usually *why* (it carries the last error). |
+| **Sentiment key** | `mysql_replication_thread_health` |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card is a logical AND across both threads on every replica. There is no averaging and no percentile: replication is either running or it is not.
+
+```text
+For each replica:
+  status   = SHOW REPLICA STATUS
+  io_ok    = (status.Replica_IO_Running  == 'Yes')
+  sql_ok   = (status.Replica_SQL_Running == 'Yes')
+  healthy  = io_ok AND sql_ok
+
+headline = healthy for ALL replicas ? "Healthy" : "Broken"
+```
+
+Two subtleties the engine handles:
+
+1. **`Connecting` is not `Yes`.** The IO thread can sit in a `Connecting` state when it is trying and failing to reach the source (bad credentials, network, or the source is down). The engine treats anything other than `Yes` as not healthy, so a flapping `Connecting` thread raises the alert rather than being read as a transient.
+2. **The error fields carry the cause.** When the SQL thread stops, `Last_SQL_Error` and `Last_SQL_Errno` explain why (a duplicate-key collision, a missing table, a statement the replica cannot apply). When the IO thread stops, `Last_IO_Error` explains the connection problem. The engine surfaces these so the alert is actionable, not just "broken".
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MySQL 8.0 source with two read replicas. Snapshot taken on 18 Apr 26 at 02:15 BST, shortly after a nightly maintenance job ran a manual `DELETE` directly on `replica-a` (a mistake: writes should only happen on the source).
+
+| Node | Replica_IO_Running | Replica_SQL_Running | Last_SQL_Errno | Reading |
+| --- | --- | --- | --- | --- |
+| replica-a | Yes | **No** | 1062 | SQL thread stopped on a duplicate-key error. |
+| replica-b | Yes | Yes | 0 | Healthy. |
+
+The headline reads **Broken** with a red border, and a Nerve Centre alert fires immediately. The team works it:
+
+1. **The IO thread is fine, the SQL thread is stopped.** `replica-a` is still receiving events into its relay log, but it has stopped applying them. Lag will now climb without bound until the SQL thread is restarted, because nothing is being applied.
+2. **`Last_SQL_Errno` is 1062, a duplicate-key error.** The manual `DELETE` removed a row, then the binlog from the source tried to apply a `DELETE` for a row that no longer existed, or a later `INSERT` collided. The replica's data and the source's binlog have diverged.
+3. **The decision is correctness over speed.** Skipping the offending transaction (`SET GLOBAL sql_slave_skip_counter`) would restart replication but leave the replica permanently inconsistent with the source. The team instead rebuilds `replica-a` from a fresh source snapshot so it is guaranteed consistent, and routes its catalogue traffic to `replica-b` in the meantime.
+
+```text
+Divergence framing while replica-a's SQL thread is stopped:
+  - Stopped at ~02:14; detected by the card within one refresh
+  - Source write rate overnight: ~120 transactions/min
+  - Every minute the SQL thread stays stopped = ~120 transactions the replica is missing
+  - At 30 minutes the replica is ~3,600 transactions behind and unsafe to promote
+```
+
+The rebuild completes by 03:40, both threads read `Yes`, and the card clears. The follow-up is to lock down replica write access so application credentials cannot run DML directly against a replica.
+
+Three takeaways:
+
+1. **A stopped thread is a different emergency from high lag.** Lag self-heals when the workload eases; a stopped thread never self-heals. It will sit broken until a human intervenes, and the divergence grows the whole time.
+2. **The error number tells you whether you can recover or must rebuild.** Transient errors (lost connection, source restart) usually resolve on a thread restart. Data-collision errors (1062 duplicate key, 1032 row not found) mean the replica has diverged, and the safe fix is a rebuild, not a skip.
+3. **Never write to a replica.** The single most common cause of a stopped SQL thread is a stray write directly on the replica. Enforce `read_only` / `super_read_only` and scope application credentials so only the source accepts DML.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Replication Thread Health | What the combination tells you |
+| --- | --- | --- |
+| [Replication Lag (Seconds_Behind_Source)](/nerve-centre/kpi-cards/mysql/replication-lag-seconds-behind-source) | Lag reports `NULL` the moment a thread stops. | Thread broken plus lag `NULL` equals replication is dead, not slow. |
+| [Active Replicas](/nerve-centre/kpi-cards/mysql/active-replicas) | The count of attached replicas. | A replica with a stopped IO thread may drop off the count entirely. |
+| [Binlog Backlog (MB) on Primary](/nerve-centre/kpi-cards/mysql/binlog-backlog-mb-on-primary) | The source-side binlog the IO thread consumes. | A stopped IO thread means the source's binlog backlog grows because it is not being consumed. |
+| [Replication Threads Stopped or Lag Exceeds Threshold](/nerve-centre/kpi-cards/mysql/replication-threads-stopped-or-lag-exceeds-threshold) | The Nerve Centre alert feed for this exact condition. | The paging entry that wakes on-call when a thread stops. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite that weights replication health heavily. | A broken thread should visibly drop the composite. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/mysql/last-successful-backup-hours-ago) | Recovery depends on a recent, consistent backup. | A broken replica plus a stale backup equals limited recovery options. |
+| [MySQL Inventory Rows vs Ecom Inventory Count](/nerve-centre/kpi-cards/mysql/mysql-inventory-rows-vs-ecom-inventory-count) | The downstream drift if a replica serves storefront reads. | A stopped applier means the storefront reads ever-staler inventory. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mysql/query-error-rate) | Apps may error when they hit a broken or stale replica. | Thread broken plus rising query errors equals the app is failing reads against the dead replica. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL's own tooling:**
+
+> **`SHOW REPLICA STATUS\G`** on each replica is the canonical source. The fields that matter:
+> ```text
+> Replica_IO_Running:   Yes
+> Replica_SQL_Running:  No
+> Last_SQL_Errno:       1062
+> Last_SQL_Error:       Could not execute Delete_rows event ...
+> Last_IO_Errno:        0
+> Last_IO_Error:
+> ```
+> **Performance Schema** for the structured view: `performance_schema.replication_connection_status` (IO/receiver) and `performance_schema.replication_applier_status_by_worker` (SQL/applier, per worker).
+> **The replica's error log** for the full stack around the failure, often with more context than the single `Last_SQL_Error` line.
+> **Managed-service consoles:** Amazon RDS surfaces replication state and will raise a `Replication` event; Aurora reports replica state in the cluster members view. These should agree with this card.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **`Connecting` state** | Engine stricter | The engine treats `Connecting` (IO thread retrying) as not healthy; a quick glance at the UI might read it as "trying", but it is not `Yes`. |
+| **Multi-worker applier** | Engine more precise | The single `Replica_SQL_Running` field can mask a single failed worker; the engine reads per-worker status from Performance Schema. |
+| **Auto-restart windows** | Brief disagreement | Some managed services auto-restart a stopped thread; the card may show broken for one refresh before the platform recovers it. |
+| **Field naming** | None if mapped | Pre-8.0.22 uses `Slave_*` names; the engine maps both, but a manual query on an old server uses the old field names. |
+| **Worst-node headline** | Variable | The card reports the worst replica; a per-node manual check on a healthy replica will disagree with the broken-node headline. |
+
+**Cross-connector reconciliation:** if you run an APM connector, a stopped applier often shows up downstream as stale-read errors or growing queue depth in the application. A broken thread here plus a spike in application error rate in Datadog confirms the failure is reaching customers, not just sitting in the database tier.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card says broken but the replica seems to be serving reads fine. How?**
+A replica with a stopped SQL thread still answers queries; it just answers them from increasingly stale data. The IO thread may even still be running, filling the relay log. Everything looks alive until someone notices the data is old. That is precisely why this card exists: replication can be broken while the replica appears healthy.
+
+**Which is worse, a stopped IO thread or a stopped SQL thread?**
+Both are emergencies, but they fail differently. A stopped IO thread means no new events reach the replica at all (usually a connection, credential, or source-availability problem, often transient). A stopped SQL thread means events are arriving but cannot be applied (usually a data collision, which means the replica has diverged and may need a rebuild). The IO thread is more often recoverable with a restart; the SQL thread more often signals real divergence.
+
+**Can I just skip the bad transaction to get replication running again?**
+You can (`sql_slave_skip_counter` or injecting an empty GTID), and sometimes it is right for a known-benign event. But skipping a data-collision error leaves the replica permanently inconsistent with the source: every future read is potentially wrong, and the replica is unsafe to promote. For collision errors the safe path is a rebuild from a fresh source snapshot. Skip only when you understand exactly what you are dropping.
+
+**Why did my SQL thread stop with a duplicate-key (1062) error?**
+Almost always because something wrote directly to the replica. A row was inserted or deleted on the replica out of band, then the source's binlog tried to apply a conflicting change. Enforce `super_read_only` on all replicas and scope application credentials so DML only ever hits the source.
+
+**The thread shows `Connecting` and never reaches `Yes`. What now?**
+The IO thread cannot establish a session with the source. Check, in order: network path and firewall to the source port, the replication user's credentials and host grant, whether the source is up and accepting connections, and whether the source has purged a binlog the replica still needs (which requires re-seeding the replica). `Last_IO_Error` usually names the specific cause.
+
+**Does this card cover Group Replication or InnoDB Cluster?**
+This card reads the classic asynchronous / semi-synchronous replica threads. Group Replication exposes its member state through `performance_schema.replication_group_members` instead, which is a different model. If you run InnoDB Cluster, read member health from that table; the IO/SQL thread card applies to traditional source-replica topologies.
+
+**Can I change what counts as healthy?**
+The healthy condition (both threads `Yes`) is intrinsic to MySQL replication and is not configurable: there is no "partially running" that is safe. What you can configure in the Sensitivity tab is the paging behaviour and whether `Connecting` raises immediately or after a short grace period, useful if your network has known brief blips during source restarts.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Replication Thread Health (IO/SQL)* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

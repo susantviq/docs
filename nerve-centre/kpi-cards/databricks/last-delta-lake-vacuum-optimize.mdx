@@ -1,0 +1,141 @@
+---
+title: "Last Delta Lake Vacuum / Optimize, Databricks"
+sidebarTitle: "Last Delta Lake Vacuum / Optimize"
+description: "Last Delta Lake Vacuum / Optimize for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Backup](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Delta Lake has no traditional "backup" in the relational-database sense. Instead, recoverability rests on two mechanisms: Time Travel (the transaction log retains versions for a default 7-day window) and the table-maintenance commands `OPTIMIZE` (compacts small files) and `VACUUM` (removes files no longer referenced by retained versions). This card tracks the age, in hours, of the last successful maintenance run on your largest tables. A platform team should read it as "how long since my recoverability and read-performance posture was last refreshed?" If it climbs past three days, small-file bloat and stale tombstones are accumulating, and Time Travel windows may no longer line up with your maintenance cadence.
+
+| | |
+| --- | --- |
+| **What it tracks** | Hours since the most recent successful `OPTIMIZE` (and, where configured, `VACUUM`) on the largest monitored Delta tables. Reported as `dbx_last_backup_age_hours`. |
+| **Data source** | The Delta transaction log (`DESCRIBE HISTORY <table>`) plus the Jobs API run history for any scheduled maintenance job. Vortex IQ reads the most recent `OPTIMIZE` / `VACUUM` operation entry and computes elapsed hours against the current time. |
+| **Why "backup" for a lakehouse** | Delta Lake recoverability is Time Travel (default 7-day version retention) combined with regular maintenance. There is no nightly dump file. `OPTIMIZE` keeps reads fast; `VACUUM` reclaims storage but also shortens the recoverable window, so the two must be co-ordinated. |
+| **Time window** | `RT` (real-time): the value is recomputed each refresh against the live transaction-log history. |
+| **Alert trigger** | `> 72h`. If the last successful maintenance run on a monitored table is older than 72 hours, the card flags amber/red and pages the platform on-call. |
+| **Sentiment** | Lower is healthier. Zero to 24h is green; 24 to 72h is amber; above 72h is red. |
+| **Roles** | owner, engineering, operations (DBA / platform / SRE) |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card is derived, not a single API counter. For each monitored table, Vortex IQ runs the equivalent of `DESCRIBE HISTORY <catalog>.<schema>.<table>` and scans the operation history for the most recent entry whose `operation` is `OPTIMIZE` or `VACUUM END` with a successful outcome. It records that commit's `timestamp`, then computes:
+
+```text
+age_hours = (now_utc - last_successful_maintenance_timestamp_utc) / 3600
+```
+
+When several tables are monitored, the card reports the worst (oldest) value, because recoverability posture is only as good as the least-maintained large table. The Jobs API run history is used as a cross-check: a maintenance job that reported "Succeeded" but whose commit never landed in the transaction log (for example, it ran against an empty predicate) is treated as not-run, so the card cannot be gamed by a green job that did no work.
+
+`VACUUM` is treated with care. Because `VACUUM` with too short a retention can delete files that Time Travel still needs, the card surfaces the configured retention alongside the age so the reader can sanity-check that maintenance is not silently shrinking the recoverable window below the team's recovery-point objective.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a lakehouse that feeds an ecommerce analytics layer. The three largest tables are `prod_silver.orders` (4.2 TB), `prod_silver.web_events` (11 TB) and `prod_gold.customer_360` (900 GB). A nightly job named `delta-maintenance-prod` runs `OPTIMIZE` then `VACUUM RETAIN 168 HOURS` across all three. Snapshot taken on 14 Apr 26 at 08:00 UTC.
+
+| Table | Last `OPTIMIZE` | Last `VACUUM` | Age (h) | Note |
+| --- | --- | --- | --- | --- |
+| `prod_silver.orders` | 13 Apr 26 02:14 | 13 Apr 26 02:31 | 29.8 | Healthy |
+| `prod_gold.customer_360` | 13 Apr 26 02:48 | 13 Apr 26 02:55 | 29.1 | Healthy |
+| `prod_silver.web_events` | 10 Apr 26 02:20 | 10 Apr 26 02:44 | **101.7** | Stale, breached 72h |
+
+The card headline reads **101.7h** in red, driven by `web_events`. The platform engineer drills in and finds the cause: on 11 Apr the `delta-maintenance-prod` job started skipping `web_events` because the `OPTIMIZE` step now exceeds the job's 2-hour timeout. The table grew past the point where a full-table compaction completes in the window, so the step times out, the job marks that task as failed, continues to the other two tables, and reports overall "Succeeded with errors".
+
+```text
+Recoverability framing:
+  - VACUUM retention configured: 168h (7 days)
+  - Last successful VACUUM on web_events: 10 Apr 02:44
+  - Time Travel window still valid back to: roughly 3 Apr (last VACUUM minus retention)
+  - Small-file count on web_events has grown 38% since 10 Apr
+  - p95 scan time on web_events queries up 22% over the same window
+```
+
+Three takeaways for the team:
+
+1. **The breach is a symptom of table growth, not a forgotten cron.** The fix is to switch `web_events` to incremental compaction (`OPTIMIZE ... WHERE ingest_date >= current_date - 2`) or to enable predictive optimisation, not to lengthen the timeout indefinitely.
+2. **Read performance is already degrading.** The 22% rise in p95 scan time will show up on [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) for any warehouse querying `web_events`. The maintenance lag and the latency rise are the same story told twice.
+3. **Recoverability is still intact, but only just.** Because `VACUUM` also stopped, no files have been deleted since 10 Apr, so Time Travel is actually wider than usual. The risk flips once maintenance resumes: a catch-up `VACUUM` with the default 168h retention could prune versions the team assumed were safe. Confirm the recovery-point objective before letting the catch-up run.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Last Delta Lake Vacuum / Optimize | What the combination tells you |
+| --- | --- | --- |
+| [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) | Small-file bloat from skipped `OPTIMIZE` shows up as read latency. | Rising p95 plus a stale maintenance age equals compaction debt, not a warehouse-sizing problem. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/databricks/slow-query-rate) | The downstream effect of un-compacted tables. | More slow queries appearing on tables that missed `OPTIMIZE` confirms the cause. |
+| [Failed Jobs (24h)](/nerve-centre/kpi-cards/databricks/failed-jobs-24h) | The maintenance job is itself a job; if it fails, this card stalls. | A failed maintenance job is the usual reason this card breaches 72h. |
+| [Top 10 Failing Workflows (7d)](/nerve-centre/kpi-cards/databricks/top-10-failing-workflows-7d) | Surfaces whether `delta-maintenance` is a repeat offender. | Maintenance in the failing-workflows list equals a chronic compaction gap. |
+| [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) | `OPTIMIZE` is compute-heavy; catch-up runs spike DBU. | A maintenance backlog clearing shows as a one-off DBU bump here. |
+| [Databricks Health Score](/nerve-centre/kpi-cards/databricks/databricks-health-score) | The composite that weights recoverability posture. | A red maintenance age pulls the composite down even when clusters are healthy. |
+| [Pipeline Lag (since last success)](/nerve-centre/kpi-cards/databricks/pipeline-lag-since-last-success) | The pipeline equivalent of "how stale is my data layer?" | Both stale at once equals an upstream scheduler or workspace problem, not a single table issue. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> Run `DESCRIBE HISTORY <catalog>.<schema>.<table>` in a SQL editor or notebook for the per-table operation log, including `OPTIMIZE` and `VACUUM END` rows with timestamps and metrics.
+> Open **Workflows → Jobs** and the `delta-maintenance` job's run history to confirm whether the latest run actually touched the table or skipped it.
+> In Unity Catalog, the `system.access.table_lineage` and `system.storage` views (where the system schema is enabled) give an account-level view of table activity.
+> If predictive optimisation is enabled, check **Catalog → table → Details** for the managed-maintenance status; Databricks may be running `OPTIMIZE` for you.
+
+**Why our number may legitimately differ from the Databricks UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Time zone** | Timestamps shift | `DESCRIBE HISTORY` renders in the workspace's session time zone; Vortex IQ computes age in UTC and renders in your profile time zone. |
+| **Worst-table vs single-table** | Vortex IQ age higher | The card reports the oldest maintenance across all monitored tables; the UI shows one table at a time. |
+| **Job "Succeeded" vs commit landed** | Vortex IQ age higher | A job that reported success but committed no maintenance is treated as not-run, so our age can exceed what the Jobs UI implies. |
+| **Predictive optimisation** | Vortex IQ age lower | Managed `OPTIMIZE` writes its own history entries; if those are included, the age can be fresher than your scheduled job's. |
+| **Refresh latency** | Brief | Between refreshes the displayed age is point-in-time; a maintenance run that just landed appears at the next poll. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Slow SQL Queries During Checkout Window](/nerve-centre/kpi-cards/databricks/slow-sql-queries-during-checkout-window) | Stale maintenance on hot tables raises slow-query counts during peak. | Slow queries with fresh maintenance points at warehouse sizing, not compaction. |
+| [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume) | A catch-up `OPTIMIZE` adds DBU without added order volume. | A DBU bump that tracks a maintenance catch-up, not demand, is expected and benign. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Delta Lake has no backups, so why is this card in the Backup category?**
+Because it is the closest equivalent. A lakehouse recovers through Time Travel (versioned transaction log) rather than dump files. `OPTIMIZE` keeps reads healthy and `VACUUM` reclaims storage, and the two together define how far back you can recover and how fast you can read. This card is the single number that tells a platform team their recoverability and read-health posture is current.
+
+**Does a fresh `VACUUM` improve or hurt my recovery position?**
+Both, depending on retention. `VACUUM` deletes data files no longer referenced by versions inside the retention window (default 168 hours / 7 days). A fresh `VACUUM` reclaims storage but also enforces the retention floor: anything older than the window becomes unrecoverable. Always confirm the configured retention is at or above your recovery-point objective before celebrating a green age.
+
+**Why does the card report the oldest table rather than an average?**
+Recoverability is a weakest-link property. Averaging would let one badly-lagging 11 TB table hide behind several freshly-maintained small ones. The worst-table reading is the honest one for a platform team.
+
+**My maintenance job shows "Succeeded" but the card still says 80h. Why?**
+The job almost certainly skipped the large table (timeout, a `WHERE` predicate that matched nothing, or a per-task failure inside an overall-green run). The card reads the transaction log, not the job's exit code, so it only counts maintenance that actually committed. Open `DESCRIBE HISTORY` on the lagging table to confirm no recent `OPTIMIZE` row exists.
+
+**Should I run `OPTIMIZE` and `VACUUM` together?**
+Run `OPTIMIZE` frequently (daily or via predictive optimisation) and `VACUUM` less often, with a retention that protects your recovery window. Running `VACUUM` immediately after `OPTIMIZE` is common, but be aware that `OPTIMIZE` creates new compacted files and tombstones the old ones, so an aggressive same-run `VACUUM` can prune the pre-compaction versions sooner than expected.
+
+**Does predictive optimisation make this card unnecessary?**
+No. Predictive optimisation (managed `OPTIMIZE`, and managed `VACUUM` in newer releases) reduces how often you breach 72h, but you still want to confirm it is actually running on your largest tables and that its retention matches your recovery-point objective. The card includes managed-maintenance history entries so it reflects both scheduled and managed runs.
+
+**Can I monitor liquid-clustering tables the same way?**
+Yes. Liquid clustering changes how data is laid out but still records `OPTIMIZE` operations in the transaction log, so the age computation is identical. The small-file-bloat interpretation is slightly different (liquid clustering reduces the need for partition-based compaction), but a stale age still signals that maintenance is not running.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Last Delta Lake Vacuum / Optimize* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

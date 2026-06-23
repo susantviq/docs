@@ -1,0 +1,141 @@
+---
+title: "PostgreSQL QPS Spike vs Ecom Order Rate, PostgreSQL"
+sidebarTitle: "PostgreSQL QPS Spike vs Ecom Order Rate"
+description: "PostgreSQL QPS Spike vs Ecom Order Rate for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Cross-Channel](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **PostgreSQL QPS Spike vs Ecom Order Rate** plots database query throughput against the storefront's order rate on a dual axis over a rolling 15-minute window. In a healthy storefront the two lines move together: more shoppers means more queries and more orders. When query volume spikes but orders do not, the extra load is not coming from buyers. It is bots, scrapers, a misbehaving integration, or a runaway query loop hammering the database for no commercial return. This card exists to separate "we are busy because we are selling" from "we are busy because something is abusing us", which are the same load on the database but opposite situations for the business.
+{/* /HUMAN_AUTHORED:tldr */}
+
+| | |
+| --- | --- |
+| **PostgreSQL side** | Queries per second, the live throughput from the same basis as the [Queries per Second (live)](/nerve-centre/kpi-cards/postgresql/queries-per-second-live) card (transaction/statement rate derived from `pg_stat_database` counters or `pg_stat_statements` call deltas). |
+| **Ecom side** | The order rate from the connected storefront connector (orders per interval from Shopify, BigCommerce, or Adobe Commerce), windowed to the same 15-minute buckets. |
+| **What the card shows** | A dual-axis chart, QPS on one axis and order rate on the other, so divergence between the two lines is immediately visible. |
+| **Aggregation window** | 15-minute rolling window, refreshed every cycle. Short enough to catch a scraper burst, long enough to ignore single-request noise. |
+| **Time window** | `15m` (rolling). |
+| **Alert trigger** | A QPS spike with no corresponding order spike, the bot / scraper signature. Query volume jumps while the order line stays flat. |
+| **Roles** | DBA, platform engineering, SRE, ecommerce operations, security. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calc */}
+The PostgreSQL side reads query throughput on the same basis as the standalone QPS card: the delta in transaction and statement counters from `pg_stat_database` (`xact_commit + xact_rollback`) or, where `pg_stat_statements` is enabled, the change in total `calls` across the window, divided by elapsed seconds. The result is queries (or transactions) per second over each 15-minute bucket.
+
+The ecom side reads the order rate from the linked storefront connector, counting orders created per bucket and aligning them to the same time grid. The card then watches the relationship between the two series:
+
+```text
+For each 15-minute bucket:
+  qps_zscore   = how far QPS sits above its rolling baseline
+  order_zscore = how far the order rate sits above its rolling baseline
+  divergence   = qps_zscore elevated AND order_zscore flat   -> bot/scraper signature
+```
+
+The insight is in the divergence, not either line alone. A spike in both QPS and orders is healthy demand, scale to it. A spike in QPS with a flat order line is the alert condition: the database is doing far more work than the commercial activity justifies. Typical culprits are a scraper crawling the catalogue (lots of product-page reads, zero checkouts), a price-comparison bot, a broken client retrying a failing query in a tight loop, or an analytics export running against production. The card cannot name the culprit, but it reliably flags that the load is non-commercial, which is the cue to look at access logs, `pg_stat_activity`, and the top-queries card.
+{/* /HUMAN_AUTHORED:calc */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a storefront on Adobe Commerce backed by PostgreSQL. Baseline daytime load is roughly 800 QPS and 40 orders per 15-minute bucket. On 21 Apr 26 from 16:00 BST the card shows the lines pulling apart:
+
+| Bucket (BST) | QPS (avg) | Orders / 15m | Reading |
+| --- | --- | --- | --- |
+| 15:45 | 820 | 41 | Baseline, lines tracking |
+| 16:00 | 1,950 | 39 | QPS up 2.4x, orders flat |
+| 16:15 | 2,480 | 42 | QPS up 3x, orders flat |
+| 16:30 | 2,510 | 38 | Sustained, orders flat |
+
+The card flags the **QPS spike with no order spike** from 16:00 onward. The team works the divergence:
+
+1. **This is not a sale.** A genuine traffic surge lifts both lines. Orders are sitting dead flat at their normal 38 to 42 while QPS has tripled. The extra ~1,700 QPS is buying the business nothing.
+2. **The shape points at reads, not writes.** Cross-checking [Top 10 Slowest Queries](/nerve-centre/kpi-cards/postgresql/top-10-slowest-queries) and `pg_stat_activity` shows the surge is almost entirely catalogue `SELECT`s from a narrow set of client IPs, with no matching rise in order-insert statements. That is the classic scraper fingerprint: crawling product pages, never checking out.
+
+```text
+Sizing the cost of the non-commercial load:
+  - Excess QPS: ~1,700 over baseline, sustained
+  - Buffer cache hit rate dropped from 99.2% to 96.1% as the scraper pulled cold pages
+  - Connection pool saturation rose from 45% to 88% (see the pool cross-channel card)
+  - p95 query latency for real shoppers rose from 60ms to 210ms during the burst
+  - Real revenue at risk: not the scraper's queries, but the latency it inflicts on genuine buyers
+```
+
+The danger is second-order: the scraper itself generates no revenue, but it degrades the database for the shoppers who would. As pool saturation and latency climb, real checkout queries slow down and conversion dips. The action is to rate-limit or block the offending IPs at the edge (WAF / CDN), confirm the order line recovers its share of the load, and add a bot-detection rule so the next crawl is throttled before it reaches PostgreSQL.
+
+Three takeaways:
+
+1. **Load on the database is not the same as value to the business.** QPS measures work done; the order rate measures work that pays. When they diverge, the gap is waste, and waste that degrades latency is waste that costs real sales.
+2. **Both-lines-up is good news; one-line-up is the alarm.** Scale happily to a spike that lifts orders too. Investigate a spike that does not, because the database is being used by something other than buyers.
+3. **The card flags the pattern; the next click finds the culprit.** Once divergence is confirmed, jump to the top-queries card and `pg_stat_activity` to identify which statements and which clients are driving the non-commercial load, then act at the edge.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this card | What the combination tells you |
+| --- | --- | --- |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/postgresql/queries-per-second-live) | The standalone QPS line without the order overlay. | This card adds the commercial context that tells you whether the QPS is worth anything. |
+| [PgBouncer Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/postgresql/pgbouncer-pool-saturation-vs-traffic-burst) | The capacity cross-channel sibling. | A non-commercial QPS spike often saturates the pool, degrading real shoppers; read the two together. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/postgresql/top-10-slowest-queries) | The query-level drill-down. | Once divergence is flagged, this names the statements driving the surge. |
+| [Buffer Cache Hit Rate %](/nerve-centre/kpi-cards/postgresql/buffer-cache-hit-rate) | The cache-pressure view. | A scraper pulling cold catalogue pages drives the hit rate down, confirming non-commercial reads. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p95-ms) | The shopper-latency impact. | The cost of a non-commercial spike shows up as latency on real queries. |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/postgresql/slow-queries-during-checkout-window-5m) | The checkout-specific latency cross-channel card. | Confirms whether the spike is slowing the queries that actually convert. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The executive composite. | A sustained non-commercial spike degrades latency and cache, pulling the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look directly:**
+
+> For the PostgreSQL side, sample throughput twice and difference it: `SELECT sum(xact_commit + xact_rollback) FROM pg_stat_database;` a few seconds apart gives transactions per second, or use `pg_stat_statements` (`SELECT sum(calls) FROM pg_stat_statements;`) deltas for statement-level QPS.
+> Inspect live load with `SELECT state, query, client_addr FROM pg_stat_activity WHERE state = 'active';` to see what is running and from where during a spike.
+> For the order side, reconcile against the storefront connector's order count for the same 15-minute window (Shopify, BigCommerce, or Adobe Commerce order reports).
+
+**Why our number may legitimately differ from a manual sample:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Counter basis** | Variable | Transactions per second (`pg_stat_database`) and statements per second (`pg_stat_statements`) are different numbers; one transaction can contain many statements. The card states which basis it uses; match it when reconciling. |
+| **Window smoothing** | Lower peaks | The card reports the 15-minute bucket average; a hand sample taken at the peak instant reads higher than the bucketed value. |
+| **Counter reset** | Lower | `pg_stat_statements` and `pg_stat_database` counters reset on `pg_stat_reset()` or instance restart; a recent reset shortens the delta baseline. |
+| **Order-side timing** | Marginal | Order creation timestamps and database samples come from different systems bucketed to the same grid; a small phase offset between the two lines is normal. |
+
+**On managed services:** RDS / Aurora expose throughput via CloudWatch (`Queries`, `CommitThroughput`, `Transactions`) and detailed query mix via Performance Insights; Cloud SQL surfaces query and transaction counts in Cloud Monitoring and Query Insights; Azure Database for PostgreSQL exposes `tps` and per-query stats. Use the provider metric to corroborate the QPS line, and the storefront admin to corroborate the order line; the divergence between them is the card's actual output.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**QPS spiked and orders also rose. Should I worry?**
+No, that is healthy demand. When both lines lift together the database is busy because the business is busy; the correct response is to make sure you have capacity (check the pool-saturation and latency cards) and let it run. The alert is specifically for QPS rising while orders stay flat.
+
+**QPS spiked, orders flat. How do I find the culprit?**
+The card confirms the pattern; the next clicks identify the source. Open [Top 10 Slowest Queries](/nerve-centre/kpi-cards/postgresql/top-10-slowest-queries) and run `SELECT query, client_addr, count(*) FROM pg_stat_activity WHERE state='active' GROUP BY query, client_addr ORDER BY count(*) DESC;` to see which statements and which client IPs dominate the surge. A narrow set of IPs hammering catalogue reads with no order inserts is the scraper signature; act at the edge with a WAF or rate limit.
+
+**Could a flat order line with high QPS be legitimate?**
+Occasionally. A scheduled analytics export, a cache-warming job, a full-catalogue reindex, or a heavy reporting query against production all raise QPS without orders and are not malicious. The card flags the pattern; you decide whether the load is wanted. Move such jobs to a read replica so they stop competing with shopper traffic and stop tripping the alert.
+
+**Why a 15-minute window rather than real-time?**
+A 15-minute bucket is short enough to catch a scraper burst within a refresh or two, but long enough to ignore the per-second jitter that would make a real-time comparison noisy. Order rates are naturally lumpy at the second level, so a sensible bucket is needed to compare the two series fairly.
+
+**The QPS number does not match my managed-service console. Why?**
+Usually a basis mismatch. The card may report transactions per second while the console reports statements (or vice versa), and one transaction can hold many statements. Window smoothing also lowers the card's value relative to an instantaneous console peak. Confirm both are measuring the same thing over the same window before treating it as a discrepancy.
+
+**Does this card detect a DDoS or only scrapers?**
+It detects any non-commercial load that reaches the database: aggressive scrapers, price bots, a broken client in a retry loop, or the database-facing portion of an application-layer attack. It does not see traffic blocked at the edge before it hits PostgreSQL, and it is not a security product. Treat it as an early signal that warrants a look at edge logs and WAF rules, then pair it with [PgBouncer Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/postgresql/pgbouncer-pool-saturation-vs-traffic-burst) to gauge the impact on real shoppers.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*PostgreSQL QPS Spike vs Ecom Order Rate* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

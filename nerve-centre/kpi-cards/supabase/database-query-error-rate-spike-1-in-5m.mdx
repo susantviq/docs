@@ -1,0 +1,159 @@
+---
+title: "Database Query Error Rate Spike (>1% in 5m), Supabase"
+sidebarTitle: "Database Query Error Rate Spike (>1% in 5m)"
+description: "Database Query Error Rate Spike (>1% in 5m) for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> An alert pulse that fires when more than 1% of database transactions roll back or error, sustained over a 5-minute window. This is the database-layer counterpart to the PostgREST 5xx alert: where that card measures failures at the API surface, this one measures failures inside Postgres itself. A query error spike means transactions are aborting (constraint violations, deadlocks, statement timeouts, permission failures, or a database that has gone read-only). When this fires alongside a PostgREST 5xx spike, the database is the cause and the API is just relaying it.
+
+| | |
+| --- | --- |
+| **Data source** | Postgres statistics views (`pg_stat_database` commit/rollback counters) and the project metrics endpoint. The card tracks the rate of rolled-back / errored transactions against total transactions for the project database. |
+| **Metric basis** | Query error rate = errored or rolled-back transactions divided by total transactions (commit + rollback), as a percentage, over the window. Database-side failures, not API status codes. |
+| **Aggregation window** | `5m` rolling. Evaluated over the trailing 5 minutes; the alert requires the breach to be sustained across the window. |
+| **Alert threshold** | `> 1% sustained for 5m`. Occasional rollbacks are normal (every retried optimistic-lock conflict is a rollback); a sustained elevation above 1% is the fault signal. |
+| **Why it matters** | A spike means transactions are failing at the database. Causes include a bad migration, a missing or renamed object, a permissions change, deadlock storms, statement timeouts, or the database entering read-only mode after hitting the disk cap. These are the failures that data integrity and write availability depend on. |
+| **What counts** | Transactions that roll back or error, as reflected in the database statistics counters for the project database. |
+| **What does NOT count** | Application-side retries that ultimately succeed are still counted as a rollback for the failed attempt (this is correct: the attempt did fail). Read-only query plans that succeed do not count. |
+| **Time window** | `5m` (rolling 5-minute window) |
+| **Alert trigger** | `> 1% sustained 5m` |
+| **Roles** | owner, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card divides errored or rolled-back transactions by total transactions for the project database over the trailing 5-minute window:
+
+```text
+query_error_rate = (xact_rollback_delta / (xact_commit_delta + xact_rollback_delta)) * 100
+                   over a rolling 5-minute window
+```
+
+The counters come from the Postgres `pg_stat_database` view, which Postgres maintains as monotonically increasing totals of committed and rolled-back transactions. Vortex IQ samples those counters and works with the delta across the window rather than the lifetime totals, so the rate reflects what is happening now, not the database's entire history since the last statistics reset.
+
+The alert is sustained, not instantaneous. A baseline rollback rate is normal and healthy: every optimistic-concurrency retry, every deadlock the application recovers from, and every constraint a write deliberately tests produces a rollback. Paging on those would be useless. The pulse raises only when the error rate stays above 1% across the full 5-minute window, which separates a genuine fault (a broken migration, a permissions change, a deadlock storm, a read-only database) from the routine background of recoverable rollbacks.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team ships a schema migration to a Supabase-backed application during a low-traffic window. Snapshot taken on 03 Jun 26 at 02:40 BST, minutes after the migration ran.
+
+| Window (BST) | Total transactions | Rolled back | Error rate |
+| --- | --- | --- | --- |
+| 02:30 to 02:35 | 88,400 | 71 | 0.08% |
+| 02:35 to 02:40 | 84,900 | 3,140 | 3.70% |
+
+The error rate jumped from a baseline 0.08% to 3.70% and held across the 02:35 to 02:40 window, so the sustained-5-minute condition was met and the pulse fired. The Nerve Centre headline shows **Database Query Error Rate Spike at 3.70%** outlined in red.
+
+What the platform team should read into this:
+
+1. **The timing points straight at the migration.** The spike began within minutes of the deploy. The most common cause of a sudden, sustained database error rate immediately after a migration is a structural change the application still violates: a renamed or dropped column the app still writes to, a new NOT NULL or CHECK constraint that existing writes fail, or a row-level-security policy change that rejects updates.
+2. **This is failing writes, which is worse than failing reads.** Rollbacks mean transactions did not commit. If the failing transactions are on the write path (orders, cart updates, inventory decrements), data is silently not being saved. Reads degrade the experience; failed writes lose business state. Treat a write-path error spike as higher severity than a read-path one.
+3. **The fastest safe action is usually to roll the migration back.** Rather than debug forward under failing writes, reverting the schema change restores the contract the running application expects. Confirm the spike clears after rollback, then reproduce and fix the migration in a non-production environment before re-shipping. If rollback is not possible, identify the specific failing statement from the Postgres logs and patch the offending constraint or grant.
+
+```text
+Impact framing for this event:
+  - 5-minute window: 84,900 transactions
+  - Rolled back: 3,140 (3.70%)
+  - If write-path heavy, ~3,140 attempted state changes did not persist
+  - Sustained at this rate: ~38,000 failed transactions/hour
+  - Likely cause: post-migration constraint or object mismatch
+```
+
+The decisive pairing is [PostgREST 5xx Error Spike (>1% in 5m)](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-spike-1-in-5m): if both fire together, the database fault is propagating up through the API as 5xx, confirming a single root cause at the data layer. If this card spikes but PostgREST 5xx stays clean, the failing transactions are being caught and retried by the application before they surface as API errors, which still means data work is failing even if shoppers are not yet seeing it.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Database Query Error Rate Spike | What the combination tells you |
+| --- | --- | --- |
+| [Database Query Error Rate %](/nerve-centre/kpi-cards/supabase/database-query-error-rate) | The continuous gauge this alert is built on. | The alert says the line was crossed; the gauge shows the shape of the spike over time. |
+| [PostgREST 5xx Error Spike (>1% in 5m)](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-spike-1-in-5m) | The API layer above the database. | Both firing equals a database fault relayed as 5xx; this alone equals errors caught by app retries. |
+| [Deadlocks (last 5m)](/nerve-centre/kpi-cards/supabase/deadlocks-last-5m) | Deadlocks are a specific cause of rolled-back transactions. | A deadlock storm shows up here as an error spike; the deadlock card isolates that cause. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/supabase/database-disk-usage) | A full disk forces the database into read-only mode. | Disk near 100% plus an error spike equals writes failing because the database is restricted. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate) | Statement timeouts turn slow queries into errors. | A slow-query rise then an error spike means queries are timing out into rollbacks. |
+| [Supavisor Pool at >90% Saturation](/nerve-centre/kpi-cards/supabase/supavisor-pool-at-90-saturation) | Connection failures can present as transaction errors. | Pool saturated plus error spike points at connection-level failure, not query logic. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite this alert feeds. | An open query error spike pulls the composite down and frames it against other live signals. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase's own tooling:**
+
+> **Logs → Postgres** in the managed-service console for the per-statement error stream; the error bodies name the exact failing constraint, object, or permission.
+> **Project metrics endpoint** (`/customer/v1/privileged/metrics`, Prometheus format) for the commit and rollback counters Vortex IQ reads.
+> **Reports → Database** for the transaction and error graphs over time.
+> **Database → Migrations** to confirm which migration ran and when, the prime suspect when a spike follows a deploy.
+
+**Confirm the picture with native SQL:**
+
+```sql
+-- Commit vs rollback totals and the lifetime rollback percentage for the
+-- project database (Vortex IQ works from the delta of these counters):
+SELECT datname, xact_commit, xact_rollback, deadlocks,
+       round(100.0 * xact_rollback / nullif(xact_commit + xact_rollback, 0), 2) AS rollback_pct
+FROM pg_stat_database
+WHERE datname = current_database();
+
+-- Whether the database has gone read-only (the disk-cap failure mode):
+SHOW default_transaction_read_only;
+```
+
+**Why our number may legitimately differ from a manual SQL read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Lifetime vs windowed** | SQL higher or lower | `pg_stat_database` shows totals since the last statistics reset; the card uses the 5-minute delta, so the live rate differs from the lifetime percentage. |
+| **Statistics reset** | SQL drops | If the database statistics were reset, the SQL totals restart while the card's windowed delta is unaffected. |
+| **Window alignment** | Variable | The card uses a rolling 5-minute window; a console graph on calendar buckets can split a spike across two bars. |
+| **Sampling cadence** | Brief lag | The metrics endpoint is scraped on an interval; a value at the exact moment of a spike may lag the live console graph by one scrape. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [PostgREST 5xx Error Spike (>1% in 5m)](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-spike-1-in-5m) | Usually co-occurs when the database fault reaches the API. | This alone, with clean PostgREST, means app retries are absorbing the failures. |
+| [Deadlocks (last 5m)](/nerve-centre/kpi-cards/supabase/deadlocks-last-5m) | A deadlock storm raises the error rate. | An error spike with zero deadlocks rules deadlocking out as the cause. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My error rate is never exactly zero. Is a low baseline a problem?**
+No. A small, steady rollback rate is healthy and expected. Every optimistic-concurrency retry, every deadlock the application recovers from, and every write that deliberately tests a constraint produces a rollback. That is the system working as designed. The 1% sustained threshold exists precisely to ignore that baseline and fire only on a genuine, ongoing fault.
+
+**This spiked right after a deploy. Where do I start?**
+With the migration. A sudden, sustained error spike within minutes of a deploy is almost always a structural mismatch: a renamed or dropped object the app still references, a new constraint existing data or writes violate, or a permissions/row-level-security change that rejects transactions. Read the Postgres logs for the specific error body, which names the failing object or constraint, and consider rolling the migration back before debugging forward.
+
+**This card is red but PostgREST 5xx is clean. How can both be true?**
+The application is catching the database errors and retrying them before they surface as API failures. The query attempts genuinely failed (which is why this card fires), but the app's retry logic eventually succeeded or returned a graceful response, so PostgREST never emitted a 5xx. This still matters: failing-then-retrying work adds latency and load, and if the underlying fault worsens, the retries will eventually exhaust and the 5xx spike will follow.
+
+**Could a full disk cause this?**
+Yes, and it is a severe case. When a Supabase project hits its disk cap, the database is placed into a restricted, effectively read-only state. Every write transaction then fails, which shows up here as a sharp error spike dominated by rollbacks. If this card fires, always check [Database Disk Usage %](/nerve-centre/kpi-cards/supabase/database-disk-usage); a disk-driven spike is fixed by freeing space or raising the cap, not by touching query logic.
+
+**Are deadlocks counted here?**
+Yes. A deadlock causes Postgres to abort one of the conflicting transactions, which registers as a rollback and so contributes to this rate. A deadlock storm will push the error rate above threshold. To confirm deadlocking specifically is the cause, pair with [Deadlocks (last 5m)](/nerve-centre/kpi-cards/supabase/deadlocks-last-5m); if deadlocks are flat while errors spike, the cause is something else (constraints, timeouts, permissions).
+
+**Why a 5-minute window rather than firing immediately?**
+Because the baseline is never zero. Recoverable rollbacks happen constantly, and an instantaneous trigger would fire on normal operation. The 5-minute sustained window distinguishes a real fault, which produces a continuous elevation, from the routine churn of retried and recovered transactions.
+
+**Can I change the 1% threshold?**
+Yes, it is configurable per project in the Sensitivity tab. Workloads with heavy optimistic-concurrency patterns sometimes carry a higher healthy baseline and raise the threshold accordingly; low-write transactional workloads may lower it to catch faults sooner. Tune it to sit comfortably above your normal rollback rate so it fires on faults, not on healthy retries.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Database Query Error Rate Spike (>1% in 5m)* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,135 @@
+---
+title: "Query Latency p99 (ms), Snowflake"
+sidebarTitle: "Query Latency p99 (ms)"
+description: "Query Latency p99 (ms) for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Query Latency p99 (ms)** is the 99th-percentile end-to-end execution time: only the slowest 1% of queries are above this number. It is the extreme tail of your latency distribution, the worst experience anyone is having, the queries that make an analyst think "is this thing frozen?" or that push a scheduled job towards its statement-timeout ceiling. p99 is noisier than p95 by nature (a single pathological query can move it), so read it for direction and for catching the genuinely stuck statements rather than for steady-state tuning. As with all Snowflake latency, remember the console reports seconds while this card displays milliseconds, so the 30,000ms threshold reads as 30 seconds in Snowsight.
+
+| | |
+| --- | --- |
+| **What it tracks** | The 99th percentile of `TOTAL_ELAPSED_TIME` across all queries in the selected period, expressed in milliseconds. |
+| **Data source** | `detail`: Query Latency p99 (ms) for the selected period. Computed from `TOTAL_ELAPSED_TIME` in `QUERY_HISTORY`; Snowflake's native seconds are normalised to milliseconds for display. |
+| **Time window** | `RT/1h` (live read over the rolling last hour). |
+| **Alert trigger** | `> 30000ms` (30 seconds). Sustained p99 above this pages the platform on-call. |
+| **Roles** | owner, platform, SRE, data engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+The card computes the 99th percentile of `TOTAL_ELAPSED_TIME` (wall-clock time from submission to result, inclusive of queue and provisioning time) across every query that completed in the rolling hour. Because the 99th percentile is determined by the slowest 1% of queries, it is sensitive to individual outliers in a way p50 and p95 are not: one giant unpartitioned table scan, one runaway cross-join, or one query stuck behind a long queue can lift the whole reading. Snowflake stores the column in milliseconds but displays seconds in Snowsight; the card displays milliseconds, so the 30,000ms threshold equals 30 seconds when you cross-check. See the worked example below for how to use p99 to find a single stuck statement.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A data platform team runs a Snowflake account serving nightly ELT, BI dashboards, and a data-science worksheet pool. Snapshot taken on 18 Apr 26 at 02:35 BST, during the nightly batch window.
+
+| Period | p50 | p95 | p99 | Read |
+| --- | --- | --- | --- | --- |
+| Baseline (typical night) | 620ms | 4,800ms | 18,000ms | Healthy, p99 under threshold |
+| 02:35 today | 640ms | 5,200ms | **62,000ms** | p99 breached hard, p50 and p95 nearly flat |
+
+The p99 card turns red at 62,000ms (62 seconds), more than double the 30,000ms threshold, while p50 and p95 barely moved. The platform team's read:
+
+1. **This is a single-outlier event, not a broad degradation.** p50 and p95 are essentially unchanged, so 99% of queries are fine. The breach is driven by a tiny number of very slow statements (probably one or two), which is the classic p99 signature: a localised pathology, not a system-wide problem.
+2. **Find the offender, do not resize the warehouse.** Drilling into [Top 10 Slowest Queries](/nerve-centre/kpi-cards/snowflake/top-10-slowest-queries) for the window surfaces a single data-science query: an unfiltered join across a 4-billion-row events table and a dimension table, with no clustering key engaged, scanning the full micro-partition set. It has been running for 62 seconds and is still going. The warehouse is not saturated ([Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) is at 40%); one query is simply doing far too much work.
+3. **The fix is at the query level.** Add a date filter so the join prunes micro-partitions, add or engage a clustering key on the events table, or move the exploratory workload to a separate warehouse so it cannot drag the shared p99 for everyone else. None of these require scaling compute.
+
+```text
+Why p99 caught this and p95 did not:
+  - ~2,000 queries ran in the hour
+  - p95 = the 1,900th-fastest query  -> a normal heavy ELT model (5.2s)
+  - p99 = the 1,980th-fastest query  -> the runaway data-science join (62s)
+  - The single bad query sits in the top 1%, invisible to p50 and p95
+```
+
+Three takeaways:
+
+1. **p99 is the outlier-catcher, not the steady-state gauge.** A p99 spike with flat p50 and p95 almost always means a small number of pathological queries, often one. Do not respond by resizing the warehouse; respond by finding the statement and fixing or isolating it.
+2. **p99 is legitimately noisy.** Because it is governed by the slowest 1%, it can swing on a single ad-hoc query and settle again the next hour. Watch the trend and the alert (sustained breach), not every momentary spike. A one-off 62-second exploratory query that someone ran once is not an incident.
+3. **A sustained p99 breach is a different beast.** If p99 stays above 30 seconds hour after hour, you have a recurring heavy job (a scheduled query, a dashboard tile) that genuinely takes that long. Decide whether it belongs on its own warehouse, needs optimising, or needs a higher threshold because it is expected.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Latency p99 | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/snowflake/query-latency-p95-ms) | The next tail down; the heavy-but-common workloads. | p99 far above p95 means a handful of extreme outliers, not broad slowdown. |
+| [Query Latency p50 (ms)](/nerve-centre/kpi-cards/snowflake/query-latency-p50-ms) | The median; confirms whether the typical query is affected. | p99 up, p50 flat equals an isolated outlier; both up equals a whole-distribution shift. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/snowflake/top-10-slowest-queries) | Names the exact statements in the extreme tail. | The fastest route from a p99 spike to the offending query. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/snowflake/slow-query-rate) | Counts how many queries breach a slow threshold. | A high p99 with a low slow-query rate confirms it is a tiny outlier set. |
+| [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse) | Distinguishes a slow query from a queued one. | Flat queue plus high p99 means the query itself is heavy, not waiting. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/snowflake/query-error-rate) | Queries near the statement timeout often fail next. | p99 approaching `STATEMENT_TIMEOUT_IN_SECONDS` means timeouts and errors are imminent. |
+| [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) | Rules in or out a capacity cause. | Low saturation plus high p99 confirms a single-query problem, not a sizing one. |
+| [Snowflake Health Score](/nerve-centre/kpi-cards/snowflake/snowflake-health-score) | The composite that weights tail latency. | A sustained p99 breach drags the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake's own tooling:**
+
+> **Snowsight to Monitoring to Query History**, sort by Duration descending, and the topmost queries are your p99 population (Snowsight shows seconds; divide our ms by 1000 to compare).
+> **Query Profile** on the slowest query to see partitions scanned, spilling to local or remote storage, and the most expensive operators.
+> **`SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY`** or the live **`INFORMATION_SCHEMA.QUERY_HISTORY`** table function for the authoritative numbers.
+
+To reproduce p99 over the last hour (returns milliseconds, matching the card):
+
+```sql
+SELECT PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY TOTAL_ELAPSED_TIME) AS p99_ms
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(
+  DATEADD('hour', -1, CURRENT_TIMESTAMP()), CURRENT_TIMESTAMP()));
+```
+
+**Why our number may legitimately differ from Snowflake's UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Seconds vs milliseconds** | Apparent 1000x gap | Snowsight displays seconds; the card displays milliseconds. 62s in Snowsight equals 62,000ms here. A display convention, not a real difference. |
+| **Percentile method** | Marginal | The card uses continuous interpolation (`PERCENTILE_CONT`); a discrete method (`PERCENTILE_DISC`) lands on an actual row and can differ slightly on small samples. |
+| **ACCOUNT_USAGE latency** | Brief lag | `ACCOUNT_USAGE` can trail live activity by up to 45 minutes; the live read uses `INFORMATION_SCHEMA`. |
+| **In-flight queries** | Vortex IQ may read lower | A query still running when the window closes has no final `TOTAL_ELAPSED_TIME` yet, so the worst case may not be reflected until it completes. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`slow-analytics-queries-during-checkout-window`](/nerve-centre/kpi-cards/snowflake/slow-analytics-queries-during-checkout-window) | An extreme outlier during a peak ecom window is higher-impact. | A 60-second query running during checkout peak can starve the warehouse the live dashboards depend on. |
+| Ecom order volume (Shopify / BigCommerce / Adobe) | No direct causal link. | A pathological query during a sales event delays the reporting merchandising relies on. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My p99 spiked for one hour then went back to normal. Is that an incident?**
+Often not. p99 is governed by the slowest 1%, so a single ad-hoc exploratory query can spike it and the next hour it is gone. The alert fires on sustained breach for exactly this reason. A one-off spike that self-resolves is usually one analyst running one heavy query; check [Top 10 Slowest Queries](/nerve-centre/kpi-cards/snowflake/top-10-slowest-queries) to confirm it was isolated, then move on.
+
+**Why is the p99 threshold 30 seconds when p95 is 5 seconds?**
+The tail widens fast on an analytics warehouse. The slowest 1% of queries are legitimately much heavier than the typical heavy query, so a 30-second line for p99 is the analytics-appropriate equivalent of the 5-second line for p95. Both are conservative defaults; tune them in the Sensitivity tab to your workload.
+
+**p99 is high but p50 and p95 are fine. Where do I look?**
+Straight to [Top 10 Slowest Queries](/nerve-centre/kpi-cards/snowflake/top-10-slowest-queries). A high p99 with a healthy p50 and p95 is the textbook signature of one or two pathological queries. Find them, open the Query Profile, and look for full-table scans, missing pruning, or spilling to remote storage. The fix is almost always at the query or clustering level, not the warehouse level.
+
+**Does p99 include queue time?**
+Yes. `TOTAL_ELAPSED_TIME` is wall-clock from submission to result, including queue and provisioning. A query stuck in a long queue can land in the p99 even if its execution time is modest. Check [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse): if the queue is deep, the p99 outlier may be a waiting query rather than a heavy one.
+
+**My p99 is approaching my statement timeout. What happens next?**
+Failures. If `STATEMENT_TIMEOUT_IN_SECONDS` is, say, 90 seconds and your p99 is creeping towards it, the next step up in the tail will breach the timeout and the query will be cancelled and counted as a failure. Watch [Query Error Rate %](/nerve-centre/kpi-cards/snowflake/query-error-rate) alongside p99; a rising p99 plus a rising error rate means queries are timing out at the ceiling.
+
+**Why does Snowsight show a slightly different p99 than Vortex IQ?**
+Three usual causes: the seconds-versus-milliseconds display convention, the percentile method (`PERCENTILE_CONT` interpolation versus a discrete method), and `ACCOUNT_USAGE` latency if a longer window is being read. On small query counts the percentile method matters most, because there are few rows to interpolate between. Match the window and units before assuming a real divergence.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Latency p99 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

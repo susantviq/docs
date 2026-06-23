@@ -1,0 +1,172 @@
+---
+title: "Query Latency p95 (ms), MySQL"
+sidebarTitle: "Query Latency p95 (ms)"
+description: "Query Latency p95 (ms) for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Query Latency p95 (ms)** is the 95th-percentile statement execution time: 95% of queries in the window finish faster than this number, the slowest 5% take longer. It is the metric that best tracks real user pain, because the median (p50) hides the tail and the maximum is too noisy to act on. When p95 climbs, the slow 5% is getting slower, and at storefront volumes that 5% is thousands of shoppers hitting a sluggish page load, a laggy search, or a checkout that stalls. This is a Hero sensitivity card with a 200ms alert: for an OLTP primary, a p95 above 200ms means the tail of the workload has crossed from "fast enough" into "noticeably slow".
+
+| | |
+| --- | --- |
+| **What it tracks** | The 95th-percentile query execution time in milliseconds over the selected window. |
+| **Data source** | Statement timing from Performance Schema, principally `events_statements_summary_by_digest`, aggregated into a percentile distribution. Timer values are stored in picoseconds and converted to milliseconds for display. |
+| **Time window** | `RT/5m` (real-time gauge with a rolling 5-minute aggregation for the percentile distribution). |
+| **Alert trigger** | `> 200ms`. A sustained p95 above 200ms on an OLTP instance pages the on-call; tune the threshold to your workload in the Sensitivity tab. |
+| **Aggregation** | 95th percentile of the per-statement latency distribution across the window, not an average. A few slow queries move it; one outlier does not dominate it the way it would the maximum. |
+| **Units** | Milliseconds. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card builds a latency distribution from MySQL's statement instrumentation and reports its 95th-percentile point:
+
+```text
+Query Latency p95 = value below which 95% of statement execution times fall, over the 5m window
+```
+
+The source is Performance Schema. Each statement digest in `events_statements_summary_by_digest` carries timing data, and MySQL maintains latency histograms (`events_statements_histogram_global` and per-digest histograms) that bucket execution times. The engine reads those buckets to find the 95th-percentile boundary across all statements executed in the window. Timer columns such as `SUM_TIMER_WAIT` and `AVG_TIMER_WAIT` are expressed in picoseconds, so the card divides by 1,000,000,000 to render milliseconds.
+
+Two points on what this captures:
+
+- **It is execution time, not round-trip time.** Performance Schema times the statement inside the server, from parse to result generation. Network transit between the application and the database is not included, so a client-observed latency may be higher than the card by the network round-trip cost.
+- **It is a percentile, not an average.** This is the whole point of p95. An average is dragged around by both extremes; the 95th percentile isolates the tail experience while staying stable against a single freak query. It is the standard "how bad is it for the unlucky few?" measure.
+
+The `RT/5m` window means the distribution is recomputed continuously over a rolling 5-minute span. The alert evaluates a sustained breach, so a momentary spike (one heavy analytical query, a brief checkpoint flush) does not page the on-call; a persistent climb above 200ms does.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MySQL 8.0 primary behind the product, search, and checkout services for a retailer. Normal p95 sits around 45ms. Snapshot taken on 18 Apr 26 from 11:00 BST, during a mid-morning traffic build.
+
+| Window (5m) | p50 (ms) | p95 (ms) | p99 (ms) | State |
+| --- | --- | --- | --- | --- |
+| 10:50 | 8 | 44 | 95 | Healthy |
+| 10:55 | 9 | 51 | 110 | Healthy |
+| 11:00 | 11 | 180 | 420 | Climbing |
+| 11:05 | 12 | **260** | 690 | **Alert** |
+
+At 11:05 p95 crosses 200ms and the card fires. The tell is the gap between p50 and p95: the median barely moved (8ms to 12ms) while p95 nearly 6x'd. That pattern points squarely at the tail, not the common path. The DBA pulls the slowest digests for the window:
+
+```sql
+SELECT DIGEST_TEXT,
+       COUNT_STAR,
+       AVG_TIMER_WAIT/1000000000 AS avg_ms,
+       SUM_ROWS_EXAMINED/COUNT_STAR AS avg_rows_examined
+FROM performance_schema.events_statements_summary_by_digest
+ORDER BY AVG_TIMER_WAIT DESC
+LIMIT 5;
+```
+
+```text
+DIGEST_TEXT                                  avg_ms  avg_rows_examined
+SELECT * FROM orders WHERE customer_email=?  310     842,000   <- full scan
+SELECT * FROM products WHERE title LIKE ?    140     410,000   <- LIKE scan
+...
+```
+
+The top offender examines 842,000 rows per execution to return a handful: a query filtering `orders` by `customer_email` with no index on that column. As traffic rose, this previously-tolerable full scan started dominating the tail. The corrective path:
+
+1. **Add the missing index.** `ALTER TABLE orders ADD INDEX idx_customer_email (customer_email);` turns an 842,000-row scan into an index seek. On a large table, build it during a low-traffic window or use an online DDL path to avoid blocking.
+2. **Confirm it is a tail problem, not a systemic one.** Because p50 stayed flat, the buffer pool and disk are healthy; this is a small number of expensive queries, not a server-wide slowdown. Cross-check [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate); if it were dropping, the story would be different.
+3. **Watch p99 as the leading edge.** p99 spiked to 690ms before p95 crossed the line. The deepest tail moves first; p99 is the early-warning version of this card.
+
+```text
+Why p95, not average:
+  - Average latency this window: ~22ms (looks fine)
+  - p95: 260ms (the slow 5% is genuinely slow)
+  - At 9,000 statements/sec, 5% = 450 statements/sec running slow
+  - The average hides them; p95 exposes them.
+```
+
+Three takeaways:
+
+1. **The p50-to-p95 gap is the diagnosis.** A small gap means uniform performance; a widening gap (flat p50, rising p95) means a tail problem, typically a few un-indexed or contended queries.
+2. **p95 is the user-pain metric.** Averages flatter the operator and hide the unlucky shoppers. The 95th percentile is what a meaningful slice of real sessions actually experiences.
+3. **The tail moves before the median.** Watch p99 and p95 together; the deepest percentile crosses first and gives you a head start before the broader slowdown arrives.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Latency p95 | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p50 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p50-ms) | The median baseline. | Flat p50 with rising p95 equals a tail problem; both rising equals a systemic slowdown. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p99-ms) | The deepest tail, the early-warning percentile. | p99 crosses before p95; it is the leading indicator for this card. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mysql/slow-query-rate) | The share of statements over the slow-query threshold. | A rising p95 driven by a rising slow-query rate points at specific bad queries. |
+| [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest) | Names the exact statements behind the tail. | The "who" behind a p95 breach: the digests dragging the percentile up. |
+| [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) | Whether the slowness is disk-bound. | p95 up with hit rate down means the working set spilled to disk; p95 up with hit rate fine means specific bad queries. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | The load context for the latency. | p95 rising as QPS rises means a throughput wall; p95 rising at flat QPS means a query or contention change. |
+| [InnoDB Deadlocks (last 5m)](/nerve-centre/kpi-cards/mysql/innodb-deadlocks-last-5m) | Lock contention shows up as tail latency. | A p95 spike with deadlocks present means lock waits, not scans, are the cause. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite that weights tail latency. | A sustained p95 breach pulls the health score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look on the instance:**
+
+> `SELECT * FROM performance_schema.events_statements_histogram_global;` for the global latency histogram the percentile is read from.
+> `SELECT DIGEST_TEXT, COUNT_STAR, AVG_TIMER_WAIT/1000000000 AS avg_ms, MAX_TIMER_WAIT/1000000000 AS max_ms FROM performance_schema.events_statements_summary_by_digest ORDER BY AVG_TIMER_WAIT DESC;` to find the digests driving the tail.
+> `SELECT * FROM sys.statement_analysis ORDER BY avg_latency DESC;` for the `sys`-schema friendly view with latency already formatted.
+> The slow query log (when `slow_query_log` is on) for the actual slow statements, captured with their full parameters.
+
+Remember the unit conversion: Performance Schema timers are in picoseconds. Divide `*_TIMER_WAIT` columns by 1,000,000,000 to get milliseconds. A common mistake is reading the raw picosecond value and concluding the database is impossibly slow.
+
+**On a managed service:**
+
+| Service | Where to confirm |
+| --- | --- |
+| Amazon RDS / Aurora | Performance Insights shows per-digest average latency and a "DB Load" breakdown by wait event; it does not expose a literal p95 line, so use the digest latencies and the Performance Schema histogram for the percentile. |
+| Google Cloud SQL | Query Insights surfaces per-query latency; the underlying Performance Schema views are readable directly for percentile work. |
+| Azure Database for MySQL | Query Performance Insight plus the Performance Schema views for the distribution. |
+
+**Why our number may legitimately differ from a native reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Execution vs round-trip** | Card lower | The card times execution inside the server; a client-side APM measures round-trip including network, so the application's observed p95 is usually higher. |
+| **Average vs percentile** | Console lower | Many native views default to average latency, which sits well below p95. Comparing the card's p95 to a console average is comparing two different statistics. |
+| **Histogram resolution** | Marginal | Percentiles are read from bucketed histograms; the precision is bounded by bucket width near the boundary. |
+| **Digest aggregation reset** | Card temporarily off | A `TRUNCATE performance_schema.events_statements_summary_by_digest` or a restart clears the base; the first windows after that are computed from a partial distribution. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why watch p95 instead of average latency?**
+Average latency flatters the operator and hides the unlucky users. A server can show a 22ms average while the slowest 5% of queries run at 260ms, and that 5% is thousands of real sessions at storefront volume. The 95th percentile isolates the tail experience while staying stable against a single freak query (which would dominate the maximum). It is the standard measure of "how bad is it for the people having a bad time?".
+
+**My p95 jumped but p50 is flat. What does that mean?**
+It is the signature of a tail problem: the common path is fine but a small slice of queries got much slower. The usual causes are a few un-indexed or full-scan queries that became expensive under load, lock contention hitting a subset of statements, or a single heavy reporting query running on the primary. Pull [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest) to name the culprits. If p50 had risen too, the story would instead be systemic (buffer-pool pressure or disk saturation).
+
+**The card reads lower than my application's observed latency. Why?**
+The card measures execution time inside the server; your application measures round-trip, which includes network transit, connection acquisition from the pool, and result transfer. On a healthy network the gap is small, but cross-region traffic or a saturated connection pool can add tens of milliseconds the card does not see. If the application's p95 is much higher than the card's, the bottleneck is outside the database, often the connection pool, so check [Connection Pool Saturation %](/nerve-centre/kpi-cards/mysql/connection-pool-saturation).
+
+**Is 200ms the right threshold for my workload?**
+200ms is a sensible default for an OLTP primary serving interactive traffic, where queries should mostly be index seeks. It is too tight for an analytical or reporting database where multi-second queries are normal, and arguably too loose for a latency-critical path. Tune it in the Sensitivity tab to match your baseline; the right threshold is one that fires on genuine degradation, not on your normal tail.
+
+**Why does p99 cross the alert line before p95?**
+Because the deepest tail moves first. When a problem begins to bite, the very slowest queries (p99) feel it before the broader slow band (p95) does. That makes [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p99-ms) the early-warning version of this card. Watching p95 and p99 together gives you a head start: p99 climbing while p95 is still calm is your cue to investigate before the breach widens.
+
+**Does the percentile include queries that errored?**
+A statement that failed still consumed execution time up to the point of failure, and that time is recorded in Performance Schema, so it can contribute to the distribution. In practice errored statements usually fail fast and sit at the low end, so they rarely move p95. If you see high error rate and high p95 together, the cause is likely timeouts (slow failures), which is worth distinguishing from fast rejections; pair with [Query Error Rate %](/nerve-centre/kpi-cards/mysql/query-error-rate).
+
+**Performance Schema is disabled on my instance. Can the card still report p95?**
+No. The percentile is built from Performance Schema statement instrumentation; with it disabled there is no per-statement timing histogram to read from. Enable `performance_schema` and the statement instruments (on most managed services they are on by default) to populate this card. The slow query log is a coarse fallback for finding individual slow statements but cannot produce a true percentile distribution.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Latency p95 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

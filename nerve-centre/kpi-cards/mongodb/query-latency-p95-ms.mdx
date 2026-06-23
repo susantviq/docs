@@ -1,0 +1,132 @@
+---
+title: "Query Latency p95 (ms), MongoDB"
+sidebarTitle: "Query Latency p95 (ms)"
+description: "Query Latency p95 (ms) for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Query Latency p95 (ms)** is the 95th-percentile read latency for the MongoDB deployment over a rolling 5-minute window: 95% of reads finish faster than this number, and the slowest 5% finish slower. For a platform team this is the honest "tail" reading. The p50 (median) hides the slow queries; the p95 is where users actually start to feel pain. When p95 crosses 200ms the card alerts, because at that point a meaningful slice of application requests are waiting long enough to degrade page loads, API responses, or checkout calls that sit on top of the database.
+
+| | |
+| --- | --- |
+| **What it tracks** | The 95th-percentile read operation latency for the deployment, derived from the WiredTiger / `serverStatus` operation-latency histogram. |
+| **Data source** | `latencies.reads.latency / latencies.reads.ops` from `serverStatus` (the `opLatencies.reads` cumulative counters, sampled and windowed). |
+| **Time window** | `RT/5m` (real-time, rolling 5-minute window). |
+| **Alert trigger** | `> 200ms` sustained. Crossing 200ms at p95 means 5% of reads are slow enough to be felt by the application layer. |
+| **Calculation basis** | Read-side latency only. Write and command latencies are tracked separately; this card isolates reads because read tail latency is the most common cause of user-visible slowness. |
+| **Units** | Milliseconds (ms). |
+| **Roles** | platform, engineering, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+MongoDB does not expose a true streaming percentile in `serverStatus`; it exposes cumulative counters. The card works from `latencies.reads` (the `opLatencies.reads` document), which carries a running total `latency` (in microseconds) and a running count `ops`. Two things happen:
+
+1. **Windowing.** The engine samples the counters at the start and end of each 5-minute window and takes the delta: `(latency_end - latency_start)` over `(ops_end - ops_start)`. This yields the average read latency *for that window only*, stripping out the long-running cumulative average since process start.
+2. **Percentile estimation.** Where the deployment exposes the latency histogram (`opLatencies` with `histogram: true`, available on modern builds and surfaced natively on Atlas), the engine reads the 95th-percentile bucket directly. Where only the scalar counters are available, the card reports the windowed mean as a conservative proxy and flags the reading as an average rather than a true percentile.
+
+The result is converted from microseconds to milliseconds for display. The 200ms alert threshold is evaluated on the windowed value, so a single slow query does not trip it; the tail has to stay elevated across the window.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 3-node replica set (1 primary, 2 secondaries) backing the product and session services for a high-traffic storefront. Snapshot taken on 14 Apr 26 at 20:15 BST, during an evening traffic peak.
+
+| Window (5m) | Reads in window | p50 (ms) | p95 (ms) | Note |
+| --- | --- | --- | --- | --- |
+| 19:55 | 412,000 | 3 | 41 | Healthy steady state |
+| 20:00 | 455,000 | 4 | 58 | Traffic ramping |
+| 20:05 | 498,000 | 6 | 137 | Cache pressure building |
+| 20:10 | 510,000 | 7 | 248 | **Alert fires (> 200ms)** |
+| 20:15 | 505,000 | 9 | 263 | Sustained tail |
+
+The p50 has only drifted from 3ms to 9ms, which on its own looks benign. The p95, though, has gone from 41ms to 263ms, a 6x blow-out. That divergence is the diagnostic signal: the *typical* read is still fast, but the slowest 5% are now taking a quarter of a second. The cause here is the working set spilling out of the WiredTiger cache as traffic climbed, so a growing fraction of reads have to fetch pages from disk.
+
+```text
+Reading the tail blow-out:
+  p50 stable + p95 climbing  -> a subset of queries hitting disk / missing index
+  p50 climbing + p95 climbing together -> systemic slowdown (cache too small, slow disk, CPU saturation)
+  p95 spike with no traffic change -> a single bad query plan or a COLLSCAN entered a hot path
+```
+
+What the team does: they pull up [WiredTiger Cache Hit Rate %](/nerve-centre/kpi-cards/mongodb/wiredtiger-cache-hit-rate) and see it has dropped from 99.4% to 96.1%, confirming cache eviction. They cross-check [COLLSCAN Operations (24h)](/nerve-centre/kpi-cards/mongodb/collscan-operations-24h) to rule out a missing index that a recent deploy introduced, and [Slow Ops (15m, >100ms)](/nerve-centre/kpi-cards/mongodb/slow-ops-15m-100ms) to see exactly which collections are slow. The fix is either a larger cache (more RAM / a bigger instance tier) or shedding read load onto secondaries. The p99 sibling shows the very worst case is already at 900ms, so the urgency is real.
+
+Three takeaways:
+
+1. **Read p95 against p50, not in isolation.** A high p95 with a low p50 is a tail problem (specific slow queries); a high p95 with a high p50 is a systemic problem (capacity). The remedy is different.
+2. **200ms is a database-layer threshold, not an end-user one.** By the time a slow MongoDB read reaches the user it has accumulated application, network, and rendering time on top. A 250ms database p95 can easily become a 1s+ page.
+3. **The tail moves before the median.** p95 is an early-warning line. If you wait for p50 to climb you have already let the deployment degrade for everyone, not just the unlucky 5%.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Latency p95 | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p50 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p50-ms) | The median baseline. | p95 high + p50 flat equals a tail/slow-query problem; both climbing equals capacity. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p99-ms) | The far-tail reading. | p99 far above p95 means a small set of very slow ops; investigate those specific queries. |
+| [Slow Ops (15m, >100ms)](/nerve-centre/kpi-cards/mongodb/slow-ops-15m-100ms) | The profiler list behind the percentile. | Names the exact collections and operations dragging the tail up. |
+| [WiredTiger Cache Hit Rate %](/nerve-centre/kpi-cards/mongodb/wiredtiger-cache-hit-rate) | The cache-pressure explanation. | A falling hit rate that tracks the p95 rise confirms the working set has outgrown RAM. |
+| [COLLSCAN Operations (24h)](/nerve-centre/kpi-cards/mongodb/collscan-operations-24h) | The missing-index explanation. | A COLLSCAN spike timed to the p95 rise points at a recent code path bypassing an index. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | The load context. | A p95 rise with flat ops/sec is a regression, not just more traffic. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mongodb/query-error-rate) | The reliability peer. | High latency plus rising errors often means timeouts; the slow tail is now failing outright. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | The composite roll-up. | Confirms whether the latency tail is dragging overall health below its threshold. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MongoDB's own tooling:**
+
+> Run `db.serverStatus().opLatencies.reads` in `mongosh` to read the cumulative `latency` (microseconds) and `ops` counters; the windowed average is `(latency2 - latency1) / (ops2 - ops1) / 1000` between two samples.
+> Use `mongostat` for a live, low-overhead per-second view of operation rates and latency trends.
+> On **MongoDB Atlas**, the Metrics tab exposes "Read Latency" with native p50 / p95 / p99 percentile lines per node; pick the primary (or the node serving the workload) and match the 5-minute window.
+> Enable the **database profiler** (`db.setProfilingLevel(1, { slowms: 100 })`) and query `system.profile` to see the individual slow reads that are inflating the percentile.
+
+**Why our number may legitimately differ from MongoDB's native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Cumulative vs windowed** | Native scalar often lower | `serverStatus.opLatencies` is a running average since process start; the card windows it to 5 minutes, so a recent spike shows up sharper in our value. |
+| **Percentile vs mean fallback** | Variable | If the deployment does not expose the latency histogram, the card reports a windowed mean as a proxy; Atlas reports a true percentile, so they can diverge during a skewed tail. |
+| **Per-node scope** | Variable | We read the node the connector is pointed at; if reads are distributed across secondaries, a single-node native reading may not match the workload-wide picture. |
+| **Sampling interval** | Brief lag | The card polls on a fixed interval; a 30-second spike between polls may be smoothed relative to a live `mongostat` stream. |
+
+**Cross-connector reconciliation:** pair with [MongoDB Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/mongodb/mongodb-pool-saturation-vs-traffic-burst) and [Slow Ops During Checkout Window (5m)](/nerve-centre/kpi-cards/mongodb/slow-ops-during-checkout-window-5m) to tie a latency tail to the revenue-bearing path. For divergence investigations, use Vortex Mind.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does this card track reads only, not writes?**
+Read tail latency is the most common cause of user-visible slowness, because the read path sits directly under page loads and API calls. Write latency is tracked separately. If your workload is write-heavy (event ingestion, logging), watch the write and command latency surfaces alongside this card rather than treating p95 reads as the whole story.
+
+**My p50 is fine but p95 alerted. Is that a false alarm?**
+No, that is exactly the signal this card exists to catch. A healthy median with a blown-out 95th percentile means a specific subset of queries is slow (missing index, COLLSCAN, a hot document, or cache misses) while most queries stay fast. Use [Slow Ops (15m, >100ms)](/nerve-centre/kpi-cards/mongodb/slow-ops-15m-100ms) to find which queries, then add an index or fix the query plan.
+
+**The card says "average" not "percentile" for my deployment. Why?**
+Older or minimally configured deployments expose only the scalar `opLatencies` counters, not the latency histogram needed for a true percentile. In that mode the card reports a windowed mean as a conservative proxy and labels it accordingly. To get a real p95, run a modern MongoDB build with operation-latency histograms enabled, or read the percentile directly from the Atlas Metrics view.
+
+**Should I alert at 200ms for my workload too?**
+200ms is a sensible default for an interactive OLTP workload sitting under a storefront. Analytical or batch workloads tolerate far higher latency, and ultra-low-latency caches expect single-digit milliseconds. The sensitivity threshold is configurable per profile in the Sensitivity tab; set it to your own baseline rather than the generic default.
+
+**p95 spiked but ops/sec did not change. What happened?**
+A latency rise with flat throughput is a regression, not a capacity issue. The usual causes are a deploy that changed a query plan, an index that was dropped or not yet built, a COLLSCAN entering a hot path, or a background operation (compaction, index build, balancer migration) competing for I/O. Check [COLLSCAN Operations (24h)](/nerve-centre/kpi-cards/mongodb/collscan-operations-24h) and recent deploy timing first.
+
+**Does reading from secondaries affect this number?**
+It can. The card reads the node the connector targets. If your application uses a `secondaryPreferred` read preference, the latency your users experience is a blend across nodes, which a single-node reading will not capture. Point the connector at the node (or nodes) actually serving the read workload, and cross-check the per-node Atlas percentiles.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Latency p95 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,135 @@
+---
+title: "Search Latency p95 (ms), Elasticsearch"
+sidebarTitle: "Search Latency p95 (ms)"
+description: "Search Latency p95 (ms) for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Search Latency p95 (ms)** is the time below which 95% of search queries complete: only the slowest 5% take longer. This is the storefront-facing number that matters most to real users. The median (p50) can look healthy while p95 is quietly miserable, and it is the p95 experience that shows up as a sluggish search box on a category page. For a storefront backed by Elasticsearch, p95 is directly user-impacting, which is why it carries a hard 200ms alert.
+
+| | |
+| --- | --- |
+| **What it tracks** | The 95th-percentile query service time across all search shards for the selected period. The slowest 5% of queries take longer than this value; the other 95% are faster. |
+| **Data source** | Reconstructed from `indices.search.query_time_in_millis` divided by `query_total` delta, read from the Elasticsearch node stats API (`GET /_nodes/stats/indices/search`). Vortex IQ builds a percentile distribution across the window rather than a flat counter average. |
+| **Time window** | `RT/5m` (real-time, rolling 5-minute window, refreshed continuously). |
+| **Alert trigger** | `> 200ms`. A sustained p95 above 200ms means the slow tail is wide enough that a noticeable share of shoppers are waiting on search. |
+| **Why it matters** | Search is the highest-intent path on a storefront. A slow p95 suppresses conversion long before it ever turns into an error or an outage; it is the silent revenue leak. |
+| **What counts** | Query-phase service time on the data nodes for search and `_search`-type requests. |
+| **What does NOT count** | Network round-trip from the browser, application-tier serialisation, fetch-phase of very large `_source` payloads measured separately, and aggregations-only requests if scoped out in the connector. |
+| **Roles** | engineering, operations, owner |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Elasticsearch exposes two monotonic counters per node in the search index stats: `query_total` (the number of query-phase operations completed) and `query_time_in_millis` (the cumulative milliseconds spent in the query phase). On their own these give only a lifetime average. Vortex IQ samples the counters on each poll, takes the delta between consecutive samples, and aggregates the per-shard service times into a distribution across the rolling 5-minute window. The 95th percentile is read from that distribution and reported as the card value in milliseconds.
+
+Because the figure is a percentile and not a counter ratio, it is robust to a few very slow queries skewing a window average, and it captures the experience of the unlucky tail. The value is cluster-wide by default: it blends every searchable index. Where a connector is scoped to a specific index pattern (for example the product catalogue index that powers storefront search), the distribution is built only from those shards, which is the reading most ops teams want because it isolates the customer-facing path from background analytics queries.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 6-node Elasticsearch cluster behind a high-traffic storefront. The product-search index has 3 primary shards and 1 replica each. Snapshot taken on 14 Apr 26 at 19:40 BST during the evening traffic peak.
+
+| Percentile | Reading | Window |
+| --- | --- | --- |
+| p50 | 38ms | RT/5m |
+| **p95** | **264ms** | **RT/5m** |
+| p99 | 910ms | RT/5m |
+
+The p95 card has crossed its 200ms threshold and is outlined as a breach. The median is fine at 38ms, so this is not a broad slowdown: the typical query is fast, but the slow tail has widened. The team reads three things at once:
+
+1. **The breach is in the tail, not the bulk.** p50 at 38ms against p95 at 264ms is a 7x spread. That pattern points at a subset of expensive queries, not at an undersized cluster. Likely culprits: deep pagination (`from` + `size` reaching into the thousands), unbounded wildcard or leading-wildcard terms, or a heavy aggregation riding on the same index.
+2. **It co-occurs with the peak.** The breach started at 19:25 as traffic climbed. Pairing with [Search Queries per Second (live)](/nerve-centre/kpi-cards/elasticsearch/search-queries-per-second-live) shows QPS up 40% over the afternoon baseline, so the tail is partly load-driven. The search thread pool is queueing.
+3. **Heap is warm but not critical.** [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) reads 71%, just below the 75% GC-pressure line. Garbage-collection pauses are starting to nibble at the tail.
+
+```text
+Cost framing for the storefront:
+  - Storefront search sessions during the breach window: ~3,100 / hour
+  - Industry-observed conversion drag at p95 > 250ms: ~2-4% relative
+  - Assume 3% of search-led sessions abandon early
+  - 3,100 x 3% = ~93 lost search-led sessions / hour
+  - At a 2.1% baseline search-to-purchase rate and £58 AOV:
+      93 x 2.1% x £58 = ~£113 / hour of suppressed revenue while p95 stays over threshold
+```
+
+Action order: (1) check the slowlog via [Top 10 Slow Searches](/nerve-centre/kpi-cards/elasticsearch/top-10-slow-searches) to find the offending query shape; (2) confirm whether the [Slow-Query Rate %](/nerve-centre/kpi-cards/elasticsearch/slow-query-rate) is climbing in step; (3) if load-driven, add a replica to spread query load, or cap deep pagination with `search_after`. The takeaway: p95 is the number that tells you customers are feeling it, well before any error card lights up.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Search Latency p95 | What the combination tells you |
+| --- | --- | --- |
+| [Search Latency p50 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p50-ms) | The median, the bulk-of-traffic baseline. | A wide p50-to-p95 gap means a slow tail (expensive queries); a narrow gap that rises together means a broadly overloaded cluster. |
+| [Search Latency p99 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p99-ms) | The extreme tail, the worst 1%. | p99 spiking while p95 holds means a handful of pathological queries; both rising means systemic pressure. |
+| [Search Queries per Second (live)](/nerve-centre/kpi-cards/elasticsearch/search-queries-per-second-live) | The load driving the latency. | p95 up with QPS up equals capacity; p95 up with flat QPS equals a query-shape or heap problem. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/elasticsearch/slow-query-rate) | The share of searches breaching the slowlog threshold. | Confirms whether the tail is a few outliers or a growing fraction of all traffic. |
+| [Top 10 Slow Searches](/nerve-centre/kpi-cards/elasticsearch/top-10-slow-searches) | The actual query shapes behind the tail. | Names the offending queries so you can fix the cause, not the symptom. |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | Heap pressure drives GC pauses that inflate the tail. | Heap above 75% with a rising p95 means GC pauses are the cause. |
+| [Search Error Rate %](/nerve-centre/kpi-cards/elasticsearch/search-error-rate) | The failure peer to the latency reading. | Latency high then errors high means the search pool is saturating into rejections. |
+| [HTTP Connection Saturation %](/nerve-centre/kpi-cards/elasticsearch/http-connection-saturation) | Connection-tier headroom under load. | Saturation high with rising p95 means clients are queueing before queries even start. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> **`GET /_nodes/stats/indices/search`** for the raw `query_total` and `query_time_in_millis` counters per node; the lifetime ratio is `query_time_in_millis / query_total`.
+> **`GET /<index>/_stats/search`** for the same counters scoped to a single index pattern.
+> **Kibana Stack Monitoring → Overview → Search** for the latency chart over time, and the **search-slowlog** (configured via `index.search.slowlog.threshold.query.warn`) for the actual slow queries.
+> On **Elastic Cloud** or **AWS OpenSearch Service**, the search-latency series appears in the cluster's monitoring dashboard.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Percentile vs counter average** | Either | The node stats ratio is a window average; Vortex IQ reports a true 95th percentile across the window, which is usually higher than the average. |
+| **Window length** | Either | Vortex IQ uses a rolling 5-minute window; a Kibana chart bucketed at 1-minute or 1-hour will smooth differently. |
+| **Index scope** | Usually lower | A connector scoped to the storefront index excludes background analytics queries that inflate a cluster-wide average. |
+| **Phase boundary** | Usually lower | This card measures the query phase only; end-to-end request time also includes the fetch phase and coordinating-node overhead. |
+| **Time zone** | Axis shift only | Chart axes render in the merchant's display time zone; Elasticsearch stores UTC. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Slow Searches During Checkout Window (5m)](/nerve-centre/kpi-cards/elasticsearch/slow-searches-during-checkout-window-5m) | A p95 breach should correlate with slow searches landing in checkout windows. | Breach with no checkout-window slow searches means the tail is on non-purchase paths (admin, analytics). |
+| [ES Search Pool Saturation vs Ecom Burst](/nerve-centre/kpi-cards/elasticsearch/es-search-pool-saturation-vs-ecom-burst) | p95 rises as the search pool saturates during an ecom traffic burst. | p95 up with low pool saturation means a query-shape problem, not capacity. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My users complain search is slow but p95 reads 90ms. Why?**
+p95 measures only the query phase service time on the data nodes. The user's experience also includes browser-to-app network latency, application-tier query construction, the fetch phase for large result payloads, and any front-end rendering. If p95 is healthy but users are not, look upstream of Elasticsearch, or check [Search Latency p99 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p99-ms) in case the specific users hitting trouble are in the worst 1%.
+
+**Why 200ms as the threshold and not something lower?**
+200ms is the point at which a noticeable share of shoppers begin to perceive the search box as laggy on a storefront. It is a sensible default, not a law. The threshold is configurable per profile in the Sensitivity tab; a latency-sensitive catalogue may want 150ms, a complex faceted search may tolerate 300ms.
+
+**p95 spiked for one window then recovered. Should I worry?**
+A single 5-minute spike that self-recovers is often a segment merge, a brief GC pause, or a one-off heavy aggregation. Worry when the breach is sustained across several windows, or when it recurs at the same time each day (a scheduled job or a daily traffic pattern). Pair with [GC Pause Time (5m total ms)](/nerve-centre/kpi-cards/elasticsearch/gc-pause-time-5m-total-ms) to rule out garbage collection.
+
+**Does p95 include aggregation queries?**
+By default the card blends all query-phase operations on the in-scope indices, which includes aggregations. Heavy aggregations are a common tail driver. If you want to isolate plain search from analytics, scope the connector to the storefront index pattern only.
+
+**How is the percentile calculated if Elasticsearch only exposes counters?**
+Elasticsearch node stats give cumulative `query_total` and `query_time_in_millis`, which alone yield only an average. Vortex IQ samples per-shard deltas across the 5-minute window and reconstructs a distribution, then reads the 95th percentile from it. This is why the card value can sit above the simple counter ratio you would compute by hand.
+
+**Can a healthy p50 hide a bad p95?**
+Yes, and that is exactly why p95 is a Hero card. A median of 35ms with a p95 of 280ms means most queries are fine but the slow tail is wide enough to hurt conversion. Always read p50 and p95 together; the gap between them is the diagnostic.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Search Latency p95 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

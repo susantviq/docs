@@ -1,0 +1,125 @@
+---
+title: "Cluster Node Count, CockroachDB"
+sidebarTitle: "Cluster Node Count"
+description: "Cluster Node Count for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Cluster Node Count** is the number of nodes currently participating in the CockroachDB cluster. It is the single most important "is my cluster intact?" signal: CockroachDB is a distributed, shared-nothing database where each node holds a slice of the ranges and a share of the leases, so losing a node means lease transfers, re-replication, and, if you lose enough nodes, loss of quorum and data unavailability. The card compares the live node count against the expected count you provisioned. When the live figure drops below expected, a node has been lost and the clock is running on re-replication.
+
+| | |
+| --- | --- |
+| **What it tracks** | Cluster Node Count for the selected period: the number of nodes the cluster recognises as part of its membership, with the live count compared against the expected (provisioned) count. |
+| **Data source** | Node membership and liveness from `crdb_internal.gossip_liveness` and the `_status/nodes` endpoint, with the `liveness.livenodes` time-series metric. The DB Console Cluster Overview shows the same Live / Suspect / Dead / Decommissioned breakdown. |
+| **Time window** | `RT` (real-time, refreshed on each poll). Node loss must be surfaced in seconds, so this reads live. |
+| **Alert trigger** | `< expected (= node lost)`. Any live count below the provisioned node count means a node has stopped heartbeating and dropped out of the cluster. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card reads cluster membership and node liveness, then compares two figures: the **expected** node count (the number you provisioned, which Vortex IQ learns from the steady-state membership) and the **live** node count (nodes currently reporting a `live` liveness status). A node is `live` only while its lease on the node-liveness range is valid, which depends on a regular heartbeat (the default liveness duration is roughly 9 seconds). When a node stops heartbeating, it transitions out of the live set within seconds, becoming `suspect` and then, after the time-until-store-dead window (5 minutes by default), `dead`.
+
+The headline value is the live count, and the alert is a comparison: live `< expected`. Crucially, the card distinguishes a lost node from a deliberately removed one. A node you `decommission` is gracefully drained and its ranges are moved off before it leaves, so an intentional scale-down lowers the expected baseline rather than tripping the alert. An unplanned drop, a crash, an OOM-kill, a network partition, a host failure, is what the alert is built to catch, because in that case ranges that lived on the lost node are suddenly down a replica and the cluster must re-replicate to restore the configured replication factor.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 5-node CockroachDB cluster (replication factor 3) across three availability zones, backing the order, inventory, and session services for a retail estate. Expected node count is 5. Snapshot taken on 22 May 26 at 09:12 BST.
+
+| Time | Live nodes | Expected | State | What happened |
+| --- | --- | --- | --- | --- |
+| 09:11 | 5 | 5 | healthy | steady state |
+| 09:12 | **4** | 5 | **alert** | n4 stopped heartbeating |
+| 09:12 | 4 | 5 | alert | leases on n4 transfer to peers |
+| 09:13 | 4 | 5 | alert | balancer begins re-replicating n4's ranges |
+| 09:21 | 4 | 5 | recovering | under-replicated count falling toward 0 |
+
+The card headline drops to **4 of 5** in the red band the instant n4 stops heartbeating. The DBA's first question is "lost or decommissioned?" The answer is lost: nobody ran a decommission, so this is unplanned. With replication factor 3 across 3 AZs, losing one node does not cost quorum, no range lost two replicas simultaneously, so the cluster stays fully available for reads and writes. That is the designed-for case, and it is why CockroachDB survives a node loss without an outage.
+
+The risk is not now; it is the re-replication window. While n4 is gone, every range that had a replica on n4 is running on 2 replicas instead of 3, so a *second* failure in that window could cost quorum on those ranges.
+
+```text
+Severity depends on what failed and how many:
+  - 1 node lost, RF=3, no other failures   -> available, re-replicating, low risk
+  - 2 nodes lost in the same AZ, RF=3       -> some ranges down a 2nd replica, elevated risk
+  - 3 nodes lost (or a full AZ), RF=3       -> ranges with all replicas gone lose quorum
+                                               => those ranges become UNAVAILABLE
+```
+
+The DBA confirms scope with [Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/under-replicated-ranges) (climbed then is falling as the balancer heals) and watches [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges) (still 0, so no quorum loss). They check the host: n4 was OOM-killed, confirmed by the [Memory Usage %](/nerve-centre/kpi-cards/cockroachdb/memory-usage) spike that preceded the drop. Actions: let the balancer finish re-replicating, restart n4 once memory is bounded, and do not start maintenance on any other node until the under-replicated count is back to 0.
+
+Three takeaways:
+
+1. **Lost is not the same as decommissioned.** A graceful decommission lowers the expected baseline and is not an incident; an unplanned drop is. The alert is tuned to fire only on the latter.
+2. **The danger is the re-replication window, not the moment of loss.** One node down with RF=3 is survivable; a second loss before re-replication completes is what turns a non-event into an outage. Freeze other maintenance until under-replication clears.
+3. **Pair the count with the range cards immediately.** Node count tells you a node is gone; under-replicated and unavailable ranges tell you whether any data is at risk because of it.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Cluster Node Count | What the combination tells you |
+| --- | --- | --- |
+| [Active Nodes (status=live)](/nerve-centre/kpi-cards/cockroachdb/active-nodes-statuslive) | The live-set headcount this card compares against expected. | Live below expected confirms exactly which nodes dropped from the heartbeat. |
+| [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges) | The quorum-loss signal. | Node loss with unavailable ranges above 0 equals data is actually offline, the worst case. |
+| [Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/under-replicated-ranges) | The re-replication-in-progress signal. | A spike then decline after a node drop is the healing window; a stuck non-zero means re-replication is blocked. |
+| [Decommissioning Nodes](/nerve-centre/kpi-cards/cockroachdb/decommissioning-nodes) | Tells you whether a drop was intentional. | A drop with no decommission in progress equals an unplanned loss to investigate. |
+| [Memory Usage %](/nerve-centre/kpi-cards/cockroachdb/memory-usage) | A common root cause of node loss. | A memory spike just before the count drop equals an OOM-kill. |
+| [Raft Quiescent Lag (seconds)](/nerve-centre/kpi-cards/cockroachdb/raft-quiescent-lag-seconds) | Replication health during recovery. | Rising lag while re-replicating equals the balancer struggling to keep up. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The composite executive view. | A node loss pulls the health score down until membership and replication recover. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+To confirm the figure natively, run `SELECT node_id, is_live, draining, membership FROM crdb_internal.gossip_liveness ORDER BY node_id;` to see the membership and liveness of every node, or run `cockroach node status` from the CLI for the live/dead table. The DB Console **Cluster Overview** groups nodes as Live, Suspect, Dead, and Decommissioned. On CockroachDB Cloud the live node count and node list appear on the cluster **Overview** page.
+
+| Reason our number may differ | Direction | Why |
+| --- | --- | --- |
+| **Suspect vs dead timing.** A node that just missed a heartbeat is `suspect` before it is `dead`. | Vortex IQ may dip briefly then recover | Allow a few seconds for liveness to settle before treating a dip as a confirmed loss. |
+| **Decommissioned nodes.** A drained, decommissioned node leaves membership. | Expected baseline lowers | Vortex IQ lowers the expected count for a graceful decommission so it does not alert; a native point-in-time view may still list it as decommissioned. |
+| **Joining nodes.** A node added during scale-up is counted once it heartbeats. | Brief lag | A newly started node appears in the live set only after its first liveness heartbeat. |
+| **Time zone.** Chart axes render in the cluster locale. | Cosmetic | Axis labels shift; the count does not. |
+
+For divergence investigations use Vortex Mind to correlate the drop with host metrics and the re-replication timeline.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**I deliberately scaled down a node. Why did the alert not fire?**
+Because you decommissioned it gracefully. A decommission drains the node's ranges and removes it from membership cleanly, so Vortex IQ lowers the expected baseline rather than treating the change as a loss. The alert is reserved for unplanned drops where ranges are suddenly down a replica.
+
+**One node is gone but the site is still up. Is this actually a problem?**
+With a replication factor of 3 and no second failure, a single node loss is survivable by design: no range loses quorum, so reads and writes continue. It is still an alert because you are now running with reduced redundancy until re-replication completes, and a second failure in that window could cost quorum. Treat it as urgent-but-not-outage.
+
+**How many nodes can I lose before data goes offline?**
+With replication factor N, a range stays available while it keeps a majority of its replicas, so it tolerates losing up to (N-1)/2 of its replicas. For the common RF=3, that is one replica per range; lose two replicas of the same range simultaneously and that range loses quorum and becomes unavailable. Spreading replicas across AZs is what protects you from a correlated multi-node failure.
+
+**The count flickered down and back up within seconds. Was a node really lost?**
+Probably not. A missed heartbeat marks a node `suspect` momentarily; if the heartbeat resumes, it returns to `live` without ever being `dead`. Transient network blips cause this. A real loss persists and is accompanied by a rising under-replicated range count.
+
+**A new node I added is not showing in the count yet.**
+A joining node is counted only after it completes its first liveness heartbeat and enters the live set. If it never appears, check that it can reach the existing nodes on the gossip/RPC port and that it joined with the correct `--join` addresses.
+
+**Does this card distinguish a dead node from a partitioned one?**
+Not directly, both stop heartbeating and leave the live set. The cluster cannot tell the difference either at first, which is the point of the liveness timeout. Use host-level checks to determine whether the node crashed or is isolated; the remediation differs (restart vs fix networking).
+
+**What should I freeze while one node is down?**
+Any other node maintenance. Do not restart, drain, or decommission a second node until [Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/under-replicated-ranges) is back to 0. Stacking a planned operation on top of an unplanned loss is the most common way a single-node event becomes an availability incident.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Cluster Node Count* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

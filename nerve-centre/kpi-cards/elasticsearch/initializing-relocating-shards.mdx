@@ -1,0 +1,142 @@
+---
+title: "Initializing / Relocating Shards, Elasticsearch"
+sidebarTitle: "Initializing / Relocating Shards"
+description: "Initializing / Relocating Shards for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cluster Health](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The count of shards the cluster is currently moving into place: shards in the `INITIALIZING` state (being created, recovered, or restored) plus shards in the `RELOCATING` state (being moved from one node to another). A small, transient number is completely normal: it is the cluster rebalancing itself. A number that stays elevated for ten minutes or more is the signal that recovery is stuck or that a rebalance is thrashing, which steals disk IO and network bandwidth from search and indexing. For a DBA, this card answers "is my cluster settling, or is it churning?"
+
+| | |
+| --- | --- |
+| **Metric basis** | The sum of `initializing_shards` and `relocating_shards` from `GET /_cluster/health`. The per-shard detail comes from `GET /_cat/shards` (state column) and `GET /_cluster/allocation/explain` for stuck shards. |
+| **What it counts** | Shards mid-flight: new primaries/replicas being built, replicas recovering after a node rejoins, shards being moved by the allocation balancer, and shards restoring from a snapshot. |
+| **What it excludes** | `STARTED` shards (already in place and serving) and `UNASSIGNED` shards (waiting, not moving). Unassigned shards are a separate, more serious card: see [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards). |
+| **Aggregation window** | `RT`: real-time reading straight from cluster health, refreshed live. |
+| **Why it matters** | Every initializing or relocating shard consumes recovery bandwidth and IO. A steady stream is healthy churn; a persistent backlog means recovery is throttled, a node is flapping, or the allocator cannot settle. |
+| **Time zone** | Cluster clock for sampling; rendered in the team's Vortex IQ display time zone. |
+| **Time window** | `RT` (real-time) |
+| **Alert trigger** | `> 5 sustained 10m`: more than five shards in motion held for ten minutes or longer pages the platform team. A brief spike above five during a planned rolling restart is expected and self-clears. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The headline value is a direct sum from cluster health:
+
+```text
+shards_in_motion = initializing_shards + relocating_shards
+```
+
+Both figures come from a single `GET /_cluster/health` call, which the cluster computes from its routing table. The alert logic adds a duration guard: the value must exceed 5 and remain above 5 continuously for 10 minutes before the sensitivity alarm fires. This duration gate is deliberate. Shards move constantly on a healthy cluster: a node restart, an ILM rollover, or a manual reindex all briefly push the count up, then it drains as recovery completes. Alerting on the instantaneous value would page on every routine operation.
+
+The card separates the two components in the detail view so you can tell churn types apart. A high `relocating_shards` count points to the balancer actively moving data (often after adding or draining a node, or after a disk watermark forced relocation). A high `initializing_shards` count points to recovery (a replica rebuilding after a node rejoined, or a snapshot restore in progress). The two have different remedies, so keeping them distinct matters.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team operates an 8-node Elasticsearch cluster supporting a marketplace search index with 40 primary shards and 1 replica each (80 shards total). One data node, es-data-5, hits a hardware fault and is fenced out at 09:02 BST on 22 Apr 26.
+
+The cluster reacts: the 10 shards that lived on es-data-5 are now under-replicated, and after the index-level `delayed_timeout` (default 1 minute) expires, the allocator begins rebuilding their missing copies on the remaining nodes.
+
+| Time (BST) | Initializing | Relocating | In motion | What is happening |
+| --- | --- | --- | --- | --- |
+| 09:02 | 0 | 0 | 0 | Node fenced; shards now unassigned, recovery delayed. |
+| 09:03 | 6 | 2 | 8 | Delay expired; replicas rebuilding, balancer relocating to even out disk. |
+| 09:09 | 7 | 4 | 11 | Recovery throttled by `indices.recovery.max_bytes_per_sec`; backlog holding. |
+| 09:18 | 5 | 3 | 8 | Still above threshold 16 minutes in: the alarm has fired. |
+| 09:34 | 1 | 0 | 1 | Recovery draining; cluster settling. |
+| 09:41 | 0 | 0 | 0 | Cluster GREEN; all replicas restored. |
+
+The sensitivity alert fired at 09:13 (count above 5 sustained for the full 10-minute window). The on-call DBA's read:
+
+```text
+Triage when shards-in-motion is stuck high:
+  1. GET /_cat/recovery?active_only=true  -> are bytes actually flowing, or is recovery stalled at 0%?
+  2. If flowing but slow: recovery throttle (indices.recovery.max_bytes_per_sec) is the bottleneck on a big rebuild. Expected; let it drain.
+  3. If stalled at 0%: GET /_cluster/allocation/explain -> a shard cannot be placed (disk watermark, allocation filter, version mismatch).
+  4. Watch Cluster Status: while recovering it will read YELLOW (replicas missing) but not RED (primaries are safe).
+```
+
+In this case recovery was simply throttled by the default `max_bytes_per_sec` on a multi-gigabyte rebuild. The team temporarily raised the throttle, the backlog drained faster, and the cluster returned to GREEN by 09:41. No data was lost because all primaries stayed allocated throughout.
+
+Three takeaways for an ops team:
+
+1. **In-motion is healthy; stuck is not.** The number going up is rarely the problem. The number staying up is the problem. That is exactly why the alert has a 10-minute sustain gate rather than firing on the raw value.
+2. **Initializing and relocating need different responses.** Stuck relocations usually mean a disk watermark or allocation filter is blocking placement; stuck initialisations usually mean recovery is throttled or a node is flapping. Read the split, not just the sum.
+3. **Pair it with status and unassigned shards.** This card shows movement; [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) shows shards that are not even moving yet, and [Cluster Status (green / yellow / red)](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) shows whether any data is actually unavailable. Together they tell you whether you are watching a normal recovery or a real outage.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Initializing / Relocating Shards | What the combination tells you |
+| --- | --- | --- |
+| [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) | The shards not yet in motion. | Unassigned high while in-motion is low means recovery has not started or is blocked; in-motion high means it is actively working. |
+| [Cluster Status (green / yellow / red)](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) | The data-availability gate. | Shards in motion with YELLOW status is normal recovery; with RED status a primary is at risk. |
+| [Active Node Count](/nerve-centre/kpi-cards/elasticsearch/active-node-count) | The cause of most relocation churn. | A node count drop immediately precedes a spike here as the cluster reallocates the lost node's shards. |
+| [Pending Cluster Tasks](/nerve-centre/kpi-cards/elasticsearch/pending-cluster-tasks) | The master-side view of the same churn. | Many shards moving plus many pending tasks means the master is saturated processing routing-table updates. |
+| [Total Shards (primary + replica)](/nerve-centre/kpi-cards/elasticsearch/total-shards-primary-replica) | The denominator for context. | A handful in motion against thousands of shards is trivial; against eighty it is significant. |
+| [Storage Usage %](/nerve-centre/kpi-cards/elasticsearch/storage-usage) | The blocker for relocations. | Relocations stuck and disk above the high watermark means the allocator has nowhere to put shards. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> **`GET /_cluster/health`** returns `initializing_shards` and `relocating_shards` directly; the sum is the headline.
+> **`GET /_cat/shards?v&h=index,shard,prirep,state,node`** lists every shard and its state, so you can see exactly which indices are mid-recovery.
+> **`GET /_cat/recovery?v&active_only=true`** shows live recovery progress with bytes and percentage complete, the fastest way to tell "moving slowly" from "stuck at 0%".
+> **`GET /_cluster/allocation/explain`** explains why a specific shard cannot be allocated when relocation is blocked.
+> On Elastic Cloud, **Stack Monitoring** shows shard activity per index; on AWS OpenSearch, the CloudWatch metrics `RelocatingShards` and `InitializingShards` mirror these counters.
+
+**Why our number may legitimately differ from a raw health read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sampling moment** | Marginal | Shard states change second to second during recovery; our sample and your manual `_cluster/health` call may catch the count at slightly different points. |
+| **Index filter scope** | Vortex IQ may read lower | If the connector is scoped to specific indices, system-index shard movement (`.kibana`, monitoring indices) is excluded from our count but present in a raw cluster-wide read. |
+| **Snapshot restores** | Vortex IQ counts them | Shards initialising from a snapshot restore are counted here, which is correct; some operators mentally exclude restores as "planned", so the number can look higher than expected. |
+
+**Cross-connector reconciliation:** sustained shard movement that coincides with a search latency spike means recovery is competing with query traffic for IO. Compare with [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms); if p95 climbs in lock-step with shards in motion, throttle recovery during business hours.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Is a non-zero count a problem?**
+No. A small, transient count is healthy: the cluster is rebalancing, recovering a replica, or completing a rollover. The alert only fires when the count exceeds 5 and stays there for 10 minutes, because a sustained backlog is the signal that recovery is stuck or thrashing.
+
+**What is the difference between initializing and relocating?**
+`INITIALIZING` shards are being built or recovered from scratch (a new replica, a snapshot restore, a primary recovering from its translog). `RELOCATING` shards already exist and are being moved from one node to another by the allocation balancer. They have different causes and different fixes, which is why the detail view splits them.
+
+**The count is stuck and recovery shows 0% progress. What now?**
+Run `GET /_cluster/allocation/explain`. The most common blockers are a disk high watermark (the target node is too full to accept the shard), an allocation filter or awareness rule preventing placement, or a node version mismatch during an upgrade. The explain output names the exact reason per shard.
+
+**Why does this card stay quiet when a shard is unassigned?**
+Unassigned shards are waiting, not moving, so they do not count here. They have their own card, [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards), which is the more urgent signal because unassigned primaries mean data is unavailable.
+
+**A rolling restart pushed this above 5. Should I worry?**
+Briefly, no. A rolling restart deliberately moves shards as each node leaves and rejoins; a short spike above 5 is expected and self-clears once recovery completes. The 10-minute sustain gate is designed so routine restarts do not page you. If it stays high well past the restart window, then investigate.
+
+**Does high shard movement slow down search?**
+It can. Recovery and relocation consume disk IO, CPU, and network bandwidth that would otherwise serve queries. If you see search latency rise alongside a recovery backlog, lower `indices.recovery.max_bytes_per_sec` to cap the impact during business hours, or schedule large rebalances for off-peak.
+
+**Can I make recovery finish faster?**
+Yes, within limits. Raising `indices.recovery.max_bytes_per_sec` and `cluster.routing.allocation.node_concurrent_recoveries` lets more shards move at once and each move faster, at the cost of more load on the cluster. Raise it to drain a backlog quickly, then return to defaults so the next routine recovery does not overwhelm live traffic.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Initializing / Relocating Shards* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

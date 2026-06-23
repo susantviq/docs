@@ -1,0 +1,158 @@
+---
+title: "Query Error Rate Spike (>1% in 5m), PostgreSQL"
+sidebarTitle: "Query Error Rate Spike (>1% in 5m)"
+description: "Query Error Rate Spike for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This is the alert card that fires when more than 1% of queries against your PostgreSQL instance return an error over a rolling five-minute window. A database that is healthy answers nearly every query it is sent; when even 1% start failing, something structural has changed: a migration left a column behind, a deploy shipped a bad query, the disk filled, a lock storm started timing out, or a role lost a permission. For a DBA or platform engineer this is the "something just broke in code or config" alarm, distinct from latency (the database is slow) or pool exhaustion (the database cannot accept connections). Here the database is up, accepting work, and refusing it.
+
+| | |
+| --- | --- |
+| **What it tracks** | The share of executed queries that ended in an error (a non-zero SQLSTATE other than the success class) over the trailing five minutes, and whether that share has crossed 1% and held. |
+| **Data source** | Derived from PostgreSQL error logging and statement counters: `xact_rollback` deltas from `pg_stat_database`, parsed `log_min_error_statement` entries from the server log, and where available the failed-call counters. The continuous percentage is the sibling [Query Error Rate %](/nerve-centre/kpi-cards/postgresql/query-error-rate) gauge. |
+| **Time window** | `5m` (rolling five-minute window; the rate is recomputed on each poll). |
+| **Alert trigger** | `>1% sustained 5m`. The breach must persist across the window, so a single failed batch job or a one-off bad query does not page; a genuine, ongoing failure pattern does. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The error rate is the ratio of failed statements to total statements over the trailing five minutes:
+
+```text
+error_rate = failed_queries(5m) / total_queries(5m)
+fire when:  error_rate > 0.01  AND  the condition holds across the 5m window
+```
+
+A "failed query" is any statement that returned a SQLSTATE outside the success class `00`. In practice the high-volume offenders cluster into a few SQLSTATE families, and the family tells you the cause:
+
+| SQLSTATE class | Meaning | Typical cause |
+| --- | --- | --- |
+| `23xxx` | Integrity constraint violation | Unique/foreign-key/not-null breach, often a bad write path after a deploy |
+| `42xxx` | Syntax error or access rule violation | Undefined column/table, missing privilege, a migration applied out of order |
+| `40xxx` | Transaction rollback | Deadlock (`40P01`) or serialisation failure (`40001`) under contention |
+| `53xxx` | Insufficient resources | Disk full (`53100`), out of memory, too many connections (`53300`) |
+| `57xxx` | Operator intervention | Query cancelled or backend terminated, statement timeout |
+
+The denominator comes from the statement counters (`pg_stat_statements.calls` deltas where available, otherwise transaction counts from `pg_stat_database`). Because `pg_stat_statements` records successful executions and the error log records failures, the engine reconciles the two streams so the percentage reflects all attempts, not just the ones that completed.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs PostgreSQL 14 behind a SaaS billing service. Normal error rate sits near 0.02%, almost all of it benign unique-constraint retries. A schema migration ships at 09:30 on 22 Mar 26. Snapshot taken at 09:36.
+
+| Window | Total queries | Failed queries | Error rate | State |
+| --- | --- | --- | --- | --- |
+| 09:25 to 09:30 (pre-deploy) | 412,000 | 84 | 0.02% | healthy |
+| 09:31 to 09:36 (post-deploy) | 398,500 | 7,140 | 1.79% | **BREACH** |
+
+The card fires. The headline reads **Query Error Rate 1.79% (BREACH, 5m)**. The on-call engineer pivots straight to the SQLSTATE breakdown:
+
+```text
+Error breakdown for the breach window (last 5m):
+  42703  undefined column "customer_uuid"     6,980   (97.8%)
+  23505  unique_violation                        92    (1.3%)
+  40P01  deadlock_detected                        68    (0.9%)
+
+Reading: a single SQLSTATE (42703, undefined column) is the whole spike.
+The migration renamed `customer_id` to `customer_uuid` on the table, but the
+application release that reads the new name has not rolled out yet, so the
+running code is selecting a column that no longer exists.
+```
+
+Three things the breakdown makes obvious:
+
+1. **This is a deploy-ordering bug, not a database fault.** The database is doing exactly what it should: rejecting a query for a column that does not exist. The fix is to roll the migration back (or roll the application forward) so schema and code agree.
+2. **It is one query, not a general failure.** 97.8% of the errors are a single SQLSTATE on a single statement. That is the signature of a code/schema mismatch, very different from a `53100` disk-full storm that would hit every write.
+3. **Latency is fine.** Cross-reference [Query Latency p95 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p95-ms); it is unchanged. The database is fast and refusing work, which is the defining shape of an error spike rather than a slowdown.
+
+```text
+Resolution path:
+  1. Confirm the dominant SQLSTATE and the offending statement.
+  2. If schema/code mismatch: roll the migration back OR fast-track the app deploy.
+  3. If 23xxx constraint storm: check the write path that started failing validation.
+  4. If 53100 disk full: free WAL/temp space, see Database Disk Usage %.
+  5. If 40P01 deadlock storm: see Deadlocks (last 5m) for the lock graph.
+```
+
+Three takeaways:
+
+1. **The SQLSTATE class is the diagnosis.** Never treat "errors went up" as one problem. A `42xxx` spike is a code/schema bug; a `53xxx` spike is a resource crisis; a `40xxx` spike is contention. The remedy differs completely.
+2. **1% is a lot for a database.** Application services tolerate a few percent error rate; a healthy database sits at hundredths of a percent. Crossing 1% means roughly one query in a hundred is now failing, which at OLTP volumes is thousands of failed requests a minute.
+3. **Error spikes usually trail a change.** When this fires, the first question is "what shipped in the last fifteen minutes?", a migration, a deploy, a config push, or a permission change. Correlate the breach timestamp with your release log.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Error Rate Spike | What the combination tells you |
+| --- | --- | --- |
+| [Query Error Rate %](/nerve-centre/kpi-cards/postgresql/query-error-rate) | The continuous gauge this alert is built on. | The gauge shows the baseline; this card marks the breach moment. |
+| [Deadlocks (last 5m)](/nerve-centre/kpi-cards/postgresql/deadlocks-last-5m) | Isolates the `40P01` share of the errors. | If the spike is mostly deadlocks, the cause is contention, not bad code. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/postgresql/database-disk-usage) | Catches the `53100` disk-full cause. | An error spike with disk near full means writes are failing for space, not logic. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/postgresql/connection-errors-24h) | Separates query-level from connection-level failures. | Errors up but connections clean equals a query/schema fault, not a pool problem. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p99-ms) | Distinguishes "slow" from "failing". | Flat latency with rising errors confirms refusal, not slowdown. |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/postgresql/slow-queries-during-checkout-window-5m) | The cross-channel revenue tie-in. | Confirms whether the failures land on a revenue-critical path. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The composite that drops when errors are error-free factor fails. | A sustained breach pulls the composite below its healthy band. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL's own tooling:**
+
+> Inspect the server log directly. With `log_min_error_statement = error` (the default) every failing statement is logged with its SQLSTATE; grep the log for the breach window and tally by error class.
+> Run `SELECT datname, xact_commit, xact_rollback FROM pg_stat_database;` and watch the `xact_rollback` delta. A rising rollback rate is the coarsest server-side signal of failing transactions.
+> If `pg_stat_statements` is installed, compare `calls` growth against the logged failure count to derive the percentage yourself.
+> On a managed service, the provider's log export (RDS CloudWatch Logs / PostgreSQL log, Cloud SQL Logs Explorer, Azure diagnostic logs) carries the same error lines, and the provider often surfaces a `DatabaseError` or rollback metric.
+
+**Why our number may legitimately differ from PostgreSQL's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Logging level** | Card may under-count | If `log_min_error_statement` is set above `error` (e.g. `fatal`), warning-class failures never reach the log and cannot be counted. |
+| **Counter vs log reconciliation** | Slight skew | The denominator blends `pg_stat_statements` calls with logged failures; if `pg_stat_statements` is not installed the rate is approximated from rollback ratios. |
+| **Statement-timeout cancels** | Direction depends | A `57014` query cancellation is an error here but may be classed as a timeout, not an error, in some provider dashboards. |
+| **Benign retries** | Card may read higher | Application-level unique-constraint upserts that fail and retry are real SQLSTATE errors and counted, even though the app recovers transparently. |
+| **Log sampling on managed tiers** | Provider lower | Some managed tiers sample or rate-limit log export under heavy error volume, so the provider console can under-report a large spike. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My app retries failed queries and recovers, so users see nothing. Why page on that?**
+Because a 1% error rate is a structural signal even when the application masks it. Retries cost latency and capacity, and the underlying cause (a contended lock, a flaky constraint, a marginal disk) usually worsens. The card surfaces the failure before retries stop being enough. If a specific benign retry pattern dominates your baseline, raise the threshold for that instance in the Sensitivity tab rather than ignoring the page.
+
+**Are unique-constraint violations from upserts counted as errors?**
+Yes. A `23505 unique_violation` is a real SQLSTATE error regardless of whether your application uses it deliberately (the classic "insert, catch duplicate, update" pattern). Many teams move to `INSERT ... ON CONFLICT` precisely to stop generating these. If your baseline error rate is dominated by benign upsert conflicts, that is worth fixing for both this card and for write throughput.
+
+**What is the difference between this card and Query Latency?**
+Latency measures how long successful queries take; this card measures how many queries fail outright. They move independently: a database can be fast and failing (a bad migration, flat latency, high errors) or slow and succeeding (a missing index, high latency, no errors). Read them together to tell the two failure modes apart.
+
+**A nightly batch job failed once and the card did not fire. Is it broken?**
+No. The `sustained 5m` qualifier means a single failed statement, or one bad batch, does not breach. The error rate must stay above 1% across the rolling window. One-off failures are expected in any system and are deliberately not pageable.
+
+**Disk filled up and now everything is failing. Will this catch it?**
+Yes, the spike will appear as a flood of `53100 disk_full` (and related `53xxx`) errors. But the better leading indicator is [Database Disk Usage %](/nerve-centre/kpi-cards/postgresql/database-disk-usage), which fires before the disk is full. Treat an error spike dominated by `53xxx` as a resource emergency and free WAL/temp space immediately.
+
+**Can I see which query is causing the spike?**
+Yes. The breach view groups failures by SQLSTATE and, where the log captures the statement text, by normalised query. The dominant SQLSTATE plus the offending statement is almost always enough to identify the cause. For deeper attribution, cross-reference `pg_stat_statements` for the same statement fingerprint.
+
+**We rely on statement timeouts to kill runaway queries. Do those inflate this card?**
+They can. A cancelled query raises `57014 query_canceled`, which is an error. If you cancel a meaningful fraction of queries by design (an aggressive `statement_timeout` on an analytics path), that path will contribute to the rate. Either scope the timeout to the right sessions or raise the threshold for the instance so legitimate cancellations do not page you.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Error Rate Spike (>1% in 5m)* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

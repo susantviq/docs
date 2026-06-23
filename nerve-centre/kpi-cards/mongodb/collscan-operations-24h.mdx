@@ -1,0 +1,150 @@
+---
+title: "COLLSCAN Operations (24h), MongoDB"
+sidebarTitle: "COLLSCAN Operations (24h)"
+description: "COLLSCAN Operations over 24h for MongoDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **COLLSCAN Operations (24h)** counts the number of queries in the last 24 hours that executed a full collection scan rather than using an index. A `COLLSCAN` is MongoDB's plan stage for "read every document in the collection to satisfy this query". This is one of the most MongoDB-distinctive performance signals there is: a non-zero, rising count almost always means an index is missing, or a recent code path is issuing a query the existing indexes do not cover. On any collection larger than a few thousand documents, a collection scan is slow, CPU-hungry, and cache-thrashing. A spike in this card is the classic fingerprint of "someone shipped a query that bypasses the index".
+
+| | |
+| --- | --- |
+| **What it tracks** | The count of operations over the trailing 24 hours whose query plan used the `COLLSCAN` stage (a full collection scan) instead of an index scan. |
+| **Data source** | MongoDB query-plan telemetry: operations whose winning plan stage is `COLLSCAN`, surfaced via the profiler and slow-query log over the 24-hour window. |
+| **Time window** | `24h` (trailing 24 hours). |
+| **Alert trigger** | `>10`, more than 10 collection-scan operations in the window raises the alert. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card counts operations over the trailing 24 hours whose query execution used a `COLLSCAN` stage. MongoDB records the chosen execution plan for each operation; when the planner cannot find a usable index for a query's filter, it falls back to scanning every document in the collection, and the plan's winning stage is recorded as `COLLSCAN`. The engine reads this from MongoDB's query telemetry: profiler entries (when the database profiler is enabled) and the slow-query log, both of which record the plan summary for each operation.
+
+```text
+collscan_count = count of ops in last 24h where planSummary == "COLLSCAN"
+alert if collscan_count > 10
+```
+
+A `COLLSCAN` is not always wrong. Tiny collections (a few hundred documents) can be scanned faster than an index lookup, and the planner correctly chooses to scan them. The threshold of 10 over 24 hours is deliberately low because, on a production OLTP collection of any real size, even a handful of genuine collection scans is worth investigating: each one reads the whole collection, evicts useful data from the WiredTiger cache, and burns CPU. The value of the card is the trend and the spike, not the absolute floor: a count that jumps from 2 to 400 right after a deploy is the signal you act on.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MongoDB instance behind a product-catalogue service. The `products` collection holds 1.2 million documents. Snapshot taken on 18 Mar 26 at 10:20 GMT, the morning after an evening release.
+
+| Window | COLLSCAN count (24h) | Baseline (prior week) |
+| --- | --- | --- |
+| Last 24h | **412** | 3 |
+
+The card reads 412 collection scans against a baseline of 3, well over the threshold of 10, and the jump started at 20:40 the previous evening, exactly when the release went out. The on-call DBA pulls the slow-query log and finds the offending query:
+
+```text
+db.products.find({ "attributes.material": "linen" })
+  planSummary: COLLSCAN
+  docsExamined: 1,200,000
+  nReturned: 318
+  millis: 2,140
+```
+
+What the team reads from this:
+
+1. **A new filter has no supporting index.** The release added a "filter by material" feature on the catalogue page. The query filters on `attributes.material`, but there is no index on that field, so every request scans all 1.2 million documents to return a few hundred. Each scan reads the whole collection (`docsExamined: 1,200,000`) to return 318 matches: a ratio of nearly 4,000 documents examined per document returned.
+2. **The cost compounds with traffic.** At 412 scans over 24 hours, each touching 1.2 million documents and taking over 2 seconds, the feature is both slow for shoppers and corrosive to the cache: every scan pulls cold documents into the WiredTiger cache and evicts hot ones, dragging down unrelated queries too. Expect [WiredTiger Cache Hit Rate %](/nerve-centre/kpi-cards/mongodb/wiredtiger-cache-hit-rate) to dip and [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) to rise across the board.
+3. **The fix is a single index.** Creating an index on `attributes.material` (built in the background to avoid blocking) turns the `COLLSCAN` into an `IXSCAN`, dropping `docsExamined` from 1.2 million to a few hundred and the query time from 2,140ms to single-digit milliseconds. After the index builds, the card's count should fall back toward its baseline.
+
+```text
+Cost framing for the offending query:
+  - docs examined per call: 1,200,000
+  - docs returned per call: 318
+  - examined:returned ratio: ~3,774:1  (catastrophic; healthy is near 1:1)
+  - per-call latency: 2,140ms
+  - 412 calls/24h all scanning the full collection → sustained cache eviction
+  - remedy: createIndex({ "attributes.material": 1 }, { background: true })
+```
+
+Three takeaways for the team:
+
+1. **A COLLSCAN spike is almost always a missing index from a recent change.** The first move when this card jumps is to correlate the spike time with deploys, then pull the slow-query log to find the query with `planSummary: COLLSCAN`.
+2. **The examined-to-returned ratio is the tell.** A query that examines 1.2 million documents to return 318 is screaming for an index. Healthy indexed queries examine roughly as many documents as they return.
+3. **One bad query poisons the whole instance.** Because collection scans thrash the WiredTiger cache, a single un-indexed query can slow down completely unrelated collections. This is why the threshold is low and why the card is a Hero: the blast radius is the whole instance, not just one feature.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with COLLSCAN Operations | What the combination tells you |
+| --- | --- | --- |
+| [Slow Ops (15m, >100ms)](/nerve-centre/kpi-cards/mongodb/slow-ops-15m-100ms) | Collection scans are the most common cause of slow operations. | A COLLSCAN spike plus a slow-ops spike confirms the scans are the source of the latency. |
+| [Top 10 Slow Operations](/nerve-centre/kpi-cards/mongodb/top-10-slow-operations) | Identifies the exact queries doing the scanning. | Use it to find the offending query shape and the collection to index. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) | Scans push tail latency up across the instance. | Rising p95 alongside the COLLSCAN spike shows the blast radius reaching unrelated queries. |
+| [WiredTiger Cache Hit Rate %](/nerve-centre/kpi-cards/mongodb/wiredtiger-cache-hit-rate) | Scans evict hot data and drag the hit rate down. | A falling cache hit rate during a COLLSCAN spike confirms cache thrash. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | Traffic volume multiplies the cost of each scan. | High ops plus a COLLSCAN spike equals a large, compounding performance hit. |
+| [MongoDB OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mongodb/mongodb-ops-spike-vs-ecom-order-rate) | Distinguishes real demand from bot-driven scan storms. | Scans driven by a scraper hitting an un-indexed search path show ops with no matching orders. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | The composite that weights query efficiency. | A sustained COLLSCAN spike pulls the overall score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MongoDB's own tooling:**
+
+> Run `.explain("executionStats")` on the suspect query in `mongosh`; if the `winningPlan` stage is `COLLSCAN` and `totalDocsExamined` dwarfs `nReturned`, you have found a scan that needs an index.
+> Enable the database profiler (`db.setProfilingLevel(1, { slowms: 100 })`) and query `db.system.profile` filtering on `planSummary: "COLLSCAN"` to list scanning operations over your window.
+> Grep the `mongod` slow-query log for `COLLSCAN` to find the offending query shapes and their `docsExamined` counts.
+> On MongoDB Atlas, the **Performance Advisor** flags collections lacking indexes and recommends specific indexes, and the **Query Profiler** shows `planSummary` per operation. Atlas also surfaces a **Query Targeting** metric (scanned-to-returned ratio) that rises with collection scans.
+
+**Why our number may legitimately differ from a manual reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Profiler scope** | Our number lower | If the profiler is set to capture only slow operations (`slowms` threshold), fast scans on tiny collections may not be recorded; the count reflects what telemetry captured. |
+| **Window boundary** | Either | We count a rolling 24-hour window; a manual `system.profile` query uses whatever time filter you apply. |
+| **Profiler ring buffer** | Our number lower | `system.profile` is a capped collection; very high operation volume can roll old entries out before the window closes, undercounting. |
+| **Legitimate small-collection scans** | Our number includes them | The planner correctly scans tiny collections; those count here even though they are not a problem. Read the trend, not the floor. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | A COLLSCAN spike on a catalogue or search collection can slow storefront browsing and dent conversion. | A scan spike with no revenue impact equals scans on a background collection; a scan spike with a conversion dip equals customer-facing slowdown. |
+| APM / application traces | The slow endpoint in APM should map to the scanning query. | The endpoint that regressed in APM after a deploy is usually the one issuing the un-indexed query found here. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Is a COLLSCAN always bad?**
+No. On very small collections (a few hundred documents), scanning the whole collection is cheaper than an index lookup, and MongoDB's planner correctly chooses `COLLSCAN`. Those count toward this card but are not a problem. The danger is collection scans on large collections, where each scan reads millions of documents. Read the examined-to-returned ratio: a scan that examines vastly more documents than it returns is the one to fix.
+
+**The count jumped overnight. Where do I start?**
+Correlate the jump time with your deploy history first, a COLLSCAN spike almost always traces to a release that added a query the existing indexes do not cover. Then pull the slow-query log or `system.profile` filtered on `planSummary: "COLLSCAN"` to find the exact query shape, run `.explain("executionStats")` to confirm, and create the missing index in the background.
+
+**Why is the threshold only 10 over 24 hours? That seems strict.**
+Because on a production collection of any real size, even a handful of full scans is expensive: each one reads the entire collection, thrashes the WiredTiger cache, and slows unrelated queries. The low threshold is intentional so that a genuine spike (2 to 400 after a deploy) is impossible to miss. If your workload runs deliberate scans on small collections, raise the threshold per profile in the Sensitivity tab.
+
+**Can a COLLSCAN slow down queries on other collections?**
+Yes, and this is why the card is a Hero. A full scan pulls cold documents into the shared WiredTiger cache and evicts hot ones, so a single un-indexed query on one collection can lower the cache hit rate and raise latency across every collection on the instance. The blast radius is the whole node, not just the feature that issued the bad query.
+
+**I added an index but the count has not dropped. Why?**
+A few possibilities: the index is still building (background builds take time on large collections); the query filter does not exactly match the index (for example, the index is on `material` but the query also sorts on a different field, forcing a partial scan); or there is more than one scanning query and you have only indexed one of them. Re-run `.explain()` to confirm the query now uses `IXSCAN`, and check the slow-query log for other `COLLSCAN` shapes.
+
+**Does an aggregation pipeline count as a COLLSCAN?**
+If the pipeline's `$match` stage cannot use an index and has to read the whole collection, yes, the initial scan stage is a `COLLSCAN` and counts here. Aggregations are a common hidden source of scans because developers sometimes assume the pipeline optimiser will find an index when the `$match` is not positioned or shaped to use one. Use `.explain()` on the aggregation to confirm the first stage uses an index.
+
+**Does this card work on MongoDB Atlas?**
+Yes. The plan-stage telemetry is identical, and Atlas adds two helpful native tools: the **Performance Advisor**, which recommends specific indexes for collections it sees being scanned, and the **Query Profiler**, which shows `planSummary` per operation. This card surfaces the count inside the Nerve Centre so you can correlate scan spikes with deploys, cache hit rate, and storefront impact across your other connectors.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*COLLSCAN Operations (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,151 @@
+---
+title: "Memory Usage %, MySQL"
+sidebarTitle: "Memory Usage %"
+description: "Memory Usage % for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The proportion of the host's memory currently in use by the MySQL instance and the operating system supporting it. Memory is the resource MySQL most wants and is the most dangerous to run out of: when a database host exhausts RAM it either starts swapping to disk (catastrophic for latency) or the kernel out-of-memory killer terminates the `mysqld` process outright (an instant outage). This card is the early-warning gauge for both failure modes. Because the InnoDB buffer pool is usually the largest single consumer, memory pressure here is tightly coupled to the buffer-pool cards.
+
+| | |
+| --- | --- |
+| **What it tracks** | Memory in use as a percentage of total host memory. This is the host-level figure: it includes the InnoDB buffer pool, per-connection thread buffers (sort, join, read), the operating system page cache, and any co-resident processes. |
+| **Data source** | Host memory metrics for the instance. On self-managed hosts this is OS-level (`/proc/meminfo`, `free -m`); on Amazon RDS / Aurora the `FreeableMemory` CloudWatch metric (converted to a used percentage against instance class memory); on Google Cloud SQL the `database/memory/utilization` and components metrics in Cloud Monitoring. |
+| **Calculation basis** | `used_memory / total_host_memory * 100`. On managed services where only freeable memory is exposed, computed as `(1 - FreeableMemory / instance_memory) * 100`. |
+| **Time window** | `RT` (real-time gauge). |
+| **Alert trigger** | `> 85%`. Above this the host has little headroom for connection spikes or query buffers, and the next surge risks swapping or an OOM kill. The 15% margin is the buffer the alert protects. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card expresses host memory in use as a percentage of total host memory:
+
+```text
+memory_usage_% = (used_memory / total_host_memory) * 100
+
+on managed services exposing only freeable memory:
+memory_usage_% = (1 - (FreeableMemory / instance_class_memory)) * 100
+```
+
+What goes into "used" and why it matters:
+
+1. **The buffer pool dominates, by design.** `innodb_buffer_pool_size` is typically set to 50 to 75% of host RAM on a dedicated database server, so the single largest line of memory usage is intentional and good. A host sitting at 70% steady usage that is mostly buffer pool is healthy. The alert is about headroom for the variable consumers, not about the buffer pool itself.
+2. **Per-connection buffers are the variable, dangerous part.** Each connection can allocate sort buffers, join buffers, and read buffers on demand. Total connection-driven memory scales with [Connections In Use](/nerve-centre/kpi-cards/mysql/connections-in-use): a sudden connection storm (often from [Connection Pool Saturation %](/nerve-centre/kpi-cards/mysql/connection-pool-saturation) climbing) can add gigabytes quickly. A host at 85% with the buffer pool fixed has little room to absorb such a storm.
+3. **Page cache is reclaimable; the OOM killer still counts it carefully.** On self-managed Linux, the OS page cache shows as "used" but is reclaimable under pressure. Vortex IQ reports the practical used figure; the meaningful danger line is when reclaimable cache plus free memory no longer covers a demand spike, which is what the 85% threshold approximates.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs MySQL 8.0 on a host with 32 GB RAM. `innodb_buffer_pool_size` is set to 20 GB (62.5% of RAM). Snapshot taken on 09 Apr 26 at 18:30 BST during an evening traffic peak.
+
+| Component | Approx memory |
+| --- | --- |
+| InnoDB buffer pool | 20.0 GB |
+| Per-connection buffers (480 active connections) | 4.8 GB |
+| `mysqld` overhead + other global buffers | 1.6 GB |
+| OS + page cache | 1.5 GB |
+| **Total used** | **27.9 GB of 32 GB** |
+
+```text
+memory_usage_% = 27.9 / 32.0 = 0.872 = 87.2%
+```
+
+The gauge reads **87.2%**, above the 85% alert line, and Nerve Centre raises the sensitivity flag. Diagnosis and response:
+
+1. **The buffer pool is fixed; connections are the swing factor.** The 20 GB pool is constant. The pressure is coming from 480 active connections each holding sort / join buffers. Confirm with [Connections In Use](/nerve-centre/kpi-cards/mysql/connections-in-use) and [Connection Pool Saturation %](/nerve-centre/kpi-cards/mysql/connection-pool-saturation): if connections have jumped, the memory rise is connection-driven, and the risk is a further spike tipping the host into swap or an OOM kill.
+2. **Immediate lever: cap the connection storm.** A runaway connection count usually traces to an application connection pool that is not bounded, or slow queries holding connections open. Reducing `max_connections` is a blunt safety valve; the better fix is bounding the application-side pool and clearing the slow queries that are holding connections (see [Slow-Query Rate %](/nerve-centre/kpi-cards/mysql/slow-query-rate)).
+3. **Structural lever: rebalance the budget or upsize.** If steady-state usage is chronically near 85% even at normal connection counts, the host is genuinely undersized for the workload. Either lower `innodb_buffer_pool_size` slightly to free headroom (at some cost to hit rate) or move to a larger instance class. Confirm the buffer pool is actually needed at its current size via [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) before shrinking it.
+
+```text
+Decision trace for 87.2%:
+  - buffer pool: fixed 20 GB (hit rate 99.9% -> correctly sized)
+  - connections: 480 vs typical 150  -> connection storm is the driver
+  Action (now):   bound the app connection pool; kill stuck slow queries
+  Action (later): if storms recur, add RAM rather than shrink the pool
+  Do NOT: blindly cut buffer pool while hit rate is healthy
+```
+
+Three takeaways:
+
+1. **High memory usage is normal on a database host; the danger is the headroom, not the level.** A 70% host that is mostly buffer pool is healthy; an 87% host with a connection storm is one spike away from an OOM kill.
+2. **The variable risk is connections, not the buffer pool.** When this card alerts, look first at connection count and per-connection buffers.
+3. **Swapping and OOM are the two failure modes this card prevents.** Both are far worse than the cache-efficiency cost of keeping a sensible memory margin.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Memory Usage | What the combination tells you |
+| --- | --- | --- |
+| [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) | The buffer pool is the largest memory consumer. | High memory with a healthy hit rate means the pool is correctly sized; do not shrink it. |
+| [InnoDB Free Pages](/nerve-centre/kpi-cards/mysql/innodb-free-pages) | A full pool both raises memory use and empties the free list. | Both near their limits means the pool is fully committed and the host has no slack. |
+| [Connections In Use](/nerve-centre/kpi-cards/mysql/connections-in-use) | Per-connection buffers are the variable memory driver. | Memory rising with connections confirms a connection-driven spike, not a config change. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mysql/connection-pool-saturation) | Saturation precedes the memory spike from a connection storm. | Saturation and memory rising together is the classic pre-OOM signature. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mysql/slow-query-rate) | Slow queries hold connections (and their buffers) open longer. | A slow-query spike inflating connection counts is a common hidden memory driver. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mysql/database-disk-usage) | Swapping links memory pressure to disk pressure. | Memory maxed plus disk filling from swap is a compound-risk emergency. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite that weights capacity headroom. | Sustained memory pressure visibly pulls the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL's own / native tooling:**
+
+> **Self-managed Linux:** `free -m` and `/proc/meminfo` for the host figure; `SELECT * FROM sys.memory_global_total;` and the `sys.memory_by_thread_by_current_bytes` view (requires `performance_schema` memory instruments enabled) for the MySQL-internal breakdown.
+> **Server-side budget:** `SELECT @@innodb_buffer_pool_size, @@max_connections, @@sort_buffer_size, @@join_buffer_size;` to see the fixed and per-connection allocations behind the number.
+> **Amazon RDS / Aurora:** the `FreeableMemory` and `SwapUsage` CloudWatch metrics, plus Performance Insights for the buffer-pool component.
+> **Google Cloud SQL:** the `database/memory/utilization` and `database/memory/total_usage` metrics in Cloud Monitoring.
+
+**Why our number may legitimately differ from a native reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Page cache treatment** | Card may read higher | On Linux, reclaimable page cache counts as "used" in some tools and as "available" in others; the card reports the practical used figure, which can sit above a `free -m` "used" column that excludes cache. |
+| **Freeable-memory derivation** | Marginal | On managed services the card derives usage from `FreeableMemory` against the instance class size; rounding of the published class memory can shift the percentage by a fraction. |
+| **Sampling instant** | Either direction | Memory fluctuates with connection churn; a hand reading a moment apart from the card's sample will differ. |
+| **Co-resident processes** | Card may read higher | On a shared host, non-MySQL processes count toward host usage; the card reflects total host pressure, which is what matters for OOM risk. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Connections In Use](/nerve-centre/kpi-cards/mysql/connections-in-use) | Memory should track connection count above the fixed buffer-pool baseline. | Memory rising while connections are flat points at a memory leak or a growing temp-table workload, not connection load. |
+| [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) | A correctly sized pool explains most of the baseline usage. | High memory with a poor hit rate means the pool is too small AND the host is constrained: upsize, do not shrink. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My host is at 75% memory and steady. Should I worry?**
+Usually not. A dedicated database host is supposed to use most of its RAM, because the InnoDB buffer pool is deliberately sized to 50 to 75% of host memory and the OS page cache fills the rest. A steady 75% that is mostly buffer pool is healthy. The alert fires at 85% because that is where the variable consumers (connection buffers) no longer have safe headroom for a spike.
+
+**What actually happens if memory hits 100%?**
+One of two bad outcomes. On a host with swap enabled, MySQL pages out to disk and latency collapses, often by orders of magnitude, because random disk IO replaces RAM access. On a host without swap (common on managed services), the kernel out-of-memory killer terminates a process, frequently `mysqld` itself, causing an instant outage and crash recovery on restart. Both are far worse than keeping a memory margin, which is why the 85% line is conservative.
+
+**Should I lower `innodb_buffer_pool_size` when this card alerts?**
+Only as a last resort, and only after checking [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate). Shrinking the pool frees memory but lowers the hit rate, pushing more reads to disk and raising latency. If the alert is driven by a connection storm, the right fix is bounding connections, not shrinking the pool. Shrink the pool only when the host is chronically constrained and upsizing is not an option.
+
+**Why does memory climb when connections climb?**
+Each connection can allocate per-statement work buffers (sort, join, read) on demand, and these are not shared. A connection storm therefore adds memory roughly in proportion to active connections holding heavy queries. This is why a runaway application connection pool, or slow queries holding many connections open, is the most common cause of a sudden memory spike. See [Connections In Use](/nerve-centre/kpi-cards/mysql/connections-in-use).
+
+**The card reads higher than `free -m` says is used. Is it wrong?**
+No, the difference is usually page-cache accounting. Linux counts reclaimable page cache as "used" in some views and as "available" in others. The card reports the practical used figure that matters for OOM risk. For the MySQL-internal breakdown that excludes OS cache, use `sys.memory_global_total` and the `sys.memory_by_thread_by_current_bytes` view with `performance_schema` memory instruments enabled.
+
+**Does the buffer pool shrink automatically under memory pressure?**
+No. `innodb_buffer_pool_size` is a fixed allocation; MySQL does not shrink it on demand (online resizing exists but is an explicit operation, not automatic). This is precisely why the variable consumers (connections) are the danger: the largest block of memory is immovable, so a spike has to come out of the remaining headroom. Plan the memory budget assuming the pool is constant.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Memory Usage %* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,175 @@
+---
+title: "Last Successful Backup (hours ago), kpi"
+sidebarTitle: "Last Successful Backup (hours ago)"
+description: "Last Successful Backup (hours ago) for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Backup](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How many hours have passed since the last backup that completed successfully and was verified as restorable. This is not "when did a backup job last run", it is "how recent is the most recent backup you could actually recover from". For a platform team it answers the only question that matters after a catastrophic failure: how much data would we lose, and how far back do we have to go. A backup that ran but failed silently is worse than no backup, because it gives false confidence. This card measures recoverability, not job execution.
+
+| | |
+| --- | --- |
+| **What it tracks** | Wall-clock hours since the last successful, verified backup completed. "Last successful `pg_basebackup` / WAL archive. For RDS: derived from CloudWatch backup events." |
+| **Data source** | On self-managed instances: the completion timestamp of the most recent successful `pg_basebackup` or base backup taken by a tool (pgBackRest, Barman, WAL-G), combined with the most recent successfully archived WAL segment (so the recovery point is base-backup time plus the latest archived WAL). On RDS / Aurora: derived from CloudWatch automated-snapshot completion events and the latest restorable time. On Cloud SQL: the most recent successful automated or on-demand backup. |
+| **Time window** | `RT` (real-time, evaluated each polling cycle against the latest backup completion timestamp). |
+| **Alert trigger** | `> 72h`. If the most recent successful backup is more than 72 hours old, the card pages the on-call DBA. Many teams tighten this in the Sensitivity tab to match their actual backup cadence (daily backups should alert well before 72 hours). |
+| **What "successful" means** | The backup process completed without error AND, where the backup tool supports it, passed a verification / integrity check. A job that started but failed, or a snapshot that completed but cannot be restored, does not reset the clock. |
+| **What does NOT count** | Backup jobs that errored or timed out, partial / interrupted backups, snapshots that failed verification, and replica standbys (a standby is not a backup: it replicates corruption and accidental deletes in real time). |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The headline is `now() - last_successful_backup_completion`, expressed in hours.
+
+The meaning of "recovery point" in PostgreSQL is more nuanced than a single timestamp, and the engine reflects that:
+
+- A **base backup** (`pg_basebackup`, pgBackRest, Barman) is a full physical copy of the data directory taken at a point in time. On its own it recovers you to that point.
+- **WAL archiving** ships every write-ahead-log segment to durable storage as it fills. Combined with a base backup, archived WAL lets you replay forward to any point after the base backup: this is point-in-time recovery (PITR).
+
+So the true recovery point is the base-backup time plus the latest successfully archived WAL segment. The card's headline tracks the base-backup age (the anchor you must have), and the drill-down reports the WAL-archive recency separately, because a fresh base backup with broken WAL archiving still limits you to recovering only to the base-backup moment, losing everything since.
+
+On self-managed instances the engine reads the backup tool's completion log or repository metadata (for example pgBackRest's `info` output, which records the timestamp and verification status of each backup), plus the timestamp of the most recent file in the WAL archive location.
+
+On managed services there is no direct backup-tool access, so the engine derives the figure from the provider:
+
+- RDS / Aurora: CloudWatch backup events and the instance's `LatestRestorableTime` (which already accounts for continuous WAL / transaction-log backup).
+- Cloud SQL: the most recent successful backup record from the instance's backup history.
+
+The verification dimension is what separates this card from a naive "last job ran" timer. A backup that completed but cannot be restored is not counted as successful. Where the backup tool runs an integrity check (pgBackRest's `--repo-retention-full` verification, a periodic test restore), only a backup that passes resets the clock.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a self-managed PostgreSQL 15 primary for an order database, backed up nightly by pgBackRest with continuous WAL archiving to S3. Their stated recovery objective is RPO 5 minutes (lose no more than 5 minutes of data), RTO 1 hour. Snapshot taken on 17 Apr 26 at 09:00 BST.
+
+| Backup component | Most recent success | Age |
+| --- | --- | --- |
+| Full base backup | 13 Apr 26, 01:00 | 80 h |
+| WAL archive (latest segment) | 14 Apr 26, 23:47 | 33 h |
+
+The card reads **80 hours** in red and has paged the DBA, because 72 hours was crossed at 01:00 today. Two things are wrong, and the WAL line reveals the deeper problem:
+
+1. The nightly base backup has not succeeded since 13 Apr. The 14 Apr, 15 Apr, and 16 Apr jobs all failed.
+2. Worse, WAL archiving stopped at 23:47 on 14 Apr. So even PITR cannot recover past that point.
+
+Investigating, the DBA finds the root cause: an S3 bucket-policy change on 14 Apr revoked the backup IAM role's write permission. The base-backup jobs failed with access-denied, and `archive_command` (which pushes WAL to the same bucket) has been failing silently ever since, returning non-zero. Because PostgreSQL retains WAL locally until `archive_command` succeeds, `pg_wal` had also been growing for three days, which a glance at [Database Disk Usage %](/nerve-centre/kpi-cards/postgresql/database-disk-usage) confirms (climbing toward the volume ceiling).
+
+```text
+The exposure, stated plainly:
+  - If the primary's disk had failed at 09:00 today, the team could recover
+    only to 14 Apr 23:47 (the last archived WAL).
+  - That is ~33 hours of committed orders lost: catastrophically worse than
+    the stated 5-minute RPO.
+  - The team believed they were protected. They were not. The backup jobs
+    "ran" every night; they just failed every night, silently.
+
+Recovery actions, in order:
+  1. Restore the IAM write permission on the S3 bucket.
+  2. Confirm archive_command now succeeds: SELECT pg_switch_wal(); then verify
+     the new segment lands in S3. This also drains the backlog of retained WAL,
+     relieving the disk pressure.
+  3. Take an immediate fresh base backup (pgBackRest backup --type=full) and
+     confirm it passes verification.
+  4. Add an alert on archive_command failures (pg_stat_archiver.failed_count)
+     so silent WAL-archiving failure can never recur undetected.
+```
+
+After the permission is restored and a fresh verified base backup completes at 09:40, the card drops to **0 hours** and WAL archiving resumes, draining the local backlog. The team's real RPO is restored to 5 minutes.
+
+Three lessons platform teams should carry:
+
+1. **A backup that ran is not a backup that works.** The single most dangerous backup failure is the silent one: jobs scheduled, jobs executing, jobs failing, nobody alerted. This card measures successful, verified completion precisely because "the cron fired" is not recoverability.
+2. **Base backup and WAL archiving are two separate failure points.** PITR needs both. A fresh base backup with broken WAL archiving caps you at the base-backup moment; healthy WAL archiving with an ancient base backup means a punishingly long replay. Watch both, which is why the drill-down reports them separately.
+3. **A replica is not a backup.** Streaming replication copies your data, including the accidental `DELETE FROM orders` with no `WHERE` clause, to the standby in milliseconds. Only a point-in-time backup lets you recover to just before the mistake. Failover protects against hardware loss; backups protect against data loss.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Last Successful Backup | What the combination tells you |
+| --- | --- | --- |
+| [Failover Readiness](/nerve-centre/kpi-cards/postgresql/failover-readiness) | The other half of your recovery story: HA for hardware loss, backups for data loss. | No promotable standby plus stale backup equals you have no recovery path at all. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/postgresql/database-disk-usage) | Failed WAL archiving makes `pg_wal` grow and fills the data volume. | Stale backup plus rising disk strongly suggests `archive_command` is failing. |
+| [WAL Lag Bytes (primary to standby)](/nerve-centre/kpi-cards/postgresql/wal-lag-bytes-primary-standby) | WAL is the shared mechanism behind archiving and replication. | WAL piling up against both standby and archive points to a WAL-shipping problem. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The composite that folds recoverability into the executive number. | A stale backup is one of the most consequential drags on the score. |
+| [Replication Lag (seconds)](/nerve-centre/kpi-cards/postgresql/replication-lag-seconds) | A long-running base backup can momentarily affect replication. | Backup-window lag spikes are usually benign and self-clearing. |
+| [Instance Uptime](/nerve-centre/kpi-cards/postgresql/instance-uptime) | A recent restart can interrupt an in-flight backup. | Low uptime plus a missed backup window equals the restart killed the backup job. |
+| [Replication Lag Exceeds Threshold or Standby Unreachable](/nerve-centre/kpi-cards/postgresql/replication-lag-exceeds-threshold-or-standby-unreachable) | The alert feed for replication breakage that shares WAL infrastructure. | Concurrent backup and replication failures point to a shared storage or credential fault. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL and your backup tool:**
+
+> **WAL archiving health (self-managed):** `SELECT last_archived_wal, last_archived_time, failed_count, last_failed_wal, last_failed_time FROM pg_stat_archiver;` This is the single most important query: `failed_count` climbing means WAL archiving is broken right now.
+> **pgBackRest:** `pgbackrest info` lists every backup with its timestamp, type (full / diff / incr), and whether it is valid.
+> **Barman:** `barman list-backup <server>` and `barman check <server>` for status and verification.
+> **Current WAL position vs archived:** compare `pg_current_wal_lsn()` against the latest archived segment to size how much un-archived WAL is at risk.
+> **Managed services:** the RDS / Aurora console shows automated backups and `LatestRestorableTime` under the instance Maintenance & backups tab; Cloud SQL shows backup history on the instance Backups page.
+
+**Why our number may legitimately differ from a quick console glance:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Verified vs completed** | Vortex IQ may read older | We reset the clock only on a successful, verified backup; a console that shows the last job as "completed" without verification may look more recent. |
+| **Base backup vs PITR window** | Depends what you read | We headline base-backup age; managed `LatestRestorableTime` already includes continuous transaction-log backup, so it can look more recent than our base-backup figure. The drill-down reconciles both. |
+| **Time zone** | Display only | Backup timestamps are stored UTC and rendered in your Vortex IQ display time zone; the tool's own log may show host local time. |
+| **Snapshot publish lag (RDS)** | Brief | CloudWatch backup events publish on the provider's interval; a just-completed snapshot may take a few minutes to appear. |
+| **Manual / on-demand backups** | Possible mismatch | An ad-hoc backup taken outside the scheduled tool may not be recorded in the repository the engine reads; ensure on-demand backups go through the same tool. |
+
+**Cross-source reconciliation:**
+
+| Source | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| `pg_stat_archiver` | `failed_count = 0` and recent `last_archived_time` should accompany a healthy figure | A non-zero `failed_count` is the smoking gun for silent WAL-archive failure. |
+| pgBackRest / Barman `info` | Latest valid full backup should match our headline | A job that completed but failed verification is excluded by us, included by a naive read. |
+| RDS `LatestRestorableTime` | Should be very recent (minutes) on a healthy instance | If it stalls, automated backup or transaction-log backup has broken. |
+
+<details>
+<summary><em>A backup you have never restored is a hypothesis, not a backup</em></summary>
+
+The only proof that a backup works is a successful test restore. Many teams discover at the worst possible moment that their backups were corrupt, incomplete, or missing a critical tablespace. Where the backup tool supports automated verification (pgBackRest verification, periodic restore tests into a scratch instance), this card honours it and only counts verified backups as successful. If your pipeline never test-restores, treat the headline as "last backup that completed" rather than "last backup proven restorable", and schedule a periodic test restore to close that gap.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My backup cron runs every night and never errors in the scheduler. Why does this card say 80 hours?**
+Because the scheduler firing is not the same as the backup succeeding. The job ran, but it failed inside, most often a storage permission change, a full backup destination, or an expired credential. The classic case is `archive_command` returning non-zero while the cron exit code still looks clean. Check `pg_stat_archiver.failed_count` and your backup tool's `info` output: the card reflects verified success, which is exactly the signal a clean scheduler hides.
+
+**Is my streaming replica a backup?**
+No, and this is the most dangerous misconception in PostgreSQL operations. A replica copies every change, including mistakes, to the standby in real time. An accidental `DROP TABLE` or an un-`WHERE`-d `DELETE` is replicated to the standby within milliseconds. Only a point-in-time backup lets you recover to the moment before the error. Replicas protect against hardware failure; backups protect against data loss. You need both.
+
+**What is the difference between the base-backup age and the recovery point?**
+The base backup is your anchor: a full physical copy at a point in time. WAL archiving lets you replay forward from that anchor to any later moment (PITR). So your real recovery point is base-backup time plus the latest archived WAL. The card headlines base-backup age because you cannot recover without it, and shows WAL-archive recency in the drill-down because that determines how far forward you can replay. Healthy backups need both to be current.
+
+**Why is the default alert 72 hours? I back up daily.**
+72 hours is a deliberately loose floor so the card does not nag teams with weekly or infrequent backup policies. If you back up daily (or continuously via WAL), tighten the threshold in the Sensitivity tab to match: a daily-backup shop should probably alert at 26 to 30 hours so a single missed night is caught immediately rather than after three. The 72-hour default catches catastrophic neglect; your real RPO should drive the actual threshold.
+
+**On RDS the card looks very recent even though I have not configured anything. Why?**
+RDS and Aurora run automated daily snapshots plus continuous transaction-log backup by default (within your configured retention window), so `LatestRestorableTime` is typically only a few minutes behind live. The engine reads that, so the card looks healthy out of the box. The caveat: confirm your backup retention period is long enough for your needs and that you have not disabled automated backups, which on RDS also disables PITR.
+
+**A long base backup overlapped my backup window and the next one was skipped. Does that count as a failure?**
+If the next scheduled backup did not run or did not complete successfully, the clock keeps ticking from the last successful one, so yes, it will eventually push the age up. A base backup that takes longer than the interval between backups is itself a warning sign (the dataset has outgrown the backup method or the storage is too slow). Consider incremental / differential backups (pgBackRest supports these) so each run is fast and the full is taken less often.
+
+**Does this card verify I can restore, or just that a backup exists?**
+Where your backup tool exposes a verification or integrity result, the card counts only verified backups as successful, so it is closer to "restorable" than "exists". But true confidence only comes from an actual test restore into a scratch instance. If your pipeline does not test-restore, treat the figure as "last completed backup" and add a periodic restore test. A backup you have never restored is a hypothesis, not a guarantee.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Last Successful Backup (hours ago)* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

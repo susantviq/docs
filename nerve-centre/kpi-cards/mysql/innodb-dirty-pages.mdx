@@ -1,0 +1,144 @@
+---
+title: "InnoDB Dirty Pages %, MySQL"
+sidebarTitle: "InnoDB Dirty Pages %"
+description: "InnoDB Dirty Pages % for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [InnoDB Buffer Pool](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The share of the InnoDB buffer pool that holds modified ("dirty") pages not yet flushed to disk. Dirty pages are a normal, healthy part of how InnoDB batches writes: it modifies pages in memory and flushes them to storage in the background. The percentage matters because it is a pressure gauge. A steady, moderate level means flushing is keeping pace with the write workload; a high and rising level means the flusher is falling behind, which leads to checkpoint pressure, synchronous flush stalls, and bursty "async write storm" behaviour that spikes latency.
+
+| | |
+| --- | --- |
+| **What it tracks** | `Innodb_buffer_pool_pages_dirty / Innodb_buffer_pool_pages_total`, expressed as a percentage. `pages_dirty` is the count of pool pages that have been modified in memory but not yet written to disk; `pages_total` is the total pages the pool holds. |
+| **Data source** | `SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_pages_%'`, sampled in real time. The same counters appear in `SHOW ENGINE INNODB STATUS` under BUFFER POOL AND MEMORY ("Modified db pages N"), and on managed services via Performance Insights / Cloud Monitoring buffer-pool metrics. |
+| **Calculation basis** | A point-in-time ratio of two gauge counters (not deltas). Both values are current snapshots, so the percentage reflects the instant the sample was taken. |
+| **Time window** | `RT` (real-time gauge). |
+| **Alert trigger** | `> 75%`. Above this, the pool is heavily dirty and InnoDB is at risk of hitting `innodb_max_dirty_pages_pct` (default 90), at which point it switches to aggressive synchronous flushing that stalls writes. The 75% line gives headroom to act before that cliff. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card divides the current dirty-page count by the current total-page count:
+
+```text
+dirty_pages_% = (Innodb_buffer_pool_pages_dirty / Innodb_buffer_pool_pages_total) * 100
+```
+
+Context that makes the number readable:
+
+1. **Dirty is not bad; runaway-dirty is bad.** InnoDB intentionally keeps recently modified pages in memory so it can coalesce many small writes into fewer, larger, sequential disk writes. A write-heavy instance routinely sits at 20 to 60% dirty during peak with no ill effect. The danger is the trend, not the absolute: a level climbing toward `innodb_max_dirty_pages_pct` (default 90%) means the background flusher (`innodb_io_capacity` / `innodb_io_capacity_max`) cannot drain dirty pages as fast as the workload creates them.
+2. **The 90% cliff.** When dirty pages reach `innodb_max_dirty_pages_pct`, InnoDB stops being lazy and flushes aggressively and synchronously, which throttles incoming writes to let the flusher catch up. This shows up as a sudden latency spike on writes ("furious flushing" / async write storm). The 75% alert exists to catch the approach before the cliff.
+3. **Checkpoint age is the deeper signal.** The dirty-page percentage correlates with checkpoint age (how far the redo log has advanced past the oldest unflushed change). If the redo log is undersized relative to the write rate, checkpoint pressure forces flushing regardless of the dirty percentage. Pair with redo-log sizing when this card alerts persistently.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a write-heavy MySQL 8.0 primary backing an order-ingestion pipeline. `innodb_buffer_pool_size` is 32 GB (roughly 2,000,000 pages at the default 16 KB page size). Snapshot taken on 22 May 26 at 20:15 BST during a flash-sale write burst.
+
+| Counter | Value |
+| --- | --- |
+| `Innodb_buffer_pool_pages_total` | 2,000,000 |
+| `Innodb_buffer_pool_pages_dirty` | 1,560,000 |
+
+```text
+dirty_pages_% = 1,560,000 / 2,000,000 = 0.78 = 78.0%
+```
+
+The gauge reads **78.0%**, above the 75% alert line, and Nerve Centre raises the sensitivity flag. What it means and what to do:
+
+1. **The flusher is behind.** At 78% the pool is closing on the 90% synchronous-flush cliff. If the write burst continues, InnoDB will start throttling writes within minutes and write latency will spike. [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) on write statements will already be drifting.
+2. **First lever: raise flush throughput.** If the storage can take more IOPS, raise `innodb_io_capacity` (and `innodb_io_capacity_max`) so the background flusher drains dirty pages faster. On fast NVMe / provisioned-IOPS volumes the default of 200 is far too conservative; values of several thousand are appropriate. Confirm the disk is not already saturated before raising this, otherwise it makes things worse.
+3. **Second lever: redo-log headroom.** If checkpoint age is the driver, increasing `innodb_redo_log_capacity` (MySQL 8.0.30+) gives InnoDB more room to defer flushing and smooth the burst. This trades a longer crash-recovery time for steadier write latency.
+4. **Do not lower `innodb_max_dirty_pages_pct` as a reflex.** Lowering it makes InnoDB flush sooner, which reduces the dirty percentage but increases total write IO and can hurt throughput. It is a tuning trade-off, not a fix.
+
+```text
+Decision trace for this snapshot:
+  - disk IOPS during burst: 4,100 / provisioned 6,000  -> headroom exists
+  - innodb_io_capacity: 200 (default)                  -> too low for this disk
+  Action: raise innodb_io_capacity to 4000 and io_capacity_max to 6000.
+  Dirty % drains from 78% back toward 45% within 3 minutes; write p95 recovers.
+```
+
+Three takeaways:
+
+1. **Read the trend, not the snapshot.** 78% holding steady through a burst and then draining is healthy batching; 78% and still climbing is the warning.
+2. **The percentage is a proxy for flush-vs-workload balance.** When it alerts, the question is always "can the disk flush faster, or is the redo log too small?"
+3. **Pair with hit rate and latency.** Dirty pages is the write side; [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) is the read side. Together they describe the whole buffer pool.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Dirty Pages | What the combination tells you |
+| --- | --- | --- |
+| [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) | The read-side companion to this write-side metric. | High dirty plus healthy hit rate equals a write-bound, read-healthy instance; tune flushing, not RAM. |
+| [InnoDB Free Pages](/nerve-centre/kpi-cards/mysql/innodb-free-pages) | Free pages shrink as dirty pages grow under pressure. | Low free plus high dirty equals a pool with no slack; flushing must catch up. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) | The user-visible symptom of a flush stall. | Write p95 spiking as dirty crosses 75% confirms the approach to the synchronous-flush cliff. |
+| [Memory Usage %](/nerve-centre/kpi-cards/mysql/memory-usage) | Host RAM context behind the pool. | High dirty on a memory-constrained host limits options to flush tuning only. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mysql/slow-query-rate) | Flush stalls turn fast writes into slow ones. | A slow-query spike co-timed with a dirty-page spike points at the flush cliff. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | Workload volume context. | Dirty climbing with QPS confirms write load is the driver, not a config change. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite that weights buffer-pool pressure. | Sustained high dirty visibly pulls the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL's own tooling:**
+
+> **`SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_pages_%';`** for `pages_dirty` and `pages_total`. Divide and multiply by 100 to match the card.
+> **`SHOW ENGINE INNODB STATUS\G`** , the BUFFER POOL AND MEMORY section, which prints "Database pages", "Modified db pages", and pending-flush counts directly.
+> **`SELECT @@innodb_max_dirty_pages_pct, @@innodb_io_capacity, @@innodb_io_capacity_max;`** to see the thresholds and flush settings driving the behaviour.
+> On Amazon RDS / Aurora, **Performance Insights** buffer-pool counters; on Google Cloud SQL, the InnoDB buffer-pool metrics in **Cloud Monitoring**.
+
+**Why our number may legitimately differ from a hand reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sample timing** | Either direction | Dirty pages fluctuate second to second under write load; a hand `SHOW STATUS` taken a moment apart from the card's sample will not match exactly. Both are correct snapshots. |
+| **Page size assumption** | None for the ratio | The percentage is a page-count ratio, so it is independent of the 16 KB page size; only absolute byte sizing depends on page size. |
+| **Engine-status interval** | Marginal | `SHOW ENGINE INNODB STATUS` reflects the instant it is run, same as the card; tiny differences are pure timing. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) | Write p95 should spike as dirty approaches the flush cliff. | p95 spiking while dirty stays low points at lock contention or slow reads, not flush pressure. |
+| [InnoDB Free Pages](/nerve-centre/kpi-cards/mysql/innodb-free-pages) | Free and dirty move inversely under pressure. | Both low at once means the pool is fully committed; flushing is the only relief. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Is a high dirty-page percentage always a problem?**
+No. A write-heavy instance routinely runs at 20 to 60% dirty during peak and that is healthy batching. The concern is a level that is high and still climbing toward `innodb_max_dirty_pages_pct` (default 90%), because at that cliff InnoDB switches to synchronous flushing and throttles writes. The 75% alert is an early-warning line, not a hard fault.
+
+**What actually happens at the 90% cliff?**
+When dirty pages reach `innodb_max_dirty_pages_pct`, InnoDB stops deferring writes and flushes aggressively and synchronously to bring the level down, throttling incoming writes in the process. The visible effect is a sudden write-latency spike, sometimes called "furious flushing" or an async write storm. The goal of watching this card is to act before you hit that point.
+
+**Should I lower `innodb_max_dirty_pages_pct` to keep the percentage down?**
+Usually not as a first move. Lowering it forces earlier, more frequent flushing, which reduces the dirty level but increases total write IO and can cut throughput. The better levers are raising `innodb_io_capacity` (if the disk has headroom) and increasing `innodb_redo_log_capacity` (to give more room to defer). Adjust the dirty-pages cap only after those, and with care.
+
+**The percentage spiked during a backup and recovered. Why?**
+Some backup methods (and large bulk-load or `ALTER TABLE` operations) generate heavy write activity that fills the pool with dirty pages faster than the flusher drains them. Once the operation finishes, the flusher catches up and the level recovers. If backups routinely push you near the cliff, run them against a replica or schedule them off-peak.
+
+**Does dirty-page percentage affect crash recovery time?**
+Indirectly, yes. The unflushed (dirty) changes are protected by the redo log, and crash recovery replays redo from the last checkpoint. A larger redo log and more deferred flushing mean faster steady-state writes but a longer recovery after an unclean shutdown. This is the core trade-off behind `innodb_redo_log_capacity` sizing.
+
+**Why is this a point-in-time gauge and not a windowed delta like the hit rate?**
+Dirty and total page counts are current-state gauges, not monotonically increasing counters, so the meaningful value is the instantaneous ratio. The hit rate is built from cumulative counters and therefore needs delta windowing; dirty-pages does not.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*InnoDB Dirty Pages %* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

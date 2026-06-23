@@ -1,0 +1,153 @@
+---
+title: "Blocked Clients (BLPOP / BRPOP / WAIT), Redis"
+sidebarTitle: "Blocked Clients (BLPOP / BRPOP / WAIT)"
+description: "Blocked Clients for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Some Redis commands park a client in a waiting state instead of returning immediately: `BLPOP`/`BRPOP` wait for an element to appear on a list, `BLMOVE`/`BRPOPLPUSH` wait to move one, `BZPOPMIN`/`BZPOPMAX` wait on sorted sets, `XREAD`/`XREADGROUP ... BLOCK` wait on streams, and `WAIT` blocks until replicas acknowledge a write. The `blocked_clients` field counts how many connections are parked like this right now. A handful is normal for a queue-consumer or pub/sub stack that is idle and waiting for work. A sustained pile, more than 100, usually means consumers are starved, a producer has stalled, or `WAIT` calls are hung on slow replicas. This card surfaces that backlog.
+
+| | |
+| --- | --- |
+| **Data source** | `INFO clients`, the `blocked_clients` field, sampled each poll. |
+| **Metric basis** | A live gauge (not a counter): the number of clients currently parked in a blocking command. It rises and falls in real time as clients block and unblock. |
+| **What lives here** | Clients waiting on blocking commands: queue-consumer and pub/sub stacks live here. `BLPOP`/`BRPOP`/`BLMOVE` consumers, `XREAD ... BLOCK` stream readers, and `WAIT` calls awaiting replica acknowledgement. |
+| **Aggregation window** | `RT` (real-time). The card reads the current `blocked_clients` on every poll. |
+| **Alert trigger** | `>100 sustained`. A transient spike (a batch of consumers all waiting between jobs) does not fire; a sustained backlog above 100 does. |
+| **What does NOT count** | (1) Clients running a normal non-blocking command; (2) clients idle but not in a blocking call (connected, doing nothing, not parked); (3) clients waiting on the network rather than on Redis. Only connections inside a blocking command are counted. |
+| **Topology scope** | Per node. On a cluster, blocking consumers connect to the node owning the relevant slots; the card reads per node and surfaces the busiest. |
+| **Time window** | `RT` (real-time, sampled on every poll) |
+| **Alert trigger** | `>100 sustained` |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calc */}
+The card reads the `blocked_clients` integer from the `# Clients` section of `INFO`:
+
+```text
+blocked_clients = number of connections currently parked in a blocking command
+```
+
+This is a point-in-time gauge, not a cumulative counter, so it needs no differencing: the value Redis reports is exactly the count of clients blocked at that instant. The card samples it each poll and applies a sustained-over-window test so that a normal idle queue (consumers all blocked waiting for the next job) does not fire, only a backlog that holds above 100 across the window does.
+
+For context the card also reads `connected_clients`, so the headline can express blocked clients as a share of all connections. A high blocked share (most connections parked) on a queue system is often healthy idleness; the same share on a request-serving cache is suspicious and worth investigating.
+{/* /HUMAN_AUTHORED:calc */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team uses Redis lists as a job queue: a producer service `LPUSH`es jobs onto `queue:orders`, and a fleet of worker processes each run a loop of `BRPOP queue:orders 5` to pull the next job. Normally there are 40 workers; when the queue is busy almost none are blocked (they are all processing), and when it is quiet most are blocked waiting. Snapshot taken on 18 Apr 26 from 14:00 to 14:20 BST after a downstream payment API began timing out.
+
+| Time (BST) | Workers | `blocked_clients` | Queue depth (`LLEN queue:orders`) |
+| --- | --- | --- | --- |
+| 14:00 | 40 | 8 | 12 |
+| 14:05 | 40 | 35 | 90 |
+| 14:10 | 40 (stalling) | **140** | 1,400 |
+| 14:20 | 40 (stalled) | **39** | **9,800 and climbing** |
+
+This sequence is the interesting part. At 14:10 a downstream payment API started timing out, so each worker took far longer to finish a job. With workers tied up, the queue backed up and many workers were caught mid-`BRPOP` waiting for their next turn, pushing `blocked_clients` to 140 and firing the alert. By 14:20 the situation inverted: there were always jobs waiting, so workers no longer blocked at all (`BRPOP` returned instantly), `blocked_clients` fell back to 39, but the queue depth exploded to 9,800 because workers could not keep up.
+
+```text
+INFO snapshot at 14:10:
+  connected_clients:48          # 40 workers + 8 producers/monitors
+  blocked_clients:140           # sustained > 100 -> ALERT
+  -> blocked share: 140 / 48 ... but 40 are workers; the count exceeds workers
+     because retry connections also opened blocking calls
+LLEN queue:orders -> 1,400 (and climbing)
+```
+
+The Vortex IQ headline reads **140 blocked clients** in amber. What the on-call engineer reads from this:
+
+1. **The blocking backlog is a symptom of a stalled consumer chain, not a Redis fault.** Redis is doing exactly what it was asked: parking workers until a job is available. The pile-up appeared because the workers slowed down (the payment API), so each `BRPOP` waited longer.
+2. **The number is non-monotonic, so read it with queue depth.** Blocked clients rose then fell while the real problem (queue depth) only grew. A falling blocked count is not always good news: here it meant the queue was permanently non-empty, the worst case. Always pair this card with the queue length you care about.
+3. **The fix is upstream, plus capacity.** Resolving the payment API timeout lets workers drain the backlog; adding workers temporarily increases drain rate. Restarting Redis would do nothing useful, the blocking is a faithful reflection of consumer behaviour.
+
+```text
+Diagnosis framing during the incident:
+  - blocked_clients spiked to 140 (workers waiting), then fell to 39
+  - LLEN climbed 12 -> 90 -> 1,400 -> 9,800 (the real signal)
+  - Root cause: downstream payment API timeouts slowing job completion
+  - Mitigation: fix/route around the payment API; add temporary workers to drain
+  - Do NOT restart Redis: it is reporting consumer state correctly
+```
+
+Three takeaways for the on-call DBA:
+
+1. **Blocked clients on a queue system is a two-edged signal.** High can mean healthy idleness (consumers waiting for work) or a stalled producer; low can mean healthy throughput or a flooded queue with no spare consumers. The number only makes sense next to the queue depth.
+2. **`WAIT` blocks for a different reason.** If your `blocked_clients` is high and you use `WAIT numreplicas timeout` for write durability, the blocking may be replicas failing to acknowledge, a replication problem, not a queue problem. Check [Replica Lag (seconds)](/nerve-centre/kpi-cards/redis/replica-lag-seconds) before assuming it is the queue.
+3. **Blocked connections still occupy a client slot.** Every parked client counts against `maxclients`. A large blocked backlog can contribute to connection saturation, so read this alongside the connection-ceiling cards during heavy load.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside this one
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Blocked Clients | What the combination tells you |
+| --- | --- | --- |
+| [Connected Clients](/nerve-centre/kpi-cards/redis/connected-clients) | Blocked clients are a subset of connected. | Most connections blocked on a queue system equals idle waiting; on a cache it is suspicious. |
+| [Clients vs maxclients %](/nerve-centre/kpi-cards/redis/clients-vs-maxclients) | Blocked clients consume slots toward the cap. | A blocked backlog plus high saturation can push you toward connection rejection. |
+| [Replica Lag (seconds)](/nerve-centre/kpi-cards/redis/replica-lag-seconds) | `WAIT` blocks until replicas acknowledge. | High blocked count plus high replica lag equals `WAIT` calls hung on slow replicas, not a queue stall. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live) | Throughput while clients are parked. | Low OPS plus many blocked clients equals an idle, waiting system; rising OPS plus rising blocked equals contention. |
+| [Command Latency p95 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p95-ms) | Slow commands can keep consumers blocked longer. | If consumers slow because Redis itself is slow, latency rises alongside the blocked count. |
+| [Connections Rejected Due to maxclients](/nerve-centre/kpi-cards/redis/connections-rejected-due-to-maxclients) | The saturation endpoint a blocked backlog feeds. | A growing blocked backlog can precede connection rejections under load. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis itself:**
+
+> **`INFO clients`** reports `blocked_clients` directly: `redis-cli INFO clients | grep blocked_clients`. This is the authoritative live count.
+> **`CLIENT LIST`** shows every connection; blocked clients carry a `cmd` of `blpop`, `brpop`, `blmove`, `bzpopmin`, `xread`/`xreadgroup`, or `wait`, and a long `age` with a short `idle`. Filter this list to see exactly which consumers are parked and on what.
+> **`LLEN <key>`** / **`XLEN <stream>`** gives the queue or stream depth, the partner number that makes the blocked count interpretable.
+> **`INFO replication`** confirms replica acknowledgement state if you suspect `WAIT` is the cause of the blocking.
+
+**Why our number may legitimately differ from a single live read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Gauge volatility** | Our value can differ from a manual `INFO` seconds later | `blocked_clients` swings second to second as consumers block and unblock. A one-off `INFO` and our last poll will rarely match exactly; the sustained trend is what matters. |
+| **Sustained-window filter** | Our alert lags a brief spike | A momentary spike above 100 will not fire; the card waits for it to hold across the window, so a manual read can show >100 while the card is still green. |
+| **Per-node view** | Cluster totals differ | On a cluster we surface the busiest node, not the sum; adding every node's `blocked_clients` exceeds our headline. |
+| **`WAIT` vs queue blocking** | Same count, different cause | The field does not distinguish queue blocks from `WAIT` blocks; use `CLIENT LIST` to separate them. Our headline counts both. |
+
+**Native-tooling note:** There is no managed-service metric that is exactly `blocked_clients`; AWS ElastiCache, Azure Cache for Redis, and Redis Cloud all expose `connected_clients`-style metrics but blocked clients are read from `INFO clients` directly. Reconcile by running `redis-cli INFO clients` against the same endpoint your monitoring uses, and cross-check the parked connections with `CLIENT LIST`.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**A high blocked-clients count on my job queue, is that good or bad?**
+It depends entirely on the queue depth alongside it. Many blocked consumers with a near-empty queue means a healthy, idle system: workers are waiting for the next job, exactly as designed. Many blocked consumers with a deep, growing queue means consumers are starved or stalled. And, counter-intuitively, a low blocked count with a deep queue is often the worst case: there is always work, so consumers never block, but they cannot keep up. Never read this card without the matching `LLEN`/`XLEN`.
+
+**My `blocked_clients` is high but I do not use any blocking list commands. What is blocking them?**
+Most likely `WAIT`, or stream reads with `BLOCK`. `WAIT numreplicas timeout` parks the calling client until the requested number of replicas acknowledge the write, so if replicas are slow or down, `WAIT` calls accumulate as blocked clients. `XREAD ... BLOCK` and `XREADGROUP ... BLOCK` on Redis Streams also block. Run `CLIENT LIST` and look at the `cmd` column to see exactly which command each blocked client is in.
+
+**Does a blocked client consume resources while it waits?**
+It holds a connection (a file descriptor and an output buffer) and counts against `maxclients`, but it uses no CPU while parked, Redis is event-driven and simply does not service that client until its condition is met. The main risk is connection-slot exhaustion: a large blocked backlog can contribute to hitting the connection ceiling, so watch [Clients vs maxclients %](/nerve-centre/kpi-cards/redis/clients-vs-maxclients) under load.
+
+**Why did my blocked count drop to almost zero right when my queue exploded?**
+Because once the queue is never empty, blocking commands return immediately, there is always an element to pop, so consumers stop blocking. A falling blocked count is therefore not automatically good news; if it falls because the queue is permanently full, you have a throughput problem. This is exactly why the worked example pairs the count with queue depth.
+
+**Can a single hung `BLPOP` with no timeout block forever?**
+Yes. `BLPOP key 0` blocks indefinitely until an element arrives. If a consumer issues a zero-timeout blocking call and the producer never pushes, that client stays blocked for the life of the connection. This is usually intentional for long-lived consumers, but a leak of such connections (consumers that crash without closing) can inflate the count. Use `CLIENT LIST` to find old blocked connections and `CLIENT KILL` to reap dead ones.
+
+**The alert fired during a normal quiet period when all my workers were waiting. Is the threshold wrong?**
+If you legitimately run more than 100 consumers that block while idle, the default threshold of 100 sustained will fire during quiet periods even though nothing is wrong. This card's threshold is configurable per profile in the Sensitivity tab; raise it above your normal idle-consumer count so the alert only fires on a genuine backlog. Set it to your steady-state blocked count plus a margin.
+
+**On a cluster, blocked clients cluster on one node. Why?**
+Blocking consumers connect to the node that owns the slots for the key they are blocking on. If all your workers `BRPOP` the same queue key, they all connect to the one node owning that key's slot, so the blocked count concentrates there while other nodes stay near zero. This is expected for a single hot queue key. The card surfaces the busiest node so that hot spot is visible.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Blocked Clients (BLPOP / BRPOP / WAIT)* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,170 @@
+---
+title: "Snowflake Event Ingest vs Ecom Orders, Snowflake"
+sidebarTitle: "Snowflake Event Ingest vs Ecom Orders"
+description: "Snowflake Event Ingest vs Ecom Orders for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A dual-axis chart that overlays the rate at which event rows are landing in Snowflake (the ingest pipeline, typically Fivetran, Snowpipe, or a Kafka connector loading order, clickstream, and inventory events) against the rate at which the storefront is taking real orders. The two lines should move together: more shopping activity means more events to load. The dangerous shape is divergence in one specific direction, orders flowing healthily on the storefront while the Snowflake ingest line flattens or drops to zero. That gap means the data warehouse has gone stale: every downstream dashboard, every Vortex Mind investigation, every finance report is now reading yesterday's world while today's revenue is happening live. The `Fivetran ingest stalled while orders flowing` alert exists because a silent ingest stall is invisible from the storefront. Sales look fine; the data backing every decision is quietly hours out of date.
+
+| | |
+| --- | --- |
+| **What it tracks** | Two series on one chart over the trailing 24 hours: (1) Snowflake event-ingest rate, the count of rows landing in the raw landing tables per interval, read from `SNOWFLAKE.ACCOUNT_USAGE.COPY_HISTORY` (bulk and Snowpipe loads) and the connector's loaded-row counters; (2) ecom order rate, orders per interval from the linked Shopify, BigCommerce, or Adobe Commerce connector. |
+| **Data source** | Snowflake side: `COPY_HISTORY`, `PIPE_USAGE_HISTORY`, and row-count deltas on the configured landing tables. Ecom side: the order-volume feed from the joined storefront connector. The card joins the two on a shared time axis. Snowflake Event Ingest vs Ecom Orders for the selected period. |
+| **Why it matters** | Ingest staleness is the one warehouse failure that does not show up as an error. The COPY job did not fail; it simply has not run, or the source connector paused. Orders keep flowing, so nothing on the storefront alerts. This card is the only place the divergence is visible. |
+| **Aggregation window** | `24h` trailing, bucketed (typically hourly) so a stall that began overnight is obvious against the morning order ramp. |
+| **Time window** | `24h` |
+| **Alert trigger** | `Fivetran ingest stalled while orders flowing`, the ingest line flattens (or drops near zero) for a sustained interval while the order line stays healthy. |
+| **Roles** | owner, engineering, operations, data |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card computes two independent rate series and looks for divergence between them:
+
+```text
+ingest_rate(t)  = rows loaded into landing tables in bucket t
+                  (sum of ROW_COUNT from COPY_HISTORY + Snowpipe deltas)
+order_rate(t)   = orders created in bucket t (from linked ecom connector)
+
+divergence(t)   = (order_rate normalised) − (ingest_rate normalised)
+alert fires when ingest_rate ≈ 0 for N consecutive buckets
+                 AND order_rate stays above its baseline
+```
+
+What a data and platform team needs to know about how Snowflake surfaces ingest, and why a stall hides:
+
+- **A paused source connector is not a Snowflake error.** If Fivetran, Airbyte, or a custom job stops pushing rows, Snowflake has nothing to do. `COPY_HISTORY` simply shows no new entries. There is no failed query, no errored task, nothing for an error-rate card to catch. The absence of work is the symptom, and absence is what this card is built to detect.
+- **Snowpipe latency is normally seconds, so a flat line is meaningful.** Snowpipe auto-ingest typically lands files within a minute or two of arrival in the stage. If the ingest line goes flat for an hour while orders flow, the file is not arriving in the stage at all (an upstream export or a cloud-storage notification problem), not a Snowflake delay.
+- **`COPY_HISTORY` reports per-file load outcomes.** Each entry carries `ROW_COUNT`, `ROW_PARSED`, `ERROR_COUNT`, and `STATUS`. A stall shows as no new rows; a partial failure shows as `STATUS = 'LOAD_FAILED'` or a non-zero `ERROR_COUNT`. The card reads both, but the alert is specifically about the no-new-rows case while orders continue.
+- **The order line is the ground truth.** Because the storefront connector reads orders directly from the commerce platform's own API, the order rate is not dependent on Snowflake at all. That independence is the whole point: it gives you a trusted external pulse to compare the warehouse against.
+- **Account Usage views carry their own latency.** `COPY_HISTORY` in the `ACCOUNT_USAGE` schema can lag actual loads by up to ~90 minutes. Where lower latency matters, the connector also reads `INFORMATION_SCHEMA.COPY_HISTORY` (the table function), which is near real-time but limited to the last 14 days and a single table or pipe per call.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs Snowflake behind an ecommerce retailer on Shopify. Fivetran syncs the Shopify `orders`, `customers`, and `line_items` objects into a `RAW_SHOPIFY` schema every 15 minutes; a separate Snowpipe streams web clickstream events. The BI layer, the finance close, and several Vortex Mind investigations all read from these tables. Reading taken on 17 May 26.
+
+**Normal morning (16 May 26), the two lines tracking together:**
+
+| Hour (UTC) | Orders (ecom) | Rows ingested (Snowflake) |
+| --- | --- | --- |
+| 07:00 | 42 | 6,180 |
+| 08:00 | 71 | 9,940 |
+| 09:00 | 96 | 13,420 |
+| 10:00 | 88 | 12,610 |
+
+Roughly 140 rows ingested per order (order header plus line items plus clickstream). The ratio is stable; the lines move in lockstep.
+
+**The stall (17 May 26):**
+
+| Hour (UTC) | Orders (ecom) | Rows ingested (Snowflake) |
+| --- | --- | --- |
+| 07:00 | 45 | 6,300 |
+| 08:00 | 69 | 9,610 |
+| 09:00 | 93 | **0** |
+| 10:00 | 91 | **0** |
+| 11:00 | 99 | **0** |
+
+At 09:00 the ingest line falls off a cliff to zero while the order line keeps climbing into the day. The alert fires: `Fivetran ingest stalled while orders flowing`. Crucially, nothing on the storefront looks wrong. Checkout is healthy, payments are clearing, the [QPS vs Order Rate](/nerve-centre/kpi-cards/snowflake/snowflake-qps-spike-vs-ecom-order-rate) card is normal. Only this card shows the problem.
+
+The team's response, in order:
+
+1. **Confirm the stall is upstream, not in Snowflake.** Query `INFORMATION_SCHEMA.COPY_HISTORY` for the `RAW_SHOPIFY.ORDERS` table over the last three hours. No new entries since 08:52 confirms Snowflake received nothing to load: the source stopped pushing. A Snowflake-side failure would instead show `LOAD_FAILED` rows.
+2. **Check the source connector.** In this case the Fivetran connector's OAuth token to Shopify had expired at 08:52 and the sync paused with a re-auth prompt. The fix is to re-authorise the connector; Fivetran then backfills the gap on its next sync.
+3. **Communicate the blast radius while it backfills.** Until the backfill completes, every dashboard and report reading `RAW_SHOPIFY` is missing ~2.5 hours of orders. Anyone making a same-day decision (marketing pacing, inventory reorder, a finance flash) needs to know the warehouse is behind. This is the part teams forget: the data being stale is worse than the data being down, because stale data looks usable.
+
+```text
+Cost framing of a silent ingest stall:
+  Orders during the stall window (09:00 to 11:30): ~233
+  Revenue those orders represent: ~£18,600
+  None of it visible in the warehouse until backfill completes.
+  Decisions made on stale data during the gap: marketing budget pacing,
+  a low-stock reorder trigger, the 11:00 ops standup numbers.
+Caught by the alert at 09:15: re-auth and backfill, ~30 minutes to current.
+Caught at the next finance close: a day of every report being quietly wrong.
+```
+
+Three things worth remembering:
+
+1. **A flat ingest line with a healthy order line is the signature of a paused source, not a Snowflake fault.** Do not start by debugging warehouses or queries; start at the source connector (Fivetran, Snowpipe stage, Kafka).
+2. **Stale beats down for danger, because stale is invisible.** A warehouse that is fully down gets noticed fast. A warehouse that is silently three hours behind keeps serving plausible-looking numbers that are wrong, and people act on them.
+3. **The order line is your trusted external pulse.** Because it comes from the commerce platform directly, it never depends on Snowflake. Whenever you doubt a warehouse signal, this independent line is the reference to triangulate against.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Snowflake Event Ingest vs Ecom Orders | What the combination tells you |
+| --- | --- | --- |
+| [Snowflake QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/snowflake/snowflake-qps-spike-vs-ecom-order-rate) | The query-side cross-channel twin of this ingest-side card. | Ingest stalled but QPS normal = dashboards still serving stale data confidently; both flat = the warehouse is fully out of the loop. |
+| [Credit Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/snowflake/credit-burn-vs-ecom-order-volume) | The cost-side divergence check on the same axes. | Ingest stalled often coincides with a credit dip (no load jobs running), a corroborating signal. |
+| [Slow Analytics Queries During Checkout Window](/nerve-centre/kpi-cards/snowflake/slow-analytics-queries-during-checkout-window) | The other revenue-at-risk cross-channel card. | Stale data plus slow checkout-window queries = the analytics layer is both behind and struggling. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/snowflake/query-error-rate) | Confirms whether loads are failing versus simply not arriving. | Error rate flat during a stall confirms a source pause, not a Snowflake load failure. |
+| [Snowflake Health Score](/nerve-centre/kpi-cards/snowflake/snowflake-health-score) | The composite a sustained ingest stall should pull down. | A health-score dip with no query or cost cause often traces back to ingest freshness. |
+| [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) | Load jobs accrue credits; a stall shows as a small burn dip. | A drop in burn with no schedule change can be the first quiet hint of a stalled pipeline. |
+| [Last Snapshot Age (hours)](/nerve-centre/kpi-cards/snowflake/last-snapshot-age-hours) | The recoverability sibling, for when stale data needs a rewind. | If a bad backfill lands, Time Travel age tells you how far back you can recover. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake's own tooling:**
+
+> **Recent loads (near real-time, last 14 days):** `SELECT * FROM TABLE(INFORMATION_SCHEMA.COPY_HISTORY(TABLE_NAME=>'RAW_SHOPIFY.ORDERS', START_TIME=>DATEADD('hour', -6, CURRENT_TIMESTAMP())));` shows per-file `ROW_COUNT`, `STATUS`, and `ERROR_COUNT`. A gap with no rows confirms a stall.
+> **Account-wide load history (up to ~90 min latency):** `SELECT table_name, SUM(row_count), MAX(last_load_time) FROM SNOWFLAKE.ACCOUNT_USAGE.COPY_HISTORY WHERE last_load_time >= DATEADD('hour', -24, CURRENT_TIMESTAMP()) GROUP BY table_name ORDER BY 3 DESC;`
+> **Snowpipe ingest:** `SELECT * FROM SNOWFLAKE.ACCOUNT_USAGE.PIPE_USAGE_HISTORY WHERE start_time >= DATEADD('hour', -24, CURRENT_TIMESTAMP());` and `SELECT SYSTEM$PIPE_STATUS('your_pipe');` for live pipe state.
+> **Managed console:** Snowsight under **Monitoring -> Copy History** gives a visual per-table load timeline; a flat stretch is the same stall this card shows. For the source side, the stall usually originates in the ingest tool's own console (Fivetran sync history, Airbyte job log), not in Snowflake at all.
+
+**Why our number may legitimately differ from a native query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Account Usage latency** | Our line can lag | `ACCOUNT_USAGE.COPY_HISTORY` lags up to ~90 minutes; for the lowest-latency view we use the `INFORMATION_SCHEMA` table function, which a native ad-hoc query against `ACCOUNT_USAGE` will not match exactly. |
+| **Table scope** | Our total lower | The card counts rows only for the configured landing tables; an account-wide native sum across all tables will be higher. |
+| **Snowpipe vs bulk COPY** | Variable | Whether streaming pipe rows are folded into the ingest line depends on the connector reading `PIPE_USAGE_HISTORY`; confirm scope if the two views disagree. |
+| **Bucketing** | Edge buckets shift | We bucket on a trailing window; a native query grouped by calendar hour will split a stall that straddles an hour boundary differently. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_orders`](/nerve-centre/kpi-cards/shopify/total-orders) / [`bigcommerce.total_orders`](/nerve-centre/kpi-cards/bigcommerce/total-orders) | The ecom order line should match the storefront connector's own order count for the same window. | A gap means the storefront feed itself is delayed, not Snowflake; check the commerce connector first. |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) | Orders flowing implies revenue flowing; both confirm the storefront is live while ingest is stalled. | Revenue and orders both flat would mean a real storefront problem, a different card's job. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The ingest line is flat but no query errored and no load shows LOAD_FAILED. Is this a false alarm?**
+No, this is exactly the case the card is built for. A stalled source pushes nothing, so there is no failed load to find: `COPY_HISTORY` simply has no new entries. The symptom is the absence of work, not an error. Start at the source connector (Fivetran, Airbyte, Snowpipe stage, Kafka), not at Snowflake. A re-auth, an upstream export job, or a cloud-storage notification is the usual culprit.
+
+**Why compare ingest against orders specifically, rather than just alerting on ingest going to zero?**
+Because ingest legitimately goes quiet at low-traffic hours. A flat ingest line at 03:00 with almost no orders is normal. The divergence framing only alerts when ingest is flat while the storefront is genuinely busy, which removes the overnight false positives and catches the dangerous daytime stalls.
+
+**My ingest line lags the order line by an hour even when healthy. Is that a problem?**
+Usually not, if it is a consistent offset. Batch ingest tools (Fivetran on a 15 to 60 minute schedule) naturally trail live orders by up to a sync interval, and `ACCOUNT_USAGE.COPY_HISTORY` adds its own latency. A steady lag is your normal freshness budget. A lag that grows without bound, or a line that flattens entirely, is the failure mode.
+
+**We use Snowpipe Streaming, not Fivetran. Does this card still apply?**
+Yes, and the freshness expectation is tighter. Snowpipe and Snowpipe Streaming land rows within seconds to a couple of minutes, so a flat line for even ten minutes during busy hours is meaningful. The connector reads `PIPE_USAGE_HISTORY` and `SYSTEM$PIPE_STATUS` for the streaming case; the order comparison works identically.
+
+**The alert fired but the data caught up on its own a few minutes later. Should I tune it?**
+A brief self-recovering blip (a single sync that ran late, then caught up) is benign. If your source tool batches on a long interval, raise the sustained-interval threshold so the alert only fires once the gap exceeds one normal sync cycle. The goal is to catch a genuine stall, not a late-but-recovering sync.
+
+**Can a backfill cause a false healthy reading?**
+It can briefly. When a stalled source resumes, it often dumps the whole backlog in one large COPY, so the ingest line spikes well above the order line for a bucket or two. That spike is the recovery, not a new problem. Read it together with the order line: a one-off catch-up spike following a stall is the system healing, not a fault.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Snowflake Event Ingest vs Ecom Orders* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

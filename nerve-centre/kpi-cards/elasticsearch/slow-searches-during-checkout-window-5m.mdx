@@ -1,0 +1,166 @@
+---
+title: "Slow Searches During Checkout Window (5m), table"
+sidebarTitle: "Slow Searches During Checkout Window (5m)"
+description: "Slow Searches During Checkout Window (5m) for Elasticsearch stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This table lists the individual slow Elasticsearch searches that occurred inside a live checkout window over the last 5 minutes, and pairs that count against any drop in checkout conversion on the connected storefront. It exists because not all slow searches are equal: a slow query at 3am against an internal report is a curiosity, but a slow search while shoppers are trying to find and buy is money walking out the door. The card joins the search slowlog to the checkout funnel so you can see, in one place, whether slow search is co-occurring with shoppers failing to complete purchases. The alert fires when more than 5 slow searches coincide with a measurable checkout drop in the same window, because that conjunction is the strongest available signal that search latency is directly costing conversions right now.
+
+| | |
+| --- | --- |
+| **What it tracks** | A per-row table of slow searches captured in the last 5 minutes that fell inside an active checkout window, joined to the storefront's checkout conversion for the same window. Each row is one slow search (or slow-search group) with its latency, index, and timestamp. |
+| **Data source** | Elasticsearch side: the search slowlog (`index.search.slowlog`) and/or search stats exceeding the configured slow threshold. Ecom side: checkout-funnel/conversion signal from the connected commerce connector (Shopify/BigCommerce/Adobe). The card co-locates both within the same 5-minute bucket. The `detail` for this card is the cross-channel join: slow searches that co-occur with a checkout drop. |
+| **Time window** | `5m`. A short, rolling window so the co-occurrence is tight and causally meaningful, not a daily average that hides the moment of impact. |
+| **Alert trigger** | `> 5 slow searches co-occur with a checkout drop`. The alert needs both conditions: slow-search volume above 5 AND a checkout conversion drop in the same window. Either alone does not fire this card. |
+| **Cross-channel join** | Requires both Elasticsearch and an ecom connector. The "checkout drop" half comes from the storefront; Elasticsearch supplies only the slow-search half. |
+| **Why the conjunction matters** | Slow search during browsing is annoying; slow search during checkout (or in the search-to-cart path) correlates with abandonment. Joining the two removes the guesswork about whether latency is actually hurting revenue. |
+| **What does NOT count** | Slow searches outside a checkout window; indexing operations; slow internal/admin queries if excluded by the connector filter. |
+| **Roles** | owner, engineering, operations, merchandising |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card builds the table in two steps and then evaluates the alert as a conjunction:
+
+```text
+slow_searches = searches in last 5m where took >= slowlog_threshold
+                 (default slowlog warn/info threshold, commonly 1s)
+checkout_window = periods in last 5m with active checkout sessions
+in_window      = slow_searches whose timestamp falls in checkout_window
+checkout_drop  = conversion(this 5m) < conversion(rolling baseline)
+
+ALERT if  count(in_window) > 5  AND  checkout_drop is true
+```
+
+The slow-search half is sourced from the Elasticsearch search slowlog, which logs any query whose `took` time crosses a configured threshold (set per index via `index.search.slowlog.threshold.query.warn`, commonly 1s). Where the slowlog is not enabled, the card falls back to flagging searches whose latency exceeds the slow threshold from search stats, but the slowlog is preferred because it captures the exact query text and source, which is what makes the table actionable.
+
+The checkout-drop half comes from the storefront connector's conversion signal for the same 5-minute bucket compared to a short rolling baseline. The alert is deliberately a logical AND: more than 5 slow searches with no checkout drop is a performance concern handled by the latency cards, not this one; a checkout drop with no slow searches points at a different cause (payment gateway, cart bug) and again is not this card. Only the conjunction implicates search latency in lost revenue.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A beauty retailer on Shopify uses Elasticsearch for on-site product search, with the search box prominent in the header throughout the funnel including the cart page. The search slowlog threshold is set to 1s. Snapshot covers the 5 minutes from 19:42 to 19:47 GMT on 03 Jun 26, during an evening traffic peak driven by an email campaign.
+
+| Time | Index | Query (summarised) | took (ms) | In checkout window |
+| --- | --- | --- | --- | --- |
+| 19:42:11 | products | filtered facet search, 8 aggregations | 1,840 | yes |
+| 19:43:02 | products | text search + sort by price | 1,210 | yes |
+| 19:43:55 | products | filtered facet search, 8 aggregations | 2,030 | yes |
+| 19:44:40 | products | autocomplete prefix, deep | 1,090 | yes |
+| 19:45:18 | products | filtered facet search, 8 aggregations | 1,920 | yes |
+| 19:46:05 | products | text search + sort by relevance | 1,330 | yes |
+
+Six slow searches landed inside the checkout window, above the threshold of 5. In the same 5 minutes, checkout conversion dropped from a rolling baseline of 3.1% to 2.2%. Both conditions are met, so the Vortex IQ alert fires. The platform team reads the table and acts:
+
+1. **Spot the dominant query shape.** Three of the six slow rows are the same expensive pattern: a filtered facet search with 8 aggregations. That is the heavy query, and it is firing at peak traffic exactly when shoppers are deepest in the funnel.
+2. **Connect latency to abandonment.** The checkout drop of 0.9 percentage points coincides precisely with the slow-search burst. Shoppers who searched mid-checkout waited nearly 2 seconds for results; a meaningful share bounced rather than waiting.
+3. **Quantify the exposure.** At this traffic level the 0.9pp conversion drop maps to lost orders that are directly attributable to the window, not a vague "search feels slow" complaint.
+
+```text
+Revenue framing (illustrative):
+  - Checkout sessions in the 5m window: ~640
+  - Baseline conversion: 3.1%  ->  ~20 orders expected
+  - Observed conversion: 2.2%  ->  ~14 orders
+  - Shortfall: ~6 orders in 5 minutes co-occurring with slow search
+  - Average order value £48  ->  ~£288 at risk in this single window
+  - If the heavy query persists across the peak hour, the figure compounds
+```
+
+4. **Remediate.** Short term, the team caps the expensive aggregation query (reduces facet count, adds a request cache, or routes it to a dedicated node). Conversion recovers toward baseline in the next window and the alert clears. Long term, they pre-compute the heavy facets or add a filter cache so the query never crosses 1s at peak.
+
+Three takeaways for the platform team:
+
+1. **Co-occurrence is the whole point.** Slow searches alone do not prove harm and a checkout dip alone does not prove search caused it. The card only raises an alarm when both happen together, which is the closest you get to a causal signal without a controlled experiment.
+2. **The table tells you what to fix, not just that something is wrong.** Because it lists the actual slow queries, you can see the offending query shape immediately (here, an 8-aggregation facet search) rather than guessing.
+3. **Timing within the funnel is everything.** The same slow query at 3am would not fire this card. It fired because it happened while real shoppers were trying to buy. That is why this is a Revenue-at-Risk card and not a generic latency card.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this card | What the combination tells you |
+| --- | --- | --- |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/elasticsearch/slow-query-rate) | The aggregate rate this card slices to the checkout window. | A high overall slow-query rate explains why slow searches keep landing in checkout windows. |
+| [Top 10 Slow Searches](/nerve-centre/kpi-cards/elasticsearch/top-10-slow-searches) | The 24h list of the worst offenders by query. | If the same query shape appears here and in this table, you have found the durable fix target. |
+| [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) | The latency distribution behind the slowlog hits. | Rising p95 during the window confirms the slow searches are systemic, not one-off. |
+| [Search Latency p99 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p99-ms) | The tail that the slowlog captures most. | p99 spiking maps almost one-to-one to slowlog rows in the table. |
+| [Search Error Rate %](/nerve-centre/kpi-cards/elasticsearch/search-error-rate) | The failure mode when slow becomes timeout. | Errors plus slow searches in checkout means some shoppers got no results at all. |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | Heavy facet/aggregation queries inflate heap and slow everything. | Heap pressure during the window explains why otherwise-fine queries went slow. |
+| [Search QPS Spike vs Ecom Traffic](/nerve-centre/kpi-cards/elasticsearch/search-qps-spike-vs-ecom-traffic) | The volume-side cross-channel peer. | A QPS spike that drove the slow searches points at load, not query shape. |
+| [ES Search Pool Saturation vs Ecom Burst](/nerve-centre/kpi-cards/elasticsearch/es-search-pool-saturation-vs-ecom-burst) | The capacity-side cross-channel peer. | Pool saturation during the window means queuing, the mechanism behind the slow latencies. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch and the storefront:**
+
+> **The search slowlog** is the primary source. It is configured per index via `index.search.slowlog.threshold.query.warn` (and `.info`, `.debug`, `.trace`); the logged entries land in the slowlog file/index and contain the query text, `took` time, and index. Confirm the threshold matches the 1s the card assumes.
+> **`GET /<index>/_settings?include_defaults=true&filter_path=**.slowlog`** confirms the active slowlog thresholds for the product index.
+> **`GET /<index>/_stats/search`** gives `query_time_in_millis` and `query_total` so you can corroborate that average latency rose in the window.
+> On the storefront side, reconcile the checkout-drop half against the platform's own funnel report (Shopify checkout/conversion analytics, BigCommerce analytics, or Adobe Commerce reports) for the same 5 minutes.
+
+**Why our number may legitimately differ from a raw slowlog read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Slowlog threshold mismatch** | more or fewer rows | If your index threshold is not 1s, the slowlog captures a different set; the card uses the configured threshold, so align them. |
+| **Slowlog disabled** | fewer rows | With no slowlog, the card falls back to stats-derived slow flags, which lack query text and may miss some entries. |
+| **Checkout-window definition** | rows in/out of scope | A slow search just outside the active checkout window is excluded; the boundary depends on how the connector defines an active checkout session. |
+| **Conjunction logic** | no alert despite slow searches | More than 5 slow searches with no checkout drop will not fire this card by design; check the latency cards instead. |
+| **Time zone** | timestamps shift | Slowlog timestamps are UTC; the card renders the 5m table in your Vortex IQ display time zone. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| Storefront checkout conversion (Shopify/BigCommerce/Adobe) | The checkout-drop half should match the platform's own funnel figure for the window. | If the storefront shows no drop, the conjunction fails and the card should not have alerted; recheck the connector's conversion source. |
+| [Search Latency p99 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p99-ms) | The slowlog rows should align with a p99 spike in the same window. | If p99 is flat but the table is full, your slowlog threshold may be set too low and is catching normal queries. |
+
+<details>
+<summary><em>Cross-engine note (same concept on other search backends)</em></summary>
+
+The "slow query at a revenue-critical moment" join is engine-agnostic. On OpenSearch the same per-index search slowlog settings apply. On Solr the equivalent is the slow-query log driven by `slowQueryThresholdMillis`; on Algolia it is the per-query `processingTimeMS` available in the Search Insights/analytics. Listed only for teams running more than one engine; the Vortex IQ card reconciles against your Elasticsearch slowlog and your connected storefront funnel.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does this card need a checkout drop as well as slow searches? Slow searches are bad on their own.**
+Because slow searches on their own are handled by the latency and slow-query-rate cards. This card exists to answer a sharper question: are slow searches costing conversions right now? The conjunction of "more than 5 slow searches" AND "checkout conversion dropped in the same window" is the strongest cheap signal that latency is directly hurting revenue. Without the checkout half, you cannot distinguish "search is slow" from "search is slow and it matters".
+
+**The table is empty but I know search felt slow. Why?**
+Three common reasons: (1) the slow searches did not fall inside an active checkout window, so they are excluded by design; (2) your slowlog threshold is higher than the queries' `took` time, so they were never logged as slow; (3) the slowlog is not enabled, so the card is on its stats-based fallback and may miss entries. Check `GET /<index>/_settings ... slowlog` to confirm the threshold.
+
+**What is the right slowlog threshold for a storefront product index?**
+For shopper-facing search, 1s is already generous: most shoppers perceive anything over a few hundred milliseconds as sluggish. Many teams set `threshold.query.warn` to 1s and `threshold.query.info` to 500ms so they capture the merely-sluggish as well as the genuinely slow. Set it to match what you consider unacceptable for a live shopper, not what is comfortable for a back-office report.
+
+**Several rows are the same query shape. Is that normal?**
+It is the most useful thing the table can show you. Repeated identical slow queries (here, an 8-aggregation facet search) mean you have a single expensive query pattern firing under load, which is a precise fix target: cap the aggregation, add a request cache, pre-compute facets, or route it to a dedicated node. One durable fix removes many future rows.
+
+**Could a checkout drop be caused by something other than slow search even when this card fires?**
+Yes, correlation is not proof. A payment-gateway hiccup or a cart bug could cause the checkout drop while slow searches happen coincidentally. The card raises the hypothesis; you confirm it by checking whether the slow searches were in the search-to-cart path and whether fixing the query shape recovers conversion. Pair with the storefront's payment and cart signals to rule out other causes.
+
+**Does the 5-minute window mean I only get 5 minutes to react?**
+The window is the analysis window, not a deadline. The card recomputes on each refresh over a rolling 5 minutes, so a sustained problem keeps the alert raised window after window. The short window is chosen so the co-occurrence is tight and causal; a longer window would average away the exact moment of impact and weaken the signal.
+
+**We run facet-heavy search. Will this card alert constantly during every peak?**
+If it does, that is a true positive worth acting on, not noise: it means your facet queries genuinely cross the slow threshold under load and genuinely coincide with conversion dips. The remedy is to make the heavy query cheap (filter caches, fewer aggregations, pre-computed facets) so it stops crossing the threshold at peak. The card is telling you the storefront's busiest moments are also its slowest, which is the worst possible combination for revenue.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow Searches During Checkout Window (5m)* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

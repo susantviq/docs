@@ -1,0 +1,157 @@
+---
+title: "DBU by Cluster (7d), Databricks"
+sidebarTitle: "DBU by Cluster (7d)"
+description: "DBU by Cluster (7d) for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [DBU Burn](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Databricks Units (DBU) consumed over the last 7 days, attributed per cluster and ranked highest first. DBU is the normalised unit Databricks bills on: every cluster, SQL warehouse, and job-compute resource burns DBU per hour at a rate set by instance type and workload (Jobs, All-Purpose, SQL). This card answers the question a platform owner asks every Monday: "Which clusters spent our money last week, and is the ranking what I expected?" A single cluster quietly dominating the bar chart is the most common root cause of an unexplained invoice.
+
+| | |
+| --- | --- |
+| **Data source** | Databricks billable usage. The card reads from `system.billing.usage` (Unity Catalog system tables) where available, falling back to the account-level Billable Usage download / `GET /api/2.1/usage` log when system tables are not enabled. Each row carries `usage_date`, `sku_name`, `usage_quantity` (DBU), and `usage_metadata.cluster_id`. |
+| **What it counts** | DBU only, not the cloud-infrastructure (EC2 / VM / blob) cost that sits underneath. DBU multiplied by your negotiated `$/DBU` rate gives the Databricks line of the bill; the cloud-provider line is separate. |
+| **Attribution** | Grouped by `cluster_id`, then resolved to the human-readable cluster name via the Clusters API. Job-compute clusters (ephemeral, created per run) are rolled up under the job name where the `job_id` tag is present; orphaned compute with no tag appears as "Unattributed". |
+| **Aggregation window** | Rolling 7 days, midnight-aligned to the workspace time zone. The bar chart shows the per-cluster total for the window; hovering a bar reveals the daily breakdown. |
+| **Time window** | `7d` (rolling 7 days) |
+| **Alert trigger** | `-` (no hard alert; this is a ranking / attribution card, not a threshold card). Pair with [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) and [DBU Burn +50% Week-over-Week](/nerve-centre/kpi-cards/databricks/dbu-burn-50-week-over-week) for the alerting view. |
+| **Roles** | owner, platform engineering, finance / FinOps |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+For each cluster in the workspace, Vortex IQ sums `usage_quantity` (the DBU figure) across all `system.billing.usage` rows whose `usage_date` falls inside the rolling 7-day window and whose `usage_metadata.cluster_id` matches that cluster:
+
+```text
+DBU(cluster, 7d) = Σ usage_quantity
+                   WHERE usage_date >= today - 7
+                   AND usage_metadata.cluster_id = <cluster_id>
+```
+
+The clusters are then sorted descending and rendered as a horizontal bar chart. Three details matter:
+
+1. **All SKUs are included.** A single cluster can burn DBU under more than one `sku_name` (for example `ENTERPRISE_ALL_PURPOSE_COMPUTE` for interactive use and `ENTERPRISE_JOBS_COMPUTE` if it also runs scheduled jobs). The card sums across SKUs per cluster so the bar reflects total spend on that cluster, not one workload type.
+2. **DBU, not currency, is the native unit.** The card displays DBU because the `$/DBU` rate varies by SKU and by contract. If your connector profile carries a blended rate, an optional currency overlay is shown; otherwise DBU is authoritative and directly reconcilable against the Databricks account console.
+3. **Photon and serverless are counted.** Photon-accelerated clusters burn DBU at a higher multiplier; serverless SQL and serverless jobs report their own SKUs. All appear in the same ranking so a "cheap looking" serverless workload that is actually expensive is not hidden.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A retail analytics platform team runs a single Databricks workspace on AWS feeding the company's reporting lakehouse. Snapshot taken on 15 Apr 26 covering 08 Apr 26 to 15 Apr 26.
+
+| Rank | Cluster | DBU (7d) | Workload | Notes |
+| --- | --- | --- | --- | --- |
+| 1 | `prod-etl-nightly` | 4,210 | Jobs compute | Nightly Delta ingestion, 6 jobs |
+| 2 | `analyst-shared-ap` | 3,880 | All-purpose | Shared interactive cluster, 14 analysts |
+| 3 | `ml-feature-build` | 1,640 | Jobs compute | Photon on, daily feature pipeline |
+| 4 | `prod-etl-hourly` | 990 | Jobs compute | Hourly micro-batch |
+| 5 | Unattributed | 520 | Mixed | No `job_id` / `cluster_name` tag |
+
+Total for the week: **11,240 DBU**. At the team's blended rate of £0.42/DBU that is roughly **£4,720** of Databricks spend for the week, before the underlying AWS EC2 cost.
+
+What the platform owner reads from this:
+
+1. **The nightly ETL is the biggest line, and that is expected.** `prod-etl-nightly` topping the chart is healthy: it is the workload that produces the business's core tables. The owner's job here is not to cut it but to confirm it has not crept. Comparing against last week's snapshot, it was 3,950 DBU, so a 7% rise. Worth a glance but not an alarm; pair with [Avg DBU per Job Run](/nerve-centre/kpi-cards/databricks/avg-dbu-per-job-run) to see whether the rise is more runs or heavier runs.
+2. **The shared all-purpose cluster is the suspicious line.** `analyst-shared-ap` at 3,880 DBU is almost as expensive as the entire production ETL, and it is interactive, meaning analysts leave it running. Cross-reference [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h): if a large slice of that 3,880 was burned with no active query, the fix is a tighter auto-termination setting (drop from 120 minutes to 30) rather than a smaller cluster.
+3. **The "Unattributed" bar is a governance gap, not a workload.** 520 DBU with no tag means some compute is being created without the team's tagging policy applied (often ad-hoc clusters spun up from notebooks). It is only 4.6% of spend today, but untagged compute is the seed of next quarter's unexplained invoice. The action is to enforce a cluster policy that requires the `cost_centre` / `job_id` tag.
+
+```text
+Quick FinOps framing for the week:
+  Production (ETL + ML, ranks 1/3/4):  6,840 DBU  → core, justified
+  Interactive (analyst shared, rank 2): 3,880 DBU  → review idle %
+  Untagged (rank 5):                      520 DBU  → close the tagging gap
+  -----------------------------------------------------------------
+  Optimisation headroom this week:    ~1,500-2,000 DBU if idle + untagged tightened
+```
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with DBU by Cluster | What the combination tells you |
+| --- | --- | --- |
+| [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) | The headline daily total this card decomposes. | If the 24h total spikes, this card shows which cluster caused it. |
+| [DBU Burn +50% Week-over-Week](/nerve-centre/kpi-cards/databricks/dbu-burn-50-week-over-week) | The anomaly alert across the same 7-day window. | When the alert fires, the offending bar is the one that grew. |
+| [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h) | Splits the per-cluster spend into useful vs wasted. | A big bar that is mostly idle is the highest-ROI tuning target. |
+| [Avg DBU per Job Run](/nerve-centre/kpi-cards/databricks/avg-dbu-per-job-run) | Per-run efficiency for the job clusters in the ranking. | Tells you whether a rising bar is more runs or heavier runs. |
+| [Avg Cluster CPU Utilisation %](/nerve-centre/kpi-cards/databricks/avg-cluster-cpu-utilisation) | The right-sizing signal for the same clusters. | High DBU with low CPU equals an over-provisioned cluster. |
+| [Active Clusters](/nerve-centre/kpi-cards/databricks/active-clusters) | How many clusters are live right now. | A long tail of small bars maps to too many clusters left running. |
+| [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume) | The cross-channel efficiency check. | Spend rising while order volume is flat means inefficient pipelines, not growth. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **Account console → Usage** is the authoritative billing view. Filter by the 7-day range and group by cluster to match this card.
+> **System tables**: query `system.billing.usage` directly in a SQL warehouse, grouping by `usage_metadata.cluster_id` and summing `usage_quantity` for the same dates. This is the exact source the card reads.
+> **Cluster details**: the Compute page shows each cluster's DBU/hour rate and current state to sanity-check the per-bar attribution.
+
+A reconciling query you can run in a Databricks SQL editor:
+
+```sql
+SELECT usage_metadata.cluster_id,
+       SUM(usage_quantity) AS dbu_7d
+FROM   system.billing.usage
+WHERE  usage_date >= current_date() - INTERVAL 7 DAYS
+GROUP  BY usage_metadata.cluster_id
+ORDER  BY dbu_7d DESC;
+```
+
+**Why our number may legitimately differ from the console:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Billing lag** | Vortex IQ may read low | `system.billing.usage` lands with up to a few hours of delay; the most recent day can still be filling. The account console smooths this once finalised. |
+| **Time zone** | Edge-day shift | The card aligns the 7-day window to the workspace time zone; the console download defaults to UTC. A job that runs near midnight can fall on either side. |
+| **SKU rollup** | Naming differences | The card resolves `cluster_id` to a friendly name; the console groups by SKU first. Same totals, different grouping. |
+| **Serverless attribution** | Possible gap | Serverless SQL bills at the warehouse, not a classic `cluster_id`. Those appear under [Active SQL Warehouses](/nerve-centre/kpi-cards/databricks/active-sql-warehouses) attribution rather than a cluster bar. |
+| **Account vs workspace scope** | Vortex IQ may read low | The console can show all workspaces in the account; this card is scoped to the connected workspace only. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume) | Total of the bars should track ecom order volume week to week. | Bars rising while orders are flat equals inefficient or runaway pipelines. |
+| [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) | Roughly one seventh of this card's total per day, in steady state. | A single day far above the 7-day average shows up as a tall daily segment on hover. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is DBU shown instead of pounds or dollars?**
+DBU is the unit Databricks itself bills on and the only figure that reconciles exactly against the account console. The `$/DBU` rate varies by SKU (Jobs compute is cheaper than All-Purpose) and by your contract, so converting to currency requires a blended rate that can mislead. If your connector profile carries that rate, a currency overlay is shown, but DBU stays authoritative.
+
+**A cluster I deleted last week still appears in the chart. Is that a bug?**
+No. The card attributes the DBU that cluster burned while it was alive during the 7-day window. Deleting a cluster does not erase its historical usage. The bar will roll off naturally as those days exit the rolling window.
+
+**What is the "Unattributed" bar?**
+Compute whose usage rows carry no resolvable `cluster_id` or `job_id` tag, typically ad-hoc clusters created from notebooks without your tagging policy applied. It is a governance signal: enforce a cluster policy that mandates a `cost_centre` tag and the bar shrinks toward zero.
+
+**Does this include the underlying cloud (EC2 / VM) cost?**
+No. DBU is the Databricks software charge only. The cloud-provider compute and storage sit on a separate invoice from AWS, Azure, or GCP. To see total cost of ownership, add your cloud bill to the DBU spend; this card covers the Databricks line.
+
+**My system tables are not enabled. Does the card still work?**
+Yes, with a fallback. If `system.billing.usage` is not available (Unity Catalog system schemas not turned on), the engine reads the account-level Billable Usage log via the usage API. The granularity is slightly coarser (it may attribute by SKU and tag rather than precise `cluster_id`), but the per-cluster ranking is preserved where tags exist. Enabling system tables gives the most accurate attribution.
+
+**Serverless SQL is a big part of our spend but I do not see it here.**
+Serverless SQL bills at the warehouse level, not against a classic interactive `cluster_id`, so it is attributed to [Active SQL Warehouses](/nerve-centre/kpi-cards/databricks/active-sql-warehouses) rather than appearing as a cluster bar. The total DBU is still captured in [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h); the per-cluster chart is specifically the classic-compute view.
+
+**Why does the biggest bar change which cluster it is from week to week?**
+Healthy variation. Month-end reporting jobs, ad-hoc model retraining, or a backfill will temporarily push a normally small cluster to the top. The card is most useful read as a trend: a cluster that climbs the ranking for three weeks running is the one to investigate, not a one-week spike that has an obvious cause.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*DBU by Cluster (7d)* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,155 @@
+---
+title: "Query Error Rate Spike (>1% in 1h), Snowflake"
+sidebarTitle: "Query Error Rate Spike (>1% in 1h)"
+description: "Query Error Rate Spike (>1% in 1h) for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> An alert that fires when more than 1% of Snowflake statements fail over a sustained one-hour window. A healthy production account sits well under 1%: the background noise of cancelled queries and the odd syntax error from an ad-hoc worksheet. When the failure rate crosses 1% and stays there for an hour, something systemic has broken: a permissions change, a schema migration that dropped a column a job still references, a warehouse that keeps hitting statement timeouts, or an upstream load that is feeding malformed data. This card turns that into a single page rather than a flood of individual failures.
+
+| | |
+| --- | --- |
+| **What it tracks** | The proportion of statements ending in a failure state over a rolling one-hour window, evaluated against the 1% threshold. |
+| **Data source** | `detail`: Alerts for Query Error Rate Spike (>1% in 1h). Computed from `EXECUTION_STATUS` and `ERROR_CODE` in `SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY`. |
+| **Time window** | `1h` (rolling one-hour window). |
+| **Alert trigger** | `>1% sustained 1h`. Error rate above 1% held for the full hour, not a single-minute blip. |
+| **Roles** | owner, platform, SRE, data engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calc */}
+The engine reads completed statements from `QUERY_HISTORY` over the trailing hour and computes:
+
+```text
+error_rate = failed_statements / total_statements   (over the rolling 1h window)
+
+FIRE when error_rate > 0.01 sustained for the full hour
+```
+
+A statement counts as failed when its `EXECUTION_STATUS` is `FAIL`. User-initiated cancellations (`EXECUTION_STATUS = 'INCIDENT'` or explicit cancels) are handled separately so a developer aborting their own slow query does not inflate the rate. The `ERROR_CODE` and `ERROR_MESSAGE` columns are carried through so the alert can group failures by cause: a wall of identical error codes (for example `002003` object does not exist, or `000604` statement reached its timeout) tells the on-call exactly which class of failure is driving the spike.
+
+The "sustained" qualifier matters. A schema deploy can momentarily push the error rate above 1% for a minute as in-flight queries hit a table mid-rename. The card requires the breach to hold across the hour window before it pages, which filters those self-healing blips while still catching a real, persistent failure mode. Because `QUERY_HISTORY` in `ACCOUNT_USAGE` carries up to ~45 minutes of latency, the live-view variant of this card also reads `INFORMATION_SCHEMA.QUERY_HISTORY` (low latency, last 7 days) so the spike is caught in near real time rather than 45 minutes late.
+{/* /HUMAN_AUTHORED:calc */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A data engineering team runs a Snowflake account behind an ecommerce analytics stack. At 14:00 on 18 Apr 26 a deploy renamed `ORDERS.SHIPPING_ADDRESS` to `ORDERS.SHIP_ADDRESS` but missed three downstream views and a reverse-ETL job. Snapshot of the 14:00 to 15:00 window:
+
+| Metric | Prior baseline (hourly) | 14:00 to 15:00 window |
+| --- | --- | --- |
+| Total statements | ~9,000 | 9,140 |
+| Failed statements | ~20 (0.2%) | 412 (**4.5%**) |
+| Dominant error code | mixed | `002003` object does not exist |
+
+The error rate held at 4.5% for the full hour, so the alert fired at 14:08 once the breach was sustained. The dashboard groups the failures by code:
+
+```text
+Error breakdown, 14:00 to 15:00:
+  002003 object/column does not exist   388 failures  (94%)
+  000604 statement timeout               14 failures
+  003001 insufficient privileges          6 failures
+  other                                    4 failures
+```
+
+The 94% concentration on a single "does not exist" code points straight at the schema change. The on-call engineer does the following, in order:
+
+1. **Read the dominant code, not the count.** 388 of 412 failures are the same object-not-found error. This is one root cause, not 412 problems. The deploy is the obvious suspect given the timing.
+2. **Confirm the blast radius.** The failing statements reference `SHIPPING_ADDRESS` across three views and one job. Storefront dashboards relying on those views are showing stale or empty data, so the impact is visible to business users even though the warehouse itself is healthy.
+3. **Decide: roll forward or roll back.** Fastest safe fix is a backward-compatible view that aliases `SHIP_ADDRESS AS SHIPPING_ADDRESS`, restoring the contract in minutes while the downstream objects are updated properly.
+4. **Watch the rate decay.** Once the alias ships, the rolling rate should fall back under 1% within the hour as the failing queries start succeeding. The card auto-resolves when the window drops below threshold.
+
+```text
+Impact framing:
+  ~400 failed statements/hour, mostly dashboard refreshes feeding ops and merchandising teams.
+  No direct credit cost (failed queries still consume compute up to the failure point), but
+  several hours of stale operational reporting until the alias lands.
+```
+
+The lesson: in Snowflake the error-rate spike is usually a contract break (schema, permissions, or data shape), and the dominant `ERROR_CODE` is the fastest route to root cause. Read the code distribution before you read anything else.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Error Rate Spike | What the combination tells you |
+| --- | --- | --- |
+| [Query Error Rate %](/nerve-centre/kpi-cards/snowflake/query-error-rate) | The continuous gauge this alert is built on. | The gauge shows the trend; the alert pages when it crosses 1% sustained. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/snowflake/top-10-slowest-queries) | Failures and timeouts often share a root cause. | If `000604` timeout dominates, the slow-query list shows which statements are timing out. |
+| [Failed Logins (24h)](/nerve-centre/kpi-cards/snowflake/failed-logins-24h) | The authentication-side error peer. | A privilege-error spike (`003001`) alongside failed logins suggests a broken role grant after an access change. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/snowflake/query-latency-p95-ms) | Latency and timeouts move together. | Rising p95 plus timeout-driven failures equals an undersized or saturated warehouse. |
+| [Warehouse Queueing Sustained](/nerve-centre/kpi-cards/snowflake/warehouse-queueing-sustained-5-queries-queued) | Queue overflow can surface as failures. | Sustained queueing plus timeout errors means the warehouse cannot keep up. |
+| [Snowflake Health Score](/nerve-centre/kpi-cards/snowflake/snowflake-health-score) | The composite that weights error rate. | A firing error-spike alert pulls the headline score below threshold. |
+| [Slow Analytics Queries During Checkout Window](/nerve-centre/kpi-cards/snowflake/slow-analytics-queries-during-checkout-window) | The cross-channel revenue-risk peer. | Error and slowness during a checkout window is the highest-priority combination. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake:**
+
+> **`SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY`** is the authoritative statement ledger. Filter `EXECUTION_STATUS = 'FAIL'` over the hour to reproduce the numerator.
+> **`INFORMATION_SCHEMA.QUERY_HISTORY`** (table function) for the low-latency live view used to catch the spike in near real time.
+> **Snowsight, Monitoring to Query History** for the managed-service console view, where you can filter by status and group by error message.
+
+A representative reconciliation query:
+
+```sql
+SELECT COUNT_IF(EXECUTION_STATUS = 'FAIL') AS failed,
+       COUNT(*) AS total,
+       ROUND(100 * failed / NULLIF(total, 0), 2) AS error_pct
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+WHERE START_TIME >= DATEADD('hour', -1, CURRENT_TIMESTAMP());
+```
+
+**Why our number may legitimately differ from Snowflake's console:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **ACCOUNT_USAGE latency** | Lag | `ACCOUNT_USAGE.QUERY_HISTORY` can lag up to ~45 minutes; the live card reads `INFORMATION_SCHEMA` to compensate, so a fresh worksheet query against ACCOUNT_USAGE may show fewer rows than the live card. |
+| **Cancellation handling** | Vortex IQ rate lower | User-cancelled statements are excluded from the failure numerator; a Snowsight filter on "not success" will include cancellations and read higher. |
+| **Time zone** | Window edges shift | Snowsight groups in account time zone; Vortex IQ aligns to your reporting time zone. |
+| **Statement scope** | Variable | The card counts statements, including DDL and utility commands; a view filtered to SELECTs only will read a different denominator. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | A spike that breaks reporting views does not directly move revenue, but breaks the dashboards leadership uses to watch it. | Revenue flat while the error spike runs confirms the impact is reporting visibility, not storefront. |
+| [Slow Analytics Queries During Checkout Window](/nerve-centre/kpi-cards/snowflake/slow-analytics-queries-during-checkout-window) | Co-occurring slowness and errors during peak commerce windows. | If both fire together, prioritise; analytics load is contending with revenue-critical processing. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My developers cancel slow queries all the time. Will that trip the 1% threshold?**
+No. User-initiated cancellations are excluded from the failure numerator. The card counts statements that ended in `EXECUTION_STATUS = 'FAIL'`, which is a genuine error, not someone aborting their own query. If your cancellation volume is unusually high you can see it in Query History, but it will not inflate this alert.
+
+**Why 1% and why "sustained for an hour"?**
+A well-run production account sits comfortably below 1% failures: the residual noise of typos in ad-hoc worksheets and the occasional transient. Crossing 1% means a class of statements is failing systematically. The one-hour sustain requirement filters the brief self-healing blips (a schema deploy, a momentary warehouse hiccup) so you are paged for persistent breakage, not transients. Both the threshold and the window are tunable per profile in the Sensitivity tab.
+
+**The alert fired but each failure is a different error code. What does that mean?**
+A spread of unrelated error codes usually points at infrastructure rather than a single contract break: a warehouse hitting repeated statement timeouts under load, a network or cloud-services blip, or a credential expiry affecting multiple roles. Read the code distribution: a single dominant code is a clean root cause (schema, permission, data shape); a flat spread points at capacity or platform. Pair with [Query Latency p95](/nerve-centre/kpi-cards/snowflake/query-latency-p95-ms) and [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation).
+
+**Do failed queries still cost credits?**
+Yes, partially. A statement that fails part-way through has already consumed compute on its warehouse up to the point of failure, so a high-volume error spike does carry some credit cost even though no results are returned. It is rarely the headline cost, but a tight retry loop that fails repeatedly can add up; cross-check [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h).
+
+**Does this catch errors in tasks and Snowpipe, or only interactive queries?**
+It counts statements recorded in `QUERY_HISTORY`, which includes statements run by tasks and stored procedures. Snowpipe and serverless ingestion have their own histories (`COPY_HISTORY`, `PIPE_USAGE_HISTORY`) and are not folded into this rate; for ingestion failures use the ingest-focused cross-channel cards such as [Snowflake Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/snowflake/snowflake-event-ingest-vs-ecom-orders).
+
+**The console shows a different failure count than the card. Why?**
+Most often latency: `ACCOUNT_USAGE.QUERY_HISTORY` can lag up to 45 minutes, so a worksheet query against it during a live spike will undercount. The card reads the low-latency `INFORMATION_SCHEMA` view to stay current. Secondary causes are cancellation handling (the card excludes user cancels) and time-zone alignment on the window edges.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Error Rate Spike (>1% in 1h)* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

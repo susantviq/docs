@@ -1,0 +1,155 @@
+---
+title: "Connection Pool Saturation %, MongoDB"
+sidebarTitle: "Connection Pool Saturation %"
+description: "Connection Pool Saturation % for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How close your MongoDB deployment is to running out of connection slots, expressed as a percentage. Every `mongod` has a hard ceiling on concurrent connections; this gauge shows what fraction of that ceiling is currently in use. At low values you have headroom; as it climbs toward 100% you approach the point where new connections are refused and your application starts throwing connection errors. The card turns red at `>90%`: at that point a single traffic burst or a misbehaving client can tip the deployment into refusing connections, which presents to users as a hard outage.
+
+| | |
+| --- | --- |
+| **What it tracks** | The proportion of the deployment's total connection capacity that is currently consumed, as a live gauge from 0% to 100%. |
+| **Data source** | `connections.current / (connections.current + connections.available)` from `serverStatus`. `current` is connections open now; `available` is the remaining headroom before the ceiling; their sum is the effective ceiling for this member. |
+| **Time window** | `RT/1m` (real-time, evaluated over a 1-minute window). The gauge shows the live value; the alert requires the breach to be sustained for a minute to avoid firing on momentary spikes. |
+| **Alert trigger** | `>90%`. Saturation above 90%, sustained over the 1-minute window, raises a sensitivity alert. By 90% you have very little margin before connection refusals begin. |
+| **What counts** | All client connections counted in `connections.current` against this member, including application drivers, `mongosh` sessions, monitoring agents, and replication-internal connections where applicable. |
+| **What does NOT count** | The ceiling is per-`mongod`, so connections to other members are not in this member's figure. The OS file-descriptor limit (`ulimit -n`) can cap the effective ceiling below the configured `maxIncomingConnections`. |
+| **Roles** | owner, platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The gauge is a direct ratio of two fields in the `connections` sub-document of `serverStatus`:
+
+```text
+pool_saturation_pct = connections.current
+                      / ( connections.current + connections.available )
+                      x 100
+```
+
+What the inputs mean:
+
+- **`connections.current`** is the number of incoming connections open to this `mongod` right now.
+- **`connections.available`** is the number of additional incoming connections the member can still accept before hitting its ceiling.
+- Their **sum is the effective ceiling** for this member, which is the smaller of the configured `net.maxIncomingConnections` and what the operating system's file-descriptor limit allows. This is the crucial subtlety: even if you configure a high `maxIncomingConnections`, a low `ulimit -n` silently caps the real ceiling, so `available` (and therefore this gauge) reflects the true limit, not the configured one.
+
+Important framing points:
+
+- **This is server-side saturation, not driver-pool saturation.** It measures how full the `mongod`'s connection capacity is, not how busy any one application's client-side connection pool is. A single application with a generous `maxPoolSize` across many instances is the usual driver of this gauge.
+- **Per-member.** On a replica set the gauge reflects the member polled (normally the primary, which carries writes and primary reads). A secondary serving heavy read traffic has its own, independent saturation.
+- **The 1-minute window on the alert** smooths over transient bursts: a brief spike to 92% that immediately recedes will not page, but a sustained climb past 90% will.
+
+The output is a single live percentage rendered on a gauge, with the raw `current` and `available` counts available on drill-down.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MongoDB 6.0 primary serving an order API from a fleet of 40 application pods. Each pod's driver is configured with `maxPoolSize: 100`. The `mongod` has `net.maxIncomingConnections` set to 5000, but the host's `ulimit -n` is 4096, so the effective ceiling is lower than the config suggests. Readings taken across a flash-sale on 03 Jun 26.
+
+| Time (UTC) | current | available | Saturation | State |
+| --- | --- | --- | --- | --- |
+| 09:00 | 1,180 | 2,820 | **29.5%** | Normal weekday |
+| 13:55 | 2,640 | 1,360 | **66.0%** | Sale ramping |
+| 14:02 | 3,690 | 410 | **90.0%** | Red, alert fires |
+| 14:05 | 3,990 | 10 | **99.8%** | Refusals imminent |
+
+At 09:00 the deployment sits at a comfortable 29.5%, well inside its headroom. As the flash-sale drives traffic, more pods open more connections; by 14:02 the gauge crosses 90% and the sustained-1-minute alert fires. Note the effective ceiling here is roughly 4,000 (`current + available`), the OS file-descriptor limit, not the 5,000 configured. By 14:05 only 10 slots remain and the next surge of new connections will be refused, surfacing to the application as `connection refused` or `pool exhausted` errors and, to shoppers, as failed checkouts.
+
+```text
+Why it saturated:
+  40 pods x 100 maxPoolSize  =  4,000 possible connections
+  Effective ceiling (ulimit) ~  4,000
+  Conclusion: at full driver-pool expansion the fleet can EXACTLY exhaust
+              the server ceiling, leaving no margin for mongosh, agents,
+              or a scale-up event.
+```
+
+The DBA's response has an immediate lever and a structural fix:
+
+1. **Immediate:** raise the host `ulimit -n` (and `maxIncomingConnections` if needed) to lift the ceiling, giving instant headroom without touching the application. This is the fastest way back below 90%.
+2. **Structural:** the fleet's total potential connections (40 x 100) is sized to exactly exhaust the server. The right fix is to lower each driver's `maxPoolSize` (most order APIs do not need 100 connections per pod) so the fleet's worst-case demand sits comfortably under the ceiling, and to confirm the application is returning connections to the pool promptly rather than holding them open.
+
+Three takeaways:
+
+1. **The configured limit is not always the real limit.** `maxIncomingConnections` can be silently capped by the OS file-descriptor limit. Because this gauge derives the ceiling from `current + available`, it shows the true limit, which is exactly why it sometimes saturates lower than your config implies.
+2. **Saturation is driven by the client fleet, not by query volume.** You can have modest [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) and still saturate the pool if many idle clients each hold connections open. Check pool sizing and connection-return behaviour, not just throughput.
+3. **90% is a "fix it now" line, not a "watch it" line.** Unlike a slowly drifting capacity metric, connection saturation fails as a cliff: everything works at 95%, then nothing works at 100%. Treat a sustained red reading as imminent outage, not as a trend to monitor.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Connection Pool Saturation | What the combination tells you |
+| --- | --- | --- |
+| [Connections In Use](/nerve-centre/kpi-cards/mongodb/connections-in-use) | The raw `current` count behind this percentage. | Watching the absolute count alongside the ratio shows whether the ceiling or the demand is changing. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mongodb/connection-errors-24h) | The downstream symptom once saturation hits 100%. | Rising connection errors immediately after a saturation spike confirms refusals are now happening. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | Separates "busy" from "many idle connections". | High saturation with low ops means idle clients holding connections, not real load. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) | Slow queries hold connections longer, inflating saturation. | Saturation and p95 rising together points to slow ops backing up the pool. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/mongodb/connection-pool-at-90-saturation) | The alert-feed companion to this gauge. | The gauge shows the live value; the alert card logs each sustained breach for the on-call timeline. |
+| [MongoDB Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/mongodb/mongodb-pool-saturation-vs-traffic-burst) | Correlates saturation with ecom traffic spikes. | Saturation climbing in lockstep with a traffic burst is capacity; saturation high without a burst is a client leak. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to confirm the number in MongoDB's own tooling:**
+
+> **`mongosh`:** `db.serverStatus().connections` returns `{ current, available, totalCreated, active, ... }`. Compute `current / (current + available)` to reproduce this gauge exactly.
+> **`mongostat`:** the `conn` column shows the live connection count (`current`); compare it against your known ceiling.
+> **Atlas:** the **Metrics** tab has a **Connections** chart showing current connections against the configured limit; Atlas also exposes a Connections alert.
+> **OS limit:** check `ulimit -n` for the `mongod` process, since the effective ceiling is the smaller of `maxIncomingConnections` and the file-descriptor limit.
+
+**Why our number may legitimately differ from the native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Effective vs configured ceiling** | Vortex IQ higher | We derive the ceiling from `current + available` (the real limit). If you compute against the configured `maxIncomingConnections` instead, your percentage will look lower. |
+| **Member polled** | Either | The gauge reads one `mongod` (normally the primary). A native tool pointed at a secondary shows that member's separate saturation. |
+| **Sampling window** | Smoother | Vortex IQ evaluates over a 1-minute window for the alert; `mongostat` at 1-second intervals shows sharper transient peaks. |
+| **Counted connection types** | Marginal | Monitoring agents and `mongosh` sessions count toward `current`; a hand calculation that ignores them reads slightly lower. |
+| **Time zone** | Axis only | Chart axes use your profile zone; the ratio is zone-independent. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [MongoDB Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/mongodb/mongodb-pool-saturation-vs-traffic-burst) | Saturation should track ecom traffic during sales. | Saturation high with no traffic burst indicates a client-side connection leak rather than real demand. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | A sustained red saturation should pull the health score down. | If the score stays green during a saturation breach, check its capacity weighting in the sensitivity profile. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does the card saturate below the connection limit I configured?**
+Because the real ceiling is the smaller of `net.maxIncomingConnections` and the operating-system file-descriptor limit (`ulimit -n`) for the `mongod` process. If your config allows 20,000 connections but the OS allows 4,096, the effective ceiling is 4,096. This gauge derives the ceiling from `current + available`, so it reflects the true limit and saturates accordingly. Raise `ulimit -n` to lift the real ceiling.
+
+**Saturation is high but operations per second is low. What does that mean?**
+Many connections are open but few are doing work: idle clients holding connections, an oversized driver `maxPoolSize`, or an application not returning connections to the pool promptly. The fix is on the client side: reduce pool sizes to match real concurrency and ensure connections are released after use. High saturation is about how many slots are held, not how busy they are.
+
+**What actually happens when this hits 100%?**
+New incoming connections are refused. Existing connections keep working, but any client trying to open a fresh connection gets a connection error, which drivers usually surface as a pool-exhausted or connection-refused exception. To users this looks like sudden failures even though the database itself is otherwise healthy. That cliff edge is why the alert fires at 90%, not 99%.
+
+**Does this gauge include connections to secondaries?**
+No. `serverStatus.connections` is per-member, and the card normally polls the primary. A secondary serving heavy reads has its own, independent saturation. If you read from secondaries, monitor their saturation separately, because a read-heavy secondary can saturate while the primary looks fine.
+
+**Why is the alert "sustained 1 minute" rather than instant?**
+Connection counts spike briefly during normal events: a deploy that recycles pods, a batch job opening a burst of connections, a brief reconnect storm after a network blip. Requiring the breach to persist for a minute avoids paging on those transients while still catching a genuine climb toward the ceiling well before refusals begin.
+
+**How do I create headroom quickly during an incident?**
+Two levers. The fast one is to raise the ceiling: increase `ulimit -n` (and `maxIncomingConnections` if it is the binding limit), which takes effect for new connections without changing the application. The durable one is to reduce demand: lower each application instance's driver `maxPoolSize` so the whole fleet's worst-case connection demand sits comfortably below the ceiling, and confirm the app returns connections promptly.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connection Pool Saturation %* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

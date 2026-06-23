@@ -1,0 +1,162 @@
+---
+title: "Active Parts (Top 10 Tables), ClickHouse"
+sidebarTitle: "Active Parts (Top 10 Tables)"
+description: "Active Parts (Top 10 Tables) for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ingest & Merges](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The count of currently active (un-merged, live) data parts on each MergeTree table, ranked highest first. In ClickHouse, every insert writes a new part on disk, and a background process merges small parts into larger ones over time. When inserts outrun merges, parts pile up. A single table carrying more than 1,000 active parts is a merge-backlog warning, and once a partition crosses the configured cap it throws the `TOO_MANY_PARTS` error (code 252), which halts ingest on that table. This card is the early-warning view: it shows the backlog building before it breaks anything.
+
+| | |
+| --- | --- |
+| **Data source** | `SELECT table, count() FROM system.parts WHERE active GROUP BY table ORDER BY count() DESC LIMIT 10`. Only parts with `active = 1` are counted (inactive parts are merge leftovers awaiting cleanup and do not count against the cap). |
+| **What it tracks** | Per-table active part count for the ten busiest MergeTree tables. The headline surfaces the table with the highest count so a DBA sees the worst offender first. |
+| **Metric basis** | Part-level count from `system.parts`, not row count or byte size. A table can be tiny in bytes but dangerous in part count if inserts are small and frequent. |
+| **Why >1000 matters** | The default `parts_to_throw_insert` is 300 per partition (3000 in newer builds) and `max_parts_in_total` is 100,000 per table. Crossing 1,000 active parts on one table signals the merge scheduler is falling behind well before the hard cap, giving you runway to act. |
+| **Time window** | `RT` (real-time, recomputed on each dashboard refresh; `system.parts` is always current state). |
+| **Alert trigger** | `>1000 parts on any table`. Any single table breaching the threshold flags the card amber and pages the on-call DBA. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine runs a grouped count against `system.parts`, the system table that exposes one row per data part on the instance:
+
+```sql
+SELECT
+    database,
+    table,
+    count()                AS active_parts,
+    formatReadableSize(sum(bytes_on_disk)) AS size,
+    sum(rows)              AS rows
+FROM system.parts
+WHERE active
+GROUP BY database, table
+ORDER BY active_parts DESC
+LIMIT 10
+```
+
+The `WHERE active` clause is load-bearing. `system.parts` retains rows for inactive parts (parts that have been merged away but not yet physically deleted), and counting those would massively overstate the backlog. Only `active = 1` parts are live and only they count toward the `parts_to_throw_insert` cap that triggers code 252.
+
+The threshold of 1,000 is deliberately below the hard cap. ClickHouse starts to *delay* inserts (the `parts_to_delay_insert` soft limit, default 150 per partition) long before it throws. By the time a table sustains 1,000+ active parts across its partitions, the merge scheduler is demonstrably not keeping up, and the prudent action is to reduce insert frequency or increase merge throughput, not to wait for the hard error.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a self-managed ClickHouse cluster behind an analytics pipeline that ingests clickstream and order events for several storefronts. Snapshot taken on 14 Apr 26 at 09:40 BST during a marketing-driven traffic surge.
+
+| Database | Table | Active parts | Size | Rows |
+| --- | --- | --- | --- | --- |
+| events | `clickstream_raw` | **1,284** | 18.4 GiB | 412,000,000 |
+| events | `order_events` | 612 | 9.1 GiB | 88,400,000 |
+| events | `pageview_agg` | 144 | 22.0 GiB | 1,900,000,000 |
+| catalog | `product_snapshots` | 71 | 3.3 GiB | 12,100,000 |
+| events | `cart_events` | 58 | 1.2 GiB | 9,400,000 |
+
+The Nerve Centre headline reads **1,284 active parts on `events.clickstream_raw`**, outlined amber because it breaches the 1,000 threshold. The DBA reads three things:
+
+1. **`clickstream_raw` is the offender.** 1,284 parts against 412M rows means roughly 320,000 rows per part: small, frequent inserts. The ingest job is almost certainly inserting per-event or per-tiny-batch rather than batching.
+2. **It is the only table over threshold.** `order_events` at 612 is climbing but has runway; `pageview_agg` has only 144 parts despite holding 1.9B rows because it is fed by large batched inserts. This contrast is the diagnosis: the problem is insert *shape*, not data volume.
+3. **The clock is running.** At the current rate the partition will reach `parts_to_throw_insert` within the hour, after which ingest on that table stops with code 252 and the [Too Many Parts Errors (24h)](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h) counter starts climbing.
+
+```text
+Why clickstream_raw is accumulating parts:
+  - Ingest writes ~3 inserts/second, each ~50k rows
+  - Merge throughput on this node: ~1 merge completing every ~8 seconds
+  - Net: parts created faster than merged, backlog grows ~2 parts/sec
+  - Mitigation options, in order of speed:
+      1. Batch inserts to >=500k rows (fewer, larger parts) - fix at source
+      2. Raise background_pool_size so more merges run concurrently
+      3. OPTIMIZE TABLE events.clickstream_raw FINAL on a quiet partition (heavy, last resort)
+```
+
+The right fix here is at the source: the ingest job should buffer to larger batches (or use async inserts with `async_insert=1`) so each insert creates one substantial part rather than dozens of tiny ones. Raising `background_pool_size` buys time but does not address a pipeline that fundamentally over-inserts.
+
+Three takeaways:
+
+1. **Part count, not row count, is what breaks ingest.** A table with billions of rows in 144 parts is healthy; a table with 400M rows in 1,284 parts is in danger. Always read the part count, not the data size.
+2. **The top offender is almost always an insert-shape problem.** Frequent small inserts are the classic cause. Batching at the source resolves it permanently; tuning merges only buys time.
+3. **This card is the leading indicator for [Too Many Parts Errors (24h)](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h).** Act while this card is amber and the error counter stays at zero.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Active Parts | What the combination tells you |
+| --- | --- | --- |
+| [Too Many Parts Errors (24h)](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h) | The hard-failure counter this card predicts. | Active parts amber with zero errors equals runway; active parts amber with errors climbing equals ingest already breaking. |
+| [Too Many Parts Error or Parts Count >1000 on Any Table](/nerve-centre/kpi-cards/clickhouse/too-many-parts-error-or-parts-count-1000-on-any-table) | The Nerve Centre alert that wraps both this count and the error code. | This card is the table detail; the alert card is the paging surface. |
+| [Merges In Progress](/nerve-centre/kpi-cards/clickhouse/merges-in-progress) | The other half of the ingest-vs-merge balance. | High parts plus low merges in progress equals the merge scheduler is starved; raise `background_pool_size`. |
+| [Inserts per Second (live)](/nerve-centre/kpi-cards/clickhouse/inserts-per-second-live) | The inflow rate driving part creation. | Rising inserts/sec with rising part count confirms an insert-shape problem at the source. |
+| [Partition Count (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/partition-count-top-10-tables) | Sister table view: partitions rather than parts. | Many partitions plus many parts equals a partition-key that is too granular (e.g. by minute). |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/clickhouse/database-disk-usage) | Inactive parts awaiting cleanup consume disk. | Backlog plus rising disk usage means merge cleanup is also lagging. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that weights part backlog. | A single table over 1,000 parts pulls the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> Run the same query the card uses against `system.parts` from `clickhouse-client`:
+> ```sql
+> SELECT table, count() FROM system.parts WHERE active GROUP BY table ORDER BY count() DESC LIMIT 10
+> ```
+> Inspect the soft and hard caps with `SELECT * FROM system.merge_tree_settings WHERE name IN ('parts_to_delay_insert','parts_to_throw_insert','max_parts_in_total')`.
+> Watch live merge activity in `system.merges` and the pending-mutation/merge picture in `system.replicas` for replicated tables.
+> On **ClickHouse Cloud**, the same `system.parts` query works in the SQL console; the managed service also surfaces part-count health in its monitoring view.
+
+**Why our number may legitimately differ from a manual query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Snapshot timing** | Slightly higher or lower | `system.parts` is live state; parts are created and merged continuously. A query run two seconds later can differ by several parts on a busy table. |
+| **Replica scope** | Card may be higher | On a multi-node cluster the card aggregates the configured node; a manual query against one replica only sees that replica's parts. Use `clusterAllReplicas('cluster', system.parts)` to match. |
+| **Inactive parts** | Manual query higher if `active` omitted | Forgetting `WHERE active` counts merge leftovers and inflates the number. The card always filters to active parts. |
+| **Refresh cadence** | Card slightly stale | The card recomputes on dashboard refresh, not continuously; a sudden burst can outpace it by a refresh interval. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ClickHouse Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/clickhouse/clickhouse-event-ingest-vs-ecom-orders) | Part growth on event tables tracks ingest volume, which tracks order/click rate. | Parts climbing while orders are flat can mean a runaway producer or a retry storm inflating inserts. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is one table showing thousands of parts but the table is small in bytes?**
+Part count is driven by how often you insert, not how much data you insert. Thousands of small inserts create thousands of small parts regardless of total size. Batch your inserts (aim for parts of at least a few hundred thousand rows) or enable `async_insert` so the server buffers small inserts into larger parts before writing.
+
+**Is 1,000 parts a hard limit?**
+No. 1,000 is the card's warning threshold, set deliberately below the engine's caps. The real soft limit is `parts_to_delay_insert` (default 150 per partition, after which inserts are throttled) and the hard limit is `parts_to_throw_insert` (default 300 per partition, after which inserts throw code 252). Because those caps are per partition, a table spread across many partitions can hold well over 1,000 active parts in total, so the card's table-level threshold is an aggregate early warning, not the exact failure point.
+
+**The count keeps changing every time I refresh. Is the card wrong?**
+No. `system.parts` reflects live state and ClickHouse merges parts continuously in the background. On a busy table the active-part count naturally fluctuates by a few parts second to second as merges complete and new inserts land. The trend matters more than any single reading: a count that is rising over minutes is the signal, not the exact value.
+
+**I ran the same query and got a higher number than the card.**
+The most common cause is omitting `WHERE active`. `system.parts` keeps rows for inactive (merged-away) parts until they are physically cleaned up, and those should not be counted. The second most common cause on clusters is replica scope: the card aggregates the configured node, so a query against a single replica with `clusterAllReplicas` may show different totals.
+
+**Does this apply to all my tables or only MergeTree?**
+Only MergeTree-family tables (MergeTree, ReplicatedMergeTree, ReplacingMergeTree, and the rest) have parts. Engines like Log, Memory, and Distributed do not create parts and never appear on this card. The vast majority of analytical workloads use the MergeTree family, so in practice this covers what matters.
+
+**What is the fastest safe way to clear a backlog right now?**
+First, reduce or pause the inflow if you can, this stops the bleeding. Second, increase merge concurrency by raising `background_pool_size` so more merges run at once. Only as a last resort run `OPTIMIZE TABLE ... FINAL` on the affected partition: it forces a full merge but is I/O-heavy and can compete with live queries, so target a single partition during a quiet window rather than the whole table.
+
+**On ClickHouse Cloud, do I still need to watch this?**
+Yes. ClickHouse Cloud manages the infrastructure but does not change the physics of parts and merges. An ingest job that inserts in tiny batches will accumulate parts and can still hit `TOO_MANY_PARTS` on Cloud. The same `system.parts` query works in the Cloud SQL console, and the same fix (batch at the source or use async inserts) applies.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Active Parts (Top 10 Tables)* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

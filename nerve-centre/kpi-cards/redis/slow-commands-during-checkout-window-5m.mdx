@@ -1,0 +1,164 @@
+---
+title: "Slow Commands During Checkout Window (5m), Table"
+sidebarTitle: "Slow Commands During Checkout Window (5m)"
+description: "Slow Commands During Checkout Window for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A correlation table that joins Redis `SLOWLOG` entries against the storefront checkout funnel over the same rolling 5-minute window. When slow Redis commands pile up at the exact moment checkout conversion dips, you have a strong causal signal that the database is the bottleneck holding up orders. For an SRE or platform team, this is the card that turns "checkout feels slow" into "command X on the cart keyspace took 280ms at 14:32, and that is when the funnel fell over."
+
+| | |
+| --- | --- |
+| **What it tracks** | Each row is a slow command captured by Redis `SLOWLOG GET`, joined to the checkout-conversion delta from the connected ecommerce platform for the same 5-minute slice. Columns surface command name, key pattern, microseconds elapsed, client address, and the co-occurring checkout drop percentage. |
+| **Data source** | `SLOWLOG GET 128` from the Redis instance (commands exceeding `slowlog-log-slower-than`, default 10000us), correlated with checkout-step counts pulled from the linked Shopify, BigCommerce, or Adobe Commerce connector. The card is, by `detail`, "Slow Commands During Checkout Window (5m), broken down by row." |
+| **Time window** | `5m` rolling, aligned to the SLOWLOG capture window and the checkout-funnel bucket. |
+| **Alert trigger** | `>5 SLOWLOG entries co-occur with checkout drop`: more than five slow-command rows land inside a 5-minute slice in which checkout conversion has measurably fallen. |
+| **Why it is cross-channel** | It is the only Redis card that fuses an infrastructure signal (SLOWLOG) with a commercial signal (checkout funnel). Neither side alone proves causation; the co-occurrence does. |
+| **Aggregation basis** | Per-command rows, not an average. A single 900ms `KEYS *` is more damaging than fifty 11ms `GET`s, so the table ranks by elapsed microseconds, not by count. |
+| **What does NOT count** | (1) Commands under the `slowlog-log-slower-than` threshold; (2) slow commands outside a checkout-drop window (they show on [SLOWLOG Entries (15m)](/nerve-centre/kpi-cards/redis/slowlog-entries-15m) instead); (3) checkout drops with no co-occurring slow commands (those point at the app tier or payment gateway, not Redis). |
+| **Roles** | platform, sre, engineering, owner |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card runs two collectors on the same 5-minute clock and joins them.
+
+**1. The Redis side.** Every poll, the engine calls `SLOWLOG GET 128` and reads the entries whose timestamp falls inside the current 5-minute bucket. Each SLOWLOG entry is a tuple of `(id, unix_timestamp, microseconds, command_args, client_addr, client_name)`. Redis only records a command here if its execution time exceeded `slowlog-log-slower-than`, which defaults to `10000` microseconds (10ms). The engine never resets the log with `SLOWLOG RESET`, so it deduplicates by SLOWLOG `id` to avoid double-counting an entry that survives across two polls.
+
+**2. The checkout side.** For the same wall-clock window, the linked ecommerce connector reports checkout-funnel counts: sessions that reached the checkout step versus completed orders. The engine computes a conversion figure for the current 5-minute slice and compares it to the trailing baseline (the same store's typical conversion for that hour-of-day and day-of-week). A negative delta beyond noise is flagged as a "checkout drop".
+
+**3. The join.** When both conditions are true in the same slice, more than five qualifying SLOWLOG entries AND a flagged checkout drop, the alert fires and the rows are surfaced in the table, ranked by microseconds descending.
+
+Because Redis records SLOWLOG in microseconds, the table preserves microsecond precision in its detail column but rolls up to milliseconds in the headline so a non-DBA reader can act on it. There is no averaging across rows: each row is one real command that genuinely ran slowly.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A homeware retailer runs sessions and cart state in a single Redis 7.2 primary behind their Adobe Commerce storefront. `slowlog-log-slower-than` is left at the default 10000us. Snapshot taken on 14 Apr 26 between 19:30 and 19:35 BST, during an evening traffic peak.
+
+The checkout side reported the drop first: checkout-to-order conversion for the 19:30 to 19:35 slice came in at 1.9%, against a trailing baseline of 3.4% for that hour, a relative drop of roughly 44%. That tripped the checkout-drop flag. In the same slice, `SLOWLOG GET` returned eight qualifying entries, comfortably over the threshold of five. The alert fired.
+
+| Elapsed | Command | Key pattern | Client | Co-occurring checkout drop |
+| --- | --- | --- | --- | --- |
+| 412 ms | `KEYS sess:*` | session keyspace | app-node-3 | -44% |
+| 309 ms | `SMEMBERS cart:items:*` | cart membership | app-node-1 | -44% |
+| 211 ms | `HGETALL cart:8841` | large cart hash | app-node-3 | -44% |
+| 188 ms | `SORT cart:items:8841 BY *` | cart sort | app-node-2 | -44% |
+| 96 ms | `LRANGE recently_viewed:441 0 -1` | unbounded list | app-node-1 | -44% |
+| 41 ms | `HGETALL cart:8839` | large cart hash | app-node-2 | -44% |
+| 28 ms | `MGET price:* (240 keys)` | price fan-out | app-node-3 | -44% |
+| 14 ms | `GET sess:ab93f...` | single session | app-node-1 | -44% |
+
+The headline command is the smoking gun: a `KEYS sess:*` taking 412ms. `KEYS` is O(N) over the entire keyspace and blocks the single Redis thread while it scans. With sessions, carts, and prices all in one instance, that one scan stalled every other command behind it, including the small `GET sess:...` and `HGETALL cart:...` calls that checkout needs on every page. The cart-sort and `SMEMBERS` rows confirm the cart code path is reading unbounded collections.
+
+What the platform team did with this, in order:
+
+1. **Confirmed the head-of-line block.** The single-threaded nature of Redis means one 412ms command delays everything queued behind it. The presence of a `KEYS` call in production is itself the finding: it should never run against a live instance.
+2. **Found the source.** The `client` column pointed at `app-node-3`. A recently shipped "admin session audit" cron had been scheduled to run every five minutes and was issuing `KEYS sess:*` to count active sessions. It happened to align with the evening peak.
+3. **Mitigated immediately.** They disabled the cron, conversion recovered to 3.3% within the next slice, and the alert cleared.
+4. **Fixed it properly.** The session count was re-implemented using `SCAN` with a cursor (non-blocking, O(1) per call) rather than `KEYS`, and the recently-viewed list was capped with `LTRIM` to bound its length.
+
+```text
+Revenue framing for this 5-minute window:
+  Baseline conversion (this hour):     3.4%
+  Observed conversion (19:30-19:35):   1.9%
+  Checkout sessions in the slice:      ~640
+  Orders lost vs baseline:             ~10 orders (0.44 x 3.4% x 640)
+  Average order value:                 £58
+  Lost revenue in 5 minutes:           ~£580
+  If the cron had run unnoticed all evening (6 windows/hr x 3 hrs):
+  Estimated exposure:                  ~£10,000
+```
+
+Three takeaways for the team:
+
+1. **Co-occurrence is the whole point.** Slow commands on their own are an SRE problem; a checkout drop on its own is a product problem. The card exists to prove the two are the same problem this minute, which collapses the cross-team finger-pointing that usually eats the first 30 minutes of an incident.
+2. **The worst offender is rarely the most frequent.** Eight rows fired, but one `KEYS` did 90% of the damage. Always read the table top-down by elapsed time, not by how many times a command appears.
+3. **A clean Redis with one bad command still tanks checkout.** Because Redis is single-threaded for command execution, you do not need broad degradation to lose orders. One O(N) command at the wrong moment is enough.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards you should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow Commands During Checkout Window | What the combination tells you |
+| --- | --- | --- |
+| [SLOWLOG Entries (15m)](/nerve-centre/kpi-cards/redis/slowlog-entries-15m) | The broader, channel-agnostic count of slow commands over 15 minutes. | This card filters SLOWLOG to checkout-impacting windows; the 15m card shows whether slowness is chronic or a one-off spike. |
+| [Top 10 SLOWLOG Commands](/nerve-centre/kpi-cards/redis/top-10-slowlog-commands) | The 24-hour leaderboard of which commands are habitually slow. | If the command in your checkout window also tops the 24h list, it is a structural problem, not a fluke. |
+| [Command Latency p95 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p95-ms) | The aggregate latency view across all commands. | p95 staying low while this table lights up means a few pathological commands, not broad degradation. |
+| [Command Latency p99 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p99-ms) | The tail-latency view that catches rare blocking commands. | A p99 spike that lines up with your slow-command rows confirms head-of-line blocking. |
+| [Redis OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/redis/redis-ops-spike-vs-ecom-order-rate) | The throughput-side cross-channel peer. | Slow commands plus an ops spike with no order spike points at a cache stampede or bot flood overwhelming Redis. |
+| [Connected Clients Saturation vs Traffic Burst](/nerve-centre/kpi-cards/redis/connected-clients-saturation-vs-traffic-burst) | The connection-side cross-channel peer. | Slow commands queueing behind a blocked thread inflate connection counts; check both during a checkout drop. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The composite executive gauge. | A sudden health-score dip during a checkout drop tells leadership the database is implicated without needing the detail table. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis itself:**
+
+> **`SLOWLOG GET 128`** returns the raw slow-command entries with id, timestamp, microseconds, full command args, and client address. This is the exact source the Redis side of this card reads.
+> **`SLOWLOG LEN`** returns the current number of entries held (capped by `slowlog-max-len`, default 128). If this is at its cap, older slow commands have been discarded.
+> **`CONFIG GET slowlog-log-slower-than`** confirms the microsecond threshold; **`CONFIG GET slowlog-max-len`** confirms the ring-buffer size.
+> **`LATENCY HISTORY command`** and **`LATENCY LATEST`** (Redis Latency Monitoring) give a complementary, event-based view of slow execution that does not depend on the SLOWLOG threshold.
+
+For a managed instance, also check the provider's native console: **AWS ElastiCache** surfaces `SlowlogGetCount` and engine CPU under CloudWatch; **Azure Cache for Redis** exposes a Slow Log via its metrics and diagnostic settings; **Redis Cloud** shows slow-log entries directly in the database dashboard. Read these alongside the host's own command, because managed proxies can add latency the in-engine SLOWLOG does not see.
+
+**Why our number may legitimately differ from a raw `SLOWLOG GET`:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window filtering** | Vortex IQ count lower | Raw `SLOWLOG GET` returns everything in the ring buffer; this card only shows entries inside a 5-minute slice that also had a checkout drop. |
+| **Ring-buffer eviction** | Either | If `slowlog-max-len` is small and traffic is heavy, entries roll off before a poll captures them; raise `slowlog-max-len` for fidelity. |
+| **Threshold mismatch** | Either | If `slowlog-log-slower-than` was changed since the last poll, the set of qualifying commands shifts. Confirm with `CONFIG GET`. |
+| **Time zone** | Timestamps shift | SLOWLOG stores Unix epoch; the card renders in your Vortex IQ display time zone, the ecommerce connector in store time zone. Align both before comparing. |
+| **Managed-proxy latency** | Vortex IQ may show fewer engine-side entries | On ElastiCache/Azure, time spent in the proxy or network is not in the in-engine SLOWLOG; the checkout drop may be real while SLOWLOG looks clean. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) / [`adobe_commerce.total_revenue`](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | A flagged window should line up with a visible dip in revenue-per-minute on the storefront connector. | Revenue holding steady during slow commands means the slow path is not on the checkout-critical route; the card may be over-attributing. |
+| [SLOWLOG Entries (15m)](/nerve-centre/kpi-cards/redis/slowlog-entries-15m) | This card's rows should be a subset of the 15m count. | If the 15m card is calm but this one fires, the slowness is tightly clustered in the checkout window, which is exactly what you want to catch. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My checkout dropped but this card shows no slow commands. What does that mean?**
+That is a useful negative result: Redis is probably not your bottleneck for that drop. Look at the application tier, the payment gateway, or the web front end instead. The whole value of this card is that an empty table during a checkout drop redirects the investigation away from the database, saving the team from chasing a phantom Redis problem.
+
+**There are slow commands but checkout is fine. Should I worry?**
+Not for revenue this minute, but yes for hygiene. Those entries will appear on [SLOWLOG Entries (15m)](/nerve-centre/kpi-cards/redis/slowlog-entries-15m) and the [Top 10 SLOWLOG Commands](/nerve-centre/kpi-cards/redis/top-10-slowlog-commands) leaderboard. A slow command that does not hit checkout today can still hit it during the next peak, so treat the table as an early warning even when the join does not fire.
+
+**Why microseconds in the source but milliseconds in the headline?**
+Redis records SLOWLOG in microseconds for precision, since many commands genuinely run in tens of microseconds. We preserve that precision in the detail column but display the headline in milliseconds because the audience acting on a checkout incident thinks in milliseconds, and "412ms KEYS" reads faster than "412000us KEYS".
+
+**A `KEYS` or `FLUSHALL` is not in my SLOWLOG even though it felt slow. Why?**
+Two common causes. First, the command may have completed just under `slowlog-log-slower-than`; lower the threshold temporarily with `CONFIG SET slowlog-log-slower-than 5000` to catch borderline cases. Second, the ring buffer may have overflowed: if `SLOWLOG LEN` equals `slowlog-max-len`, older entries were discarded. Raise `slowlog-max-len` (for example `CONFIG SET slowlog-max-len 512`) on busy instances.
+
+**Does setting `slowlog-log-slower-than` to 0 hurt performance?**
+Setting it to 0 logs every command, which adds overhead and floods the ring buffer; setting it to a negative value disables SLOWLOG entirely. Neither is recommended in production. Keep it at a meaningful threshold (the 10ms default is sensible for most workloads, or 5ms if your checkout path is latency-sensitive) so the card surfaces genuinely pathological commands rather than noise.
+
+**The same slow command appears in two consecutive 5-minute windows. Is it double-counted?**
+No. The engine deduplicates SLOWLOG entries by their Redis-assigned `id`, which is monotonic and unique per entry. An entry that straddles a poll boundary is attributed to the window containing its timestamp, not counted twice.
+
+**My instance is ElastiCache and the table looks emptier than the latency I observe. Why?**
+On managed Redis, time spent in the cluster proxy, in TLS termination, or on the network is not visible to the in-engine SLOWLOG. The command may be fast inside the engine while the round trip is slow. Reconcile against the provider's own metrics (CloudWatch `SlowlogGetCount`, engine CPU, network latency) and treat a clean SLOWLOG with a real checkout drop as a sign to look at the proxy or network layer, not the keyspace.
+
+**Can I change the checkout-drop sensitivity so it fires less often?**
+Yes. The conversion-delta threshold and the SLOWLOG-count threshold are both configurable per profile in the Sensitivity tab. Raise the count from five, or widen the conversion-delta band, to suppress firing during naturally noisy low-traffic hours. Tune to your store's real baseline rather than the generic default.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow Commands During Checkout Window (5m)* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,143 @@
+---
+title: "Slow-Query Rate %, Snowflake"
+sidebarTitle: "Slow-Query Rate %"
+description: "Slow-Query Rate % for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Slow-Query Rate %** is the share of queries in the window whose total elapsed time crossed the "slow" threshold, expressed as a percentage of all queries that ran. It answers a question a single latency percentile cannot: not "how slow is my worst query?" but "what fraction of my workload is painful right now?" For a platform team, a creeping slow-query rate is the early tremor before a saturation incident: warehouses starting to queue, a partner pushing unbounded scans, or a stats-stale table forcing full scans where a prune should have happened.
+
+| | |
+| --- | --- |
+| **What it tracks** | The percentage of completed queries in the window whose elapsed time exceeded the slow-query threshold, over the total completed query count. |
+| **Data source** | `detail`: Slow-Query Rate % for the selected period. Computed from `QUERY_HISTORY` (`TOTAL_ELAPSED_TIME`, `EXECUTION_STATUS`) in the ACCOUNT_USAGE share, optionally enriched by the live `INFORMATION_SCHEMA.QUERY_HISTORY` table function for the recent window. |
+| **Time window** | `1h` (rolling one-hour window). |
+| **Alert trigger** | `> 5%`. More than one query in twenty running slow over a sustained hour pages the platform on-call. |
+| **Why it matters** | A rising slow-query rate degrades every consumer at once: dashboards time out, scheduled jobs overrun, and queue depth builds. It is a leading indicator of warehouse saturation and of inefficient or runaway SQL that also burns credits. |
+| **Roles** | owner, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card divides the count of slow queries by the count of all completed queries in the rolling hour and multiplies by 100:
+
+```text
+slow_query_rate_pct = ( slow_queries / total_completed_queries ) * 100
+
+where slow_query = a query whose TOTAL_ELAPSED_TIME >= slow_threshold
+```
+
+`TOTAL_ELAPSED_TIME` in `QUERY_HISTORY` is the full wall-clock duration of the query: compilation, queueing (provisioning and overload), and execution combined. The card uses elapsed rather than execution-only time on purpose, because a query that "executed" in 2s but sat queued for 40s is slow from the consumer's point of view; queue time is part of the user's pain. The slow threshold is configurable per profile in the Sensitivity tab; for Snowflake analytics workloads it is commonly set in the multi-second range (Snowflake latency is naturally measured in seconds, not milliseconds), so the default should be tuned to your workload shape rather than borrowed from an OLTP database.
+
+Two filters keep the denominator honest. First, only queries with a terminal `EXECUTION_STATUS` of `SUCCESS` or `FAIL` count; queries still running or in `BLOCKED` state are excluded so the live tail does not skew the ratio. Second, system and metadata queries (cache-only lookups, `SHOW`/`DESCRIBE`, results-reuse hits with zero scan) are excluded where the engine can identify them, because counting near-instant metadata calls in the denominator would mask a genuinely degrading analytical workload. The result is a rate that reflects the queries a human or a job actually waited on.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A data platform team supports a BI estate where roughly 1,200 queries run per hour against the `BI_WH` (Medium) and `LOAD_WH` (Large) warehouses. Their slow threshold is set to 30 seconds, alert at `> 5%`. Snapshot taken on 22 Apr 26 at 14:00 BST.
+
+| Hour | Total queries | Slow (>=30s) | Slow-query rate | State |
+| --- | --- | --- | --- | --- |
+| 12:00 to 13:00 | 1,190 | 21 | 1.8% | healthy |
+| 13:00 to 14:00 | 1,240 | 34 | 2.7% | healthy |
+| 14:00 to 15:00 | 1,265 | 96 | **7.6%** | alert |
+
+At 14:00 the rate jumps to 7.6% and Nerve Centre pages. Latency percentiles alone would have been ambiguous (the p95 moved only modestly), but the rate makes it obvious that a large slice of the workload is now slow.
+
+```text
+Diagnosis trail:
+  - QUERY_HISTORY for the alert hour, ordered by TOTAL_ELAPSED_TIME:
+      72 of the 96 slow queries hit BI_WH and share a query_text
+      pattern: SELECT ... FROM ORDERS o JOIN ORDER_LINES l ... (no date filter)
+  - QUEUED_OVERLOAD_TIME is non-zero on most of them: BI_WH is queueing.
+  - Root cause: a partner embedded-analytics release shipped a dashboard
+    tile with an unbounded full-table join; it fires for every viewer and
+    pins BI_WH at full concurrency, queueing everything behind it.
+
+Impact while rate = 7.6%:
+  - Scheduled 14:15 finance refresh on BI_WH overran by 9 minutes.
+  - Two analyst dashboards timed out at the 5-minute client limit.
+  - Credit burn on BI_WH up ~30% for the hour vs the prior baseline.
+```
+
+The fix is two-layered. Immediately, the team moves the offending dashboard to a dedicated `EMBED_WH` so it can no longer starve `BI_WH`, and the slow-query rate on `BI_WH` falls back to 2.4% within the next window. Structurally, they push the partner to add a date predicate so the tile prunes by micro-partition instead of full-scanning, which removes the slow queries entirely rather than just isolating them.
+
+Three takeaways for the team:
+
+1. **Rate catches breadth; percentiles catch depth.** p95/p99 tell you how bad the worst queries are; slow-query rate tells you how widespread the pain is. A small number of catastrophic queries can leave the rate low; this card is the "how much of my workload hurts" view.
+2. **Queue time counts as slow.** Because the metric uses elapsed (not execution) time, warehouse queueing inflates the rate directly. A jump in slow-query rate with no change in scanned bytes points at saturation, not bad SQL.
+3. **Isolation buys time; pruning fixes it.** Moving a noisy workload to its own warehouse stops it starving others, but the credits still burn. The durable fix is making the query prune properly.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow-Query Rate | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/snowflake/query-latency-p95-ms) | Depth view: how slow is the slow tail? | Rate up with p95 flat means many mildly-slow queries; rate up with p95 up means the tail is also degrading. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/snowflake/query-latency-p99-ms) | The extreme tail. | A few monster queries can spike p99 while the rate stays low. |
+| [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse) | Confirms whether slow equals queued. | High rate plus high queue depth equals a saturation problem, not a SQL problem. |
+| [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) | The capacity read behind the slowness. | Saturated warehouse plus high slow-query rate equals upsize or multi-cluster. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/snowflake/top-10-slowest-queries) | The named offenders behind the rate. | Use it to find the exact query texts inflating the percentage. |
+| [Avg Cost per Query ($)](/nerve-centre/kpi-cards/snowflake/avg-cost-per-query) | Slow queries usually cost more. | A rising slow-query rate often drags cost-per-query up in lockstep. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/snowflake/query-error-rate) | Slow can tip into failed (timeouts). | Rate climbing then errors appearing means queries are now timing out. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake's own tooling:**
+
+> Query `SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY` filtering on `START_TIME` within your hour and `TOTAL_ELAPSED_TIME >= threshold`, divided by total rows, to recompute the rate by hand.
+> For the recent window with no ACCOUNT_USAGE delay, use the `INFORMATION_SCHEMA.QUERY_HISTORY` table function.
+> In Snowsight, open **Monitoring to Query History**, filter by duration and warehouse, and sort by total duration to see the slow set directly.
+
+**Why our number may legitimately differ from Snowflake's view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **ACCOUNT_USAGE latency** | Vortex IQ may lag | `ACCOUNT_USAGE.QUERY_HISTORY` is delayed up to ~45 minutes; the card blends it with the live `INFORMATION_SCHEMA` table function, so a same-instant `ACCOUNT_USAGE` recompute can differ. |
+| **Threshold definition** | Variable | Your manual query uses whatever cutoff you type; the card uses the profile's configured slow threshold. Match them before comparing. |
+| **Denominator filtering** | Vortex IQ rate may be higher | The card excludes metadata/cache-only queries from the denominator; a naive `COUNT(*)` over all rows includes them and dilutes the rate. |
+| **Time zone** | Window edges shift | Snowflake displays in account/session timezone; Vortex IQ renders your profile timezone. Compare on UTC instants. |
+| **Elapsed vs execution** | Vortex IQ may be higher | The card counts queue time as part of "slow"; a query filtered only on `EXECUTION_TIME` would miss queue-bound slowness. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What counts as a "slow" query?**
+A completed query whose `TOTAL_ELAPSED_TIME` (compile plus queue plus execute) is at or above the slow threshold configured for your profile. Because Snowflake latency is naturally in the seconds range for analytics, the default threshold is set in seconds, not milliseconds. Tune it in the Sensitivity tab to your workload; an OLTP-style cutoff will flag almost everything.
+
+**My p95 looks fine but the slow-query rate is high. How?**
+The two answer different questions. p95 reports the duration at the 95th percentile (depth of the tail); the rate reports how large a fraction crossed your line (breadth). Many queries clustered just over the threshold raise the rate while leaving p95 only mildly elevated. Read both: rate for breadth, percentiles for depth.
+
+**Does queue time inflate this number?**
+Yes, deliberately. The metric uses elapsed time, which includes provisioning and overload queue time. A query that executed quickly but waited 40s in a queue is slow from the consumer's perspective, so it counts. If your rate jumps with no change in scanned data, suspect warehouse saturation and check [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse).
+
+**Why exclude metadata and cache-only queries from the denominator?**
+A workload can fire thousands of near-instant `SHOW`, `DESCRIBE`, and results-reuse calls. Counting them in the denominator would mathematically suppress the rate and hide a genuinely degrading analytical workload behind a wall of trivial calls. The card focuses the ratio on queries someone actually waited on.
+
+**The rate spiked for one hour then returned to normal. Was it a real problem?**
+Often yes, but transient. A single bad dashboard release, an ad-hoc unbounded scan, or a one-off bulk load can spike the rate for an hour. The card's job is to make that spike visible so you can decide whether it is a one-off or a pattern. Use [Top 10 Slowest Queries](/nerve-centre/kpi-cards/snowflake/top-10-slowest-queries) for the hour to identify whether it was a recurring query text.
+
+**Can a high slow-query rate cost me money even if nothing fails?**
+Yes. Slow queries hold compute longer and often scan more, both of which burn credits, and queueing keeps warehouses running at full tilt. A sustained high rate usually shows up as elevated [Avg Cost per Query ($)](/nerve-centre/kpi-cards/snowflake/avg-cost-per-query) and [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h). Performance and cost move together here.
+
+**Does results caching skew the rate downward?**
+It can, in your favour, and that is accurate. A query served entirely from the results cache returns in milliseconds and is genuinely fast for the user, so excluding or fast-counting it is correct. The risk is the opposite: if cache hit rates fall (for example after a data load invalidates results), previously fast queries re-run cold and the slow-query rate can rise even though no SQL changed.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow-Query Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

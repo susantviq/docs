@@ -1,0 +1,151 @@
+---
+title: "Query Error Rate %, MongoDB"
+sidebarTitle: "Query Error Rate %"
+description: "Query Error Rate % for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The share of operations against your MongoDB deployment that failed, expressed as a percentage over the recent window. This is the database's "is anything broken right now" pulse. A healthy deployment runs at or near 0%: the vast majority of queries, inserts, updates, and commands succeed. When this gauge lifts off zero it means operations are being rejected or are failing mid-flight, which the application sees as errors and users may see as failed actions. The card turns red at `>1%`: a sustained error rate above one percent is no longer noise, it is a real fault affecting a measurable slice of traffic.
+
+| | |
+| --- | --- |
+| **What it tracks** | The percentage of operations in the recent window that ended in an error rather than success: command failures, assertion errors, write errors, and rejected operations, as a fraction of total operations attempted. |
+| **Data source** | Query Error Rate % for the selected period, derived from server-side error and assertion counters in `serverStatus` (the `asserts` document and command-failure counters) measured against total operation volume from `opcounters` over the window. |
+| **Time window** | `5m` (rolling 5-minute window). Errors and operation totals are accumulated over the trailing five minutes and divided, so a one-off failure barely registers but a sustained fault climbs quickly. |
+| **Alert trigger** | `>1%`. An error rate above 1% over the 5-minute window raises a sensitivity alert. For most order-backing workloads even 1% is a lot of failed user actions, so many teams tighten this. |
+| **What counts** | Operations that returned an error to the client: command failures, write assertions, document-validation rejections, authorisation failures, and operations killed for exceeding limits. |
+| **What does NOT count** | Slow-but-successful operations (those belong on the latency cards), retried operations that ultimately succeeded, and connection-level refusals (those surface on the connection cards). |
+| **Roles** | owner, platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The gauge is a ratio of failed operations to total operations over the trailing 5-minute window:
+
+```text
+query_error_rate_pct = errored_ops(window)
+                       / total_ops(window)
+                       x 100
+```
+
+How each side is sourced:
+
+- **`errored_ops`** is accumulated from the server's error-tracking counters. `serverStatus.asserts` exposes `regular`, `warning`, `msg`, `user`, and `rollovers` assertion counters; `user` assertions in particular capture client-facing failures such as write errors, validation rejections, and bad commands. The engine takes the delta of these counters over the window. Where available, command-failure counters complement the assertion counts.
+- **`total_ops`** is the delta of the summed `opcounters` (query, insert, update, delete, getmore, command) over the same window, the same basis used by [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live).
+- Both deltas are computed across the rolling 5-minute boundary, then divided, so the rate is naturally smoothed: a single failed operation in a busy window rounds to ~0%, while a fault failing a steady fraction of traffic produces a stable, readable percentage.
+
+Framing points that matter when reading it:
+
+- **Error rate is independent of latency.** An operation can be fast and fail, or slow and succeed. This card is about correctness; the latency cards are about speed. A spike here means operations are being rejected, not merely delayed.
+- **Counter resets on restart.** Like `opcounters`, the `asserts` counters reset when `mongod` restarts. The engine detects the counter going backwards and discards the spanning interval rather than reporting a false rate.
+- **Per-member.** The counters are per-`mongod`; the card normally reflects the primary. A fault isolated to one secondary's reads shows on that member.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MongoDB 7.0 replica set behind an order and inventory API. On 09 Jun 26 they ship a schema-validation change to the `orders` collection that tightens a required field. Readings taken across the deploy.
+
+| Time (UTC) | total ops (5m) | errored ops (5m) | Error rate | State |
+| --- | --- | --- | --- | --- |
+| 10:00 | 612,000 | 18 | **0.003%** | Normal baseline |
+| 10:30 | 598,400 | 12 | **0.002%** | Healthy |
+| 10:46 | 605,200 | 9,680 | **1.60%** | Red, alert fires |
+| 11:05 | 609,900 | 30 | **0.005%** | Recovered |
+
+The baseline at 10:00 and 10:30 is effectively zero: a handful of assertions across more than half a million operations, the normal background of transient client errors. At 10:46, six minutes after the validation change went live, the error rate jumps to 1.60% and the alert fires. Crucially, [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) stayed flat through the spike: the database is just as fast as before, it is simply rejecting a slice of writes.
+
+```text
+Diagnosis of the 10:46 spike:
+  - error rate    0.002%  ->  1.60%   (sharp step, not a ramp)
+  - p95 latency   unchanged
+  - the errored ops are write errors on the orders collection
+  - timing: ~6 minutes after the validation deploy
+  Conclusion: the new validation rule is rejecting legitimate order
+              writes that the old clients still send in the old shape.
+```
+
+A step change in error rate that lines up with a deploy, with latency unaffected, is the classic signature of a logic or validation regression rather than a capacity problem. The on-call SRE's response is to roll back the validation change (or relax the rule and migrate the data), not to add hardware. By 11:05 the rollback is live and the rate is back to baseline.
+
+Three takeaways:
+
+1. **Zero is the expected resting state.** Unlike throughput or latency, which have a healthy non-zero range, error rate should sit at or near 0% almost all the time. Any sustained lift off zero is a signal, even below the 1% alert line.
+2. **Read it against latency to classify the fault.** Error rate up with latency flat means operations are being rejected (validation, auth, bad commands, logic bugs). Error rate up with latency also up means the deployment is struggling and operations are timing out or being killed. The pair tells you whether to fix code or add capacity.
+3. **The step versus the ramp tells the story.** A sudden step in error rate usually means a change just shipped: a deploy, a config push, a new client version. A slow ramp usually means a creeping resource problem: disk filling, a degrading node. The shape points you at the cause before you read a single log line.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Error Rate | What the combination tells you |
+| --- | --- | --- |
+| [Query Error Rate Spike (>1% in 5m)](/nerve-centre/kpi-cards/mongodb/query-error-rate-spike-1-in-5m) | The alert-feed companion to this gauge. | The gauge shows the live rate; the alert card logs each breach onto the on-call timeline. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) | Separates rejection from struggle. | Errors up with latency flat is a logic or validation fault; errors up with latency up is a capacity fault. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mongodb/connection-errors-24h) | A distinct error surface (connect-time, not query-time). | Both rising together points to an overloaded deployment refusing and failing operations at once. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | The denominator behind this percentage. | A drop in ops alongside an error spike means clients are giving up after failures. |
+| [COLLSCAN Operations (24h)](/nerve-centre/kpi-cards/mongodb/collscan-operations-24h) | A new query path can both error and scan. | A deploy that raises both errors and COLLSCANs usually shipped a broken, unindexed query. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | Error rate is a heavy input into the composite. | A sustained error spike alone can drop the health score below threshold. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to confirm the number in MongoDB's own tooling:**
+
+> **`mongosh`:** `db.serverStatus().asserts` returns the assertion counters; read them twice across an interval and compare the delta against the `opcounters` delta to reproduce the rate. `db.serverStatus().metrics.commands` also exposes per-command `failed` counts.
+> **`mongostat`:** does not show an error-rate column directly, but a sudden change in op rates alongside log errors is corroborating.
+> **`mongod` log:** failed operations and assertions are logged; filtering for write errors, validation failures, and command failures over the window confirms the count.
+> **Atlas:** the **Metrics** tab includes assertion and query-targeting charts, and **Profiler** / **Performance Advisor** surface failing query patterns.
+
+**Why our number may legitimately differ from the native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Counter scope** | Either | Vortex IQ derives the rate from assertion and command-failure counters over the window; a hand count from logs may include or exclude different error classes (for example connection-level failures). |
+| **Window boundary** | Smoother | The card uses a rolling 5-minute window; a `mongosh` snapshot you take at a single instant captures a different slice. |
+| **Member polled** | Either | The card normally reads the primary; an error confined to one secondary's reads shows on that member, not the primary. |
+| **Counter reset** | Brief gap | A restart resets `asserts`; Vortex IQ discards the spanning interval, whereas a manual delta across the restart would look negative or huge. |
+| **Retried successes** | Vortex IQ lower | Operations that failed once and succeeded on driver retry are successes overall; raw log counts of failures may look higher than the user-facing error rate. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Slow Ops During Checkout Window (5m)](/nerve-centre/kpi-cards/mongodb/slow-ops-during-checkout-window-5m) | A checkout-time error spike often co-occurs with slow ops on the same path. | Errors without slow ops points to validation or logic faults rather than contention. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | A red error rate should pull the health score down. | If the score stays green during an error spike, check its error weighting in the sensitivity profile. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What kinds of error does this rate actually count?**
+Operations that returned a failure to the client: write errors, document-validation rejections, authorisation failures, malformed or unsupported commands, and operations killed for exceeding limits. It is derived from the server's assertion and command-failure counters. It deliberately excludes slow-but-successful operations (those are latency, not errors) and connection-level refusals (those live on the connection cards).
+
+**Why is my error rate above zero even when nothing is wrong?**
+A tiny non-zero background is normal: occasional duplicate-key errors on upserts, transient client disconnects mid-operation, the odd malformed request from a misbehaving client. As long as it stays a small fraction of a percent and does not climb, it is noise. The card exists to catch a sustained lift, which is why the alert is at 1% over five minutes rather than at the first error.
+
+**Error rate spiked but latency stayed flat. What does that tell me?**
+That operations are being rejected, not struggling. The database is just as fast as before; it is refusing a slice of traffic. The usual causes are a recent change: a new schema-validation rule, a permissions change, a client shipping malformed queries, or a logic bug. Look at what deployed just before the spike rather than at capacity. Pair with [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) to confirm latency is unaffected.
+
+**Does driver-side retry hide errors from this card?**
+Partly, and that is intentional. Modern MongoDB drivers retry certain transient operations automatically; an operation that fails once and then succeeds is a success from the user's point of view. This card reflects user-facing outcomes, so a transient failure that the driver successfully retried may not register, even though the `mongod` log shows the first attempt failing. The rate measures what actually broke for clients, not every internal hiccup.
+
+**The rate dropped to zero right after a restart, then resumed. Is that real?**
+The `asserts` counters reset on a `mongod` restart, so the engine discards the interval that spans the restart to avoid a false reading, then resumes normally on the next clean window. A brief gap or zero immediately after a restart is an artefact of the counter reset, not a real recovery. Check [Instance Uptime](/nerve-centre/kpi-cards/mongodb/instance-uptime) to confirm a restart occurred.
+
+**Can I make the alert stricter than 1%?**
+Yes. For an order-backing workload, 1% can already represent a large number of failed customer actions, so many teams set the sensitivity threshold lower (for example 0.2%) and rely on the 5-minute window to suppress single-error noise. Adjust the threshold in the sensitivity profile to match how many failed operations your business can tolerate before someone should be paged.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Error Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

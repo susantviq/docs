@@ -1,0 +1,141 @@
+---
+title: "Query Latency p95 (ms), kpi"
+sidebarTitle: "Query Latency p95 (ms)"
+description: "Query Latency p95 (ms) for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The 95th-percentile query execution time: 95% of statements finished faster than this number, and the slowest 5% took longer. This is the honest measure of how the database feels to its users, because it captures the bad tail without being dragged around by a single pathological outlier the way a maximum is. The median ([p50](/nerve-centre/kpi-cards/postgresql/query-latency-p50-ms)) tells you the typical experience; p95 tells you the experience of the unlucky one-in-twenty, which on a busy instance is thousands of requests an hour.
+
+| | |
+| --- | --- |
+| **What it tracks** | The execution time, in milliseconds, below which 95% of statements completed in the window. It measures server-side query time, not network round-trip or client-side time. |
+| **Data source** | Computed from per-statement timing in `pg_stat_statements` (`mean_exec_time`, `min_exec_time`, `max_exec_time`, `stddev_exec_time` weighted by `calls`), or from log-derived durations where `log_min_duration_statement` is enabled. The percentile is derived across the statement population in the window. |
+| **Time window** | `RT/5m` (a real-time reading smoothed over a rolling five-minute window). |
+| **Alert trigger** | `> 200ms`. For an interactive OLTP workload, a 95th-percentile above 200ms means a noticeable share of users are waiting. |
+| **Roles** | owner, engineering, operations |
+| **Why p95 and not the average** | An average hides the tail: a workload with a 5ms mean can still have a 2-second p95 if a slow subset exists, and those slow requests are exactly the ones that hurt. p95 is the standard latency SLO percentile for this reason. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+PostgreSQL does not store a true latency histogram per statement, so the 95th percentile is estimated rather than read directly. Vortex IQ uses the best basis available:
+
+1. **`pg_stat_statements` (preferred):** the extension records, per normalised statement, the `calls`, `mean_exec_time`, `min_exec_time`, `max_exec_time` and `stddev_exec_time`. Across the statement population, weighting each statement's distribution by its `calls`, Vortex IQ estimates the call-weighted 95th percentile of execution time. Because the per-statement distribution is summarised (mean and stddev, not a full histogram), the p95 is a well-grounded estimate, not an exact order statistic.
+2. **Log-derived durations (more precise when available):** with `log_min_duration_statement` set to a low value, PostgreSQL logs the duration of every statement above the threshold. Where Vortex IQ has log access it computes the percentile from the actual logged durations, which is exact for the logged population.
+
+Two properties matter for reading this card. First, it is **execution time only**: it does not include the time a statement spent waiting in the application's connection queue, nor network latency between the client and the server. A query that runs in 8ms but waits 400ms for a connection slot reads as 8ms here; the wait shows up on the saturation and connection cards instead. Second, the percentile is **call-weighted**, so a fast query run a million times pulls the p95 down and a slow query run rarely barely moves it, which is the behaviour you want for a user-experience metric.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a PostgreSQL 16 primary behind a product catalogue and search API. The p95 SLO is 200ms. Normal weekday p95 sits around 70 to 110ms. Snapshot taken on 21 Apr 26 at 20:15 BST, during the evening peak.
+
+| Window (5m) | p50 | p95 | p99 |
+| --- | --- | --- | --- |
+| 19:55 to 20:00 | 9ms | 88ms | 240ms |
+| 20:00 to 20:05 | 10ms | 96ms | 260ms |
+| 20:10 to 20:15 | 11ms | **310ms** | 1,180ms |
+
+p50 has barely moved (9ms to 11ms), so the typical query is still fast. But p95 has jumped from under 100ms to 310ms, breaching the 200ms alert. The shape of the change is the diagnosis: when the median holds steady but the tail blows out, the problem is not "everything is slow", it is "a specific subset of queries got slow". Something is selectively affecting a slice of the workload.
+
+The DBA pulls the worst offenders by total time:
+
+```text
+SELECT query, calls, mean_exec_time, max_exec_time
+FROM pg_stat_statements
+ORDER BY mean_exec_time DESC
+LIMIT 5;
+```
+
+One query dominates: a `SELECT` filtering products by a `category_id` that, after a recent data load, no longer hits an index, so it now sequentially scans a table that grew from 200k to 2.1m rows. Most page views never run it (hence p50 is unaffected), but the catalogue-filter views do, and those land squarely in the slow 5%.
+
+```text
+Why p50 stayed flat but p95 exploded:
+  90% of traffic: cached PK lookups, 5-12ms  -> sets p50
+  ~7% of traffic: indexed range scans, 40-120ms
+  ~3% of traffic: the broken category filter, 600-2,000ms -> sets p95/p99
+```
+
+The fix is a single index: `CREATE INDEX CONCURRENTLY idx_products_category ON products (category_id);`. After the index builds, the category filter drops back to single-digit milliseconds and the next window's p95 returns to 94ms.
+
+Two takeaways the team records:
+
+1. **Read p50 and p95 together; the gap is the signal.** A small p50-to-p95 gap means a uniform workload. A large and growing gap means a slow subset is forming, often a query that lost its index, a table that outgrew its plan, or a lock-contended hot row. The percentile that moves tells you whether the problem is broad or narrow.
+2. **p95 measures execution, not waiting.** If p95 looks fine but users complain of slowness, the wait is somewhere this card cannot see: the connection queue (check [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation)), the network, or the application. A clean p95 with unhappy users points you away from the database engine and toward the path in front of it.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Latency p95 | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p50 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p50-ms) | The median, the typical-query view. | A widening p50-to-p95 gap means a slow subset is forming, not a broad slowdown. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p99-ms) | The extreme tail. | p99 far above p95 means a small number of very slow queries; p99 close to p95 means the whole tail shifted. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/postgresql/slow-query-rate) | The share of calls over 100ms. | A rising p95 with a rising slow-query share names the subset that is hurting the tail. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/postgresql/top-10-slowest-queries) | The actual statements behind the tail. | Turns a p95 breach into a named query to fix, usually a missing or stale index. |
+| [Buffer Cache Hit Rate %](/nerve-centre/kpi-cards/postgresql/buffer-cache-hit-rate) | Whether the slow queries are reading from disk. | A falling cache hit rate alongside a rising p95 means cold data is forcing disk reads. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) | The wait this card cannot see. | Clean p95 but slow users means the delay is in the connection queue, not in execution. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/postgresql/queries-per-second-live) | The load context for the latency. | Rising p95 with rising QPS is load; rising p95 with flat QPS is a regression. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The composite that weights p95 latency. | A sustained p95 breach pulls the composite down through its latency input. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL itself:**
+
+> The richest source is `pg_stat_statements`. Run `SELECT query, calls, mean_exec_time, min_exec_time, max_exec_time, stddev_exec_time FROM pg_stat_statements ORDER BY mean_exec_time DESC;` to see the per-statement timing that the percentile is built from. (Requires the `pg_stat_statements` extension.)
+> For exact durations, set `log_min_duration_statement` to a low millisecond value and read the logged statement durations directly; this is the most precise basis for a percentile.
+> Note that `pg_stat_statements` counters are cumulative since the last `pg_stat_statements_reset()`; a long-running uptime means the figures reflect a long history, so reset to measure a clean window.
+> On a managed service, the console exposes a comparable view: AWS RDS Performance Insights shows per-statement average latency and load, Google Cloud SQL Query Insights surfaces per-query latency, and Azure Database for PostgreSQL exposes Query Store with per-query timing percentiles.
+
+**Why our number may legitimately differ from the console:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Estimate vs exact** | Either way | From `pg_stat_statements`, p95 is estimated from per-statement mean and stddev, not a true histogram; log-derived percentiles are exact and may differ slightly. |
+| **Execution vs total** | Vortex IQ lower | This card is execution time only; a console metric that includes connection-acquisition or planning time reads higher. |
+| **Window vs cumulative** | Either way | `pg_stat_statements` is cumulative since last reset; Vortex IQ differences a rolling window, so a hand read of the raw view (without differencing) reflects a much longer history. |
+| **Call weighting** | Either way | Vortex IQ weights by `calls`; a console that lists per-query latency unweighted highlights rare slow queries the call-weighted p95 plays down. |
+| **Mean vs percentile** | Console may read lower | Performance Insights often headlines average latency, which sits well below p95 on a tailed workload. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My p50 is fine but p95 breached. What does that pattern mean?**
+A slow subset has formed. The typical query is still fast (so the median holds), but a specific slice, often a query that lost its index, a table that outgrew its plan, or a lock-contended hot row, has become slow and landed in the worst 5%. Pull [Top 10 Slowest Queries](/nerve-centre/kpi-cards/postgresql/top-10-slowest-queries) and [Slow-Query Rate %](/nerve-centre/kpi-cards/postgresql/slow-query-rate) to name the subset. The narrowness of the problem (p50 unaffected) is itself the most useful clue.
+
+**p95 looks healthy but users say the database is slow. Where is the time going?**
+This card measures execution time only, not waiting. If queries execute fast but users wait, the delay is in front of the engine: the application's connection queue (check [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation)), the network round-trip, or the application code. A clean p95 with slow users is a strong signal that the database engine is not the bottleneck.
+
+**Why is this an estimate and not an exact percentile?**
+`pg_stat_statements` summarises each statement's timing as a mean and standard deviation, not a full histogram, so a percentile across the statement population is necessarily estimated. For an exact percentile, enable `log_min_duration_statement` and let Vortex IQ compute from the logged durations; that population is exact for everything above the log threshold.
+
+**Should p99 always be higher than p95?**
+Yes, by definition: p99 captures a longer tail than p95, so it is always equal to or greater than p95. What matters is the gap. p99 close to p95 means the whole tail shifted together (a broad slowdown). p99 far above p95 means a small number of very slow queries dominate the extreme tail, often a single pathological statement or a periodic batch job.
+
+**Does an idle or low-traffic instance give a meaningful p95?**
+With very few queries in the window, a percentile is noisy: one slow maintenance query can swing it. On a busy instance the percentile is stable because it is computed over thousands of calls. For a quiet database, read p95 alongside [Queries per Second (live)](/nerve-centre/kpi-cards/postgresql/queries-per-second-live) so you know how many samples back the number.
+
+**The console shows a much lower latency than this card. Why?**
+Managed-service consoles often headline *average* latency, which sits well below the 95th percentile on any workload with a slow tail. Compare like with like: look at the per-statement view or Query Store percentiles, not the average, and confirm whether the console figure includes planning and connection time that this execution-only card excludes.
+
+**Can I change the 200ms threshold?**
+Yes, per profile in the Sensitivity tab. 200ms suits an interactive OLTP API; a reporting or analytics workload where multi-second queries are normal would set a far higher threshold, and a latency-critical real-time path might tighten it to 50ms. Set it to your SLO, not the generic default.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Latency p95 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

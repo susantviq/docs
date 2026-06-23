@@ -1,0 +1,144 @@
+---
+title: "Databricks SQL Spike vs Ecom Order Rate, Databricks"
+sidebarTitle: "Databricks SQL Spike vs Ecom Order Rate"
+description: "Databricks SQL Spike vs Ecom Order Rate for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A dual-axis chart that plots Databricks SQL query rate (queries per second on your SQL warehouses) against live ecommerce order rate over the last hour. When query volume spikes in step with orders, that is healthy demand: more shoppers means more lookups. The signal this card hunts for is the opposite: a query spike with no matching order spike. That divergence usually means something is hammering the warehouse that is not driven by genuine business: a runaway dashboard, a misconfigured BI tool refreshing in a loop, a scraper, or a badly scheduled batch landing in peak hours. It is both a cost risk and a saturation risk for the queries that do serve revenue.
+
+| | |
+| --- | --- |
+| **Left axis (Databricks)** | SQL query rate (queries per second, or per minute) across the SQL warehouses, derived from the query history feed (`/api/2.0/sql/history/queries`, mirrored by `system.query.history`). |
+| **Right axis (ecom)** | Order rate from the connected storefront (Shopify, BigCommerce or Adobe Commerce), counted as orders per interval over the same hour. |
+| **What it tracks** | Whether query demand is explained by business demand. A query spike with flat orders is the failure signature. |
+| **Data source** | Databricks SQL query history for the query rate; the connected ecommerce platform's orders data for the order rate. Aligned to the same intervals and time zone. |
+| **Time window** | `1h` (trailing 60 minutes, fine-grained intervals). |
+| **Alert trigger** | `qps spike with no order spike`. When query rate jumps sharply while order rate stays within its normal band, the card flags an unexplained-load divergence. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card overlays two aligned series over the trailing hour.
+
+The Databricks series is SQL query rate. The engine reads the SQL warehouse query history (`/api/2.0/sql/history/queries`, equivalent to the `system.query.history` system table), counts queries per interval (typically per minute, expressed as queries per second), and plots the rate. This is the live-rate companion to the [SQL Queries per Hour (live)](/nerve-centre/kpi-cards/databricks/sql-queries-per-hour-live) card.
+
+The ecommerce series is order rate: orders per interval from the connected storefront over the same window.
+
+The divergence test compares the shape of the two series. Under normal operation, storefront-driven query load rises and falls with orders: product lookups, cart reads, recommendation queries all scale with traffic. The card establishes a baseline ratio of queries to orders and flags when query rate spikes (a sharp rise above its recent trend) while order rate stays flat (within its normal short-term band). The absolute query count is not the point; an unexplained query spike is, because those queries compete for the same warehouse capacity as the ones that actually serve checkout. A spike that orders explain is capacity you should provision for; a spike that orders do not explain is load you should investigate and probably eliminate.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A health-and-beauty retailer serves its product-detail and recommendation lookups from a Databricks SQL warehouse that sits behind the storefront. The platform team watches this card during business hours. Reading taken on Tuesday 09 Jun 26, close-up on 11:00 to 11:30 BST.
+
+| Time (BST) | Query rate (qps) | Order rate (orders/min) | State |
+| --- | --- | --- | --- |
+| 11:00 | 42 | 9 | normal |
+| 11:05 | 45 | 10 | normal |
+| 11:10 | 47 | 9 | normal |
+| 11:15 | 118 | 9 | **divergence** |
+| 11:20 | 165 | 10 | **divergence** |
+| 11:25 | 171 | 8 | **divergence** |
+
+For the first ten minutes the ratio is steady at roughly 5 queries per order: ordinary lunchtime browsing. At 11:15 the query rate nearly triples while the order rate does not move at all. The alert fires on the broken ratio.
+
+```text
+Unexplained-load divergence (what the alert caught):
+  - Baseline ratio:            ~5 queries per order
+  - Query rate at spike:       171 qps (was ~45)
+  - Order rate at spike:       ~9 orders/min (unchanged)
+  - Implied ratio at spike:    ~19 queries per order, a ~4x jump
+  - Warehouse impact: p95 query latency rising, real product lookups now
+    queueing behind the unexplained load
+```
+
+The engineer drills in. The order line rules out a genuine traffic surge: shoppers are behaving exactly as before. The query history shows the spike traffic originates from a single service principal belonging to a newly published BI dashboard. A scheduled refresh had been misconfigured to auto-refresh every 30 seconds for every viewer, and a team meeting had just opened the dashboard on a dozen screens at once. The warehouse was being hammered by dashboard refreshes, not by the storefront.
+
+Three takeaways the team should remember:
+
+1. **Orders are the denominator that makes query rate meaningful.** 171 qps is either fine or alarming depending entirely on whether orders justify it. A query spike that tracks orders is demand you should scale for; a spike that orders do not explain is waste, or worse, contention for the queries that serve revenue.
+2. **Unexplained query load steals from revenue queries.** A SQL warehouse has finite slots. Every query the runaway dashboard runs is a slot a real product-lookup or checkout query cannot use. That is why this lives in Revenue at Risk: the spike does not just cost DBU, it can slow the queries customers depend on. Pair with [SQL Warehouse Saturation](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation) and [SQL Query Latency p95](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) to see the contention.
+3. **The source is almost always identifiable.** Query history carries the user or service principal and the statement text. An unexplained spike nearly always traces to one principal: a dashboard, a notebook left looping, a BI tool, or a scraper. Find the principal, fix the config, and the spike disappears, rather than throwing more warehouse at it.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Databricks SQL Spike vs Ecom Order Rate | What the combination tells you |
+| --- | --- | --- |
+| [SQL Queries per Hour (live)](/nerve-centre/kpi-cards/databricks/sql-queries-per-hour-live) | The single-number version of the left axis. | Confirms the absolute query volume behind the spike. |
+| [SQL Warehouse Saturation %](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation) | Shows whether the spike is actually overloading the warehouse. | A query spike plus high saturation equals real contention for revenue queries. |
+| [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) | The latency cost of the spike. | If p95 rises with the spike, customer-facing lookups are now slow. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/databricks/slow-query-rate) | Whether the spike is pushing queries over the slow threshold. | A spike that drags slow-query rate up is harming the experience, not just the bill. |
+| [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries) | Identifies the heavy statements during the window. | Surfaces the exact query or dashboard behind the spike. |
+| [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume) | The cost sibling in the same cross-channel category. | A sustained query spike with flat orders shows up here as a DBU divergence. |
+| [Active SQL Sessions](/nerve-centre/kpi-cards/databricks/active-sql-sessions) | Shows how many sessions are driving the load. | Many sessions from one principal points straight at a runaway client. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks for the query side:**
+
+> **SQL → Query History** with a 1-hour filter to see the live query stream; group or filter by user / service principal to find the source of a spike.
+> **SQL → SQL Warehouses → [warehouse] → Monitoring** for the warehouse's own query-count and concurrency charts.
+> **`system.query.history`** (Unity Catalog) to count queries per minute and attribute them to `executed_by` programmatically.
+
+**Where to look for the ecom side:**
+
+> Order rate comes from the connected storefront's live order feed (Shopify, BigCommerce or Adobe Commerce). Match the same intervals and time zone.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **History ingestion lag** | Vortex IQ briefly lower | Query history records land a short time after execution; the most recent minute can be incomplete until the feed catches up. |
+| **Counted statement types** | Vortex IQ may differ | The card counts user and service-principal queries; metadata or system queries may be included or excluded depending on connector settings, so a raw history count can differ. |
+| **Warehouse scope** | Headline differs | The card can aggregate across all tracked warehouses; a single-warehouse monitoring chart shows only its own queries. |
+| **Time zone / interval** | Boundaries shift | Vortex IQ buckets in your reporting time zone and chosen interval; the UI uses workspace time. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_orders`](/nerve-centre/kpi-cards/shopify/total-orders) / [`bigcommerce.total_orders`](/nerve-centre/kpi-cards/bigcommerce/total-orders) | The right axis should match the storefront's live order count for the same intervals. | A mismatch is usually a time-zone or order-status difference; reconcile the order definition first. |
+| [`databricks.qps`](/nerve-centre/kpi-cards/databricks/sql-queries-per-hour-live) | The left axis should align with the live queries-per-hour card over the same window. | History ingestion lag or warehouse scope explains small gaps. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Query rate spiked but the card did not flag. Why?**
+Because orders spiked too. If the query rise is matched by an order rise, the ratio holds and the load is explained by genuine demand. The alert only fires when query rate jumps while order rate stays flat, the unexplained-load case. A demand-driven spike is something to provision for, not to alarm on.
+
+**Why a 1-hour window rather than something longer?**
+Unexplained query spikes are short and sharp: a looping dashboard, a scraper burst, a batch landing in peak hours. A 1-hour fine-grained window catches the spike against the live order rate while it is still actionable. The longer-horizon cost view of the same behaviour lives on [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume).
+
+**A scheduled batch job runs SQL every hour. Will that trip the alert?**
+It can if the batch is heavy enough to look like a spike against flat orders, which is itself useful to know: peak-hour batches compete with revenue queries for warehouse capacity. If the batch is expected and benign, move it off peak hours or exclude its service principal in the connector settings so the card focuses on storefront-relevant load.
+
+**The spike traffic is internal analytics, not customer-facing. Does it still matter?**
+Yes, because internal and customer-facing queries share the same warehouse slots. An internal dashboard refreshing in a loop can starve the product-lookup queries that serve the storefront, raising their latency. The card flags the contention regardless of who caused it. The fix is usually to put heavy internal analytics on a separate warehouse so they cannot crowd out revenue queries.
+
+**How do I find what caused the spike?**
+Query history carries the executing user or service principal and the statement text. Filter Query History to the spike window and group by `executed_by`; the culprit is almost always a single principal (a dashboard, a notebook, a BI connector, or a scraper). [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries) and [Active SQL Sessions](/nerve-centre/kpi-cards/databricks/active-sql-sessions) help narrow it further.
+
+**Could a query spike with flat orders ever be legitimate?**
+Occasionally, yes: a planned backfill, a one-off data export, a migration, or an analyst running ad-hoc exploration. The card cannot tell intent from volume, so it flags the divergence and leaves the judgement to you. The value is that you find out in real time and can decide whether to let it run, throttle it, or move it to an isolated warehouse, rather than discovering it on next month's bill.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Databricks SQL Spike vs Ecom Order Rate* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

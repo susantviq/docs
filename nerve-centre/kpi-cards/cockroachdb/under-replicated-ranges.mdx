@@ -1,0 +1,134 @@
+---
+title: "Under-Replicated Ranges, CockroachDB"
+sidebarTitle: "Under-Replicated Ranges"
+description: "Under-Replicated Ranges for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ranges & Leases](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Under-Replicated Ranges** counts the ranges that currently have fewer live replicas than their configured replication factor. A range that is under-replicated still has a quorum, so it keeps serving reads and writes, but it has lost some of its redundancy: it is one or two more failures away from going unavailable. This is the early-warning sibling of [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges). A brief, falling count during a rebalance or a node restart is completely normal and self-heals. A count that stays above zero for several minutes means the cluster cannot re-replicate fast enough, usually because the balancer is overloaded or a node is down, and that is when the alert fires.
+
+| | |
+| --- | --- |
+| **What it tracks** | The number of ranges currently below their configured replication factor across the cluster. |
+| **Data source** | Ranges below the configured replication factor: this typically self-heals, but a sustained value above zero means the balancer is overloaded or a node is down. Vortex IQ reads the `ranges.underreplicated` cluster metric and `crdb_internal.kv_store_status`, with node liveness from `crdb_internal.gossip_liveness` for context. On CockroachDB Cloud the same figure is read via the Cloud metrics API and the Replication dashboard. |
+| **Time window** | `RT` (real-time, continuously evaluated). |
+| **Alert trigger** | `> 0 sustained 5m`. Transient under-replication is expected and tolerated; a value that stays above zero for five minutes is the signal that re-replication is stuck. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card surfaces CockroachDB's own under-replicated range count, with the alert built around the difference between transient and sustained under-replication.
+
+- **What under-replicated means.** Every range targets a replication factor (3 by default, often 5 for critical data). A range is under-replicated when it has fewer up-to-date replicas than that target but still retains a quorum, so it can serve traffic. CockroachDB notices the gap and the replicate queue starts copying the missing replica to a healthy store to restore the target.
+- **Why a transient count is normal.** Any time the cluster moves data, it briefly drops a range below its target before the new replica catches up: rolling restarts, node decommissions, rebalancing after a node joins, or zone-config changes that move replicas. These show up as a short-lived count that falls back to zero as re-replication completes. This is healthy and expected.
+- **Why a sustained count is not.** If the count stays above zero for minutes, the cluster cannot keep up with re-replication. The usual causes are a node that is down (so its replicas never come back and others must be re-created), a balancer or snapshot-rate limit throttling the copy, disk pressure preventing new replicas from landing, or simply too many ranges needing re-replication at once.
+- **Source counter.** The `ranges.underreplicated` metric is the cluster-wide count; `crdb_internal.kv_store_status` carries the per-store view, and the Problem Ranges report lists the specific under-replicated ranges.
+
+The 5-minute sustain on the alert is the key design choice: it suppresses the normal rebalancing noise so the card only pages when re-replication is genuinely stuck.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 6-node CockroachDB cluster (v23.2, replication factor 3) behind an ecommerce stack. Two scenarios on 14 Apr 26 show the difference between healthy and stuck under-replication.
+
+**Scenario A, a rolling upgrade (healthy).** At 22:00 BST the team starts a rolling restart to apply a patch. As each node drains and restarts, its replicas go briefly stale and the count climbs, then falls as the node rejoins.
+
+| Time | Under-replicated ranges | Notes |
+| --- | --- | --- |
+| 22:00 | 0 | Steady state. |
+| 22:03 | 410 | Node 1 restarting, its replicas temporarily behind. |
+| 22:06 | 60 | Node 1 back, catching up. |
+| 22:09 | 0 | Fully re-replicated, ready for node 2. |
+
+The count rose and fell within a few minutes per node and never sustained above zero for the full five minutes, so the alert never fired. This is exactly what a healthy rolling operation looks like.
+
+**Scenario B, a dead node (stuck).** At 03:40 BST node 4's disk fails and the node goes dead. Its ~5,000 replicas are now gone and the cluster must rebuild them elsewhere.
+
+| Time | Under-replicated ranges | Notes |
+| --- | --- | --- |
+| 03:40 | 0 → 4,900 | Node 4 dead, all its replicas missing. |
+| 03:45 | 4,300 | Re-replication started but slow. |
+| 03:55 | 3,100 | Still well above zero, alert firing (sustained > 5m). |
+| 04:40 | 0 | Re-replication finally complete. |
+
+```text
+Stuck under-replication on 14 Apr 26, 03:55 BST
+  Under-replicated ranges:   3,100   (alert: > 0 sustained 5m)
+  Unavailable ranges:        0       (quorum held, data still served)
+  Nodes live:                5 of 6  (node 4 dead, disk failure)
+  Meaning:                   redundancy degraded, NOT an outage
+  Risk:                      a second node loss now could cause unavailability
+```
+
+Crucially, [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges) stayed at zero throughout: with replication factor 3, losing one node drops ranges to 2 replicas (still a quorum), so nothing went offline. But the cluster is now fragile: a second node loss before re-replication completes could push some ranges below quorum. The on-call's job is to (1) confirm node 4 is genuinely dead and not coming back, (2) let re-replication run (or raise the snapshot rate if it is throttled), and (3) avoid any other node-affecting operations until the count returns to zero.
+
+Two takeaways:
+
+1. **Transient is healthy, sustained is a problem.** A count that spikes and clears within minutes during a restart or rebalance is the cluster working as designed. The 5-minute sustain on the alert exists precisely to ignore that noise and catch only genuinely stuck re-replication.
+2. **Under-replicated is "fragile", not "down".** The data is still served; you have lost redundancy, not availability. The danger is a second failure landing before the cluster heals. Watch it alongside [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges) and [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Under-Replicated Ranges | What the combination tells you |
+| --- | --- | --- |
+| [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges) | The escalation if under-replication tips into quorum loss. | Under-replicated rising toward unavailable shows the cluster is one failure from an outage. |
+| [Unavailable or Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-or-under-replicated-ranges) | The combined alert that fires on either condition. | The alert-list card that pages when this card or its unavailable sibling crosses zero. |
+| [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count) | A dropped node is the most common cause of sustained under-replication. | Under-replication with a lost node means re-replicating a dead node's replicas. |
+| [Active Nodes (status=live)](/nerve-centre/kpi-cards/cockroachdb/active-nodes-statuslive) | The live-node liveness view. | Fewer live nodes than expected explains where the missing replicas went. |
+| [Decommissioning Nodes](/nerve-centre/kpi-cards/cockroachdb/decommissioning-nodes) | Decommissioning intentionally moves replicas. | Expected under-replication during a decommission; a stuck decommission keeps the count high. |
+| [Raft Quiescent Lag (seconds)](/nerve-centre/kpi-cards/cockroachdb/raft-quiescent-lag-seconds) | Replication progress on the ranges being rebuilt. | High raft lag with high under-replication means the re-replication itself is slow. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/cockroachdb/database-disk-usage) | New replicas need somewhere to land. | A near-full disk can stall re-replication, keeping the count stuck above zero. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The composite where replication is a weighted axis. | Sustained under-replication pulls the replication axis, and the overall score, down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+CockroachDB exposes under-replication natively, so the card is a direct read:
+
+- **DB Console.** The Replication dashboard charts under-replicated ranges over time, and the Problem Ranges page (`/#/reports/problemranges`) lists the specific under-replicated ranges and their current replica counts. During a node loss this page shows the re-replication queue draining toward zero.
+- **Cluster metrics.** The `ranges.underreplicated` time-series in the Metrics dashboard is the same counter the card reads. The related `queue.replicate.*` metrics show how fast the replicate queue is working through the backlog.
+- **`crdb_internal` tables.** `SELECT * FROM crdb_internal.kv_store_status;` exposes per-store range health, and `system.replication_stats` / `crdb_internal.ranges` let you locate under-replicated ranges and their replica sets. `crdb_internal.gossip_liveness` shows node status for context.
+- **Snapshot rate settings.** If re-replication is throttled, the `kv.snapshot_rebalance.max_rate` and `kv.snapshot_recovery.max_rate` cluster settings govern the copy rate; comparing them against the queue length explains a slow drain.
+
+On CockroachDB Cloud the Replication dashboard and Metrics tab show the same figures, and Vortex IQ reads them via the Cloud metrics API. A brief disagreement between the card and the console during a fast rebalance is metric-scrape timing; the Problem Ranges page is the authoritative live view.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My under-replicated count spiked during a restart but the alert never fired. Is that a bug?**
+No, that is the design. The alert only fires when the count stays above zero for a sustained five minutes, precisely so that the normal, healthy spikes during restarts, rebalances, and node joins do not page you. A spike that clears within a few minutes is the cluster re-replicating as intended.
+
+**What is the difference between under-replicated and unavailable?**
+Under-replicated means a range has fewer replicas than configured but still has a quorum, so it keeps serving reads and writes while the cluster rebuilds the missing replica. Unavailable means the range has lost quorum and cannot serve traffic at all. Under-replication is degraded redundancy (a warning); unavailability is an outage. See [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges).
+
+**The count is stuck high and not falling. What is blocking re-replication?**
+Common causes: a node is genuinely dead so its replicas must be rebuilt from scratch (this takes time proportional to the data it held); the snapshot rate limits (`kv.snapshot_rebalance.max_rate`, `kv.snapshot_recovery.max_rate`) are throttling the copy; a store is near disk capacity so new replicas cannot land; or so many ranges need re-replication at once that the queue is saturated. Check [Database Disk Usage %](/nerve-centre/kpi-cards/cockroachdb/database-disk-usage), node liveness, and the `queue.replicate.*` metrics.
+
+**Should I do anything while the count is high after a node loss?**
+Mainly, let it heal and protect against a second failure. Confirm whether the lost node is recoverable (bringing it back is faster than rebuilding all its replicas), avoid starting any other node-affecting operations (no further restarts, no decommissions) until the count is back to zero, and if re-replication is throttled and you have spare disk and network headroom, consider raising the snapshot rate to speed it up.
+
+**Does decommissioning a node cause under-replication?**
+Yes, intentionally. Decommissioning moves a node's replicas to other nodes, which briefly pushes ranges under-replicated until the copies land. This is expected and clears as the decommission progresses. A decommission that leaves the count stuck high usually means a stuck drain, check [Decommissioning Nodes](/nerve-centre/kpi-cards/cockroachdb/decommissioning-nodes).
+
+**Does it work the same on self-hosted and CockroachDB Cloud?**
+Yes. The `ranges.underreplicated` metric, the Replication dashboard, and the `crdb_internal` views exist on both. On Cloud, Vortex IQ reads the same counter through the Cloud metrics API, and the managed support team monitors it too, so a self-hosted and a Cloud cluster behave identically here.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Under-Replicated Ranges* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

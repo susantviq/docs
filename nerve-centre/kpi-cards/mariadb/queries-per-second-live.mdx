@@ -1,0 +1,145 @@
+---
+title: "Queries per Second (live), MariaDB"
+sidebarTitle: "Queries per Second (live)"
+description: "Queries per Second (live) for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Queries per Second (live)** is the rate at which the MariaDB server is executing statements right now, derived from the rising `Questions` (or `Queries`) status counter sampled over a short interval. It is the single best heartbeat for the instance: a healthy database under traffic shows a steady, traffic-shaped QPS curve, and the most telling failures are the ones where this number does something unexpected. A flat line means the database has stalled; a vertical spike with no matching business activity usually means a runaway job, a missing cache, or a scraper; a sudden drop during business hours means queries are queueing or connections are being refused upstream. As a hero card it gives the platform team an at-a-glance pulse before they drill into latency, errors, or capacity.
+
+| | |
+| --- | --- |
+| **What it tracks** | The live statement-execution rate of the instance. Queries per Second (live) for the selected period. |
+| **Data source** | The delta of `SHOW GLOBAL STATUS LIKE 'Questions'` (client statements) or `'Queries'` (including stored-procedure internals) across the sampling interval, divided by the elapsed seconds. On managed services the figure is read from the provider's throughput metric. |
+| **Time window** | `RT` (real-time, recomputed each sampling interval as a per-second rate). |
+| **Alert trigger** | None. QPS has no fixed "good" value; it is a context metric read against its own baseline and against the business activity it should mirror. |
+| **Metric basis** | A rate (per second), NOT a cumulative count. The underlying `Questions` counter only ever rises; the card reports the slope, not the total. |
+| **What does NOT count** | (1) Statements that never reach the server (served from an application cache or a proxy result cache); (2) `COM_PING` and other lightweight admin packets when using the `Queries`-vs-`Questions` distinction; (3) replicated writes applied on a replica, which inflate a replica's apparent QPS relative to the primary. |
+| **Sentiment key** | `maria_qps` |
+| **Roles** | dba, platform, sre, owner |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+QPS is a rate computed from a monotonic counter:
+
+```text
+QPS = (Questions_now − Questions_previous) / (timestamp_now − timestamp_previous)
+```
+
+`Questions` is a global status counter that increments once per client statement and only ever rises until the server restarts. To turn it into a rate, the card reads the counter twice (at the start and end of the sampling interval), subtracts, and divides by the elapsed seconds. The result is the average statements-per-second over that short window.
+
+Two definitions exist and the distinction matters:
+
+1. **`Questions`** counts statements sent by clients. It excludes statements executed inside stored procedures and excludes some admin commands. This is the figure most DBAs mean by "QPS" because it tracks real application demand.
+2. **`Queries`** counts everything `Questions` does plus statements executed within stored programs and certain internal commands. On a workload heavy with stored procedures, `Queries` reads meaningfully higher than `Questions`.
+
+The card reports the `Questions`-based rate by default so the number reflects client demand, and recomputes it every sampling interval against the `RT` window so the gauge tracks live traffic. Because there is no universal threshold, the card carries no alert: its value is comparative, read against the instance's own daily and weekly baseline and against the order or request rate it should mirror.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MariaDB 10.11 primary behind an ecommerce API. Normal weekday daytime QPS sits around 1,800. Snapshot taken on 09 May 26 across a 20-minute window.
+
+| Time (BST) | QPS | What is happening |
+| --- | --- | --- |
+| 10:00 | 1,820 | Baseline weekday traffic. |
+| 10:08 | 1,790 | Steady. |
+| 10:11 | 6,400 | Sudden 3.5x spike. |
+| 10:14 | 6,550 | Sustained, not a blip. |
+| 10:19 | 6,480 | Still elevated. |
+
+The card shows QPS jumping from ~1,800 to ~6,500 and holding there. There is no alert (QPS has none), but the hero gauge makes the jump impossible to miss. The team reads three things:
+
+1. **The spike is real and sustained, not a deploy blip.** A reconnect storm or a single batch job would spike and recede within a minute or two. Three minutes of sustained 6,500 QPS is a genuine change in demand or a genuine problem.
+2. **The next question is whether business activity matches.** This is where the cross-channel card earns its place: [MariaDB QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mariadb/mariadb-qps-spike-vs-ecom-order-rate) overlays the order rate on the QPS curve. In this incident the order rate stayed flat at its 10:00 level while QPS tripled. Tripled queries with flat orders is the classic signature of a bot or scraper hammering a product or search endpoint, not real customers.
+3. **The downstream risk is capacity, not revenue (yet).** Watch [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation) and [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms): if the scraper's load pushes latency up, real customers' queries slow down too. The fix is upstream (rate-limit or block the offending source at the edge or API gateway), not in the database.
+
+```text
+Spike triage at 10:14:
+  Baseline QPS         ~1,800
+  Current QPS          ~6,550   (3.6x)
+  Order rate           flat at baseline   ← decisive signal
+  p95 latency          climbing from 40ms to 110ms
+Diagnosis: query volume detached from business activity = scraper/bot.
+Action: identify source via PROCESSLIST host grouping; rate-limit at the
+        gateway. No schema or server change needed.
+```
+
+The lesson: QPS alone never tells you whether a spike is good or bad. A spike that tracks orders is a sale; a spike that does not is an attack or a bug. Always read QPS against the business activity it should mirror.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Queries per Second (live) | What the combination tells you |
+| --- | --- | --- |
+| [MariaDB QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mariadb/mariadb-qps-spike-vs-ecom-order-rate) | Overlays business activity on the query rate. | QPS up with orders up equals a sale; QPS up with orders flat equals a bot or runaway job. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms) | The cost of the load. | Rising QPS with stable p95 equals healthy scaling; rising QPS with rising p95 equals approaching a capacity wall. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mariadb/query-error-rate) | Whether the load is succeeding. | QPS up with error rate up means the spike is overwhelming the instance, not being served cleanly. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation) | Whether there are slots for the load. | A QPS spike that exhausts the pool turns into refused connections; watch both during bursts. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mariadb/slow-query-rate) | Whether the extra queries are cheap or expensive. | A QPS spike of cheap cached lookups is harmless; a spike of slow queries is dangerous at any volume. |
+| [Instance Uptime](/nerve-centre/kpi-cards/mariadb/instance-uptime) | Context for a flat-line reading. | QPS dropping to zero with uptime resetting equals a restart; zero QPS with uptime intact equals a stall. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite that uses throughput as one input. | A sudden QPS change is often the first mover before the health score reacts. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> **`SHOW GLOBAL STATUS LIKE 'Questions'`** twice, a few seconds apart, then divide the difference by the elapsed seconds to compute QPS by hand.
+> **`SHOW GLOBAL STATUS LIKE 'Queries'`** for the stored-procedure-inclusive figure, useful when your workload is procedure-heavy.
+> **`SHOW GLOBAL STATUS LIKE 'Com_%'`** to break the rate down by statement type (`Com_select`, `Com_insert`, `Com_update`), which reveals whether a spike is reads or writes.
+> **`SHOW PROCESSLIST`** grouped by host or user to find where a spike is coming from.
+
+Command-line tools `mysqladmin extended-status --relative --sleep=1` and `mytop` compute and display the same per-second rate live. On a managed service, compare against the provider's queries-per-second or throughput metric on the managed-database console.
+
+**Why our number may legitimately differ from MariaDB's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **`Questions` vs `Queries`** | Card lower on procedure-heavy workloads | The card uses `Questions` (client statements); a tool reading `Queries` includes stored-procedure internals and reads higher. |
+| **Sampling interval** | Smoothing | The card averages over its interval; a one-second `mysqladmin --relative` sample catches sharper peaks and troughs. |
+| **Replica vs primary** | Replica higher | A replica applies the primary's writes plus serves its own reads, so its `Questions`/`Queries` can exceed the primary's. |
+| **Proxy result caching** | Card lower than app expectation | Statements served from a ProxySQL query cache never reach the server and are not counted; the application thinks it issued more queries than the server saw. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does this card have no alert threshold?**
+Because there is no universally "bad" QPS. A spike to 6,000 is wonderful if it is a sale and alarming if it is a scraper; a drop to zero is fine at 03:00 and a crisis at 13:00. QPS is a context metric: its meaning comes from comparison against the instance's own baseline and against the business activity it should mirror. Alerting on a fixed number would page constantly during normal traffic swings. Pair it with cards that do have thresholds, such as [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms) and [Query Error Rate %](/nerve-centre/kpi-cards/mariadb/query-error-rate), to know whether a QPS change is healthy.
+
+**My QPS dropped to near zero but the database is up. What does that mean?**
+A live but idle database during business hours usually means queries are stuck, not absent. Likely causes: a long lock holding everyone behind it, connection-pool exhaustion refusing new clients upstream, or a stalled replica. Check [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation), `SHOW PROCESSLIST` for queries stuck in `Waiting for lock`, and [InnoDB Deadlocks (last 5m)](/nerve-centre/kpi-cards/mariadb/innodb-deadlocks-last-5m). A genuine traffic drop, by contrast, shows up identically on the application's request rate.
+
+**`Questions` or `Queries`: which is "real" QPS?**
+Both are real; they measure different things. `Questions` counts statements your application sends and is the better proxy for client demand. `Queries` adds statements executed inside stored procedures and triggers, so on a procedure-heavy schema it reads higher. This card uses `Questions` so the number reflects what your application asked for, not internal fan-out.
+
+**Why is my replica's QPS higher than my primary's?**
+A replica does two jobs: it applies every write the primary made (via the replication threads) and it serves whatever read traffic you route to it. Its `Questions`/`Queries` counters therefore include the replayed writes on top of its own reads, which can push the figure above the primary's. This is expected and not a sign of a problem.
+
+**A QPS spike fired no alert but caused an outage. Why did the card not warn me?**
+This card deliberately carries no alert; it is a heartbeat, not a guardrail. The outage would have been caught by the threshold cards the spike fed into: [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation) crossing 90%, [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms) crossing 200ms, or [Query Error Rate %](/nerve-centre/kpi-cards/mariadb/query-error-rate) crossing 1%. Treat the QPS gauge as the thing you glance at first, then follow it into the cards that page.
+
+**Can application-side caching make QPS look artificially low?**
+Yes, and that is usually a good thing. Statements served from an application cache (Redis, Memcached) or a proxy result cache never reach MariaDB, so they do not appear in `Questions`. A low server QPS alongside high application request volume means your cache is doing its job. It becomes a problem only when the cache fails: QPS then leaps as all that traffic suddenly hits the database directly.
+
+**How do I tell reads from writes in a spike?**
+This card reports the combined rate. To split it, read `SHOW GLOBAL STATUS LIKE 'Com_select'` against `Com_insert`, `Com_update`, and `Com_delete` over the same interval. A read-heavy spike (mostly `Com_select`) is a candidate for caching or a read replica; a write-heavy spike stresses the primary and replication and cannot be offloaded to replicas.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Queries per Second (live)* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

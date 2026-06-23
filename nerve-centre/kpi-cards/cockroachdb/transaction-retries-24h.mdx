@@ -1,0 +1,123 @@
+---
+title: "Transaction Retries (24h), CockroachDB"
+sidebarTitle: "Transaction Retries (24h)"
+description: "Transaction Retries (24h) for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Transaction Retries (24h)** counts how many transactions CockroachDB had to rerun over the last day because they conflicted with another transaction. This is a CockroachDB-distinctive signal: because the database is serialisable and distributed, transactions that touch the same keys do not deadlock, they abort and retry. A few retries are normal and expected under load. A flood of them is the unmistakable signature of a contention hotspot: the same rows being fought over so hard that work has to be redone again and again. The count answers "how much wasted work is contention costing me?" Low and flat is healthy; a sustained climb means a hotspot; above 1,000 over the window fires an alert.
+
+| | |
+| --- | --- |
+| **What it tracks** | The total number of transaction retries across the cluster over the trailing 24 hours. |
+| **Data source** | CockroachDB-distinctive: distributed transactions retry on conflict, and a high retry count points straight at a contention hotspot. Vortex IQ reads the retry counters CockroachDB exposes (`sql.txn.restart.count` in the time-series, plus the per-statement and per-transaction retry counts in `crdb_internal.statement_statistics` and `crdb_internal.transaction_statistics`). On CockroachDB Cloud the same counters are read via the Cloud metrics API and the SQL Activity page. |
+| **Time window** | `24h` (a trailing 24-hour total, so an overnight contention spike is still visible the next morning). |
+| **Alert trigger** | `> 1000`. More than a thousand retries in the window means contention is now costing meaningful wasted work, not just incidental cross-talk. |
+| **Roles** | DBA, platform, SRE, application engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card is a straight 24-hour sum of CockroachDB's retry counters, with a little structure underneath:
+
+- **What counts as a retry.** When a transaction's serialisable guarantee would be violated by a concurrent transaction (a write-write or read-write conflict, a pushed timestamp, or a `ReadWithinUncertaintyInterval`), CockroachDB aborts and retries it. Each rerun increments the retry counter. The card sums these over 24 hours.
+- **Server-side and client-side.** CockroachDB retries many conflicts automatically inside the gateway node (server-side / "automatic" retries). When it cannot (the transaction has already returned results to the client), it surfaces a `40001` serialisation error and the application must retry (client-side). The card focuses on the server-side restart counters, which are the cleanest measure of contention pressure; the client-side `40001` errors show up on [Statement Error Rate %](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate).
+- **Source counters.** The `sql.txn.restart.count` time-series gives the cluster-wide total; `crdb_internal.transaction_statistics` and `crdb_internal.statement_statistics` give the per-fingerprint breakdown so a spike can be attributed to a specific transaction shape.
+- **Internal traffic excluded.** Retries from internal CockroachDB jobs are filtered out so the count reflects application transactions.
+
+A retry is not an error in the user-visible sense: a server-side retry is invisible to the application (the transaction eventually succeeds), it just costs latency and CPU. That is why this is an Errors-category signal rather than a hard failure count: it measures wasted work and contention pressure, the early warning before retries exhaust and become real `40001` failures.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 5-node CockroachDB cluster (v23.2) behind an ecommerce checkout. Snapshot taken on 14 Apr 26, reviewing the trailing 24 hours after an overnight latency alert.
+
+| Window | Transaction retries | Reading |
+| --- | --- | --- |
+| Previous day baseline | 180 | Normal incidental contention. |
+| 24h to 09:00 (with overnight sale) | 14,600 | Far above the 1,000 trigger, card red. |
+
+The retry count is 80x the baseline. The team's first move is to find the shape of transaction responsible, so they open [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) and see a single `UPDATE inventory SET qty = qty - $1 WHERE sku = $2` dominating contention on one hot SKU. The picture is consistent: thousands of decrements serialising on one primary-key row, each conflict forcing a retry.
+
+```text
+24h retry review on 14 Apr 26
+  Transaction retries (24h):  14,600   (alert: > 1000)
+  Baseline:                   ~180
+  Dominant transaction:       UPDATE inventory ... hot SKU
+  Co-signal:                  p99 latency 1,200ms, slow-query rate 6%
+  Root cause:                 single-row write hotspot during flash sale
+```
+
+Crucially, [Statement Error Rate %](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate) is still only 0.4%, under its 1% line. That tells the team the retries are mostly succeeding on rerun (server-side), so customers are not seeing failures yet, just slowness. The retry count is the leading indicator: if the contention worsens, retries will start exhausting their budget and tip into `40001` errors that the error-rate card will then catch.
+
+The remedy is the same as for any single-row write hotspot: shard or batch the inventory counter, or split the hot range so writes spread across more leaseholders. After the team shards the counter, the retry count falls back under 300 within the hour and p99 returns to ~90ms.
+
+Two takeaways:
+
+1. **Retries are wasted work, not yet failures.** A high retry count means the cluster is redoing transactions, burning latency and CPU, before any user sees an error. It is the cheapest place to catch a contention problem early.
+2. **Read it with contention and errors.** Retries climbing while [Statement Error Rate %](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate) stays low means "contention, handled". Retries climbing and errors crossing 1% means "contention, now failing", which is a sharper escalation. [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) names the culprit either way.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Transaction Retries | What the combination tells you |
+| --- | --- | --- |
+| [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) | Names the statement driving the retries. | A retry spike plus a dominant contended statement is the textbook single-row hotspot. |
+| [Statement Error Rate %](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate) | The point where retries become user-visible failures. | Retries up with errors low equals "handled"; retries up with errors over 1% equals "now failing". |
+| [Statement Latency p99 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p99-ms) | Each retry adds latency. | A retry climb almost always shows up as a blown-out p99. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/cockroachdb/slow-query-rate) | The workload-share view of the resulting slowness. | Retries dragging the slow rate up confirms the contention is affecting real traffic. |
+| [Range Lease Balance Skew %](/nerve-centre/kpi-cards/cockroachdb/range-lease-balance-skew) | A hot range often shows up as lease skew. | High skew with high retries points to one overloaded leaseholder. |
+| [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live) | The load context. | Retries scaling faster than QPS means contention is getting worse per unit of work. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The composite that absorbs latency and errors. | Sustained retries drag latency and errors down, pulling the overall health score. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation) | Retries hold connections longer. | A retry storm can saturate the pool because each transaction occupies its connection for longer. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+CockroachDB exposes retries directly, so reconciliation is a matter of matching counters and windows:
+
+- **Time-series.** The `sql.txn.restart.count` metric (visible in the DB Console SQL dashboard) is the cluster-wide retry counter. Summing it over a 24-hour window reproduces the headline. The dashboard also breaks restarts down by reason (write-too-old, serializable, uncertainty), which is useful for diagnosing the type of conflict.
+- **`crdb_internal` statistics.** `crdb_internal.transaction_statistics` and `crdb_internal.statement_statistics` carry per-fingerprint retry counts, so you can attribute the total to specific transaction shapes (the same data behind [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements)).
+- **DB Console SQL Activity / Insights.** The Insights page flags high-retry statements alongside high-contention ones; the Transactions page shows retry counts per transaction fingerprint.
+- **Application logs.** Client-side `40001` serialisation errors in your application logs are the retries CockroachDB could not absorb automatically; these correlate with, but are not identical to, the server-side restart count this card sums.
+
+On CockroachDB Cloud the same metric and SQL Activity views are available via the Metrics tab. If the Vortex IQ count looks higher than a single metric panel, remember the card sums over a full 24 hours and counts every restart, including automatic server-side ones the application never saw; a panel scoped to a shorter range or to client-visible errors will read lower.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Is a transaction retry the same as a failed transaction?**
+No, and this is the key thing to understand. Most retries are automatic, server-side reruns that the application never sees: the transaction eventually succeeds, it just took longer. A retry is wasted work and a latency cost, not a failure. Only when CockroachDB cannot retry automatically does it return a `40001` error for the client to handle, and those show up on [Statement Error Rate %](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate), not here.
+
+**Some retries are normal, so why alert at all?**
+Exactly because some are normal, the alert is set at a level (more than 1,000 in 24 hours) that distinguishes incidental contention from a real hotspot. A handful of retries an hour on a busy OLTP cluster is healthy; a thousand-plus over the window means the same rows are being fought over hard enough to cost measurable work. The threshold is configurable per profile.
+
+**My retry count is high but error rate and latency look fine. Should I worry?**
+It is the cheapest early warning you have, so it is worth investigating but not panicking. High retries with low errors means contention is being absorbed by automatic reruns. The risk is that if contention worsens, retries exhaust their budget and tip into `40001` failures. Find the hotspot now via [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) and fix it before it escalates.
+
+**How do I actually reduce retries?**
+Reduce contention. The most common fixes: shard or batch single-row write hotspots (counters, inventory decrements), switch monotonic primary keys to non-sequential ones so writes scatter across ranges, shorten transactions so they hold locks for less time, and use `SELECT ... FOR UPDATE` to order conflicting access deterministically. Adding nodes does not reduce retries on a hot key.
+
+**Does this count read-only transactions?**
+Read-only transactions can still retry, most often due to `ReadWithinUncertaintyInterval` (a read that overlaps a recent write whose timestamp is uncertain). These are usually brief and resolve on the automatic rerun. If you see a lot of uncertainty restarts, tightening clock synchronisation across nodes (NTP / PTP) often helps, because the uncertainty window is bounded by the configured max clock offset.
+
+**Does it work the same on self-hosted and CockroachDB Cloud?**
+Yes. The `sql.txn.restart.count` time-series and the `crdb_internal` statistics exist on both. On Cloud, Vortex IQ reads the same counters through the Cloud metrics API and the SQL Activity page, so a self-hosted and a Cloud cluster with identical workloads will report the same retry behaviour.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Transaction Retries (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

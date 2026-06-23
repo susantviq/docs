@@ -1,0 +1,150 @@
+---
+title: "Connection Pool at >90% Saturation, PostgreSQL"
+sidebarTitle: "Connection Pool at >90% Saturation"
+description: "Connection Pool at >90% Saturation for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This is the alert card that fires when your PostgreSQL connection pool crosses 90% of `max_connections` and holds there. In plain terms: the database is running out of places to put new connections. When the last few slots fill, new connection attempts get rejected with "too many clients already" (`FATAL: sorry, too many clients already`), and every application that talks to the database starts throwing connection errors at the same time. For an SRE or DBA this is one of the highest-signal alerts on the board, because pool exhaustion is the single most common cause of a total, instant database outage that looks like a crash but is not one.
+
+| | |
+| --- | --- |
+| **What it tracks** | Whether `(active + idle + idle-in-transaction) / max_connections` has crossed 90% and stayed there for at least one minute. The card surfaces the breach as an alert entry, not a continuous gauge. |
+| **Data source** | Backend count from `pg_stat_activity` (one row per backend) compared against the `max_connections` GUC. On instances fronted by PgBouncer or pgpool-II, the proxy's own pool counters are read in addition to the server-side count. See the live gauge sibling [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) for the underlying calculation. |
+| **Time window** | `RT` (real-time, evaluated on each poll, roughly every 60 seconds). |
+| **Alert trigger** | `>90% sustained 1m`. A single momentary spike does not fire; the breach must hold across the one-minute evaluation window to avoid paging on transient connection storms that drain on their own. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The breach condition is computed directly from the two numbers PostgreSQL itself exposes:
+
+```text
+saturation = count(pg_stat_activity backends) / max_connections
+fire when:  saturation > 0.90  AND  the condition holds for >= 60 seconds
+```
+
+The backend count is `SELECT count(*) FROM pg_stat_activity` (all states: `active`, `idle`, `idle in transaction`, `idle in transaction (aborted)`, plus background workers that count against the limit). The denominator is `SHOW max_connections` (or `SELECT setting FROM pg_settings WHERE name = 'max_connections'`).
+
+A subtlety that matters: PostgreSQL reserves a handful of slots above the application-visible limit via `superuser_reserved_connections` (default 3) and, from PostgreSQL 16, `reserved_connections`. Those reserved slots exist precisely so a DBA can still log in to fix the problem when the pool is full. The card measures saturation against the full `max_connections`, so a reading of "100%" still leaves the superuser slots free for you to connect and triage.
+
+When a connection pooler is present (PgBouncer in `transaction` mode is the common case), there are two distinct pools to watch: the client-side pool the application fills, and the server-side pool PgBouncer maintains against PostgreSQL. The card reads both and fires on whichever crosses 90% first, because exhaustion at either layer produces the same application-visible failure.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a primary PostgreSQL 15 instance on a managed service backing a fashion retailer's order and inventory APIs. `max_connections` is set to 200. PgBouncer sits in front in transaction-pooling mode. Snapshot taken on 14 Apr 26 at 20:05 BST, the start of a flash-sale window.
+
+| Metric | Reading | Threshold | State |
+| --- | --- | --- | --- |
+| Backends in `pg_stat_activity` | 187 | n/a | rising |
+| `max_connections` | 200 | n/a | fixed |
+| Server-side saturation | 93.5% | 90% | **BREACH** |
+| Duration above 90% | 2m 10s | 1m | **BREACH** |
+| `idle in transaction` backends | 41 | n/a | suspicious |
+
+The card fires. The headline reads **Connection Pool at 93.5% (BREACH, 2m)**. The on-call DBA reads three things immediately:
+
+1. **The pool is nearly full and not draining.** At 187 of 200 with traffic still climbing, the next minute will hit the wall. New API requests are about to start failing with `FATAL: sorry, too many clients already`.
+2. **41 of those backends are idle in transaction.** That is the tell. These are connections that opened a transaction (`BEGIN`) and then went quiet without committing or rolling back, often because an application thread is blocked on an external call while holding a database connection open. Cross-reference [Idle-in-Transaction Backends](/nerve-centre/kpi-cards/postgresql/idle-in-transaction-backends).
+3. **This is a pooling problem, not a query problem.** Latency (see [Query Latency p95 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p95-ms)) is still healthy at 38ms. The database can do the work; it just cannot accept the connections.
+
+```text
+Triage path during the breach:
+  1. Identify the idle-in-tx offenders:
+     SELECT pid, state, now() - state_change AS idle_for, query
+     FROM pg_stat_activity
+     WHERE state = 'idle in transaction'
+     ORDER BY state_change ASC;
+  2. If a deploy just shipped, suspect a code path that forgot to commit.
+  3. Short-term relief: terminate the oldest idle-in-tx backends:
+     SELECT pg_terminate_backend(pid)
+     FROM pg_stat_activity
+     WHERE state = 'idle in transaction'
+       AND now() - state_change > interval '5 minutes';
+  4. Set idle_in_transaction_session_timeout so the DB self-heals next time.
+  5. Confirm PgBouncer pool_size and the app's own pool size are not summed
+     above what PostgreSQL can serve.
+```
+
+Three takeaways:
+
+1. **Pool exhaustion is almost never about traffic alone.** A healthy app with correct connection handling will queue at the pooler, not flood the server. When this fires, the first suspect is a connection leak (idle-in-transaction), not "we got popular".
+2. **The fix is usually configuration, not a bigger box.** Raising `max_connections` to paper over a leak makes the eventual failure worse, because each backend costs memory (`work_mem` per sort, plus per-backend overhead). The durable fix is a pooler sized correctly plus `idle_in_transaction_session_timeout`.
+3. **This alert is a leading indicator of a total outage.** Unlike a slow query, which degrades one endpoint, a full pool takes the whole database offline for every caller at once. Treat a sustained breach as a near-page-1 event.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Connection Pool at >90% Saturation | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) | The continuous gauge this alert is built on. | The gauge shows the climb; this card marks the moment it became dangerous. |
+| [Idle-in-Transaction Backends](/nerve-centre/kpi-cards/postgresql/idle-in-transaction-backends) | The most common cause of slow-building saturation. | High idle-in-tx plus rising saturation equals a connection leak, not real load. |
+| [Connections In Use](/nerve-centre/kpi-cards/postgresql/connections-in-use) | The raw backend count behind the percentage. | Confirms whether the breach is many small users or a few stuck sessions. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/postgresql/connection-errors-24h) | The downstream symptom once the pool is full. | A spike here right after the breach confirms rejected connections reached clients. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/postgresql/queries-per-second-live) | Distinguishes a real traffic surge from a leak. | Saturation up with flat QPS equals a leak; both up together equals genuine demand. |
+| [PgBouncer Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/postgresql/pgbouncer-pool-saturation-vs-traffic-burst) | The cross-channel view tying pool pressure to storefront traffic. | Confirms whether the burst is paying customers or scrapers. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The composite that drops sharply when the pool saturates. | One sustained breach pulls the composite below its healthy band. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL's own tooling:**
+
+> Run `SELECT count(*) FROM pg_stat_activity;` and compare against `SHOW max_connections;`. The ratio is the saturation the card reports.
+> Break it down by state with `SELECT state, count(*) FROM pg_stat_activity GROUP BY state;` to see how much of the pool is genuinely working versus idle or stuck.
+> On PgBouncer, connect to the admin console (`psql -p 6432 pgbouncer`) and run `SHOW POOLS;` and `SHOW CLIENTS;` to see client-side queueing the server-side count cannot show.
+> On a managed service (Amazon RDS / Aurora, Google Cloud SQL, Azure Database for PostgreSQL), the `DatabaseConnections` metric in the provider's monitoring console is the same number, sampled at the provider's interval.
+
+**Why our number may legitimately differ from PostgreSQL's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Poll timing** | Brief lag | The card polls roughly every 60s; a `pg_stat_activity` query you run by hand is instantaneous. A fast spike can show on one and not the other. |
+| **Reserved slots** | Card may read 100% while you can still connect | Saturation is measured against full `max_connections`; `superuser_reserved_connections` keeps DBA slots free above the application ceiling. |
+| **Pooler layer** | Card may fire when the server looks calm | If PgBouncer's client pool saturates while its server pool is small, the server-side count stays low but clients are rejected. The card reads both layers. |
+| **Background workers** | Card slightly higher | Parallel workers, autovacuum workers, and logical replication workers occupy `pg_stat_activity` rows and count against the limit. |
+| **Managed-service sampling** | Provider console smoother | RDS / Cloud SQL sample `DatabaseConnections` on a coarser interval and may miss a sub-minute breach the card catches. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card fires at 90% but my app is fine. Why page on that?**
+90% sustained for a minute is a near-miss, not a current outage, and that is the point. At 100% you are already rejecting connections and customers are seeing errors. The alert is deliberately a leading indicator so you can act in the gap between "nearly full" and "rejecting clients". If your workload routinely runs at 92% safely, raise the sensitivity threshold for this instance in the Sensitivity tab rather than ignoring the page.
+
+**Should I just increase `max_connections` to stop this firing?**
+Almost never as the first move. Each backend reserves memory (per-backend overhead plus `work_mem` for sorts and hashes), so a higher ceiling raises your worst-case memory footprint and can trade a connection outage for an out-of-memory one. The correct fix for most workloads is a connection pooler (PgBouncer in transaction mode) sized so the application never opens more server-side connections than PostgreSQL can comfortably hold, plus `idle_in_transaction_session_timeout` to reclaim leaked sessions.
+
+**What is the difference between this and the live saturation gauge?**
+[Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) is a continuous gauge you glance at; it is green most of the time. This card is an alert entry that only appears when the gauge crosses 90% and holds. Use the gauge for trend, this card for "wake me up".
+
+**My instance is behind PgBouncer. Which pool does the alert watch?**
+Both. PgBouncer maintains a client-facing pool and a server-facing pool against PostgreSQL. Exhaustion at either layer produces the same `too many clients` symptom for the application, so the card fires on whichever crosses 90% first. Check `SHOW POOLS;` in the PgBouncer admin console to see which layer is the bottleneck.
+
+**Connections jumped to 95% for ten seconds and the card did not fire. Is it broken?**
+No, that is the `sustained 1m` qualifier working as designed. Connection storms (a deploy restart, a pod rollout, a brief retry burst) routinely spike the count for a few seconds and drain on their own. Paging on those would be noise. The breach must hold across the one-minute evaluation window.
+
+**Does autovacuum or replication count against the pool?**
+Yes. Autovacuum workers, parallel query workers, and walsender processes for streaming replication all occupy rows in `pg_stat_activity` and count against `max_connections`. On a busy instance with several replicas and parallel queries enabled, the non-application share can be meaningful, so size the ceiling with headroom for them.
+
+**Can I see which application is holding the connections?**
+Yes, if your application sets `application_name` on its connections (most drivers do, or you can set it in the connection string). Run `SELECT application_name, count(*) FROM pg_stat_activity GROUP BY application_name ORDER BY 2 DESC;` to attribute the pool by service. This is the fastest way to find which deploy or service introduced a leak.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connection Pool at >90% Saturation* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

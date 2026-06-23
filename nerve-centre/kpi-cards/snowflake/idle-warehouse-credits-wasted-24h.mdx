@@ -1,0 +1,147 @@
+---
+title: "Idle Warehouse Credits Wasted (24h), Snowflake"
+sidebarTitle: "Idle Warehouse Credits Wasted (24h)"
+description: "Idle Warehouse Credits Wasted (24h) for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Credit Burn](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The credits your warehouses spent while they were running (billing the clock) but doing no useful work, that is, no queries executing. In Snowflake a warehouse bills per second from the moment it resumes until it auto-suspends, so any time it sits idle above its `AUTO_SUSPEND` floor is money spent for nothing. This card is the single clearest signal that an `AUTO_SUSPEND` setting is too generous, or that a warehouse is being kept warm "just in case". For a platform team, it answers: how much of yesterday's compute bill bought literally nothing?
+
+| | |
+| --- | --- |
+| **What it tracks** | Credits consumed by each warehouse during intervals where the warehouse was resumed but zero queries were executing, summed across all warehouses for the last 24 hours. |
+| **Data source** | `SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY` (credits billed per warehouse per hour) reconciled against `QUERY_HISTORY` to find the windows with no query activity. The minimum auto-suspend dwell time per resume is treated as unavoidable; everything above it is counted as waste. |
+| **Time window** | `24h` rolling. The card reads the trailing 24 hours, not a calendar day. |
+| **Alert trigger** | `> 10% of total`. When idle credits exceed 10% of the account's total 24h credit spend, the card flags amber/red and the sensitivity rule fires. |
+| **Units** | Snowflake credits (and, where a $/credit rate is configured, the cash equivalent). One credit on a Standard-edition X-Small warehouse equals one warehouse-hour. |
+| **Latency** | `WAREHOUSE_METERING_HISTORY` is hourly-granular with up to ~3 hours of view latency in `ACCOUNT_USAGE`. The headline is therefore "near-yesterday", not live to the second. |
+| **Roles** | owner, platform, finops, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The metric isolates the portion of metered credits that maps to idle time. Conceptually, per warehouse:
+
+```text
+For each hour H in the trailing 24h:
+  billed_credits[H]   = WAREHOUSE_METERING_HISTORY.credits_used (compute portion)
+  active_seconds[H]   = sum of query execution overlap within H (from QUERY_HISTORY)
+  resumed_seconds[H]  = seconds the warehouse was in 'started'/'resumed' state in H
+
+  idle_seconds[H]     = max(0, resumed_seconds[H] - active_seconds[H] - unavoidable_dwell)
+  idle_credits[H]     = billed_credits[H] * (idle_seconds[H] / resumed_seconds[H])
+
+idle_total            = sum(idle_credits) over all warehouses, all 24 hours
+idle_pct              = idle_total / total_credits_24h
+```
+
+`unavoidable_dwell` accounts for the fact that a warehouse cannot suspend instantly: Snowflake bills a 60-second minimum on each resume and then per-second after that, and the `AUTO_SUSPEND` setting itself holds the warehouse warm by design. Vortex IQ treats the configured `AUTO_SUSPEND` window as the floor it cannot blame you for; idle time beyond that floor is the waste this card surfaces. Where `$/credit` is set on the connector, the cash figure is `idle_total * rate`.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A data platform team runs Snowflake behind their BigCommerce analytics stack. Four warehouses serve different workloads. Snapshot for the 24 hours to 09 May 26, 08:00 UTC, with a configured rate of $3.00/credit (Standard edition, on-demand).
+
+| Warehouse | Total credits (24h) | Idle credits | Idle % | `AUTO_SUSPEND` |
+| --- | --- | --- | --- | --- |
+| `TRANSFORM_WH` (ELT/dbt) | 42.0 | 1.1 | 2.6% | 60s |
+| `BI_WH` (Looker/Tableau) | 18.5 | 7.9 | 42.7% | 600s |
+| `INGEST_WH` (Fivetran) | 9.0 | 0.4 | 4.4% | 60s |
+| `ADHOC_WH` (analyst console) | 6.5 | 3.8 | 58.5% | 900s |
+| **Account total** | **76.0** | **13.2** | **17.4%** | |
+
+The headline reads **13.2 idle credits wasted (17.4% of total)**, which is above the 10% trigger, so the card is amber.
+
+The story is not the total, it is the per-warehouse split. `TRANSFORM_WH` and `INGEST_WH` are tight: scheduled jobs land, run, and suspend almost immediately. The waste lives in `BI_WH` and `ADHOC_WH`:
+
+1. **`BI_WH` (42.7% idle).** A BI tool is configured with a 10-minute (`600s`) auto-suspend so dashboards feel snappy. But analysts hit it in bursts: a flurry of queries at 09:00, then nothing for 40 minutes, then another flurry. Between bursts the warehouse stays warm for the full 10 minutes after each query, then suspends, then resumes on the next click and pays the 60-second minimum again. Dropping `AUTO_SUSPEND` to 120s would reclaim most of the 7.9 idle credits with a barely perceptible warm-up penalty.
+2. **`ADHOC_WH` (58.5% idle).** An analyst ran a query at 17:30, then went home leaving the session open. With `AUTO_SUSPEND` at 900s (15 minutes), the warehouse sat warm far longer than needed. This is the textbook auto-suspend tuning candidate.
+
+```text
+Cash framing at $3.00/credit:
+  Idle credits today:        13.2  ->  $39.60 wasted in 24h
+  Annualised (if typical):   13.2 * 365 = 4,818 credits  ->  $14,454/yr
+  Quick win (BI_WH 600s->120s): reclaim ~6.5 credits/day -> ~$7,100/yr
+```
+
+Three takeaways:
+
+1. **Idle credits are almost always an `AUTO_SUSPEND` story, not a query story.** Tuning the suspend timer is the lever, not rewriting SQL.
+2. **A high idle % on a small warehouse is cheaper to fix and cheaper to ignore than a low idle % on a huge one.** Always read idle credits, not just idle percent. `BI_WH` at 42.7% costs more cash than `ADHOC_WH` at 58.5%.
+3. **Some idle is healthy.** Forcing `AUTO_SUSPEND` to the 60s minimum on an interactive BI warehouse trades credit savings for cold-start latency that analysts feel. The goal is the knee of the curve, not zero.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Idle Warehouse Credits Wasted | What the combination tells you |
+| --- | --- | --- |
+| [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) | The denominator. Idle credits are a slice of total spend. | Idle % only means something against total burn; read them side by side. |
+| [Credits by Warehouse (7d)](/nerve-centre/kpi-cards/snowflake/credits-by-warehouse-7d) | Shows which warehouse the idle waste lives in over a week, not just a day. | A warehouse that is both top spender and high-idle is your first tuning target. |
+| [Avg Cost per Query ($)](/nerve-centre/kpi-cards/snowflake/avg-cost-per-query) | Idle credits inflate cost-per-query because the denominator (queries) is zero during idle. | Rising cost-per-query plus high idle equals an over-warm warehouse, not inefficient SQL. |
+| [Credit Burn +50% Week-over-Week](/nerve-centre/kpi-cards/snowflake/credit-burn-50-week-over-week) | The anomaly alert that idle creep can quietly feed. | A slow rise in idle credits can push weekly burn over the +50% line. |
+| [Active Warehouses](/nerve-centre/kpi-cards/snowflake/active-warehouses) | How many warehouses are resumed right now. | More warehouses warm than workloads in flight is the live form of this card. |
+| [Snowflake Health Score](/nerve-centre/kpi-cards/snowflake/snowflake-health-score) | The composite that takes credit efficiency as one input. | Sustained idle waste drags the cost dimension of the health score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake:**
+
+> **Snowsight → Admin → Cost Management → Consumption** for the warehouse-level credit breakdown by hour.
+> Query `SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY` for the raw billed credits per warehouse per hour.
+> Cross-reference `SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY` (filter on `WAREHOUSE_NAME` and `START_TIME`) to see which hours had no executing queries.
+> `SHOW WAREHOUSES` reveals each warehouse's current `AUTO_SUSPEND` and state.
+
+**Why our number may legitimately differ from Snowflake's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **`ACCOUNT_USAGE` latency** | Brief lag | `WAREHOUSE_METERING_HISTORY` can trail real time by up to ~3 hours, so a freshly resumed warehouse may not yet appear. |
+| **Idle definition** | Vortex IQ usually lower | Snowflake does not publish an "idle credits" field; we derive it. We subtract the configured `AUTO_SUSPEND` dwell as unavoidable, so our waste figure is conservative. |
+| **Cloud Services credits** | Minor | We count compute credits, not the separately-metered Cloud Services layer that may net to zero under the 10% daily adjustment. |
+| **Time zone** | Window edges shift | Snowsight defaults to your account time zone; Vortex IQ windows on UTC and renders in your profile time zone. |
+| **Per-second vs hourly rollup** | Marginal | `WAREHOUSE_METERING_HISTORY` is hourly; we apportion within the hour using `QUERY_HISTORY` overlap, so boundary hours can round slightly. |
+
+**Cross-connector reconciliation:** a sustained climb in idle credits with flat ecom volume is exactly the inefficiency that [Credit Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/snowflake/credit-burn-vs-ecom-order-volume) is built to catch.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is this not just zero? My warehouses suspend automatically.**
+Auto-suspend is not instant. Snowflake bills a 60-second minimum on every resume and holds the warehouse warm for the full `AUTO_SUSPEND` window after the last query. A bursty workload pays that warm-up tax repeatedly. The card surfaces the time spent warm beyond the floor we treat as unavoidable.
+
+**Should I just set `AUTO_SUSPEND` to 60 seconds everywhere?**
+No. For ELT and ingest warehouses, yes, a tight 60s is usually right. For interactive BI and analyst warehouses, a 60s suspend means every dashboard click pays a cold-start penalty, which analysts feel as lag. Tune to the knee: low enough to stop bleeding credits, high enough that bursty interactive use does not constantly cold-start.
+
+**Does this count multi-cluster warehouse credits?**
+Yes. If a multi-cluster warehouse spins up extra clusters that then sit warm with no queries, that idle time is included per cluster via the metering history.
+
+**The card says 17% but my Snowsight Consumption screen does not show an idle figure.**
+Snowflake does not expose "idle credits" as a native metric. You reconcile by hand: take a warehouse's billed credits for an hour from `WAREHOUSE_METERING_HISTORY`, then check `QUERY_HISTORY` for that hour and warehouse. Hours with billed credits but no queries are pure idle.
+
+**Does Cloud Services or storage spend show up here?**
+No. This card is compute (warehouse) credits only. Cloud Services credits and storage cost are tracked separately; see [Storage Used (TB)](/nerve-centre/kpi-cards/snowflake/storage-used-tb) for the storage side.
+
+**Why is the alert a percentage (>10%) and not a credit amount?**
+Because a fair idle threshold scales with account size. Ten idle credits is trivial for a team burning 5,000/day and alarming for one burning 50/day. The percentage normalises across account sizes; the cash figure beside it tells you whether it is worth your afternoon.
+
+**Can a serverless feature (Snowpipe, Tasks, Search Optimization) create idle credits here?**
+No. Serverless features are billed against Snowflake-managed compute, not your warehouses, so they never sit "idle and warm" in the warehouse sense. This card is scoped to user-managed virtual warehouses.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Idle Warehouse Credits Wasted (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

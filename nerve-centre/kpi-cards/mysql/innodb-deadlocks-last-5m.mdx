@@ -1,0 +1,143 @@
+---
+title: "InnoDB Deadlocks (last 5m), MySQL"
+sidebarTitle: "InnoDB Deadlocks (last 5m)"
+description: "InnoDB Deadlocks (last 5m) for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of InnoDB deadlocks detected in the last 5 minutes. A deadlock is two (or more) transactions each holding a lock the other needs, so InnoDB breaks the cycle by killing one of them with error 1213, `Deadlock found when trying to get lock`. For a DBA, this is "are concurrent transactions colliding on the same rows in incompatible lock orders?" A clean instance shows zero. Anything above zero means at least one transaction was rolled back, and if your application does not retry it, a user saw an error. This is why the alert fires at the first deadlock, not at a threshold.
+
+| | |
+| --- | --- |
+| **Data source** | The `Innodb_deadlocks` delta. The engine snapshots `SHOW ENGINE INNODB STATUS` (and the equivalent `Innodb_deadlocks` status counter where the build exposes it) and reports the increase over the trailing 5 minutes. The `LATEST DETECTED DEADLOCK` section of `SHOW ENGINE INNODB STATUS` supplies the offending statements and lock waits for the drill-down. |
+| **Metric basis** | A delta over the window, not a lifetime total. InnoDB's counter is monotonic and only resets on server restart, so the card reports the 5-minute increase. |
+| **Aggregation window** | Trailing 5 minutes, recomputed on the live refresh. Deadlocks are bursty, so a tight window keeps the signal sharp. |
+| **What counts** | Any cycle InnoDB's deadlock detector resolves by rolling back a victim transaction (error 1213). Each detected deadlock increments the counter once, regardless of how many transactions were in the cycle. |
+| **What does NOT count** | (1) Lock-wait timeouts (error 1205, `Lock wait timeout exceeded`), which are a different failure mode tracked via `Innodb_row_lock_waits`; (2) metadata locks (table-level DDL waits); (3) successful transactions that simply waited briefly for a lock and then proceeded. |
+| **Managed-service note** | On RDS/Aurora and Cloud SQL the same `SHOW ENGINE INNODB STATUS` output and `Innodb_deadlocks` counter are available; the providers do not surface a dedicated deadlock CloudWatch metric, so the card reads the engine status directly, which makes it the more reliable source on managed instances. |
+| **Time window** | `5m` (trailing 5 minutes, live refresh) |
+| **Alert trigger** | `> 0` deadlocks in the window pages the on-call DBA: any deadlock means a transaction was rolled back. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine reads `Innodb_deadlocks` from `SHOW ENGINE INNODB STATUS`, snapshots it, and reports the delta over the trailing 5 minutes:
+
+```text
+deadlocks_5m = Innodb_deadlocks_now - Innodb_deadlocks_5m_ago
+```
+
+A restart guard applies: if the instance restarted inside the window (the counter reset to zero and [Instance Uptime](/nerve-centre/kpi-cards/mysql/instance-uptime) dropped), the engine treats the current value as the delta so the reading never goes negative.
+
+Crucially, `SHOW ENGINE INNODB STATUS` only retains the **single most recent** deadlock in its `LATEST DETECTED DEADLOCK` section, so the headline count and the drill-down detail can diverge: the count can read 4 while the detail shows only the last collision. To capture every deadlock for forensics you need `innodb_print_all_deadlocks = ON`, which writes each one to the MySQL error log; the card surfaces a hint to enable it when the count exceeds 1 but the detail shows only one event. The drill-down parses the latest deadlock's two transaction blocks (the statements, the locks held, and the locks waited on) and the line naming which transaction InnoDB chose as the rollback victim (usually the one with the fewer rows modified, as it is cheaper to undo).
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MySQL 8.0 primary behind an inventory service. On 18 Apr 26 at 20:05 BST, during an evening flash-sale, the card jumps to **6 deadlocks in 5m**, tripping the `> 0` alert for the first time in weeks. The drill-down shows the `LATEST DETECTED DEADLOCK`:
+
+| Transaction | Statement | Holds | Waits for |
+| --- | --- | --- | --- |
+| T1 | `UPDATE stock SET qty = qty - 1 WHERE sku_id = 8841` | lock on sku 8841 | lock on sku 9102 |
+| T2 | `UPDATE stock SET qty = qty - 1 WHERE sku_id = 9102` | lock on sku 9102 | lock on sku 8841 |
+
+InnoDB rolled back T2 (fewer rows modified) and let T1 commit. The pattern is textbook: two checkout transactions decrementing stock for the same two SKUs but acquiring the row locks in **opposite order**. Under low traffic the windows never overlap; under flash-sale concurrency they collide constantly.
+
+```text
+Why it spiked now:
+  - Normal evening: ~30 checkouts/min, lock windows rarely overlap -> 0 deadlocks
+  - Flash sale: ~400 checkouts/min on a handful of hot SKUs
+  - Two transactions touching the same SKU pair in opposite order
+    overlap dozens of times a minute -> 6 detected in 5m (and rising)
+```
+
+The immediate mitigation is application-side: ensure the retry logic actually catches error 1213 and replays the transaction (a deadlock victim is safe to retry because it was fully rolled back). The durable fix is to make every transaction lock rows in a **consistent order**, for example always sort the SKU ids ascending before the updates, so two transactions touching 8841 and 9102 both lock 8841 first and one simply waits instead of deadlocking. Once the deploy ships, the card returns to zero even at peak concurrency.
+
+Three takeaways:
+
+1. **One deadlock means one rolled-back transaction.** If your application retries on 1213, the user never notices; if it does not, the user saw an error. The alert fires at the first deadlock because you cannot tell from the count alone whether a user was affected.
+2. **Deadlocks are a concurrency and lock-ordering problem, not a hardware problem.** Throwing CPU or memory at them does nothing. The fix is almost always consistent lock ordering, shorter transactions, or appropriate retry logic.
+3. **The count and the detail can disagree.** Native InnoDB status keeps only the latest deadlock. If the count is 6 but you can only see one collision, enable `innodb_print_all_deadlocks` so every event lands in the error log for analysis.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with InnoDB Deadlocks | What the combination tells you |
+| --- | --- | --- |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mysql/query-error-rate) | Deadlocks surface as error 1213 at the application. | Deadlocks up plus error rate up equals the application is not retrying victims; users are seeing failures. |
+| [Query Error Rate Spike (>1% in 5m)](/nerve-centre/kpi-cards/mysql/query-error-rate-spike-1-in-5m) | The real-time alert that catches the downstream error burst. | If this alert fires alongside deadlocks, the rollbacks are reaching users. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) | Lock contention inflates latency even when it does not deadlock. | Deadlocks plus rising p95 equals heavy lock contention, of which deadlocks are the visible tip. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p99-ms) | The tail where contention bites hardest. | A p99 spike with deadlocks confirms hot-row contention under concurrency. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mysql/slow-query-rate) | Long transactions widen the lock window that causes deadlocks. | Slow queries plus deadlocks equals transactions holding locks too long; shorten them. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | Concurrency is the trigger. | Deadlocks appearing as QPS climbs confirms a concurrency-driven collision, not a code regression. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | Deadlocks feed the performance inputs of the composite. | A sudden deadlock burst can soften the health score's slow-query and error inputs together. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL's own tooling:**
+
+> Run `SHOW ENGINE INNODB STATUS\G` and read the `LATEST DETECTED DEADLOCK` section for the most recent collision, plus the `Innodb_deadlocks` line for the lifetime counter.
+> Check `SHOW GLOBAL STATUS LIKE 'Innodb_deadlocks';` for the raw since-restart total (the card reports only the 5-minute delta of this).
+> Enable `SET GLOBAL innodb_print_all_deadlocks = ON;` to write every deadlock to the error log (`SELECT @@log_error;` for the path), since the status output keeps only the latest one.
+> Inspect live lock waits with `SELECT * FROM performance_schema.data_lock_waits;` and the `sys.innodb_lock_waits` view to see contention before it becomes a deadlock.
+
+**Why our number may legitimately differ from a raw status read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Delta vs lifetime total** | Card is much lower | `Innodb_deadlocks` in status is the since-restart total; the card reports only the trailing 5-minute increase. |
+| **Status keeps one event** | Detail under-represents count | The native `LATEST DETECTED DEADLOCK` section shows only the most recent deadlock, so a count of 6 may map to one visible collision unless `innodb_print_all_deadlocks` is on. |
+| **Server restart in window** | Card may look low | A restart zeroes the counter; the engine clamps the delta to avoid a negative, which can understate counts spanning the restart. |
+| **Refresh cadence** | Brief lag | A deadlock in the last few seconds may not yet be in the recomputed window; force a refresh for the live figure. |
+
+**Managed-service cross-checks:**
+
+| Platform | Where to confirm | Note |
+| --- | --- | --- |
+| Amazon RDS / Aurora | `SHOW ENGINE INNODB STATUS` via a client; enable `innodb_print_all_deadlocks` in the parameter group to log them. | No dedicated deadlock CloudWatch metric exists; the engine status is the source of truth. |
+| Google Cloud SQL | Same `SHOW ENGINE INNODB STATUS`; set `innodb_print_all_deadlocks` via a database flag. | Deadlock detail appears in the Cloud SQL error logs once the flag is on. |
+| Self-managed | `SHOW ENGINE INNODB STATUS` plus the error log with the flag enabled. | The most complete view; the card mirrors this exactly. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card says 4 deadlocks but `SHOW ENGINE INNODB STATUS` only shows one. Why?**
+Native InnoDB status retains only the single most recent deadlock in its `LATEST DETECTED DEADLOCK` section. The counter increments for every deadlock, but the detail is overwritten each time. To see all four, enable `innodb_print_all_deadlocks = ON` so each one is written to the error log. The card's count is correct; the native detail view is simply lossy by design.
+
+**Is a deadlock the same as a lock-wait timeout?**
+No, and conflating them leads to the wrong fix. A deadlock (error 1213) is a true cycle that InnoDB detects and resolves instantly by rolling back a victim. A lock-wait timeout (error 1205) is a transaction that waited longer than `innodb_lock_wait_timeout` for a lock that was never going to deadlock, just held too long. Deadlocks point at lock-ordering; timeouts point at long-held locks or an oversized `innodb_lock_wait_timeout`. This card counts only the former.
+
+**Should I always treat a deadlock as an incident?**
+Not necessarily, but always investigate. In a healthy concurrent system the occasional deadlock is expected and the correct response is application-side retry, not a code change. The alert fires at the first deadlock because the count alone cannot tell you whether the application retried the victim or surfaced an error to a user. If your retry logic is solid and the rate is low, log it and move on; if the rate is climbing or there is no retry logic, fix it.
+
+**How do I actually stop deadlocks?**
+Three durable techniques, in order of impact: (1) lock rows in a consistent order across all transactions (for example always sort ids ascending before updating), which converts most deadlocks into harmless brief waits; (2) keep transactions short so lock windows do not overlap; (3) add appropriate indexes so InnoDB locks fewer rows. Retry logic is a safety net, not a fix, it handles the deadlocks you could not design away.
+
+**Which transaction does InnoDB roll back?**
+InnoDB picks the victim it judges cheapest to undo, normally the transaction that has modified the fewest rows. This is why a small transaction can be rolled back in favour of a large one. You cannot reliably predict the victim, which is exactly why every transaction that might deadlock needs retry handling rather than assuming it will be the survivor.
+
+**Why did the count spike during a sale but never during normal traffic?**
+Deadlocks are a function of concurrency on the same rows. At low traffic, two transactions touching the same hot rows in opposite lock order rarely overlap in time. At high concurrency on a few hot SKUs, those windows overlap constantly and the latent lock-ordering bug becomes visible. The bug was always there; traffic exposed it. Fix the lock ordering and it stays at zero even at peak.
+
+**Does the counter include deadlocks on replicas?**
+The card reports the deadlock counter for the instance it is reading. A replica applying writes single-threaded rarely deadlocks against itself, but with parallel replication appliers it can. If you see deadlocks on a replica, check the parallel-applier settings; on the primary, deadlocks come from concurrent application transactions as described above.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*InnoDB Deadlocks (last 5m)* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,142 @@
+---
+title: "JVM Heap >85% Sustained or Circuit Breaker Tripped, Elasticsearch"
+sidebarTitle: "JVM Heap >85% Sustained or Circuit Breaker Tripped"
+description: "JVM Heap >85% Sustained or Circuit Breaker Tripped for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> An alert card that fires when a node's JVM heap usage stays above 85% for a sustained window, or when any circuit breaker trips. These two signals belong together because they are the same story at two stages: heap above 85% is the warning that a node is running out of memory; a tripped circuit breaker is Elasticsearch protecting itself by rejecting the request that would have pushed it over the edge into an out-of-memory crash. Once the heap stays high, garbage collection (GC) runs constantly, pauses get longer, and the node spends more time collecting garbage than serving traffic. This is one of the most common causes of an Elasticsearch node falling over, so it pages.
+
+| | |
+| --- | --- |
+| **What it tracks** | Per-node heap utilisation as a percentage of the configured heap, plus the tripped-count of every circuit breaker (parent, fielddata, request, in-flight requests). Either condition raises the alert. |
+| **Data source** | `GET /_nodes/stats/jvm` for `jvm.mem.heap_used_percent`, and `GET /_nodes/stats/breaker` for the `tripped` counter on each breaker. Detail: "Alerts for JVM Heap >85% Sustained or Circuit Breaker Tripped." |
+| **Time window** | `5m`. Heap is evaluated over a sustained 5-minute window; circuit-breaker trips are counted within the same window. |
+| **Alert trigger** | `heap_used_percent > 85% sustained 5m` OR any `breaker.*.tripped` increments inside the window. |
+| **Why 85% and not 75%** | The JVM old-generation GC typically kicks in hard around 75%; by 85% the node is in memory pressure and GC pauses are growing. 85% sustained is the line where a node is at real risk of OOM, which is why it pages rather than just warning. |
+| **What does NOT trigger it** | A brief heap spike that GC clears inside the 5-minute window. Heap that climbs then falls back under 85% (the normal sawtooth) is healthy and does not alert. |
+| **Roles** | platform, SRE, DBA, on-call |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card evaluates two independent conditions per node and raises the alert if either holds:
+
+**Heap condition.** From `GET /_nodes/stats/jvm`, the engine reads `nodes.<id>.jvm.mem.heap_used_percent` for every node. JVM heap usage is naturally a sawtooth: it climbs as objects are allocated, then drops sharply when GC runs. A healthy node sawtooths comfortably below 75%. The alert tracks each node's heap and starts a timer when it first crosses 85%. If the node is still above 85% after 5 continuous minutes (that is, GC is no longer reclaiming the heap back below the line), the alert fires for that node. This sustain logic is what distinguishes a dangerous "heap stuck high" state from a harmless momentary spike.
+
+**Circuit-breaker condition.** From `GET /_nodes/stats/breaker`, the engine reads the `tripped` counter on each breaker:
+
+- **parent** breaker: the overall guard, trips when total estimated memory across all breakers exceeds the limit (95% of heap by default).
+- **fielddata** breaker: trips when loading field data for aggregations/sorting on text fields would exceed its limit.
+- **request** breaker: trips when a single request's data structures (aggregation buckets, for example) would exceed the limit.
+- **in_flight_requests** breaker: trips when the bytes of in-flight HTTP request bodies exceed the limit.
+
+The `tripped` counter is monotonic (it only ever increases). The engine compares the current value to the previous poll; any increase means a breaker tripped inside the window, and a tripped breaker means Elasticsearch rejected a real request to avoid running out of memory. That is an immediate, actionable signal, so a single trip raises the alert without waiting for a sustain window.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A DBA team runs a 4-node Elasticsearch cluster (each node sized with 30 GB heap) serving product search plus an analytics dashboard that runs heavy terms aggregations. Snapshot taken on 22 Apr 26 at 14:40 BST, mid-afternoon peak.
+
+A new dashboard panel started running a high-cardinality terms aggregation on a `text` field (a classic anti-pattern that loads field data into heap). Node stats now read:
+
+| Node | heap_used_percent | parent tripped | fielddata tripped | request tripped |
+| --- | --- | --- | --- | --- |
+| es-data-01 | 91% | 0 | 3 | 0 |
+| es-data-02 | 88% | 1 | 0 | 2 |
+| es-data-03 | 62% | 0 | 0 | 0 |
+| es-data-04 | 64% | 0 | 0 | 0 |
+
+The Nerve Centre headline reads **2 nodes critical, heap >85% sustained 7m, 6 breaker trips**, outlined in red, and the on-call DBA is paged. The diagnosis falls out of the card:
+
+1. **es-data-01 and es-data-02 are in memory pressure.** Both sit above 85% and GC is no longer pulling them back. [GC Pause Time (5m total ms)](/nerve-centre/kpi-cards/elasticsearch/gc-pause-time-5m-total-ms) on these nodes will be elevated because the JVM is collecting constantly.
+2. **The breakers are doing their job.** The fielddata breaker on es-data-01 tripped 3 times: it rejected 3 attempts to load field data that would have blown the heap. The merchant sees those as failed dashboard queries, not a crashed cluster. A tripped breaker is a controlled rejection, far better than an OOM crash. Pair with [Circuit Breaker Trips (24h)](/nerve-centre/kpi-cards/elasticsearch/circuit-breaker-trips-24h) to see the daily count.
+3. **Root cause is the aggregation, not capacity.** The aggregation on a `text` field forces field data into heap. The fix is to aggregate on a `keyword` sub-field instead (which uses doc-values on disk, not heap), or to add `eager_global_ordinals` and bound the cardinality. Adding more heap would only delay the next trip.
+
+```text
+Why the breaker trip is the good outcome:
+  Without breakers: the fielddata load exceeds heap -> JVM OutOfMemoryError
+                    -> node process dies -> shards go unallocated
+                    -> cluster goes yellow/red -> Cluster Not Green pages.
+  With breakers:    the load is estimated to exceed the limit -> request rejected
+                    with a 429/CircuitBreakingException -> node stays alive
+                    -> only the offending query fails, not the whole node.
+```
+
+The actionable lesson: heap above 85% sustained is the disease, circuit-breaker trips are the immune response. If you see trips, do not raise the breaker limits to make them stop; that just removes the safety net. Find the query or mapping causing the memory pressure and fix it at source.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this alert | What the combination tells you |
+| --- | --- | --- |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | The always-on KPI gauge behind the heap half of this alert. | The gauge shows the steady-state heap; this alert is the paging wrapper at 85% sustained. |
+| [Circuit Breaker Trips (24h)](/nerve-centre/kpi-cards/elasticsearch/circuit-breaker-trips-24h) | The daily count behind the breaker half of this alert. | A single live trip pages here; the 24h count shows whether trips are chronic. |
+| [GC Pause Time (5m total ms)](/nerve-centre/kpi-cards/elasticsearch/gc-pause-time-5m-total-ms) | High heap forces constant GC, lengthening pauses. | Heap >85% plus rising GC pause means the node is spending its time collecting, not serving. |
+| [Active Node Count](/nerve-centre/kpi-cards/elasticsearch/active-node-count) | An OOM that gets past the breakers kills a node. | A node dropping out right after sustained high heap means an OOM happened. |
+| [Elasticsearch Health Score](/nerve-centre/kpi-cards/elasticsearch/elasticsearch-health-score) | The composite weights heap and breaker state. | Sustained high heap drags the score toward the 70 alert line before any node dies. |
+| [Search Error Rate %](/nerve-centre/kpi-cards/elasticsearch/search-error-rate) | Breaker trips surface to clients as request errors. | Error-rate spiking at the same time as breaker trips means rejections are reaching users. |
+| [HTTP Connection Saturation %](/nerve-centre/kpi-cards/elasticsearch/http-connection-saturation) | Saturation plus heap pressure compound each other. | High saturation feeding heavy requests into a memory-stressed node accelerates the trips. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> `GET /_nodes/stats/jvm` returns `jvm.mem.heap_used_percent` per node, the exact value the heap half of this card reads.
+> `GET /_nodes/stats/breaker` returns the `tripped` counter and `limit_size_in_bytes` for each breaker.
+> `GET /_cat/nodes?v&h=name,heap.percent,ram.percent,load_1m` gives a quick human-readable heap-per-node table.
+> The node logs record `[gc][...] overhead, spent [Xs] collecting` lines when GC pressure is high, and `CircuitBreakingException` stack traces when a breaker trips.
+
+On a managed service, Elastic Cloud surfaces JVM heap and GC under the deployment monitoring view, and AWS OpenSearch Service / managed offerings expose `JVMMemoryPressure` and circuit-breaker metrics in CloudWatch. The managed `JVMMemoryPressure` metric is effectively the same heap percentage this card reads.
+
+**Why our number may legitimately differ from a manual stats call:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sawtooth sampling** | Either direction | Heap moves second to second with GC; a manual `_nodes/stats` call catches an instant, the card evaluates a sustained 5-minute view, so a single API read can be higher or lower than the alert state. |
+| **Sustain window** | Card lags a raw read | A bare stats call shows 90% the instant it happens; the card only pages after 85% holds for 5 minutes, so a momentary spike shows in the API but not as an alert. |
+| **Counter vs rate** | Card shows the delta | The breaker `tripped` field is a lifetime cumulative counter; the card reports the increase since the last poll, so its number is smaller than the raw counter. |
+| **Managed-console smoothing** | Console can lag | CloudWatch `JVMMemoryPressure` and Elastic Cloud charts average over their sample period, smoothing the sawtooth the live API exposes raw. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My heap sawtooths up to 80% then drops to 40% constantly. Is that a problem?**
+No, that is exactly how a healthy JVM behaves. The heap fills with short-lived objects, GC reclaims them, and usage drops. The sawtooth is normal. The alert only fires when heap stays above 85% for 5 minutes, which means GC is running but not reclaiming, the signature of genuine memory pressure rather than normal allocation churn.
+
+**A circuit breaker tripped. Should I raise the breaker limit so it stops?**
+Almost never. The breaker tripped because a request would have used enough memory to risk an OOM crash. Raising the limit removes the safety net and trades a controlled rejection for an uncontrolled node death. The right fix is to find what is consuming the memory: usually a high-cardinality aggregation, fielddata loading on a `text` field, or oversized request bodies. Aggregate on `keyword`/doc-values fields, bound cardinality, or split large bulk requests.
+
+**What is the difference between the parent breaker and the others?**
+The parent breaker is the overall accountant: it trips when the sum of all tracked memory (across fielddata, request, in-flight, and the accounting breaker) exceeds 95% of heap. The child breakers (fielddata, request, in_flight_requests) guard specific categories. A parent trip without a child trip usually means many things are individually fine but collectively over the line, which points to undersized heap or too much concurrent load rather than one bad query.
+
+**Why does the alert page on a single breaker trip but require 5 minutes for heap?**
+They mean different things. High heap is a state that can self-correct (GC may catch up), so the sustain window avoids paging on transient spikes. A breaker trip is an event that already happened: a real request was rejected to protect the node. There is nothing to wait for, the damage (a failed request) is already done, so it pages immediately.
+
+**My node OOM-crashed but the heap alert never fired. Why?**
+A few possibilities: the heap climbed from below 85% to OOM faster than 5 minutes (a single huge request can blow heap in seconds, which is what the breakers exist to catch), or the poll cadence missed the climb, or the breaker that should have caught it was disabled or set too high. If breakers are tripping but the node still OOMs, your breaker limits are too generous relative to your real heap. Check `GET /_nodes/stats/breaker` limit sizes against the actual heap.
+
+**Does sizing more heap fix recurring heap-pressure alerts?**
+Sometimes, but it is the last resort, not the first. Heap above ~32 GB loses compressed object pointers (oops) and becomes less efficient, so very large heaps are counter-productive. Prefer fixing the workload: avoid fielddata on text fields, bound aggregation cardinality, reduce shard count per node, and shrink oversized bulk requests. Add heap only when the workload is genuinely legitimate and already optimised.
+
+**Heap is high on one node but fine on the others. What does that mean?**
+A single hot node usually means a hot shard or a skewed query routing all its load to one place. Check [Shard Size Skew %](/nerve-centre/kpi-cards/elasticsearch/shard-size-skew) for an oversized shard living on that node, and confirm that a single large index is not concentrating its primaries there. Rebalancing the shard layout often resolves single-node heap pressure without adding capacity.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*JVM Heap >85% Sustained or Circuit Breaker Tripped* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

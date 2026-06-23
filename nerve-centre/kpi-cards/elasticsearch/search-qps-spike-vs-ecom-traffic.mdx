@@ -1,0 +1,159 @@
+---
+title: "Search QPS Spike vs Ecom Traffic, dual_axis"
+sidebarTitle: "Search QPS Spike vs Ecom Traffic"
+description: "Search QPS Spike vs Ecom Traffic for Elasticsearch stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This dual-axis card plots Elasticsearch search queries per second against storefront traffic (sessions or page views from the connected ecom/analytics source) over the same window. In a healthy store the two lines move together: more shoppers means more searches. The signal you are watching for is divergence. A spike in search QPS with no matching spike in real traffic almost always means something non-human is hitting search: a runaway crawler, a scraper, a misbehaving integration, or an autocomplete loop firing a query on every keystroke. Catching this matters because bot-driven QPS consumes the same search thread pool and JVM heap that paying customers need, so it can degrade or take down search for everyone while generating zero revenue.
+
+| | |
+| --- | --- |
+| **What it tracks** | Two series on one chart: (axis 1) Elasticsearch search QPS, derived from the `indices.search.query_total` delta over time; (axis 2) ecom storefront traffic (sessions/page views) from the connected commerce or analytics connector, over the same 15-minute window. |
+| **Data source** | Elasticsearch side: node/index search stats (`indices.search.query_total`) sampled and differenced to a per-second rate. Ecom side: the connected storefront's traffic series (Shopify/BigCommerce/Adobe sessions, or GA4 if connected). The card aligns both to the same time buckets. |
+| **Time window** | `15m`. The card shows the most recent 15 minutes at a fine resolution so a sudden divergence is visible within a refresh or two. |
+| **Alert trigger** | A QPS spike with no corresponding traffic spike. The pattern (search volume jumps while sessions stay flat) is flagged because it indicates a bot/crawler rather than real demand. |
+| **Cross-channel join** | This card is meaningless without an ecom or analytics connector: the comparison series is the storefront traffic, not anything Elasticsearch knows about. |
+| **Why divergence matters** | Bot QPS competes for the search thread pool, file-system cache, and heap. A scraper can saturate search and push real shoppers into slow queries or timeouts while contributing nothing to revenue. |
+| **What does NOT count** | Indexing operations (these are tracked separately by the indexing-rate card); internal monitoring or health-check queries if they are excluded by the connector's filter. |
+| **Roles** | owner, engineering, operations, security |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The Elasticsearch series is a rate computed from a monotonically increasing counter:
+
+```text
+qps(t) = ( query_total(t) - query_total(t-1) ) / (seconds between samples)
+   where query_total = sum over shards of indices.search.query_total
+```
+
+`indices.search.query_total` counts query-phase executions, so a single user search that fans out across N shards increments the counter N times. The card normalises for this where shard count is known, but the headline trend is what matters: the shape of the curve, not an exact per-user figure.
+
+The ecom traffic series is taken at face value from the connector (sessions or page views per bucket) and plotted on the second axis with its own scale, which is what "dual axis" means: the two lines can have very different magnitudes and still be compared by shape.
+
+The divergence detector looks at correlation over the 15-minute window. In normal operation search QPS and traffic are tightly correlated (shoppers search as they browse). The alert fires when QPS rises sharply while the traffic line stays flat, breaking that correlation. A flat-traffic, rising-QPS pattern is the classic non-human signature, so the card calls it out as a likely bot/crawler.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A fashion retailer on BigCommerce uses a managed Elasticsearch cluster for product search and autocomplete. Storefront traffic is connected via the BigCommerce connector. Snapshot covers the 15 minutes from 13:20 to 13:35 GMT on 22 May 26.
+
+| Time bucket | Search QPS | Storefront sessions/min | Reading |
+| --- | --- | --- | --- |
+| 13:20 to 13:24 | 90 to 110 | 480 to 510 | Lines move together, healthy |
+| 13:25 to 13:29 | 340 and rising | 495 | QPS tripled, sessions flat |
+| 13:30 to 13:34 | 610 sustained | 500 | Clear divergence, alert fires |
+
+The dual-axis chart shows the blue QPS line climbing steeply away from the flat orange sessions line. The Vortex IQ headline flags **QPS spike with no traffic spike (likely bot/crawler)**. The platform team works the problem:
+
+1. **Confirm it is not real demand.** Sessions are flat at ~500/min, exactly where they have been all afternoon. There is no email send, no paid-media burst, no flash sale in the calendar. Real shoppers did not suddenly start searching 6x harder.
+2. **Identify the source.** A quick look at the cluster's hot threads and the load balancer access logs shows a single user-agent issuing paginated `match_all` queries against the products index, deep-paging through results, a textbook scraper. It is not coming through the storefront search box (those would create sessions), which is exactly why the traffic line never moved.
+3. **Assess the collateral damage.** During the spike, [Search Latency p95](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) climbed from 120ms to 480ms and [HTTP Connection Saturation](/nerve-centre/kpi-cards/elasticsearch/http-connection-saturation) touched 88%. Real shoppers were being slowed by the scraper. That is the revenue-at-risk: not the bot's queries (worthless), but the degradation it inflicts on genuine sessions.
+
+```text
+Impact framing (illustrative):
+  - Real sessions during the spike: ~500/min, unchanged
+  - Real search latency p95: 120ms -> 480ms (4x) while bot ran
+  - Conversion sensitivity: every +100ms search latency shaves measurable
+    conversion on search-led journeys
+  - The bot generated 0 revenue while degrading every real shopper's search
+```
+
+4. **Mitigate.** The team rate-limits the offending source at the edge (WAF/CDN), and QPS drops back to ~100 within a minute while sessions stay flat. The two lines reconverge. They then add a standing rule to block deep `match_all` pagination from unauthenticated clients.
+
+Three takeaways for the platform team:
+
+1. **Search QPS in isolation is ambiguous; against traffic it becomes diagnostic.** A QPS jump could be a genuine demand surge or a bot. The only way to tell at a glance is the second line. If traffic rose too, celebrate; if it did not, investigate.
+2. **Bots cost you through contention, not through their own queries.** The danger is the heap, thread pool, and connection capacity the bot steals from paying customers, which is why this card sits in Revenue at Risk despite measuring a non-revenue actor.
+3. **The inverse pattern is also worth a glance.** Traffic rising while QPS stays flat can mean search is broken or the search box is not loading, shoppers are landing but cannot search. Same chart, opposite divergence, also actionable.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this card | What the combination tells you |
+| --- | --- | --- |
+| [Search Queries per Second (live)](/nerve-centre/kpi-cards/elasticsearch/search-queries-per-second-live) | The raw QPS series this card overlays on traffic. | Use it for the absolute number; use this card to judge whether the number is justified. |
+| [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) | The shopper-facing cost of a QPS spike. | Divergent QPS plus rising p95 confirms the bot is degrading real search. |
+| [HTTP Connection Saturation %](/nerve-centre/kpi-cards/elasticsearch/http-connection-saturation) | The capacity ceiling a spike pushes against. | Saturation climbing with bot QPS means real shoppers are about to be refused connections. |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | Heavy or deep queries from a scraper inflate heap. | Heap climbing alongside divergent QPS warns of GC pressure and possible circuit breakers. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/elasticsearch/slow-query-rate) | Scrapers often issue expensive deep-pagination queries. | A jump in slow-query rate during the spike pinpoints expensive bot queries. |
+| [Search Error Rate %](/nerve-centre/kpi-cards/elasticsearch/search-error-rate) | The failure mode if the spike overwhelms search. | Errors rising during divergent QPS means real shoppers are now getting failed searches. |
+| [ES Search Pool Saturation vs Ecom Burst](/nerve-centre/kpi-cards/elasticsearch/es-search-pool-saturation-vs-ecom-burst) | The capacity-focused cross-channel peer. | Read together to separate "too many queries" from "queries from the wrong source". |
+| [ES Product Index Doc Count vs Ecom Catalog](/nerve-centre/kpi-cards/elasticsearch/es-product-index-doc-count-vs-ecom-catalog) | The correctness cross-channel peer. | One watches volume vs demand; the other watches catalogue completeness. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch and the storefront:**
+
+> **`GET /_nodes/stats/indices/search`** and **`GET /<index>/_stats/search`** expose `query_total` and `query_time_in_millis`; differencing `query_total` over time reproduces the QPS series.
+> **`GET /_nodes/hot_threads`** during a suspected spike shows which queries are eating CPU, useful for identifying a scraper's query shape.
+> Your load balancer / CDN / WAF access logs are the authoritative source for "who is sending these queries"; Elasticsearch counts the queries but the edge identifies the client.
+> On the storefront side, reconcile the traffic line against the platform's own analytics (BigCommerce/Shopify/Adobe reporting, or GA4 real-time) for the same 15 minutes.
+
+**Why our number may legitimately differ from a raw stats read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Shard fan-out** | raw `query_total` higher than per-user QPS | One user query increments the counter once per shard searched; the card normalises where shard count is known. |
+| **Sampling interval** | smoothing | QPS is a delta between samples; a coarser sample interval averages out sub-bucket bursts. |
+| **Internal/health queries** | raw slightly higher | Monitoring pings hit search too; the card can exclude known internal sources if the connector is configured to. |
+| **Traffic-source definition** | second-axis shape | "Sessions" vs "page views" vs "users" scale differently; only the shape matters for divergence, but confirm which metric the connector supplies. |
+| **Time zone** | axis labels only | Elasticsearch stats are UTC; the card renders the 15m axis in your Vortex IQ display time zone. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`google_analytics.realtime_users`](/nerve-centre/kpi-cards/google-analytics/ga4-property-health) | The traffic line should track GA4 real-time users closely if GA4 is the source. | If GA4 shows a surge the storefront connector does not, the connectors are measuring different scopes. |
+| Storefront sessions (Shopify/BigCommerce/Adobe) | The second axis equals the platform's own session count for the window. | A mismatch usually means bot traffic is being filtered out of analytics but still hitting search, which is exactly the signal this card surfaces. |
+
+<details>
+<summary><em>Cross-engine note (same concept on other search backends)</em></summary>
+
+The "query rate versus real demand" comparison applies to any search backend. On OpenSearch the same `indices.search.query_total` stat exists. On Algolia the equivalent is the Search API "operations" rate in usage analytics; on Solr it is `QUERY./select.requests` from the metrics endpoint. Listed only for teams running more than one search engine; the Vortex IQ card reconciles against your Elasticsearch cluster and your connected storefront.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Search QPS spiked but so did traffic. Is that an alert?**
+No. When both lines rise together it is genuine demand: an email send, a flash sale, a paid-media burst, or organic interest. The card only flags the case where QPS diverges from traffic. A correlated spike is a capacity question (watch [HTTP Connection Saturation](/nerve-centre/kpi-cards/elasticsearch/http-connection-saturation) and [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used)), not a "wrong source" question.
+
+**Why is `query_total` higher than the number of searches I think happened?**
+Because Elasticsearch counts the query phase per shard. A search that touches 5 shards adds 5 to `query_total`. The card normalises for this where it can, but for trend purposes the shape of the curve is what matters, not an exact per-user count. If you need exact user-level search counts, instrument the application layer instead.
+
+**An autocomplete box fires a query on every keystroke. Does that look like a bot?**
+It can. Aggressive autocomplete (one Elasticsearch query per keystroke, no debounce) multiplies QPS far faster than sessions grow, producing exactly the divergence this card flags. The fix is on the front end: debounce keystrokes, cache prefixes, and use the search-as-you-type or completion suggester so the query is cheap. The card is doing its job by surfacing the pattern.
+
+**The traffic line is flat at zero but QPS is normal. What does that mean?**
+Either the storefront/analytics connector is not reporting (broken connector, expired token) or you genuinely have no live sessions while a scheduled job still queries search. Check the connector health first; a missing traffic line makes the comparison meaningless and can produce a false bot signal.
+
+**Can I see which client is causing the spike from this card?**
+Not directly. Elasticsearch counts the queries but does not, by default, attribute them to a client IP or user-agent. To identify the source, correlate the spike window with your load balancer, CDN, or WAF access logs, and use `GET /_nodes/hot_threads` to see the query shape. Once identified, rate-limit or block at the edge.
+
+**Is blocking the bot the right response, or should I scale the cluster?**
+Scale only for real demand. Adding nodes to absorb scraper traffic is paying to serve queries that generate no revenue. The correct response to a divergent (bot) spike is to rate-limit or block the source at the edge. Reserve scaling decisions for correlated spikes where real shoppers are driving the load.
+
+**Does this card include indexing load?**
+No. This card is about the search path only (`indices.search.query_total`). Indexing throughput is tracked separately by [Indexing Rate (docs/sec)](/nerve-centre/kpi-cards/elasticsearch/indexing-rate-docssec). Keeping them separate matters because a search spike and an indexing spike have completely different causes and remedies.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Search QPS Spike vs Ecom Traffic* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

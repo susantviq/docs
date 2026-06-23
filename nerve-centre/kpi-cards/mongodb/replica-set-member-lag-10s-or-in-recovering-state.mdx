@@ -1,0 +1,147 @@
+---
+title: "Replica Set Member Lag >10s or in RECOVERING State, MongoDB"
+sidebarTitle: "Replica Set Member Lag >10s or in RECOVERING State"
+description: "Replica Set Member Lag or RECOVERING state for MongoDB replica sets. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> An alert card that fires when any replica-set member falls more than 10 seconds behind the primary, or reports a `stateStr` of `RECOVERING`. Lag is the gap between the primary's latest write and the secondary's last applied write, derived from `rs.status()` optimes. A `RECOVERING` member is one that cannot currently serve reads or vote normally because it is catching up or rebuilding. Either condition means your replica set has lost redundancy: a secondary that is too far behind cannot be safely promoted on failover, and a recovering member is effectively out of the set. For a platform team this is a durability and availability warning, the cluster is one more failure away from trouble.
+
+| | |
+| --- | --- |
+| **What it tracks** | Active alerts where any member's replication lag exceeds 10 seconds, or any member reports `stateStr = RECOVERING`. Each entry lists the member, its state, and its current lag. |
+| **Data source** | `rs.status()` member documents: `optimeDate` per member (lag = primary optime minus member optime) and `stateStr`. |
+| **Time window** | `RT` (real-time, evaluated on every live poll). |
+| **Alert trigger** | `any member lag >10s OR stateStr=RECOVERING`. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card reads `rs.status()` and evaluates two independent conditions across every member:
+
+```text
+member_lag = primary.optimeDate - member.optimeDate   (in seconds)
+alert if   member_lag > 10   OR   member.stateStr == "RECOVERING"
+```
+
+**Lag** is computed by taking the primary's most recent operation time (`optimeDate`) and subtracting each secondary's last applied operation time. The result is how many seconds of writes the secondary has not yet replayed. A healthy secondary on a healthy network sits at well under a second of lag; sustained lag above 10 seconds means the secondary cannot keep up with the primary's write rate, or the link between them is degraded.
+
+**State** is read directly from each member's `stateStr`. The normal healthy states are `PRIMARY` and `SECONDARY`. `RECOVERING` is a transient-but-concerning state: the member is applying its oplog to catch up after a restart, a network partition, or because it fell so far behind that it had to resync. While `RECOVERING`, the member does not serve reads and does not count as a healthy voting secondary.
+
+Either condition alone raises the alert because both reduce the effective health of the set. A laggy secondary risks data loss on failover (promoting it loses the un-replicated writes); a recovering member shrinks the pool of nodes available to take over. The card lists which members are affected so you can tell whether you are one failure from degraded or one failure from down.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a three-node replica set (one primary, two secondaries) behind an order service. Snapshot taken on 09 Jun 26 at 02:55 BST, during an overnight bulk-import job.
+
+| Member | `stateStr` | optime lag vs primary | Health |
+| --- | --- | --- | --- |
+| mongo-prod-01 | PRIMARY | 0s | healthy |
+| mongo-prod-02 | SECONDARY | **34s** | alerting (lag) |
+| mongo-prod-03 | RECOVERING | n/a | alerting (state) |
+
+The card raises two active alerts: `mongo-prod-02` is 34 seconds behind, and `mongo-prod-03` is `RECOVERING`. With the primary healthy but both secondaries impaired, the set has effectively lost its redundancy: if the primary failed right now, neither secondary could be safely and immediately promoted.
+
+What the team reads from this:
+
+1. **The lag on mongo-prod-02 is import-driven.** The 34-second lag started when the overnight bulk-import job began hammering the primary with writes. The secondary is replaying the oplog as fast as its disk allows but cannot keep pace with the import burst. This usually self-resolves once the import finishes, but while it persists the secondary is not a safe failover target.
+2. **mongo-prod-03 being RECOVERING is the bigger concern.** A member enters `RECOVERING` after a restart or after falling so far behind that it must catch up from the oplog (or resync entirely if the oplog has rolled over). The team needs to confirm it is making forward progress and not stuck; a member stuck in `RECOVERING` because the primary's oplog no longer covers its last optime requires an initial sync to recover.
+3. **The set is one failure from degraded service.** With only the primary fully healthy, a primary failure now would either fail over to a still-catching-up node (risking lost writes) or, worse, leave no eligible voting majority to elect a new primary. This is the durability warning the card exists to raise.
+
+```text
+Failover safety check at 02:55:
+  - healthy voting members: 1 (primary only)
+  - safe failover targets: 0  (02 is 34s behind, 03 is RECOVERING)
+  - majority for election: 2 of 3 needed
+  - if primary fails now: election may stall or promote a laggy node → write loss risk
+  - action: throttle the import; confirm 03 is progressing toward SECONDARY; add oplog headroom
+```
+
+Three takeaways for the team:
+
+1. **Lag and RECOVERING are both redundancy losses, treated as one alert.** They have different causes but the same consequence: a member that cannot safely take over. The card fires on either so you never miss a degraded set.
+2. **Bulk writes are the most common lag driver.** Imports, migrations, and large batch updates flood the oplog faster than secondaries can replay it. Throttling the write job or running it during a low-traffic window keeps secondaries in step.
+3. **A stuck RECOVERING member needs hands-on intervention.** If the member is not advancing toward `SECONDARY`, check whether the primary's oplog still covers its last optime. If not, an initial sync (resync) is required, and the oplog should be sized larger to prevent recurrence.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Replica Set Member Lag / RECOVERING | What the combination tells you |
+| --- | --- | --- |
+| [Replica Lag (seconds)](/nerve-centre/kpi-cards/mongodb/replica-lag-seconds) | The continuous lag gauge this alert thresholds. | Watch lag trend toward 10s before the alert fires; gives early warning during imports. |
+| [Replica Set Members (state)](/nerve-centre/kpi-cards/mongodb/replica-set-members-state) | The full per-member state table. | Shows every member's `stateStr` at once so you can see how much of the set is healthy. |
+| [Elections (24h)](/nerve-centre/kpi-cards/mongodb/elections-24h) | Lag and RECOVERING members often precede or follow elections. | Frequent elections plus lagging members equals an unstable set flapping its primary. |
+| [Query Error Rate Spike (>1% in 5m)](/nerve-centre/kpi-cards/mongodb/query-error-rate-spike-1-in-5m) | Elections during failover produce NotWritablePrimary errors. | An error spike that coincides with a RECOVERING member is failover-driven, not a code bug. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | High write throughput drives secondary lag. | An ops spike on the primary that coincides with rising lag equals the secondaries cannot keep pace. |
+| [Chunks Pending Migration](/nerve-centre/kpi-cards/mongodb/chunks-pending-migration) | On sharded clusters, each shard is its own replica set. | Pending migrations plus member lag equals a shard whose replica set is struggling under balancer load. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | The composite that weights replica-set health. | Any lagging or recovering member pulls the overall score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MongoDB's own tooling:**
+
+> Run `rs.status()` in `mongosh` connected to any member. The `members` array gives each node's `stateStr` and `optimeDate`; subtract a secondary's `optimeDate` from the primary's to get its lag.
+> Run `rs.printSecondaryReplicationInfo()` for a human-readable per-secondary lag summary.
+> Inspect the oplog window with `rs.printReplicationInfo()` to confirm the oplog still covers a recovering member's last optime; if not, an initial sync is required.
+> On MongoDB Atlas, the Metrics tab exposes **Replication Lag** and **Replication Oplog Window** charts per node, and Atlas raises its own native replica-set health alerts.
+
+**Why our number may legitimately differ from a manual reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sample timing** | Either | Lag moves second to second under write load; our poll and your `rs.status()` run are taken at slightly different instants. |
+| **Clock skew** | Either | Lag is computed from optime timestamps; if node clocks drift, the computed lag can read slightly high or low. Keep NTP in sync. |
+| **Which node you query** | Either | `rs.status()` reports the querying node's view of the set; a partitioned node may report stale state for members it cannot reach. |
+| **State transience** | Our card may show RECOVERING briefly | A member can flick through `RECOVERING` for seconds during a normal restart; the card surfaces it, which is correct, even though it may clear on its own. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | An election triggered by an unhealthy set can cause a brief order-failure dip. | A revenue dip coinciding with a RECOVERING member and an election equals failover impact on the storefront. |
+| Application read-preference behaviour | Apps reading from secondaries may serve stale data while lag is high. | If users report stale reads during a lag alert, the app is reading from a lagging secondary; pin critical reads to the primary. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**A secondary briefly went RECOVERING during a routine restart and the alert fired. Is that a false alarm?**
+Not a false alarm, but expected behaviour. A member legitimately passes through `RECOVERING` while it applies its oplog to catch up after a restart. The card surfaces it because, during that window, the member genuinely cannot serve reads or be safely promoted. If it clears back to `SECONDARY` within a minute or two, no action is needed beyond noting it. A member stuck in `RECOVERING` is the real problem.
+
+**My lag spikes every night during a batch import. How do I stop the alert?**
+The lag is real: your secondaries cannot replay the oplog as fast as the import writes it. Options, in order of preference: throttle the import (smaller batches, pauses between them), run it during a lower-traffic window, or increase secondary I/O capacity. As a last resort you can widen the sensitivity threshold, but that hides a genuine redundancy gap during the import.
+
+**What is the difference between a lagging secondary and a RECOVERING one?**
+A lagging `SECONDARY` is still applying the oplog and serving reads; it is just behind. A `RECOVERING` member is not serving reads at all, it is catching up before it can rejoin as a healthy secondary. Lag is a matter of degree; RECOVERING is a binary "this node is out of service right now". Both reduce failover safety, which is why the card fires on either.
+
+**Why is 10 seconds the threshold?**
+Sub-second lag is normal and healthy. Single-digit seconds of lag is tolerable during write bursts. Beyond about 10 seconds, the secondary is far enough behind that promoting it on failover would lose a meaningful number of writes, and stale reads from that secondary become noticeable. 10 seconds is the line where lag stops being routine and starts threatening durability. It is configurable per profile in the Sensitivity tab.
+
+**A member is stuck in RECOVERING and not catching up. What now?**
+Check whether the primary's oplog still covers the member's last applied optime, using `rs.printReplicationInfo()`. If the oplog has rolled past that point, the member cannot catch up incrementally and needs an initial sync (a full resync from another member). To prevent recurrence, size the oplog larger so it covers longer outages, and investigate why the member fell so far behind in the first place.
+
+**Does high lag mean I will lose data?**
+Only if the primary fails while a secondary is lagging and that secondary is promoted before catching up. With the default majority write concern (`w: majority`), acknowledged writes are safe because they are confirmed on a majority before the client is told they succeeded. Lag is most dangerous for writes made with weaker write concern, or for reads from a lagging secondary returning stale data. Use `w: majority` for durability-critical writes and pin critical reads to the primary.
+
+**Does this card work on a sharded cluster?**
+Yes. Each shard in a sharded cluster is itself a replica set, and the card evaluates the lag and state of every member across every shard. A RECOVERING member or a laggy secondary on any single shard raises the alert for that shard, so you can pinpoint which shard's replica set is impaired rather than treating the whole cluster as one unit.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Replica Set Member Lag >10s or in RECOVERING State* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

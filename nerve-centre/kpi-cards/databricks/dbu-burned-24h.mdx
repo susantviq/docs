@@ -1,0 +1,132 @@
+---
+title: "DBU Burned (24h), Databricks"
+sidebarTitle: "DBU Burned (24h)"
+description: "DBU Burned (24h) for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [DBU Burn](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The total Databricks Units consumed across the workspace in the last 24 hours, drawn straight from the billable usage API and spanning every compute type: job clusters, SQL warehouses, and interactive (all-purpose) clusters. DBU is the unit Databricks bills on, so this is the defining cost metric of the platform, the one number that turns "the cluster is running" into "this is what it cost". For FinOps and platform leads it is the daily pulse of spend, and the `+50% vsP` alert is the first thing that fires when a runaway job, a forgotten warehouse, or a misconfigured autoscaling policy starts burning money.
+
+| | |
+| --- | --- |
+| **Data source** | Billable usage API (the same records that feed your Databricks invoice). Where enabled, `system.billing.usage` provides the identical per-SKU DBU series for historical reconciliation. |
+| **Metric basis** | Sum of DBU across all billable SKUs in the trailing 24 hours: job compute + SQL warehouse + interactive (all-purpose) compute, including serverless where applicable. |
+| **Aggregation window** | Trailing 24 hours, compared against the prior comparable 24-hour period (`vsP`). |
+| **Comparison** | Day-over-day. The card surfaces the percentage change against the matching prior 24-hour window. |
+| **What counts** | All DBU billed against compute: jobs, warehouses, interactive clusters, Delta Live Tables, and serverless usage that appears in billable records. |
+| **What does NOT count** | Non-DBU charges (cloud-provider VM, storage, and networking costs billed by AWS/Azure/GCP directly), and usage not yet written to billing records at read time. |
+| **Time window** | `24h` (trailing 24 hours vs prior 24 hours) |
+| **Alert trigger** | `+50% vsP` (DBU burn jumped 50% day-over-day, investigate for runaway compute) |
+| **Roles** | FinOps, platform engineering, data engineering, executive |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine sums every DBU record in the billable usage feed over the trailing 24 hours, across all compute SKUs, and compares the total to the prior 24-hour window:
+
+```text
+dbu_24h      = Σ DBU across all billable SKUs in trailing 24h
+              (job compute + SQL warehouse + interactive + serverless)
+vsP_change%  = (dbu_24h - dbu_prior_24h) / dbu_prior_24h × 100
+```
+
+Because the figure comes from billable usage, it is the closest pre-invoice estimate of spend Databricks exposes, not a proxy or an instrumented guess. The day-over-day comparison is what makes the `+50% vsP` alert meaningful: most workspaces have a strong daily rhythm (nightly batch, working-hours interactive, weekend lulls), so comparing today against the same window yesterday normalises out that shape and surfaces genuine anomalies. A 50% day-over-day jump that is not explained by a planned backfill or a known new workload is almost always one of three things: a job stuck in a retry loop, a SQL warehouse left running with no auto-stop, or autoscaling overshooting on a heavier-than-usual input. DBU is a consumption unit, not a currency; to translate it to money, multiply by your per-DBU rate, which varies by SKU, cloud, and contract.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A FinOps analyst opens the card on 14 Apr 26 at 07:30 BST. The headline shows a sharp day-over-day rise that trips the alert.
+
+| Window | Job compute DBU | SQL warehouse DBU | Interactive DBU | Total |
+| --- | --- | --- | --- | --- |
+| Prior 24h (12 to 13 Apr) | 620 | 410 | 90 | 1,120 |
+| This 24h (13 to 14 Apr) | 1,180 | 430 | 95 | 1,705 |
+
+```text
+vsP_change% = (1,705 - 1,120) / 1,120 × 100 = +52%
+```
+
+The **+52% vsP** clears the threshold. The breakdown immediately points at job compute: warehouse and interactive are flat, while job DBU nearly doubled. The analyst works it through:
+
+1. **Drill into [DBU by Cluster (7d)](/nerve-centre/kpi-cards/databricks/dbu-by-cluster-7d).** One job cluster, `prod-recommendations-train`, accounts for almost the entire increase: it ran for 11 hours overnight instead of its usual 4.
+2. **Check [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) and [Job Success Rate (24h)](/nerve-centre/kpi-cards/databricks/job-success-rate-24h).** The job entered a retry loop after a transient storage error, failing and restarting on a 16-node autoscaled cluster five times before finally completing. Each retry burned a full cluster spin-up plus partial compute.
+3. **Confirm it is not waste from idle time.** [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h) is normal, so the burn was active retries, not a cluster left open doing nothing.
+
+At a contract rate of, say, £0.40 per DBU, the extra 585 DBU represents roughly £234 of unplanned spend in a single night, from one job. The fix is a bounded retry policy and a max-runs guard, not a smaller cluster. The lesson: the headline tells you spend moved; the SKU split tells you which compute type, and the per-cluster drill-down tells you which workload. Always read all three before acting, because the same +50% can come from a runaway job, an un-stopped warehouse, or genuine new demand, and the response to each is completely different.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with DBU Burned (24h) | What the combination tells you |
+| --- | --- | --- |
+| [DBU by Cluster (7d)](/nerve-centre/kpi-cards/databricks/dbu-by-cluster-7d) | Localises the burn to a specific cluster. | The cluster topping the table is where a day-over-day spike originated. |
+| [Avg DBU per Job Run](/nerve-centre/kpi-cards/databricks/avg-dbu-per-job-run) | Separates more runs from heavier runs. | Total up with per-run flat equals more volume; total up with per-run up equals an efficiency regression. |
+| [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h) | Splits active burn from idle waste. | A high total with high idle waste means clusters left open, not work done. |
+| [Avg Cluster CPU Utilisation %](/nerve-centre/kpi-cards/databricks/avg-cluster-cpu-utilisation) | The utilisation behind the spend. | Rising burn with falling utilisation equals over-provisioned or idle compute. |
+| [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) | Run duration is a direct DBU driver. | A burn spike tracking a long-running job points at a stuck or retrying workload. |
+| [Job Success Rate (24h)](/nerve-centre/kpi-cards/databricks/job-success-rate-24h) | Retries from failures burn DBU. | A burn spike alongside falling success rate means wasted retry compute. |
+| [Active SQL Warehouses](/nerve-centre/kpi-cards/databricks/active-sql-warehouses) | Forgotten warehouses are a classic burn source. | More active warehouses than expected during a spike points at missing auto-stop. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **Settings → Usage** (the account-level usage dashboard) for total DBU by SKU over a custom 24-hour range.
+> **`system.billing.usage`** for the per-record DBU series if system tables are enabled, the most precise reconciliation source.
+> **Account Console → Usage** for the consolidated cross-workspace view if you run multiple workspaces.
+
+**Why our number may legitimately differ from the Databricks UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Billing lag** | Vortex IQ slightly lower near the edge | Billable usage records can lag actual consumption by a short interval; the most recent compute may not yet be in the feed at read time. |
+| **Window boundary** | Variable | Vortex IQ uses a rolling trailing 24 hours; the native usage dashboard defaults to calendar days, so the totals cover different edges. |
+| **SKU scope** | Variable | We sum all compute DBU SKUs; if you filter the usage dashboard to a single SKU or workspace, it will read lower. |
+| **DBU vs currency** | Always | This card reports DBU, not money. The usage dashboard can show an estimated cost; multiply DBU by your per-SKU rate to compare. |
+| **Time zone** | Window alignment | Native dashboards use the account time zone; Vortex IQ stores UTC and renders in your profile time zone. |
+| **Multi-workspace** | Vortex IQ may read lower | This card covers the connected workspace; the account console aggregates across all workspaces. |
+
+**Cross-connector reconciliation:** pair with [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume). A 50% burn spike with flat order volume is the clearest evidence that the extra spend is waste rather than growth; if orders rose in proportion, the burn is the cost of genuine business demand.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Is DBU the same as money?**
+No. DBU is Databricks' consumption unit; your cost is DBU multiplied by your per-DBU rate, which varies by compute SKU (jobs vs all-purpose vs SQL vs serverless), by cloud provider, and by your contract tier. This card reports DBU so it is rate-independent; to get spend, apply your own rate. The relative day-over-day change, however, is directly meaningful regardless of rate.
+
+**Does this include the cloud VM and storage cost?**
+No. DBU covers the Databricks platform charge only. The underlying virtual machines, storage, and networking are billed separately by AWS, Azure, or GCP and do not appear here. Total cloud spend is DBU cost plus those provider charges; for a full picture, reconcile this card against your cloud bill as well.
+
+**My burn spiked 50% but nothing looks broken. What now?**
+Read the SKU split and the per-cluster drill-down before concluding anything. The three usual causes are a job in a retry loop ([Job Success Rate (24h)](/nerve-centre/kpi-cards/databricks/job-success-rate-24h)), a SQL warehouse left running without auto-stop ([Active SQL Warehouses](/nerve-centre/kpi-cards/databricks/active-sql-warehouses)), and autoscaling overshooting on heavier input ([Avg Cluster CPU Utilisation %](/nerve-centre/kpi-cards/databricks/avg-cluster-cpu-utilisation)). Each looks "not broken" on the surface but each burns real money.
+
+**Why does the number near midnight look lower than I expect?**
+Billable usage records lag actual consumption slightly, so compute from the last few minutes may not yet be in the feed. The figure settles as billing data catches up. For an exact reconciliation, read `system.billing.usage` after the lag clears rather than at the window edge.
+
+**Does serverless usage show up here?**
+Yes, where it appears in billable usage records. Serverless job, DLT, and SQL consumption is captured in the total even though the underlying nodes are not visible in the cluster-level cards. This is one reason the total can move without any change in your visible cluster fleet.
+
+**Can I see burn by team or project?**
+Not directly on this headline, but DBU records carry tags. Use [DBU by Cluster (7d)](/nerve-centre/kpi-cards/databricks/dbu-by-cluster-7d) for the per-cluster split, and for a tag-based (team, project, cost-centre) breakdown, query `system.billing.usage` grouped by your custom tags in the workspace.
+
+**Can I change the +50% threshold?**
+Yes. The day-over-day sensitivity is configurable per profile in the Sensitivity tab. Workspaces with deliberately spiky workloads (scheduled backfills, month-end loads) often widen it on those days, while steady-state production workspaces tighten it to catch smaller anomalies sooner.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*DBU Burned (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

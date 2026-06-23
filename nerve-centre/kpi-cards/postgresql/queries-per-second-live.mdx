@@ -1,0 +1,136 @@
+---
+title: "Queries per Second (live), kpi"
+sidebarTitle: "Queries per Second (live)"
+description: "Queries per Second (live) for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The live throughput of your PostgreSQL instance: how many statements per second it is executing right now. This is the database's pulse. On its own it is neither good nor bad: a healthy reporting database might idle at 5 QPS while a busy OLTP primary sustains 12,000. Its value is as a baseline. Once you know your normal range, every other Capacity and Performance card reads differently. A latency spike at 3x normal QPS is load; the same spike at flat QPS is a regression.
+
+| | |
+| --- | --- |
+| **What it tracks** | Statements executed per second across the instance, averaged over the live sampling window. It is the rate of work, not the number of connections or the amount of data. |
+| **Data source** | Derived from the `xact_commit + xact_rollback` and statement counters in `pg_stat_database`, sampled twice and differenced over the interval. Where `pg_stat_statements` is installed, the `calls` counter gives a finer statement-level rate. |
+| **Time window** | `RT` (real-time; the rate is computed from the delta between two close samples and refreshed continuously). |
+| **Alert trigger** | None. This is a context and baselining card, not an alerting one. The actionable thresholds live on the latency, error-rate and saturation cards that QPS gives context to. |
+| **Roles** | owner, engineering, operations |
+| **What it is not** | Not a measure of useful work. A QPS spike can be genuine demand, a retry storm from a failing dependency, or a scraper hammering an unindexed endpoint. QPS tells you the volume; the sibling cards tell you the quality. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+PostgreSQL does not expose a ready-made "queries per second" gauge, so Vortex IQ derives the rate from monotonic counters by sampling and differencing:
+
+```text
+qps = (counter_now - counter_prev) / (t_now - t_prev)
+```
+
+Two counter sources are used, in order of preference:
+
+1. **`pg_stat_statements.calls`** (preferred): when the `pg_stat_statements` extension is installed, summing the `calls` column across all statements gives a true count of statement executions. The delta between two samples, divided by the elapsed seconds, is the statement rate. This is the most accurate basis because it counts every executed statement, including those inside functions.
+2. **`pg_stat_database` transaction counters** (fallback): when `pg_stat_statements` is not available, Vortex IQ uses `xact_commit + xact_rollback` from `pg_stat_database` as a proxy. This counts transactions, not statements, so a workload that batches many statements per transaction will read lower than the true statement rate. It is still a faithful baseline because the ratio stays stable for a given workload.
+
+Because both bases are cumulative counters that only ever increase (until a stats reset or a server restart), the card guards against two edge cases: a counter reset (the delta would go negative, so the sample is discarded) and a server restart (uptime drops, so the rate is suppressed until a fresh baseline is established). See [Instance Uptime](/nerve-centre/kpi-cards/postgresql/instance-uptime).
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a PostgreSQL 16 primary behind an inventory and order API. Normal weekday QPS sits between 1,800 and 2,600. Snapshot taken on 22 Apr 26 at 12:05 BST.
+
+| Sample | `pg_stat_statements.calls` (cumulative) | Time |
+| --- | --- | --- |
+| Previous | 4,812,440,118 | 12:04:55 |
+| Current | 4,812,627,418 | 12:05:05 |
+
+The delta is `187,300` calls over `10` seconds, so the live reading is **18,730 QPS**, roughly 8x the normal ceiling. Nothing else is on fire yet: latency is still within band, errors are flat. The headline simply shows a number far above baseline, which is exactly the signal this card exists to give.
+
+The on-call DBA does not panic but does investigate, because 8x baseline is either a very good day or a problem:
+
+```text
+Triage in 90 seconds:
+  1. Is order rate up too?  -> check the ecom order-rate cross-channel card
+  2. Is latency holding?    -> check p95 / p99 latency
+  3. Is one query dominating? -> SELECT query, calls, total_exec_time
+                                 FROM pg_stat_statements
+                                 ORDER BY calls DESC LIMIT 10;
+```
+
+The cross-channel card [PostgreSQL QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/postgresql/postgresql-qps-spike-vs-ecom-order-rate) shows the answer: order rate is flat. Real customer demand has not changed. So 16x the normal query volume is being generated by something that is not buying anything. The top-calls query reveals a single `SELECT` against the product-availability endpoint running 14,000 times per second from one IP range: a scraper or a misbehaving client retry loop.
+
+Two takeaways the team records:
+
+1. **QPS is only meaningful against a baseline and against demand.** The same 18,730 reading would be a triumph if orders had risen with it and a crisis if they had not. The number alone decides nothing; the pairing does.
+2. **A QPS spike with flat orders is almost always non-revenue traffic:** a scraper, a retry storm from a failing dependency, a cache that just went cold, or a runaway cron. The fix is rate-limiting or caching at the application or edge, not scaling the database to serve traffic that produces no value.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Queries per Second | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p95-ms) | Latency under load is the real question. | Rising p95 with rising QPS is load; rising p95 with flat QPS is a regression or a lock. |
+| [Query Latency p50 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p50-ms) | The typical-query view under the same throughput. | p50 holding while QPS climbs means the instance has headroom. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/postgresql/query-error-rate) | Errors as a fraction of this volume. | A QPS spike that is mostly errors is a retry storm, not demand. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) | The capacity the traffic consumes. | QPS up with saturation up is healthy scaling; QPS flat with saturation up is a connection leak. |
+| [Buffer Cache Hit Rate %](/nerve-centre/kpi-cards/postgresql/buffer-cache-hit-rate) | Whether the throughput is being served from memory. | A QPS spike that drops cache hit rate is reading cold data and will hammer disk. |
+| [PostgreSQL QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/postgresql/postgresql-qps-spike-vs-ecom-order-rate) | Ties query volume to actual revenue events. | QPS spike without an order spike flags bot or scraper traffic. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/postgresql/slow-query-rate) | The quality of the queries making up the volume. | High QPS plus a high slow-query share means the throughput is expensive, not efficient. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The composite this throughput feeds into. | QPS is the load context against which every other health input is judged. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL itself:**
+
+> Reproduce the rate by hand: run `SELECT sum(calls) FROM pg_stat_statements;` twice a few seconds apart, subtract, and divide by the elapsed seconds. (Requires the `pg_stat_statements` extension and `shared_preload_libraries` configured.)
+> Without that extension, run `SELECT sum(xact_commit + xact_rollback) FROM pg_stat_database;` the same way for the transaction rate.
+> Check `SELECT stats_reset FROM pg_stat_database WHERE datname = current_database();` to see when counters last reset; a recent reset makes any rate computed across it meaningless.
+> On a managed service, the console exposes a comparable metric: AWS RDS / Aurora publishes per-database throughput in Performance Insights and `CommitThroughput` in CloudWatch, Google Cloud SQL publishes `database/postgresql/transaction_count`, and Azure publishes transaction-rate metrics.
+
+**Why our number may legitimately differ from a hand count:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Counter basis** | Either way | If `pg_stat_statements` is absent, Vortex IQ counts transactions not statements, which reads lower than a statement-level hand count when transactions batch many statements. |
+| **Sampling interval** | Either way | Vortex IQ differences two close samples; a console metric averaged over a 1-minute bucket will smooth out short spikes the live card shows. |
+| **Stats reset between samples** | Vortex IQ suppresses | If counters reset between your two manual reads, your hand maths goes negative or wrong; Vortex IQ discards such samples. |
+| **Replica vs primary** | Either way | QPS is per-instance. A read replica serving reporting traffic has its own rate, separate from the primary. |
+| **Background work** | Console may read higher | Autovacuum, the stats collector and replication generate transactions that some console metrics include and a statement-level count does not. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Is a higher QPS better or worse?**
+Neither, by itself. QPS is throughput, not health. The right reading is always relative: relative to your own baseline, and relative to demand. High QPS with healthy latency and rising orders is a great day. The same number with flat orders or climbing latency is a problem. Always pair this card with a latency card and the order-rate cross-channel card before drawing a conclusion.
+
+**My QPS reads lower than I expect. Is the card under-counting?**
+Probably you do not have `pg_stat_statements` installed, so Vortex IQ is counting transactions rather than statements. A workload that runs many statements inside each transaction will show a transaction rate well below its statement rate. Install the extension (add it to `shared_preload_libraries`, restart, then `CREATE EXTENSION pg_stat_statements;`) for a statement-accurate figure.
+
+**QPS spiked but my orders did not move. What does that mean?**
+Almost always non-revenue traffic: a scraper, a retry storm from a failing downstream service, a cron that ran amok, or a cold cache forcing the application to re-query data it should have had in memory. Run the top-`calls` query in `pg_stat_statements` to find the dominant statement, then look at [PostgreSQL QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/postgresql/postgresql-qps-spike-vs-ecom-order-rate) to confirm the demand side is flat.
+
+**Why does QPS briefly read zero or blank after a restart?**
+The rate is computed from the delta between two cumulative counter samples. A restart resets those counters and `pg_postmaster_start_time()`, so Vortex IQ suppresses the rate until it has a fresh baseline from two post-restart samples. A momentary blank right after a restart is expected; if it persists, check [Instance Uptime](/nerve-centre/kpi-cards/postgresql/instance-uptime).
+
+**Does QPS include queries served by my read replicas?**
+No. QPS is per-instance. Each replica reports its own throughput against its own counters. To see total fleet throughput, sum the primary and replica readings; Vortex IQ keeps them separate so you can tell read traffic from write traffic.
+
+**Why is there no alert on this card?**
+Because there is no universally meaningful threshold for raw throughput: 50 QPS is alarming for a busy OLTP primary and luxurious for a reporting database. The actionable thresholds live on the cards QPS gives context to, latency, error rate and saturation, which fire when high throughput actually starts to hurt. QPS itself is deliberately a context card.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Queries per Second (live)* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

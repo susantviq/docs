@@ -1,0 +1,163 @@
+---
+title: "Slow Queries During Checkout Window (5m), MariaDB"
+sidebarTitle: "Slow Queries During Checkout Window (5m)"
+description: "Slow Queries During Checkout Window (5m) for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A row-by-row table of MariaDB slow queries (statements exceeding `long_query_time`) that fired inside the same 5-minute window as a measured drop in checkout completion on the connected storefront. This is the database-side smoking gun for a checkout that is "slow for no obvious reason". Each row pairs a slow query digest with the order, cart, or inventory tables it touched, so a DBA can tell at a glance whether a checkout dip is a database problem or something further up the stack. When more than 5 slow queries co-occur with a checkout drop, the card fires: the database is the bottleneck and the storefront is bleeding conversions while it stays that way.
+
+| | |
+| --- | --- |
+| **What it tracks** | MariaDB slow queries captured in the slow query log (or `performance_schema.events_statements_summary_by_digest`) during a 5-minute window, correlated against a concurrent fall in checkout completion rate on the linked ecommerce connector. Broken down by row: one row per slow query digest. |
+| **Data source** | The MariaDB slow query log / `performance_schema` digest tables for the slow-query side; the linked storefront connector (Shopify, BigCommerce, or Adobe Commerce) for the checkout-completion side. Vortex IQ aligns the two on a shared UTC 5-minute bucket. |
+| **Detail** | "Slow Queries During Checkout Window (5m), broken down by row." Each row carries the normalised digest, count, mean and max execution time, rows examined, and the storefront checkout delta for the same window. |
+| **Time window** | `5m` rolling, refreshed each minute. The window is short by design: checkout pain is acute, and a 5-minute window keeps the correlation tight enough to be actionable. |
+| **Alert trigger** | `>5 slow queries co-occur with checkout drop`. More than 5 slow query events landing in the same 5-minute bucket as a measurable checkout-completion drop. |
+| **What counts as "slow"** | Any statement whose execution time exceeds the instance `long_query_time` (commonly 1s to 2s for OLTP). Statements not using indexes are also captured if `log_queries_not_using_indexes` is on. |
+| **What counts as a "checkout drop"** | A 5-minute checkout-completion rate that falls below the trailing baseline by more than the sensitivity threshold for the linked storefront. The drop must be measured, not inferred, so the card needs a connected storefront to populate the cross-channel half. |
+| **What does NOT count** | (1) Slow queries outside the checkout window; (2) slow queries during a window with no checkout drop (those surface on [Slow-Query Rate](/nerve-centre/kpi-cards/mariadb/slow-query-rate) instead); (3) administrative or backup statements tagged as maintenance; (4) replica-side slow queries (this card reads the primary that serves checkout writes). |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card is the intersection of two independent measurements over the same 5-minute UTC bucket.
+
+**The MariaDB side.** Every statement that exceeds `long_query_time` is recorded. Vortex IQ reads either the slow query log (when `slow_query_log = ON` and `log_output` includes `TABLE` or `FILE`) or, preferred on busy instances, the digest summary in `performance_schema.events_statements_summary_by_digest`, which aggregates by normalised statement so a single hot query does not flood the table with thousands of literal-by-literal rows. For each digest the engine carries:
+
+- `count_star`: how many times the digest executed in the window.
+- `avg_timer_wait` and `max_timer_wait`: mean and worst execution time, converted from picoseconds to milliseconds.
+- `sum_rows_examined` vs `sum_rows_sent`: a high examined-to-sent ratio is the classic signature of a missing or unused index.
+
+**The checkout side.** The linked storefront connector reports checkout-completion events per minute. Vortex IQ computes a 5-minute completion rate and compares it to the trailing baseline for that storefront and time-of-week. A fall beyond the sensitivity threshold marks the window as a "checkout drop".
+
+**The correlation.** When a checkout-drop window is detected, the card lists every slow query digest that fired in the same bucket, ordered by total time consumed (`count_star × avg_timer_wait`). The alert condition is purely a count: more than 5 slow query events landing inside a drop window. The card does not claim causation, it surfaces co-occurrence so a human can confirm it in seconds.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A mid-market homeware brand runs Adobe Commerce on a 3-node MariaDB 10.6 Galera cluster, with checkout writes served by the primary writer node. The snapshot is taken on 14 Apr 26 at 20:05 BST, during the evening traffic peak.
+
+The storefront connector reports checkout completion has fallen from a trailing baseline of 41 completions per 5 minutes to 18, a 56% drop, which crosses the sensitivity threshold and marks the window 20:00 to 20:05 as a checkout drop. The card lists the slow queries that fired in the same bucket:
+
+| Digest | Count | Avg (ms) | Max (ms) | Rows examined (avg) | Tables |
+| --- | --- | --- | --- | --- | --- |
+| `SELECT ... FROM cataloginventory_stock_item WHERE product_id IN (...)` | 14 | 2,180 | 6,400 | 1,240,000 | cataloginventory_stock_item |
+| `SELECT ... FROM quote_item WHERE quote_id = ?` | 11 | 1,640 | 3,900 | 88,000 | quote_item, quote |
+| `UPDATE sales_order_grid SET ... WHERE entity_id = ?` | 7 | 1,510 | 4,200 | 1 | sales_order_grid |
+| `SELECT ... FROM customer_grid_flat WHERE ...` | 6 | 1,120 | 2,300 | 420,000 | customer_grid_flat |
+
+The headline shows **38 slow queries** in the window, well above the threshold of 5, with the alert outlined in red. The DBA reads three things at a glance:
+
+1. **The inventory check is the prime suspect.** `cataloginventory_stock_item` is examining 1.24 million rows per execution to answer a multi-SKU stock lookup. That examined count against a table that should be a primary-key fetch screams a missing or unusable index, almost certainly because the `IN (...)` list lost its index path after a recent schema change or statistics drift. At 14 executions averaging 2.18s, this digest alone consumed roughly 30s of the 5-minute window on the writer node.
+2. **Checkout serialises behind it.** The `quote_item` reads and `sales_order_grid` writes are the checkout's own statements, slowing because they queue behind the inventory scan competing for the same buffer pool and row locks. This is why completions halved: customers are not abandoning by choice, they are timing out on a spinner.
+3. **It is the database, not the storefront.** Because the card pairs the storefront drop with concrete slow query rows, the DBA can rule out a marketing surge, a payment-gateway issue, or a frontend deploy in seconds. The evidence points at one table.
+
+```text
+Cost framing for the drop window:
+  - Baseline completions/5m: 41
+  - Observed completions/5m: 18
+  - Lost completions/5m: 23
+  - Average order value: GBP 62
+  - Lost revenue/5m: 23 x GBP 62 = GBP 1,426
+  - If the slow inventory query persists for 30 minutes: ~GBP 8,556 at risk
+```
+
+The fix is a database action, not a storefront one: confirm the index on `cataloginventory_stock_item` with `EXPLAIN`, run `ANALYZE TABLE` to refresh statistics if the optimiser has gone off-plan, and if a recent migration dropped the index, restore it. The DBA also pins [Slow-Query Rate](/nerve-centre/kpi-cards/mariadb/slow-query-rate) and [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms) to confirm the fix lands.
+
+Three takeaways:
+
+1. **Co-occurrence is the value, not the count.** "38 slow queries" on its own is a [Slow-Query Rate](/nerve-centre/kpi-cards/mariadb/slow-query-rate) story. The reason this card is a Hero is that the 38 landed exactly when checkout fell. That pairing turns a vague "the site felt slow" into a specific table and a specific index.
+2. **Read the rows-examined column first.** A high examined-to-sent ratio is the fastest tell for a missing index, which is the single most common cause of a sudden checkout-window slowdown after a deploy or a stats drift.
+3. **The writer node is the one that matters.** Galera replicates writes synchronously, but checkout statements execute on the node the application points at. Slow queries on a read replica do not appear here; this card watches the node that serves the checkout path.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow Queries During Checkout Window | What the combination tells you |
+| --- | --- | --- |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mariadb/slow-query-rate) | The instance-wide slow-query view, not gated on checkout. | A high rate here but no rows on this card equals slow queries that are not hitting the checkout path; a low rate but rows here equals a focused checkout-table problem. |
+| [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mariadb/top-10-slowest-queries-digest) | The 24h ranked digest list. | If the digest topping this card also tops the 24h list, the problem is chronic, not a one-off spike. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms) | The tail-latency view across all statements. | p95 climbing in the same window confirms the slowdown is broad, not isolated to the listed digests. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p99-ms) | The worst-case latency tail. | A p99 spike alongside these rows means a few statements are catastrophically slow, the ones most likely to time out a checkout. |
+| [Pool Saturation Across Galera Nodes vs Traffic](/nerve-centre/kpi-cards/mariadb/pool-saturation-across-galera-nodes-vs-traffic) | The connection-capacity cross-channel peer. | Slow queries plus pool saturation equals checkout starved of both query speed and connection slots, the worst combination. |
+| [MariaDB QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mariadb/mariadb-qps-spike-vs-ecom-order-rate) | The volume-mismatch cross-channel peer. | Rules out a bot or scraper: if QPS spiked without an order spike, the slow queries may be driven by scraper traffic, not real checkout load. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mariadb/query-error-rate) | The failure-rate view. | Slow queries plus a rising error rate equals statements timing out, not just running slow, which abandons carts hard. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite that folds slow-query pressure into one number. | A drop in the score concurrent with these rows confirms the slow queries are degrading overall instance health. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> **Slow query log** with `SHOW VARIABLES LIKE 'slow_query_log%';` and `SHOW VARIABLES LIKE 'long_query_time';` to confirm capture is on and the threshold matches expectations. If `log_output` includes `TABLE`, inspect `mysql.slow_log` directly.
+> **Performance Schema digest summary** with `SELECT digest_text, count_star, avg_timer_wait/1e9 AS avg_ms, sum_rows_examined FROM performance_schema.events_statements_summary_by_digest ORDER BY sum_timer_wait DESC LIMIT 20;` for the same ranked view this card builds.
+> **`SHOW FULL PROCESSLIST;`** during a live drop to see statements in flight, and `EXPLAIN` on the suspect digest to confirm the index path.
+> **Managed-service consoles** (Amazon RDS for MariaDB Performance Insights, Azure Database for MariaDB Query Performance Insight, SkySQL monitoring) surface the same slow-statement ranking under their query-performance views; confirm the time range matches the 5-minute drop window.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Digest normalisation** | Vortex IQ count lower | The slow query log records every literal variant; `events_statements_summary_by_digest` collapses them to one digest. We report digests, so a raw log scan will show more individual rows. |
+| **Threshold drift** | Either way | If `long_query_time` was changed mid-window, the log captures fewer or more statements than the card expects. Confirm the live value. |
+| **Time zone** | "Window" timestamps shift | MariaDB logs in the server's `time_zone`; Vortex IQ buckets in UTC and renders in your profile timezone. |
+| **Maintenance filtering** | Vortex IQ count lower | Backup, `ANALYZE`, and `OPTIMIZE` statements tagged as maintenance are excluded; a raw log includes them. |
+| **Replica vs primary** | Either way | The card reads the checkout-serving primary; a `SHOW PROCESSLIST` run on a replica shows different statements. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.checkout-completion-rate`](/nerve-centre/kpi-cards/shopify/total-revenue) / BigCommerce / Adobe Commerce equivalents | The storefront-side drop that gates this card should match the storefront connector's own checkout metric for the same window. | A drop here but not on the storefront card equals a sensitivity-threshold mismatch; align the thresholds. |
+| [MariaDB QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mariadb/mariadb-qps-spike-vs-ecom-order-rate) | A genuine checkout slowdown shows slow queries with stable QPS. | Slow queries with a QPS spike and no order spike points at scraper or bot load driving the database, not real shoppers. |
+
+<details>
+<summary><em>Why this card needs a connected storefront</em></summary>
+
+This is a cross-channel card: the "checkout drop" half is impossible to measure from MariaDB alone, because the database has no concept of a completed order versus an abandoned one. Without a linked Shopify, BigCommerce, or Adobe Commerce connector, the slow-query half still populates, but the card cannot gate on a checkout drop and effectively degrades to a plain slow-query window list. Connect the storefront to unlock the correlation.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows slow queries but my checkout looks fine. Why did it fire?**
+The alert fires on co-occurrence, not causation. If more than 5 slow queries land in a window where checkout also dipped, the card lists them so you can confirm. A small dip can be normal noise at low traffic (going from 3 completions to 1 looks like a 67% drop). Read the absolute counts in the worked-example style, not just the percentage, and pair with [MariaDB QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mariadb/mariadb-qps-spike-vs-ecom-order-rate) to confirm real load.
+
+**My slow query log is off. Does the card still work?**
+Partly. With `slow_query_log = OFF`, Vortex IQ falls back to `performance_schema.events_statements_summary_by_digest`, which is enabled by default on MariaDB 10.x and captures statement timing without the log overhead. If Performance Schema is also disabled, this card cannot populate the slow-query half; enable one of the two. The digest summary is preferred on busy instances because it does not write a log row per statement.
+
+**What `long_query_time` should I set so this card is useful?**
+For an OLTP checkout workload, 1s to 2s is typical. Lower (for example 0.5s) captures more and surfaces marginal queries earlier, at the cost of a noisier log. Setting it too high (10s) means a query has to be catastrophically slow before it appears, by which point checkout has already failed. Tune it so the card lights up before customers feel pain, not after.
+
+**Why are replica slow queries not shown?**
+Checkout writes (cart updates, order inserts, stock decrements) execute on the node the application points at, which is the primary writer in a Galera or primary-replica topology. Slow reads on a replica do not slow the checkout write path, so including them would add noise. Replica slow queries surface on the replica's own [Slow-Query Rate](/nerve-centre/kpi-cards/mariadb/slow-query-rate) instead.
+
+**The same digest appears every evening at peak. Is that an alert I can ignore?**
+No, that is the most actionable signal there is: a chronic, predictable slow query on the checkout path. Cross-reference [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mariadb/top-10-slowest-queries-digest) to confirm it is a recurring offender, then fix it once (usually an index, a query rewrite, or `ANALYZE TABLE` to refresh optimiser statistics). A recurring alert that you suppress instead of fixing will eventually become a peak-traffic outage.
+
+**Can a Galera flow-control pause look like slow queries here?**
+Yes, and it is worth knowing the difference. If one node falls behind, Galera throttles the whole cluster's writes via flow control, which makes checkout statements slow without any single bad query. If the rows on this card show fast individual digests but checkout still dropped, check [Galera Flow Control Paused %](/nerve-centre/kpi-cards/mariadb/galera-flow-control-paused). The fix there is a node, not an index.
+
+**Does the card distinguish a missing index from genuine high load?**
+It gives you the evidence to distinguish them yourself. The rows-examined column is the key: a digest examining millions of rows to return a handful is a missing-index signature, fixable with an index or `ANALYZE TABLE`. A digest examining roughly as many rows as it returns, but appearing many times, is genuine load, fixable with caching, read replicas, or capacity. The card reports both numbers so you can tell which one you are looking at.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow Queries During Checkout Window (5m)* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

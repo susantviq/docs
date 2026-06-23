@@ -1,0 +1,144 @@
+---
+title: "Pipeline Lag vs Ecom Order Flow, Databricks"
+sidebarTitle: "Pipeline Lag vs Ecom Order Flow"
+description: "Pipeline Lag vs Ecom Order Flow for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A dual-axis chart that plots Databricks pipeline lag (how stale your data is) against live ecommerce order flow over the last 24 hours. The dangerous pattern is the divergence: orders are still flowing into the storefront, but the pipeline that turns those orders into fresh data has stalled. Every minute the pipeline sits stuck while orders keep arriving is a minute your dashboards, inventory marts, and downstream automations are working from a frozen picture of the business. This card is the data-freshness early-warning for the platform team.
+
+| | |
+| --- | --- |
+| **Left axis (Databricks)** | Pipeline lag in seconds, the time since the pipeline last completed a successful run or processed its latest watermark. Sourced from the Jobs and DLT pipeline run history (`/api/2.1/jobs/runs/list` and `/api/2.0/pipelines`). |
+| **Right axis (ecom)** | Order flow from the connected storefront (Shopify, BigCommerce or Adobe Commerce), counted as orders per interval over the same 24-hour window. |
+| **What it tracks** | Whether data freshness keeps pace with incoming business. Rising lag while orders keep flowing is the failure signature. |
+| **Data source** | Databricks pipeline / job run history for lag; the connected ecommerce platform's orders data for flow. Aligned to the same intervals and time zone. |
+| **Time window** | `24h` (trailing 24 hours). |
+| **Alert trigger** | `pipeline stalled while orders flowing`. When pipeline lag climbs past its expected processing interval while order flow remains active, the card flags a freshness divergence. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card overlays two series over the trailing 24 hours.
+
+The Databricks series is pipeline lag in seconds. For a scheduled Job, lag is the elapsed time since the last run finished with `result_state = SUCCESS`; for a DLT pipeline, it is the time since the latest successful update or processed watermark. The engine reads the run history (`/api/2.1/jobs/runs/list`) and the pipeline state (`/api/2.0/pipelines`), takes the most recent success timestamp, and measures the gap to now. This is the same measurement that drives the [Pipeline Lag (since last success)](/nerve-centre/kpi-cards/databricks/pipeline-lag-since-last-success) card, plotted as a time series.
+
+The ecommerce series is order flow: orders per interval from the connected storefront over the same window.
+
+The divergence test is contextual, not a fixed number. Each pipeline has an expected processing interval (its schedule, or its streaming trigger cadence). Lag is normal up to roughly that interval; a job that runs hourly is expected to show up to an hour of lag just before its next run. The card flags when lag exceeds the expected interval (the pipeline has missed a run or stalled mid-stream) at the same time as order flow remains active. Lag with no orders is benign (quiet period, nothing to process); orders with no lag is healthy; the combination of stalled pipeline and live orders is the revenue-at-risk state this card exists to catch.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A fashion retailer uses a Databricks DLT pipeline to stream orders from its Shopify storefront into a near-real-time inventory mart. Merchandising dashboards and the low-stock reorder automation both read that mart. The pipeline's streaming trigger fires every 5 minutes, so anything under about 6 minutes of lag is normal. Reading taken on Thursday 18 Jun 26, covering the last 24 hours, with the close-up below from 14:00 to 15:00 BST.
+
+| Time (BST) | Pipeline lag | Orders in interval | State |
+| --- | --- | --- | --- |
+| 14:05 | 4 min | 38 | healthy |
+| 14:15 | 5 min | 41 | healthy |
+| 14:25 | 6 min | 44 | healthy |
+| 14:35 | 14 min | 47 | lag rising |
+| 14:45 | 24 min | 52 | **divergence** |
+| 14:55 | 34 min | 49 | **divergence** |
+
+Up to 14:25 the two series move together: a small, steady lag and a busy afternoon of orders. At 14:35 the lag line starts climbing while the order line carries on; by 14:45 the lag has passed the expected 6-minute interval four times over and the alert fires. Orders are still arriving at roughly 50 per ten minutes, but none of them have reached the inventory mart for over 24 minutes.
+
+```text
+Freshness divergence (what the alert is protecting against):
+  - Expected lag ceiling:      ~6 min (5-min trigger + slack)
+  - Lag at alert:              24 min and climbing
+  - Order flow during stall:   ~50 orders / 10 min, unchanged
+  - Orders unprocessed by 14:55: ~150 orders sitting outside the mart
+  - Downstream risk: low-stock reorder automation now blind to the last
+    34 minutes of sales; oversell risk on fast-moving lines
+```
+
+The on-call engineer drills in. Order flow rules out a quiet period: the data is there to process, the pipeline simply is not processing it. The DLT event log shows the streaming update retrying against a schema-mismatch error introduced by a supplier feed that added an unexpected column. The pipeline was not down, it was stuck in a retry loop, which is why a naive up/down check would have missed it: the cluster was up, the job was technically running, but no new data was landing.
+
+Three takeaways the team should remember:
+
+1. **Order flow is what turns lag from a metric into a risk.** Lag during a quiet overnight window costs nothing. The exact same lag during a busy afternoon is orders piling up unseen. Always read lag against flow, never alone.
+2. **Stalled is not the same as down.** The most expensive freshness failures are the ones where everything looks green: cluster running, job in `RUNNING` state, no failure alert. A retry loop or a stuck watermark keeps lag climbing while status stays healthy. This card catches the symptom (data not landing) rather than relying on the status flag.
+3. **Lag has a blast radius.** Stale data is not just a stale dashboard; it is every automation downstream of the mart. Reorder logic, pricing rules, fraud checks and personalisation can all act on a frozen view. When this card fires, check what reads the affected tables, not just the tables themselves.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Pipeline Lag vs Ecom Order Flow | What the combination tells you |
+| --- | --- | --- |
+| [Pipeline Lag (since last success)](/nerve-centre/kpi-cards/databricks/pipeline-lag-since-last-success) | The single-number version of the left axis. | Confirms current lag and which pipeline owns it, without the order overlay. |
+| [DLT Pipeline Status Distribution](/nerve-centre/kpi-cards/databricks/dlt-pipeline-status-distribution) | Shows how many pipelines are Running / Idle / Failed / Stopped. | A pipeline in Failed or Stopped while orders flow explains the divergence instantly. |
+| [Failed Jobs (24h)](/nerve-centre/kpi-cards/databricks/failed-jobs-24h) | The terminal-failure view. | If the stalled pipeline has actually failed, it appears here too; if not, the stall is a retry loop, not a failure. |
+| [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) | Catches a run that is technically alive but stuck. | A long-running job plus rising lag equals a hung run rather than a missed schedule. |
+| [Failed Job Burst (>5 failures in 1h)](/nerve-centre/kpi-cards/databricks/failed-job-burst-5-failures-in-1h) | The cascade signal: failures spreading across dependent jobs. | If lag is rising because upstream jobs are cascading failures, this fires alongside. |
+| [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume) | The cost sibling in the same cross-channel category. | High DBU but high lag is the worst case: paying for compute that is not landing data. |
+| [Databricks Health Score](/nerve-centre/kpi-cards/databricks/databricks-health-score) | The composite that folds freshness into overall health. | A sustained lag divergence drags the score even when nothing has formally failed. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks for the lag side:**
+
+> **Workflows → Jobs → [job] → Runs** for the last successful run timestamp of a scheduled Job; the gap to now is the lag.
+> **Delta Live Tables → [pipeline]** for the DLT update history and event log; the latest successful update's end time is the lag anchor.
+> **`system.lakeflow.job_run_timeline`** (Unity Catalog) to query last-success times across jobs programmatically.
+
+**Where to look for the ecom side:**
+
+> Order flow comes from the connected storefront's own live order feed (Shopify, BigCommerce or Adobe Commerce). Match the same intervals and time zone.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Expected-interval baseline** | Flag timing differs | Vortex IQ compares lag to each pipeline's expected interval; a raw look at the Runs page shows absolute lag without that context, so what looks alarming in the UI may be within tolerance. |
+| **Watermark vs run-end** | Lag slightly different | For streaming DLT, Vortex IQ can read the processed-watermark time; the UI often shows run-start or run-end. Continuous pipelines have no discrete run-end to compare against. |
+| **Time zone** | Interval boundaries shift | Vortex IQ aligns intervals to your reporting time zone; the Workflows UI uses workspace time. |
+| **Multiple pipelines** | Headline differs | The card can summarise the worst-lagging tracked pipeline; the UI shows each pipeline separately. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_orders`](/nerve-centre/kpi-cards/shopify/total-orders) / [`bigcommerce.total_orders`](/nerve-centre/kpi-cards/bigcommerce/total-orders) | The right axis should match the storefront's live order count for the same intervals. | A mismatch is usually a time-zone or order-status difference; reconcile the order definition first. |
+| [`databricks.replication_lag_seconds`](/nerve-centre/kpi-cards/databricks/pipeline-lag-since-last-success) | The left axis at any instant should equal the standalone lag card. | Differences come from watermark-vs-run-end choice or which pipeline is summarised. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Lag is high but the card did not flag. Why?**
+Because order flow was low or zero at the same time. Lag during a quiet period (overnight, between batch windows) is expected and harmless: there is nothing to process. The alert only fires when lag exceeds the expected interval while orders are actively flowing, which is the only state that puts revenue data at risk.
+
+**Our pipeline runs hourly, so lag is always rising until the next run. Is that a false alert?**
+No. The card knows each pipeline's expected interval, so an hourly job is allowed up to about an hour of lag before the next run. The alert only fires when lag exceeds that expected interval, meaning a run was actually missed or a streaming update has stalled, not merely that you are mid-cycle.
+
+**The cluster is up and the job shows RUNNING, but the card says the pipeline is stalled. How?**
+That is exactly the case this card is built for. A job can be in `RUNNING` state while stuck in a retry loop, blocked on a lock, or held by a watermark that is not advancing. Up/down and run-state checks miss this; lag-against-flow catches it because no new data is landing despite live orders. Check the DLT event log or the run's Spark UI for a stuck or repeatedly retrying stage.
+
+**How is lag defined for a continuous (always-on) streaming pipeline?**
+For continuous pipelines there is no discrete run-end, so lag is measured from the latest processed watermark or the last committed micro-batch. If that watermark stops advancing while orders flow, lag climbs and the card flags it, which is the correct behaviour even though the pipeline never formally "finished".
+
+**Which pipelines does this card watch?**
+By default the tracked Jobs and DLT pipelines configured for the connector. If you have many pipelines, the headline summarises the worst-lagging one against order flow; drill in to see the per-pipeline breakdown. To scope to specific business-critical pipelines (for example, only the order and inventory marts), set the pipeline scope in the connector settings.
+
+**Can stale data cause harm even after the pipeline recovers?**
+Yes, and this is the part teams underestimate. While lag was high, every downstream consumer of the affected tables acted on a frozen view: reorder automations, pricing rules, personalisation, fraud scoring. After recovery the data is fresh again, but any decisions taken during the stall were made blind. When this card fires, audit what ran against the stale tables during the window, not just the pipeline itself.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Pipeline Lag vs Ecom Order Flow* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

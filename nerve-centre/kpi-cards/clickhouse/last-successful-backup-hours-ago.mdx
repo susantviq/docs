@@ -1,0 +1,168 @@
+---
+title: "Last Successful Backup (hours ago), ClickHouse"
+sidebarTitle: "Last Successful Backup (hours ago)"
+description: "Last Successful Backup (hours ago) for ClickHouse deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Backup](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of hours since your last verified, successful ClickHouse backup completed. For a platform team, this is the single most important "can we recover?" number on the board. It does not measure whether backups are scheduled; it measures whether one actually finished. A backup job that is configured but silently failing for three days reads exactly the same as no backup at all, and this card is what catches that gap before a disk failure or a bad `ALTER` turns it into data loss.
+
+| | |
+| --- | --- |
+| **Data source** | The most recent row in `system.backups` with `status = 'BACKUP_CREATED'`, comparing `end_time` to now. On ClickHouse Cloud, where `BACKUP TO` to local disk is not the recovery path, the card reads the managed snapshot timeline (last completed automatic snapshot) exposed through the service control plane. |
+| **Metric basis** | Age of the last *successful* backup, in hours. `BACKUP_FAILED`, `CREATING_BACKUP` (in-flight), and `RESTORING` rows are ignored when picking the reference time, so a failed run never resets the clock. |
+| **What "successful" means** | Self-managed: the `BACKUP TO Disk(...)` or `BACKUP TO S3(...)` statement reached `BACKUP_CREATED` and the destination object/file is present. Cloud: the automatic snapshot reached a completed state in the service timeline. |
+| **Aggregation window** | Real-time. The card re-reads `system.backups` (or the snapshot timeline) on each refresh and recomputes the age. |
+| **Alert threshold** | `> 72h`. If no successful backup has completed in the last 72 hours, the card turns red and pages the on-call DBA. The default suits a daily backup schedule with two missed runs of tolerance; tighten it for tighter RPO targets. |
+| **What does NOT count** | (1) In-flight backups that have not finished; (2) failed or aborted backups; (3) `RESTORE` operations (those read a backup, they do not create one); (4) a `BACKUP` of a single table when your recovery plan needs the whole database; (5) snapshots that exist in object storage but were never recorded in `system.backups` because they were taken by an external tool. |
+| **Multi-node note** | On a replicated/sharded cluster, the card reports the oldest "most recent successful backup" across the nodes that own backup duty, so a cluster is only as fresh as its stalest backed-up shard. |
+| **Time window** | `RT` (real-time, recomputed on each refresh) |
+| **Alert trigger** | `> 72h` since the last successful backup. |
+| **Roles** | owner, platform, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+For a self-managed ClickHouse instance, the engine queries the backup catalogue and takes the freshest completed run:
+
+```sql
+SELECT
+    name,
+    end_time,
+    dateDiff('hour', end_time, now()) AS hours_ago
+FROM system.backups
+WHERE status = 'BACKUP_CREATED'
+ORDER BY end_time DESC
+LIMIT 1;
+```
+
+`hours_ago` is the headline. If `system.backups` has no `BACKUP_CREATED` row at all (for example after a server restart, since `system.backups` is in-memory and does not survive a restart), the engine falls back to the destination listing: it reads the newest object timestamp under the configured `BACKUP TO S3(...)` bucket or `Disk(...)` path and uses that as `end_time`. This fallback is why a restart does not spuriously turn the card red.
+
+On ClickHouse Cloud, there is no `BACKUP TO` recovery path to read; the engine reads the last completed entry in the managed snapshot timeline and computes the same age. Cloud snapshots run on the service's configured cadence (commonly every 24 hours plus continuous incremental backup), so a healthy Cloud service reads well under the 72h threshold at all times.
+
+The card stores the raw `end_time` alongside the age so that a panel reload recomputes against the current clock rather than caching a stale "hours ago" string.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a self-managed 3-node ClickHouse cluster behind a clickstream and order-events analytics workload. Backups are scheduled by cron at 02:00 UTC daily via a `BACKUP DATABASE events TO S3(...)` statement. Snapshot taken on 14 Apr 26 at 09:15 UTC.
+
+The card reads `Last Successful Backup: 7h ago` (green). The DBA drills in and sees the `system.backups` history:
+
+| Backup name | Status | end_time (UTC) | Age |
+| --- | --- | --- | --- |
+| events-2026-04-14 | `BACKUP_CREATED` | 14 Apr 26 02:18 | **7h** |
+| events-2026-04-13 | `BACKUP_CREATED` | 13 Apr 26 02:16 | 31h |
+| events-2026-04-12 | `BACKUP_FAILED` | 12 Apr 26 02:05 | (ignored) |
+| events-2026-04-11 | `BACKUP_CREATED` | 11 Apr 26 02:14 | 79h |
+
+Three things the team reads from this:
+
+1. **The clock is healthy now (7h).** The 02:18 run completed normally, so the recovery point is the early hours of 14 Apr. Recovery Point Objective (RPO) exposure is at most the 7 hours of events ingested since then.
+2. **There was a hidden near-miss.** The 12 Apr run is `BACKUP_FAILED`. The card never reset the clock to it (it only counts `BACKUP_CREATED`), so on 12 Apr the card would have read `~34h` and on 13 Apr morning it would still have read against the 11 Apr success at `~79h`, which is past the 72h alert. The team should confirm an alert fired on 13 Apr and that the 12 Apr failure (disk-full on the S3 staging mount) was the cause.
+3. **Daily cadence with one allowed miss.** With a 24h schedule and a 72h alert, the team tolerates two consecutive missed runs before the board goes red. That is the right buffer for a daily job, but tighten the threshold to `> 30h` if the RPO target is "lose at most one day".
+
+```text
+RPO framing for this snapshot:
+  - Last good backup completed: 14 Apr 26 02:18 UTC
+  - Now: 14 Apr 26 09:15 UTC
+  - Unprotected window (events since last backup): ~7 hours
+  - At ~40k events/sec sustained ingest:
+      7h x 3600s x 40,000 = ~1.0 billion events at risk if the cluster is lost now
+  - These are recoverable only if the upstream Kafka topic retention exceeds 7h
+    (so a restore + replay can rebuild the gap). Pair with retention checks.
+```
+
+The action when this card is red is unambiguous: do not wait. A red Last Successful Backup means a real `ALTER TABLE ... DROP PARTITION` mistake, a corrupted part, or a lost volume has no clean recovery point within your RPO. Re-run the backup manually, fix the root cause of the failed runs, and only then stand down.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards platform teams should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Last Successful Backup | What the combination tells you |
+| --- | --- | --- |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/clickhouse/database-disk-usage) | Backups need free space at the source and destination. | A red disk card is the single most common cause of `BACKUP_FAILED`: the backup cannot stage. Disk red plus backup ageing equals "fix disk first". |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that takes backup freshness as an input. | A stale backup pulls the health score down even when query metrics look fine. |
+| [Instance Uptime](/nerve-centre/kpi-cards/clickhouse/instance-uptime) | `system.backups` is in-memory and resets on restart. | A recent restart plus a "no rows" backup table is the false-positive case the disk-listing fallback exists to handle. |
+| [Replication Lag (absolute_delay)](/nerve-centre/kpi-cards/clickhouse/replication-lag-absolute-delay) | Replicas are availability, not recovery. | High lag plus stale backup equals double exposure: neither a replica nor a backup can give you a clean recent state. |
+| [MEMORY_LIMIT_EXCEEDED (24h)](/nerve-centre/kpi-cards/clickhouse/memory-limit-exceeded-24h) | Backups of large tables can hit memory ceilings. | A spike at backup o'clock can be the backup itself being killed. |
+| [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h) | The `BACKUP` statement is a query and lands in `query_log` on failure. | Failed-query spikes aligned to the backup schedule confirm the backup job is the failing statement. |
+| [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) | Backup compression and S3 upload consume RAM. | High memory at backup time can starve or kill the backup. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse itself:**
+
+> **`system.backups`** for the authoritative per-run history on a self-managed instance: `SELECT name, status, start_time, end_time, error FROM system.backups ORDER BY end_time DESC`. The `error` column tells you *why* a `BACKUP_FAILED` row failed.
+> **The backup destination** directly: list the S3 bucket or `Disk(...)` path the `BACKUP TO` clause targets and compare the newest object timestamp to the card. This survives restarts where `system.backups` does not.
+> **ClickHouse Cloud:** the service's Backups view in the Cloud console for the managed snapshot timeline, including the configured backup schedule and retention.
+
+**Why our number may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Server restart cleared `system.backups`** | Vortex IQ uses disk-listing fallback | `system.backups` is in-memory. After a restart the table is empty; we fall back to the destination object timestamps, so our age may be derived differently from a raw `system.backups` read that now shows nothing. |
+| **Time zone** | Apparent shift | ClickHouse stores `end_time` in the server time zone (often UTC); Vortex IQ renders the derived age but displays absolute times in your profile time zone. |
+| **External backup tools** | Vortex IQ may read older | If backups are taken by `clickhouse-backup` or a snapshot tool that does not write to `system.backups`, only the destination-listing fallback sees them. Point the connector at the correct destination path. |
+| **Per-table vs full** | Context-dependent | A recent single-table `BACKUP` resets the clock even if your recovery plan needs the full database. The age is technically fresh but the coverage may be wrong; check the backup name. |
+| **Multi-node staleness** | Vortex IQ reports the oldest | On a cluster we surface the stalest shard's last success, which can be older than the freshest single node you might check by hand. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`clickhouse.database-disk-usage`](/nerve-centre/kpi-cards/clickhouse/database-disk-usage) | A failing backup is very often preceded by a full or near-full disk. | If disk is healthy but backups still fail, the cause is downstream: S3 credentials, network, or destination permissions, not local space. |
+| [`clickhouse.instance-uptime`](/nerve-centre/kpi-cards/clickhouse/instance-uptime) | A fresh uptime value explains an empty `system.backups`. | Uptime under the backup interval means the in-memory table simply has not been repopulated yet. |
+
+<details>
+<summary><em>Same-concept peer on other database connectors</em></summary>
+
+The "age of last good backup" concept exists on every database connector with the same intent (recoverability), even though the native plumbing differs. These are not a reconciliation against your ClickHouse data; they exist so a platform team running mixed estates can cross-link the same idea across docs.
+
+- PostgreSQL equivalent: age of the last successful `pg_basebackup` / WAL archive checkpoint.
+- MySQL equivalent: age of the last successful `mysqldump` / Percona XtraBackup / binlog-consistent snapshot.
+- MongoDB equivalent: age of the last completed `mongodump` or Ops Manager snapshot.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card is green but I am not sure the backup is restorable. Does "successful" mean "tested"?**
+No. `BACKUP_CREATED` (or a completed Cloud snapshot) means the backup *wrote* successfully; it does not mean anyone has performed a test restore. A backup you have never restored is a hypothesis, not a guarantee. Schedule periodic `RESTORE` drills into a throwaway database and confirm row counts. The card measures freshness of creation, which is necessary but not sufficient for true recoverability.
+
+**My server restarted and the card briefly showed a much older age. Why?**
+`system.backups` is an in-memory system table and is cleared on every restart. Immediately after a restart it has no `BACKUP_CREATED` rows, so the engine falls back to listing the backup destination (S3 bucket or disk path) and using the newest object timestamp. If the connector cannot reach that destination, the age can read stale until the next scheduled backup repopulates the table. Confirm the connector has read access to the backup destination.
+
+**We are on ClickHouse Cloud and never run `BACKUP TO`. What is this card reading?**
+The managed snapshot timeline. ClickHouse Cloud takes automatic backups on a configured schedule with continuous incremental backup; the card reads the last completed snapshot and computes its age. You do not need to run any `BACKUP` statement. If the value ever exceeds your threshold on Cloud, that points to a service-level issue worth raising with support, not a job you forgot to schedule.
+
+**A backup ran 10 minutes ago but failed. Why didn't the clock reset?**
+By design. The engine only resets against `status = 'BACKUP_CREATED'`. A `BACKUP_FAILED` run is explicitly excluded so that a silently failing job cannot mask a growing recovery gap. This is the whole point of the card: a configured-but-failing backup should read exactly as bad as no backup. Check the `error` column in `system.backups` for the failure reason.
+
+**What threshold should I set instead of 72h?**
+Match it to your RPO and backup cadence. For a daily job with a "lose at most one day" RPO, set `> 30h` (one missed run trips it). For an hourly incremental strategy, set it much lower, for example `> 3h`. The 72h default is deliberately forgiving for a daily schedule so that a single transient failure does not page anyone, while two consecutive failures do.
+
+**Does a single-table backup count the same as a full-database backup?**
+For the *age* calculation, yes: any `BACKUP_CREATED` resets the clock. But coverage is a separate question the card cannot infer. If your recovery plan needs the full database and only a single table was backed up, the card will read green while your real exposure is high. Use a consistent full-database (or full-set-of-databases) backup as your scheduled job, and treat ad-hoc single-table backups as extras, not as the thing that satisfies your RPO.
+
+**We back up to S3 with an external tool, not `BACKUP TO`. Will the card work?**
+Only via the destination-listing fallback, and only if you point the connector at the exact bucket/prefix the tool writes to. Tools like `clickhouse-backup` do not populate `system.backups`, so the in-memory read returns nothing and the engine relies entirely on the object timestamps at the destination. Where possible, prefer the native `BACKUP TO S3(...)` path so `system.backups` carries authoritative status and error detail.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Last Successful Backup (hours ago)* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

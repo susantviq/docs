@@ -1,0 +1,123 @@
+---
+title: "Command Latency p95 (ms), Redis"
+sidebarTitle: "Command Latency p95 (ms)"
+description: "Command Latency p95 (ms) for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Command Latency p95 (ms)** is the 95th-percentile server-side command execution time, in milliseconds. Redis commands are typically sub-millisecond, so a p95 above 10ms is the signal that something pathological is in play: a large key being read or written, a slow Lua script holding the single execution thread, or the host swapping memory to disk. This is a Hero, sensitivity-tier card because Redis sits on the hot path of almost everything (sessions, carts, rate-limiters, caches), and when its tail latency degrades, the slowdown propagates straight into application response times.
+
+| | |
+| --- | --- |
+| **What it tracks** | The 95th-percentile server-side command execution latency, expressed in milliseconds. 19 of every 20 commands complete faster than this value. |
+| **Data source** | `LATENCY HISTORY` (Redis 7+ per-event latency monitoring) where the monitor is enabled, otherwise client-side sampling of command round-trips. The card reports the engine-side time, not network transit. |
+| **Time window** | `RT/5m` (real-time, computed over a trailing 5-minute window so a single slow spike does not dominate the reading). |
+| **Alert trigger** | `> 10ms`. A p95 over 10ms means a meaningful slice of traffic is hitting something slow, not just a one-off outlier. |
+| **Why it matters** | Redis is single-threaded for command execution. One slow command blocks every other command behind it, so tail latency here becomes head latency for the application. |
+| **What does NOT count** | Network latency between client and server, connection-establishment time, and client-side serialisation. This is purely the time the Redis server spends inside the command. |
+| **Roles** | engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+The card takes per-command execution timings and computes the 95th percentile across the trailing 5-minute window, then converts to milliseconds for display. Where Redis 7+ latency monitoring is active, timings come from the server's own `LATENCY HISTORY` event log; otherwise Vortex IQ samples command round-trips client-side and subtracts the measured network baseline to approximate the server-side figure. Because Redis executes commands on a single thread, the percentile is a true reflection of contention: a high p95 is not "some commands are slow in parallel" but "some commands are slow and everything else queues behind them". The detail behind this card is explicit that p95 above 10ms points at a structural cause (a large key, a slow Lua script, or the host swapping), which is why the threshold is set there rather than at a softer number.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Redis 7.2 primary as the session store and product-cache layer for a mid-market storefront. Snapshot taken on 14 Apr 26 at 20:15 BST, during an evening promo push.
+
+| Reading | Value | Status |
+| --- | --- | --- |
+| Command Latency p50 | 90us | Healthy, typical for `GET`/`HGET` |
+| **Command Latency p95** | **14.2ms** | **Breached (threshold 10ms)** |
+| Command Latency p99 | 61ms | Also breached (p99 threshold 50ms) |
+| [SLOWLOG Entries (15m)](/nerve-centre/kpi-cards/redis/slowlog-entries-15m) | 23 | Elevated |
+| [Memory Fragmentation Ratio](/nerve-centre/kpi-cards/redis/memory-fragmentation-ratio) | 0.82 | Below 1, swap suspected |
+
+The story the cards tell together: p50 is still healthy at 90us, so the typical command is fine. But p95 has jumped to 14.2ms and p99 to 61ms, meaning a specific subset of commands is dragging. The team pulls [Top 10 SLOWLOG Commands](/nerve-centre/kpi-cards/redis/top-10-slowlog-commands) and finds a `SMEMBERS` against a set that has grown to 240,000 members, called on every product page render. That single O(N) command, blocking the execution thread, is what pushed the tail out.
+
+```text
+Diagnosis trail for the 14 Apr p95 breach:
+  - p50 healthy (90us)  -> regression is tail-only, not systemic
+  - p95 14.2ms, p99 61ms -> a minority of commands are very slow
+  - SLOWLOG shows SMEMBERS on a 240k-member set
+  - Fragmentation ratio 0.82 (<1) -> host is swapping, amplifying every slow command
+
+Fix applied:
+  - Replace SMEMBERS-then-filter with SSCAN paging (or a denormalised lookup)
+  - Right-size the node so used_memory fits in RAM (kill the swap)
+  Result next morning (15 Apr): p95 back to 1.1ms, p99 to 4ms, SLOWLOG to 1
+```
+
+The lesson: a healthy p50 next to a breached p95 is the textbook signature of a few hot, oversized keys rather than a broadly overloaded instance. Fix the offending access pattern (or the key shape) and the tail collapses back to normal without needing to scale the whole node.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Command Latency p95 | What the combination tells you |
+| --- | --- | --- |
+| [Command Latency p50 (us)](/nerve-centre/kpi-cards/redis/command-latency-p50-us) | The median baseline. | p50 healthy but p95 breached equals a few slow commands, not a systemic slowdown. Both high equals the whole instance is struggling. |
+| [Command Latency p99 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p99-ms) | The deeper tail. | A widening gap between p95 and p99 means the slow commands are very slow, not just slightly slow, pointing at a single pathological key or script. |
+| [SLOWLOG Entries (15m)](/nerve-centre/kpi-cards/redis/slowlog-entries-15m) | The count of commands over the slowlog threshold. | Rising SLOWLOG alongside a p95 breach confirms the tail is real and named. |
+| [Top 10 SLOWLOG Commands](/nerve-centre/kpi-cards/redis/top-10-slowlog-commands) | Names the offending commands. | This is where you find the specific O(N) command or slow script causing the tail. |
+| [Memory Fragmentation Ratio](/nerve-centre/kpi-cards/redis/memory-fragmentation-ratio) | Detects swap (ratio < 1). | A latency breach with fragmentation below 1 means the host is swapping; every command is slow until RAM is fixed. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live) | Throughput context. | A p95 spike with flat ops/sec means harder commands, not more commands. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The composite. | Tail-latency breaches pull the health score down; this card explains why. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis's own tooling:**
+
+> `LATENCY HISTORY command` and `LATENCY LATEST` (Redis 7+) for the server's per-event latency monitor. Enable it with `CONFIG SET latency-monitor-threshold 1` if it is off.
+> `SLOWLOG GET 25` for the commands that crossed the `slowlog-log-slower-than` threshold (default 10000 microseconds), with their exact durations and arguments.
+> `redis-cli --latency-history` for an end-to-end sampled view, and `redis-cli --intrinsic-latency 60` to measure the host's own scheduling jitter (rules out a noisy-neighbour or CPU-starved VM).
+
+On a managed service, cross-check the engine-side latency metrics in the console: ElastiCache and MemoryDB expose `SuccessfulReadRequestLatency` and `SuccessfulWriteRequestLatency` in CloudWatch (in microseconds), which should track this card once you match the period and the specific node.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sampling vs native monitor** | Either | When the Redis 7+ latency monitor is off, Vortex IQ samples client-side and subtracts a network baseline; this approximation can drift a millisecond or two from the true server-side figure. |
+| **Window alignment** | Either | The card uses a trailing 5-minute window; `LATENCY HISTORY` shows discrete events and `--latency` shows a live rolling sample, so a single check at a moment in time will not match a 5-minute percentile. |
+| **Per-node vs aggregate** | Vortex IQ may be lower or higher | On a cluster, the card can report per-shard; the managed console may show a cluster-wide aggregate. Compare like for like. |
+| **Network included** | `redis-cli --latency` higher | `--latency` includes the round-trip; this card reports server-side only, so the CLI figure will read higher. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My p95 is fine but the application still feels slow. Why?**
+This card measures server-side execution only, not the round-trip. If the engine is fast but the application is slow, the time is being spent elsewhere: network latency between app and Redis (check cross-AZ placement), connection-pool contention (the app is waiting for a free connection, not for Redis), or client-side serialisation of large payloads. Pair with [Connected Clients](/nerve-centre/kpi-cards/redis/connected-clients) and [Clients vs maxclients %](/nerve-centre/kpi-cards/redis/clients-vs-maxclients) to rule out pool starvation.
+
+**What is the single most common cause of a p95 breach?**
+A large key on a hot path. `SMEMBERS`, `HGETALL`, `LRANGE 0 -1`, `KEYS *`, and unbounded `ZRANGE` on a collection that has grown large are the usual suspects: each is O(N), and N grew without anyone noticing. Use [Top 10 SLOWLOG Commands](/nerve-centre/kpi-cards/redis/top-10-slowlog-commands) to find it, then switch to a scan-based or paged access pattern.
+
+**Why milliseconds here when p50 is in microseconds?**
+Because by the time a command reaches the 95th percentile of a misbehaving instance, the interesting range is milliseconds, not microseconds. Healthy p95 will read as a small fraction of a millisecond; the threshold and the cause-finding all live in millisecond territory, so the unit keeps the actionable range readable.
+
+**Could a slow Lua script cause this?**
+Yes, and it is one of the worst offenders. A Lua script runs atomically and blocks the entire execution thread for its whole duration, so a script that takes 30ms makes every other command wait 30ms. If SLOWLOG shows `EVAL` or `EVALSHA` entries, the fix is to break the script into smaller units or move the heavy work out of Redis.
+
+**Does enabling the latency monitor itself slow Redis down?**
+The overhead of `latency-monitor-threshold` is negligible for normal thresholds; Redis only records events that exceed the threshold. Leaving it on at a 1ms threshold is standard practice and gives you `LATENCY HISTORY` data for exactly this kind of investigation, with no measurable cost.
+
+**My host is swapping. How does that show up here?**
+Swap is catastrophic for Redis latency because reading a swapped-out page from disk turns a microsecond operation into a millisecond-or-worse one, and it blocks the single thread. The tell is [Memory Fragmentation Ratio](/nerve-centre/kpi-cards/redis/memory-fragmentation-ratio) dropping below 1 (RSS smaller than logical memory means pages are on disk). The fix is to right-size the node so `used_memory` fits in RAM, never to tune Redis.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Command Latency p95 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

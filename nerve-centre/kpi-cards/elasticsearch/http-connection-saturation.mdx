@@ -1,0 +1,164 @@
+---
+title: "HTTP Connection Saturation %, Elasticsearch"
+sidebarTitle: "HTTP Connection Saturation %"
+description: "HTTP Connection Saturation % for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The share of the cluster's HTTP connection capacity currently in use, expressed as a percentage. Every client request (search, indexing, health check) arrives over an HTTP connection on the REST layer. When open connections approach the configured ceiling, new clients are refused at the door before any query even runs. This is a leading indicator of a client-side connection storm, a leaking client pool, or a traffic burst the cluster's front door cannot accept, and it bites well before CPU or heap do.
+
+| | |
+| --- | --- |
+| **API basis** | Node HTTP stats, `GET /_nodes/stats/http` (`http.current_open` per node) measured against the connection ceiling (`http.max_content_length` is unrelated; the relevant cap is `http.max_open` where set, otherwise the OS/file-descriptor limit and any load-balancer pool size). Saturation = `current_open / capacity`. |
+| **Metric basis** | A ratio, not a raw count. The card takes the busiest node's open-connection fraction so a single saturated coordinating node is not hidden by a fleet average. |
+| **Aggregation window** | Real-time, evaluated on a `1m` rolling basis (`RT/1m`) so a one-second spike does not flap the gauge. |
+| **Alert threshold** | `> 90%`. At 90% the cluster is within a hair of refusing connections; the gauge turns red and the on-call SRE is paged. |
+| **Why a gauge** | Saturation is a bounded 0 to 100% value with a clear danger zone, so it renders as a gauge rather than a trend line. The needle in the red band is the signal. |
+| **What counts** | Open HTTP/REST connections on each node's transport-to-client layer, including keep-alive connections held idle by clients. |
+| **What does NOT count** | The inter-node transport layer (port 9300/9301), which carries cluster-internal traffic and is tracked separately, and search/write thread-pool queues (those are downstream of the connection, not the connection itself). |
+| **Time window** | `RT/1m` (real-time, smoothed over a 1-minute window) |
+| **Alert trigger** | `> 90%`, the front door is nearly full and new clients will start being refused. |
+| **Roles** | platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+For each node the engine reads `http.current_open` from `GET /_nodes/stats/http` and divides it by that node's effective connection capacity:
+
+```text
+node_saturation = http.current_open / connection_capacity
+cluster_saturation = max(node_saturation across all nodes)   # the busiest front door
+```
+
+`connection_capacity` is the lowest binding ceiling in the path: an explicit `http.max_open` if configured, otherwise the process file-descriptor limit (often the real cap on Linux), and in front of the cluster the connection-pool size of any load balancer or proxy. The card reports the worst-case node because connection exhaustion is almost always uneven: coordinating nodes and whichever node the load balancer favours saturate first.
+
+A 1-minute smoothing window is applied before the gauge updates so that brief connection churn (a deploy that briefly opens and closes pools) does not flap the needle into the red. The `> 90%` alert is deliberately set below 100% because at full saturation the symptom is already user-visible: clients receive connection-refused or timeout errors rather than slow responses, which is harder to diagnose than a gauge that warned you at 90%.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 4-node Elasticsearch cluster behind an application that powers on-site search for a homeware retailer. The connection ceiling per node is the OS file-descriptor limit of 65,536, but the application's HTTP client pool is sized at 200 connections per app instance across 30 app instances, so 6,000 client connections is the realistic working maximum. On 22 May 26 at 19:40, during an evening promo, the HTTP Connection Saturation gauge climbs from a steady 35% to **93%** and trips red.
+
+Pulling `GET /_nodes/stats/http`:
+
+| node | http.current_open | role |
+| --- | --- | --- |
+| es-coord-1 | 5,580 | coordinating (LB-favoured) |
+| es-data-1 | 410 | data |
+| es-data-2 | 405 | data |
+| es-data-3 | 398 | data |
+
+The headline reads **93%** because `es-coord-1` alone is holding 5,580 of the app's 6,000-connection budget. The load balancer is pinning almost all client traffic to one coordinating node instead of spreading it.
+
+```text
+What actually happened:
+  - The promo doubled app traffic at 19:38.
+  - The app's HTTP client uses keep-alive but never trims idle connections.
+  - The load balancer's "least-connections" algorithm was misconfigured to "round-robin
+    by source IP", and most app instances sit behind one NAT egress IP.
+  - Result: one coordinating node absorbs the storm; the other three sit nearly idle.
+
+Imminent failure mode:
+  - At 100% on es-coord-1, new search requests get connection-refused.
+  - The app surfaces this to shoppers as "search unavailable", not "search slow".
+```
+
+The SRE takes two actions. Immediately, they drain `es-coord-1` from the load-balancer pool for 30 seconds so connections redistribute, dropping the gauge to 58%. Structurally, they fix the LB algorithm to genuinely least-connections and set the application client's idle-connection TTL to 60 seconds so leaked keep-alives are reclaimed. By 19:55 the gauge sits at a healthy 41% and is evenly spread across all four nodes.
+
+Three takeaways:
+
+1. **Saturation is a front-door metric, not a workload metric.** The cluster had ample CPU and heap throughout. The failure was purely about accepting connections, which is exactly why this card pages before the resource cards do.
+2. **The worst-case node is the truth.** A fleet average of `(5,580+410+405+398)/4 ≈ 1,698` would have looked calm. Reporting the busiest node exposed the lopsided load balancer.
+3. **Connection refusal is a worse user experience than slowness.** A saturated front door returns hard errors, which shoppers read as "broken", whereas a slow query at least returns results. Catching it at 90% buys time to redistribute before any client is refused.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with HTTP Connection Saturation | What the combination tells you |
+| --- | --- | --- |
+| [HTTP Connections In Use](/nerve-centre/kpi-cards/elasticsearch/http-connections-in-use) | The raw count behind the percentage. | The gauge tells you "how full"; the count tells you "which node and how many" so you can act. |
+| [Search Queries per Second (live)](/nerve-centre/kpi-cards/elasticsearch/search-queries-per-second-live) | The traffic that opens the connections. | Rising QPS with rising saturation is a real burst; flat QPS with rising saturation is a leaking client pool. |
+| [Search Error Rate %](/nerve-centre/kpi-cards/elasticsearch/search-error-rate) | The downstream symptom once the door is full. | Saturation at 100% plus a spiking error rate equals connection-refused errors reaching clients. |
+| [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) | The other thing clients feel under load. | High saturation with high p95 means the cluster is both full at the door and slow inside. |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | Rules in or out a resource cause. | High saturation with calm heap confirms a connection problem, not a workload one. |
+| [Circuit Breaker Trips (24h)](/nerve-centre/kpi-cards/elasticsearch/circuit-breaker-trips-24h) | The cluster's own overload defence. | Saturation plus breaker trips means the cluster is shedding load to protect itself. |
+| [ES Search Pool Saturation vs Ecom Burst](/nerve-centre/kpi-cards/elasticsearch/es-search-pool-saturation-vs-ecom-burst) | The cross-channel framing against storefront traffic. | Correlates this gauge with a live ecommerce traffic spike to size revenue risk. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch itself:**
+
+> `GET /_nodes/stats/http` returns `http.current_open` and `http.total_opened` per node; this is the exact source. The cat equivalent for a quick scan is `GET /_cat/nodes?v&h=name,http.current_open`.
+> `GET /_nodes/_all/settings?filter_path=**.http` confirms any configured `http.max_open` and related HTTP settings so you know the denominator.
+> On the host, `ss -s` or `lsof -p <es_pid> | wc -l` shows the OS-level socket and file-descriptor count, and `cat /proc/<es_pid>/limits` shows the file-descriptor ceiling that is often the real cap.
+
+**Why our number may legitimately differ from a manual reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Denominator choice** | Either | The card uses the lowest binding ceiling (LB pool, `http.max_open`, or FD limit). If you compute the percentage against a different ceiling, your number will differ. |
+| **Worst-node vs average** | Card higher | We report the busiest node; a fleet average looks calmer when load is uneven. |
+| **1-minute smoothing** | Card steadier | A raw `current_open` you catch mid-spike can read higher than the smoothed gauge. |
+| **Load balancer in front** | Either | A proxy or LB terminates and re-opens connections, so the cluster's `current_open` may not match what you see at the edge. Check both layers. |
+| **Managed service limits** | Either | Elastic Cloud and AWS-managed offerings impose their own per-tier connection limits that may be lower than the node FD limit. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Search Queries per Second (live)](/nerve-centre/kpi-cards/elasticsearch/search-queries-per-second-live) | Saturation should track QPS during genuine bursts. | Saturation rising while QPS is flat is the classic signature of a client-side connection leak. |
+| [Search Error Rate %](/nerve-centre/kpi-cards/elasticsearch/search-error-rate) | Errors should stay near zero until saturation nears 100%. | Errors climbing well below 100% saturation points at a different cause (query failures, mapping issues). |
+
+<details>
+<summary><em>Same-concept peer on other engines</em></summary>
+
+"Connection pool nearly full" is a universal front-door metric; only the name changes. This is **not** a reconciliation against a parallel system.
+
+- PostgreSQL equivalent: active connections vs `max_connections` (`SELECT count(*) FROM pg_stat_activity`).
+- MySQL equivalent: `Threads_connected` vs `max_connections`.
+- Redis equivalent: `connected_clients` vs `maxclients`.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The gauge is at 92% but CPU and heap are low. Is that a problem?**
+Yes, and it is exactly the problem this card exists to catch. Connection saturation is independent of workload: the cluster can be nearly idle internally yet unable to accept new clients because the connection slots are full (often from leaked keep-alive connections). At 100% new clients are refused outright. Treat a red gauge as urgent even when the resource cards look calm.
+
+**Why does the card show the busiest node instead of an average?**
+Because connection exhaustion is almost always uneven. Coordinating nodes and whichever node a load balancer favours saturate first while the rest sit idle. A fleet average would hide a single node at 100% behind three nodes at 10%. We report the worst-case node so the gauge fires when any single front door is about to refuse clients.
+
+**What is the difference between this and the inter-node transport layer?**
+HTTP/REST connections (the ones this card tracks) are how external clients talk to the cluster, typically on port 9200. The transport layer (port 9300) carries cluster-internal traffic between nodes: shard data, cluster-state publishing, search fan-out. Saturating the HTTP layer refuses clients; saturating the transport layer degrades the cluster internally. They are separate ceilings and separate problems.
+
+**Saturation keeps creeping up over days even though traffic is flat. Why?**
+That is the signature of a client-side connection leak: an application HTTP client that opens keep-alive connections but never trims idle ones, so the open count ratchets upward until it hits the ceiling. Fix it on the client by setting a sane idle-connection TTL and a bounded pool size, and confirm with `http.total_opened` rising far faster than expected for the traffic. Restarting the offending app instance is the quick mitigation.
+
+**Can I just raise the connection limit to make the alert go away?**
+Raising `http.max_open` or the OS file-descriptor limit treats the symptom, not the cause, and on a leak it only delays exhaustion. Raise the ceiling only when you have confirmed legitimate growth in concurrent clients. For a leak, fix the client pool. For uneven load, fix the load balancer. The limit should reflect real, healthy demand plus headroom, not be inflated to silence a warning.
+
+**Does a managed service (Elastic Cloud, AWS) change how I read this?**
+The metric means the same thing, but the binding ceiling may be the provider's per-tier connection limit rather than the node file-descriptor limit, and that limit can be lower than you expect. On managed tiers, check the provider's documented connection cap for your instance size and treat that as the denominator. Scaling up an instance class is sometimes the only way to raise the limit on a managed plan.
+
+**The gauge is red but no clients are reporting errors. False alarm?**
+Not necessarily. The 90% alert is intentionally early so you can act before the door fills. At 90% you still have ~10% headroom, so clients are not yet refused; the gauge is warning you that one more traffic step would tip it over. Use the window to redistribute load or trim leaked connections rather than waiting for the first connection-refused error.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*HTTP Connection Saturation %* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

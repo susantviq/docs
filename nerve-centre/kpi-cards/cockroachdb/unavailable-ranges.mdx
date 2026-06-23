@@ -1,0 +1,128 @@
+---
+title: "Unavailable Ranges, CockroachDB"
+sidebarTitle: "Unavailable Ranges"
+description: "Unavailable Ranges for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ranges & Leases](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Unavailable Ranges** is the most serious single number on the CockroachDB board. A range is a contiguous slice of the keyspace replicated across nodes; it needs a quorum of its replicas alive to serve reads and writes. A range that has lost quorum is unavailable, which means some of your data cannot be read or written at all until quorum is restored. This is not "slow", it is "offline". The healthy value is exactly zero, always. Any value above zero is a hard alert, because even a single unavailable range means a portion of the database is down. This card answers the one question that matters most during an outage: "is any of my data actually inaccessible right now?"
+
+| | |
+| --- | --- |
+| **What it tracks** | The number of ranges currently lacking quorum, and therefore unable to serve reads or writes, across the whole cluster. |
+| **Data source** | CockroachDB-distinctive: ranges lacking quorum. Any value above zero means some data is unavailable for reads and writes. Vortex IQ reads the `ranges.unavailable` cluster metric and `crdb_internal.kv_store_status` (the per-store range health counters), corroborated by node liveness in `crdb_internal.gossip_liveness`. On CockroachDB Cloud the same figure is read via the Cloud metrics API and shown on the cluster Overview. |
+| **Time window** | `RT` (real-time, continuously evaluated, because quorum loss must be caught instantly). |
+| **Alert trigger** | `> 0`. There is no tolerance band: any unavailable range at all is a page-someone-now event. |
+| **Roles** | DBA, platform, SRE, incident commander |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+There is no derivation or smoothing here; the card surfaces CockroachDB's own count of ranges that cannot reach quorum.
+
+- **What quorum means.** Each range is replicated (the default replication factor is 3, often 5 for critical clusters). To commit a write or serve a consistent read, a majority of a range's replicas must be available: 2 of 3, or 3 of 5. Lose the majority and the range can no longer make progress, it is unavailable.
+- **How a range becomes unavailable.** The usual cause is losing more nodes (or stores) than the range's fault tolerance allows at once: with replication factor 3 you can lose one node and stay available, but lose two of the three replicas for a range simultaneously and that range goes unavailable. Disk failures, network partitions isolating a majority, and zone/region outages on a poorly-distributed cluster are the common triggers.
+- **The source counter.** The `ranges.unavailable` metric is the cluster-wide count; `crdb_internal.kv_store_status` carries the per-store view. Because this is computed from raft replica state, it reflects true quorum loss, not transient leaseholder churn.
+- **Why it is real-time.** Unlike capacity or latency, which trend, quorum loss is binary and urgent: data is either reachable or it is not. The card evaluates continuously so a quorum loss is visible the moment it happens.
+
+The value should be a flat zero in steady state. A non-zero reading is never noise, it is always either a genuine quorum loss or a node/store outage that has stripped a range below majority. Treat any non-zero value as an incident.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 6-node CockroachDB cluster (v23.2, replication factor 3) across three availability zones, two nodes per zone, backing an ecommerce order and inventory stack. At 02:14 BST on 14 Apr 26 the on-call SRE is paged: Unavailable Ranges has gone from 0 to 37.
+
+The first read tells the whole story:
+
+| Signal | Reading | Meaning |
+| --- | --- | --- |
+| Unavailable Ranges | 37 | 37 ranges have lost quorum, some data is offline. |
+| [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count) | 4 of 6 expected | Two nodes are down. |
+| Node liveness | nodes 5 and 6 DEAD | Both dead nodes are in the same availability zone. |
+| [Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/under-replicated-ranges) | 880 and climbing | Many ranges lost one replica but kept quorum. |
+
+The pattern is unmistakable: an entire availability zone went down (a zone-level cloud outage), taking both nodes 5 and 6 with it. Ranges that happened to have two of their three replicas in that zone lost quorum and became unavailable; ranges with only one replica there merely went under-replicated and can still serve traffic.
+
+```text
+Incident at 02:14 BST, 14 Apr 26
+  Unavailable ranges:        37          (alert: > 0)
+  Under-replicated ranges:   880+ rising
+  Nodes live:                4 of 6      (nodes 5,6 dead, same AZ)
+  Cause:                     availability-zone outage
+  Data impact:               reads/writes failing for keys in the 37 unavailable ranges
+  Action:                    restore the AZ nodes OR, if unrecoverable, recover those ranges
+```
+
+The on-call's priorities, in order: (1) confirm the scope, which keys/tables are in the 37 unavailable ranges (some may be cold data, some may be the orders table); (2) try to bring the dead nodes back, because if the zone recovers and nodes 5 and 6 rejoin, the ranges regain quorum and unavailability clears on its own; (3) if the nodes are unrecoverable, use CockroachDB's range recovery tooling to restore quorum from the surviving replica, accepting that the most recent unreplicated writes to those ranges may be lost.
+
+The deeper lesson surfaces in the post-incident review: with replication factor 3 and two nodes per zone, a single zone outage can take two replicas of a range at once. The fix is either replication factor 5 spread across more zones, or replica-placement constraints that guarantee no two replicas of a range share a zone. This is a survivability design choice, and this card is what made the gap obvious.
+
+Two takeaways:
+
+1. **Zero is the only acceptable value.** Unlike latency or capacity, there is no "amber" band. Any non-zero reading means data is offline and is always an incident.
+2. **Read it next to node count and under-replication.** Unavailable plus dead nodes tells you the cause (quorum loss from node failure); under-replicated ranges climbing in parallel tells you how close the rest of the cluster is to the same fate. Pair with [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count) and [Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/under-replicated-ranges).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Unavailable Ranges | What the combination tells you |
+| --- | --- | --- |
+| [Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/under-replicated-ranges) | The "lost a replica but kept quorum" sibling. | Under-replicated rising toward unavailable shows how close more ranges are to going offline. |
+| [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count) | Quorum loss is almost always caused by node loss. | Unavailable ranges with a dropped node count names the failure as a node/zone outage. |
+| [Unavailable or Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-or-under-replicated-ranges) | The combined alert that fires on either condition. | The alert-list card that pages on this card or its under-replicated sibling crossing zero. |
+| [Active Nodes (status=live)](/nerve-centre/kpi-cards/cockroachdb/active-nodes-statuslive) | The live-node liveness view. | Fewer live nodes than expected explains where the lost quorum came from. |
+| [Decommissioning Nodes](/nerve-centre/kpi-cards/cockroachdb/decommissioning-nodes) | A botched or too-fast decommission can strip quorum. | Unavailable ranges during a decommission means the drain removed replicas too aggressively. |
+| [Raft Quiescent Lag (seconds)](/nerve-centre/kpi-cards/cockroachdb/raft-quiescent-lag-seconds) | Replication health on surviving ranges. | High raft lag alongside unavailability means the survivors are struggling to re-replicate. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/cockroachdb/last-successful-backup-hours-ago) | The recoverability backstop. | If unavailable ranges cannot be recovered, a fresh backup is your last line of defence. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The composite where availability is the heaviest axis. | A single unavailable range can drag the whole health score below 70 on its own. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+CockroachDB exposes unavailable ranges natively, so this card is a direct read and reconciliation is quick:
+
+- **DB Console.** The Cluster Overview and the Replication dashboard both show the unavailable-range count prominently, and the Problem Ranges page (`/#/reports/problemranges`) lists the specific ranges that lack quorum, with their replica locations. This is the page to open during an incident: it names the ranges and the tables they belong to.
+- **Cluster metrics.** The `ranges.unavailable` time-series in the Metrics dashboard is the same counter the card reads.
+- **`crdb_internal` tables.** `SELECT * FROM crdb_internal.kv_store_status;` exposes per-store range health, and the `system.replication_stats` / `crdb_internal.ranges` views let you locate unavailable ranges and their replica sets in SQL. `crdb_internal.gossip_liveness` confirms which nodes are dead.
+- **`cockroach debug` tooling.** For recovery, the `cockroach debug recover` family of commands operates on the same range state when quorum cannot be restored by bringing nodes back.
+
+On CockroachDB Cloud the cluster Overview surfaces the unavailable-range count and the managed support team is alerted on it as well; Vortex IQ reads the same figure via the Cloud metrics API. If the Vortex IQ value and the console ever briefly disagree, it is metric-scrape timing during a fast-moving incident; the Problem Ranges page is the authoritative live view.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What is the difference between unavailable and under-replicated?**
+Under-replicated means a range has fewer replicas than configured but still has a quorum, so it keeps serving reads and writes while the cluster re-replicates it. Unavailable means the range has lost quorum and cannot serve reads or writes at all, the data is offline. Under-replication is a self-healing warning; unavailability is an outage. See [Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/under-replicated-ranges).
+
+**The count is above zero but only briefly. Is that still an incident?**
+Treat it as one until proven otherwise. A brief blip can happen during a node restart if a range momentarily loses quorum before a replica catches up, but it can equally be the first second of a real outage. Because the cost of a true unavailable range is so high (offline data), the alert has no tolerance band. Investigate every non-zero reading; close it out if it was a transient restart artefact.
+
+**Will unavailable ranges fix themselves?**
+Sometimes. If the cause is nodes that come back (a transient zone outage, a node restart), the ranges regain quorum the moment enough replicas return and unavailability clears automatically. If the nodes are permanently lost, the ranges stay unavailable until you either replace the nodes or run CockroachDB's range-recovery tooling to restore quorum from the surviving replica, which can mean losing the most recent unreplicated writes.
+
+**Can a planned operation cause unavailable ranges?**
+Yes, if done carelessly. Decommissioning or shutting down too many nodes at once, or nodes that hold a majority of the same range's replicas, can strip quorum. Always decommission one node at a time and let ranges re-replicate before removing the next; watch [Decommissioning Nodes](/nerve-centre/kpi-cards/cockroachdb/decommissioning-nodes) and [Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/under-replicated-ranges) during the operation.
+
+**How do I find out which tables are affected?**
+Open the DB Console Problem Ranges page (`/#/reports/problemranges`), which lists each unavailable range and its start/end keys; those keys map to specific tables and indexes. You can also query `crdb_internal.ranges` to join range IDs to table names. Knowing whether the 40 unavailable ranges are cold archive data or your live orders table changes the urgency completely.
+
+**How do I prevent this in future?**
+Survivability is a placement problem. With replication factor 3 across three zones, two nodes per zone, a single zone outage can take two replicas of a range. To survive a full zone or region loss, use replication factor 5 spread across at least five failure domains, or apply replica-placement constraints so no two replicas of a range share a zone. CockroachDB's multi-region and zone-config features exist precisely for this.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Unavailable Ranges* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

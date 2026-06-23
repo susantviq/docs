@@ -1,0 +1,155 @@
+---
+title: "Raft Quiescent Lag (seconds), CockroachDB"
+sidebarTitle: "Raft Quiescent Lag (seconds)"
+description: "Raft Quiescent Lag (seconds) for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How far behind the slowest follower replica is in applying the Raft log, measured in seconds. CockroachDB replicates every range across multiple nodes using the Raft consensus protocol; a write is committed once a quorum acknowledges it, but follower replicas still need to catch up to the leader. This card reports the worst replication lag observed across the cluster. A healthy cluster keeps quiescent ranges (idle ranges drop out of Raft heartbeating to save CPU) and shows near-zero lag on active ranges. Sustained lag means a follower is falling behind: a sign of a slow disk, a saturated network link, an overloaded node, or a snapshot in flight. For an SRE this is the early-warning gauge for a node that is about to become unhealthy or under-replicated.
+
+| | |
+| --- | --- |
+| **Data source** | CockroachDB replication metrics, principally `raft.process.applycommitted.latency`, `raft.commandsapplied`, and the follower-behind signals derived from `raftlog.behind`, exposed via `_status/vars` and the cluster status endpoints. Vortex IQ surfaces the cluster-wide worst-case lag. |
+| **What it tracks** | Raft Quiescent Lag (seconds): the maximum time a follower replica is behind its leaseholder in applying committed Raft log entries, across all active ranges. Quiescent (idle) ranges contribute zero. |
+| **Metric basis** | Replica catch-up lag, not write commit latency. A write can commit at quorum while a non-quorum follower lags; this card measures that follower gap, which matters for failover safety and read-follower freshness. |
+| **Time window** | `RT` (real-time, refreshed continuously from the cluster status layer). |
+| **Alert trigger** | `> 10s`. A follower more than 10 seconds behind is at risk of triggering a snapshot, of leaving a range under-replicated if the leader fails, and of serving stale follower reads; the Nerve Centre raises this as a sensitivity event. |
+| **Units** | Seconds. Derived from the Raft apply position and command timing; Vortex IQ normalises to seconds for display. |
+| **Scope** | Cluster-wide worst case across all live nodes and active ranges. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+CockroachDB tracks, per range, how far each follower replica has progressed through the committed Raft log relative to the leaseholder. When a follower's applied index trails the committed index, that range has replication lag; Vortex IQ converts the worst follower's position into an elapsed-seconds estimate using the command apply timing.
+
+The displayed number is derived as follows:
+
+1. Read the replication and Raft metrics from each live node's status endpoint: the per-range follower-behind signals and `raft.process.applycommitted.latency`.
+2. Exclude quiescent ranges. Idle ranges deliberately stop Raft heartbeating to save CPU and have no meaningful lag; counting them would create false signal.
+3. Take the cluster-wide maximum lag across all active ranges and their followers. This is a worst-case gauge by design: one badly-lagging follower is the thing you need to know about, and averaging would hide it.
+4. Normalise to seconds and compare against the `> 10s` sensitivity threshold. A sustained breach flips the card to alert and feeds the sensitivity layer.
+
+The "quiescent" in the name matters: a well-behaved cluster has most ranges quiescent and the rest applying within milliseconds. Lag appears when a follower cannot keep up, which is almost always a node-local resource problem (disk, CPU, network) or an in-progress Raft snapshot moving a large range to a recovering or rebalancing node.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 5-node CockroachDB cluster (v23.2) with the default replication factor of 3. Baseline quiescent lag sits at well under 1 second. Snapshot taken on 03 Jun 26 at 21:18 BST, shortly after a node was restarted for an OS patch.
+
+| Node | Live | Role for hot ranges | Worst follower lag (s) | Disk write p99 (ms) |
+| --- | --- | --- | --- | --- |
+| n1 | yes | leaseholder | 0.2 | 4 |
+| n2 | yes | follower | 0.3 | 5 |
+| n3 | yes | follower | 0.2 | 4 |
+| n4 | yes | follower | **14.6** | 210 |
+| n5 | yes | follower | 0.4 | 6 |
+
+The cluster-wide headline reads **14.6s**, above the 10s threshold, so the card is alerting. The lag is isolated to n4, the node that was just restarted. Its disk write p99 is 40x the others, which is the tell: n4 came back, is replaying and catching up on the ranges it missed during the restart, and its disk is the bottleneck for that catch-up.
+
+This is the benign-but-watch case. A node that has just rejoined is expected to lag briefly while it reapplies missed entries and receives Raft snapshots for any ranges that moved on without it. The questions are: is it trending down, and is the cluster under-replicated while it catches up?
+
+```text
+Replication-safety framing for this snapshot:
+  - Worst lag:        14.6s on n4 (alerting; just-restarted node)
+  - Other followers:  <0.5s (healthy)
+  - n4 disk p99:      210ms (the catch-up bottleneck)
+  - Under-replicated: check the sibling; if n4's lag means a range has
+                      only 2 of 3 up-to-date replicas, a second failure
+                      now would risk that range
+  - Expected path:    lag falls steadily as n4 drains its catch-up queue
+```
+
+The team checks [Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/under-replicated-ranges): it reads a non-zero but falling count, consistent with n4 catching up. They watch for two minutes; lag drops 14.6s to 6s to 1s to 0.3s and the under-replicated count returns to zero. No action needed beyond confirming the disk on n4 is not chronically slow.
+
+The dangerous variant of this same reading would be: lag stuck at 14s and not falling, disk p99 chronically high on a node that was not restarted. That is a failing or saturated disk, and the fix is to investigate or decommission n4 before it drops out entirely and leaves ranges under-replicated for real.
+
+Three takeaways:
+
+1. **Lag right after a node rejoins is normal; lag that does not fall is not.** The shape over time is everything. A steadily declining figure after a restart or rebalance is the cluster healing. A flat, sustained figure is a node that cannot keep up and needs investigation.
+2. **Always pair lag with the under-replication view.** A lagging follower is only a safety problem if it means a range is short of up-to-date replicas. [Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/under-replicated-ranges) tells you whether the lag has crossed into real risk.
+3. **The cause is almost always node-local resources.** Disk write latency, CPU saturation, or a constrained network link on the lagging node. Find the node first (the per-node view localises it), then check that node's disk and CPU before suspecting CockroachDB itself.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Raft Quiescent Lag | What the combination tells you |
+| --- | --- | --- |
+| [Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/under-replicated-ranges) | Tells you whether the lag has become a replication-safety problem. | Lag plus rising under-replicated count equals real risk; lag alone with zero under-replicated is usually benign catch-up. |
+| [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges) | The worst case the lag can degrade into. | If lagging followers tip a range below quorum, ranges go unavailable; this is the data-loss-risk gauge. |
+| [Active Nodes (status=live)](/nerve-centre/kpi-cards/cockroachdb/active-nodes-statuslive) | Confirms whether a node has dropped out versus merely lagging. | Lag with a full live count equals a slow node; lag with a missing node equals a recovery in progress. |
+| [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count) | The expected membership baseline. | A node lost from the count explains a sudden lag and under-replication spike. |
+| [Replicas per Node](/nerve-centre/kpi-cards/cockroachdb/replicas-per-node) | Shows replica distribution and rebalancing. | A node taking on many replicas (rebalance/recovery) will show transient lag while it catches up. |
+| [Decommissioning Nodes](/nerve-centre/kpi-cards/cockroachdb/decommissioning-nodes) | A decommission drains ranges and can drive transient lag. | Lag during a decommission is expected; lag that stalls means draining is stuck. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/cockroachdb/database-disk-usage) | Disk pressure is a common lag cause. | High disk usage plus high lag on the same node points at storage as the bottleneck. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The composite that weights replication health. | Sustained lag pulls the health score down and confirms cluster-level impact. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in CockroachDB's own tooling:**
+
+> **DB Console → Metrics → Replication dashboard** carries the "Replicas per Store", "Snapshots", and follower-behind charts. The "Replica Quiescence" panel shows the quiescent vs active split.
+> **DB Console → Advanced Debug → Problem Ranges** lists ranges with replication issues, including raft-log-behind followers.
+> **`SELECT * FROM crdb_internal.kv_store_status`** and **`crdb_internal.ranges`** expose per-range and per-store replication state from SQL.
+> **`cockroach node status --ranges`** from the CLI shows per-node range and leaseholder counts, useful for localising a lagging node.
+> For **CockroachDB Cloud** (Dedicated), the same Replication dashboard is available under **Monitoring** in the Cloud Console; the metrics export feeds the identical replication metric names to Prometheus/Datadog.
+
+**Why our number may legitimately differ from the DB Console:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Worst-case vs charted series** | Vortex IQ higher | This card reports the single worst follower across the cluster; the DB Console default chart often shows a per-store or aggregate series that does not isolate the one bad replica. |
+| **Quiescent exclusion** | Vortex IQ lower in count | Vortex IQ excludes quiescent ranges from the lag calculation; some raw metric views include them at zero, diluting any per-range average. |
+| **Refresh cadence** | Brief disagreement | The card is real-time but polls on an interval; a fast-moving recovery can show different values on the two sides within the same minute. |
+| **Seconds vs index lag** | Presentation | CockroachDB internally tracks lag as a log-index gap; Vortex IQ converts to elapsed seconds using apply timing, which is an estimate, not an exact clock. |
+| **Time zone** | Axis labels shift | The DB Console renders in node-local time; Vortex IQ renders in your reporting time zone. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`crdb_unavailable_or_under_replicated`](/nerve-centre/kpi-cards/cockroachdb/unavailable-or-under-replicated-ranges) | Sustained high lag should precede or accompany under-replication alerts. | Lag without under-replication is benign catch-up; lag that does not resolve into either recovery or under-replication suggests a metric or polling artefact to investigate. |
+| Host disk/CPU metrics (any infra connector) | A lagging node should show elevated disk write latency or CPU on the same host. | Lag with no host-resource pressure is unusual and worth a closer look at the network link. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What does "quiescent" mean in the card name?**
+CockroachDB lets idle ranges go quiescent: they stop exchanging Raft heartbeats to save CPU on a large cluster with many ranges. A quiescent range has no replication work to do and contributes zero lag. This card measures lag on the active (non-quiescent) ranges only, which is why it usually sits near zero on a healthy cluster and only rises when a follower genuinely cannot keep up.
+
+**My lag spiked right after I restarted a node. Is that a problem?**
+Almost certainly not, if it falls. A rejoining node has to reapply the Raft entries it missed and may receive snapshots for ranges that moved on without it. Transient lag during catch-up is expected. Watch the trend: a steadily declining figure is the cluster healing. Worry only if the lag stalls and does not return toward zero, which points at a chronically slow disk or saturated node.
+
+**Is replication lag the same as write latency?**
+No. A write commits once a quorum of replicas acknowledges it, so commit latency can be healthy even while a non-quorum follower lags. This card measures the follower catch-up gap, which matters for two things: failover safety (if the leader dies, a lagging follower may not be able to take over without recovery) and the freshness of follower reads. It is a safety and freshness gauge, not a write-speed gauge.
+
+**Why is the worst-case value shown rather than an average?**
+Because one badly lagging follower is exactly the thing you need to know about, and averaging across hundreds of healthy ranges would bury it. A single follower 14 seconds behind is a real risk; the fact that thousands of other replicas are at zero does not reduce that risk. The card is deliberately a worst-case gauge.
+
+**The lag is high but Under-Replicated Ranges is zero. What does that mean?**
+You have a follower catching up, but every range still has its full set of up-to-date replicas (the lagging replica is the extra one beyond quorum, or the lag has not yet crossed the threshold CockroachDB uses to mark a range under-replicated). This is the safest version of lag: visible, but not yet a replication-safety problem. Keep watching; if the lag persists and a second node has trouble, the under-replicated count will rise.
+
+**What usually causes sustained lag that does not clear?**
+In order of likelihood: a slow or failing disk on the lagging node (check disk write p99), CPU saturation on that node, a constrained or saturated network link between nodes, or a very large in-progress Raft snapshot. The cause is almost always node-local resources rather than CockroachDB logic. Localise the node from the per-node view, then inspect that host's disk, CPU, and network before anything else.
+
+**Does a decommissioning node trigger this card?**
+It can, transiently. Decommissioning drains a node's ranges to others, and the receiving followers may briefly lag while they ingest the moved data. That is expected. Pair with [Decommissioning Nodes](/nerve-centre/kpi-cards/cockroachdb/decommissioning-nodes): lag during an active, progressing decommission is normal; lag with a stalled decommission means the drain is stuck and needs attention.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Raft Quiescent Lag (seconds)* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

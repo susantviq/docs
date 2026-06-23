@@ -1,0 +1,139 @@
+---
+title: "Cross-Account Replication Lag (s), Snowflake"
+sidebarTitle: "Cross-Account Replication Lag (s)"
+description: "Cross-Account Replication Lag (s) for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Cross-Account Replication Lag (s)** measures how far behind, in seconds, a secondary (target) Snowflake database or account is compared to its primary (source). Snowflake replication is asynchronous: writes land on the primary first, then a refresh copies the deltas to the secondary. The gap between "last change committed on primary" and "last change applied on secondary" is your replication lag. For a platform team running cross-region disaster recovery or a read replica feeding a reporting account, this number is your recovery-point exposure: if the primary region disappeared right now, this is roughly how many seconds of committed data the secondary would be missing.
+
+| | |
+| --- | --- |
+| **What it tracks** | The freshness gap, in seconds, between a primary database and its replicated secondary. Derived from the most recent successful refresh timestamp on the secondary against the latest committed change on the primary. |
+| **Data source** | `detail`: Cross-Account Replication Lag (s) for the selected period. Built from `REPLICATION_USAGE_HISTORY` / `DATABASE_REPLICATION_USAGE_HISTORY` in the ACCOUNT_USAGE share and the refresh state surfaced by `SHOW REPLICATION DATABASES`. |
+| **Time window** | `RT` (real-time, refreshed on the live polling cycle). |
+| **Alert trigger** | `> 10s`. Lag above ten seconds pages the platform on-call; sustained breach means the refresh schedule cannot keep pace with the write rate, or a refresh has stalled. |
+| **Why it matters** | Replication lag is recovery-point objective (RPO) made measurable. A failover when lag is 4s loses up to 4s of data; a failover when lag is 900s loses fifteen minutes. It also gates read-replica accuracy: dashboards on the secondary are this many seconds stale. |
+| **Roles** | owner, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card computes lag as the difference between the wall-clock time of the latest committed change on the primary and the timestamp of the latest change that the secondary has successfully applied:
+
+```text
+replication_lag_seconds = now_on_primary - last_applied_change_on_secondary
+```
+
+In practice the engine reads two signals. From the secondary side it takes the completion time of the most recent successful refresh (`REPLICATION_GROUP_REFRESH_HISTORY` / the refresh end time on the database). From the primary side it takes the high-water timestamp of committed DML at the moment of polling. Because Snowflake refresh is batch-oriented (it runs on a schedule or on demand, not as a continuous stream), the lag naturally saws upward between refreshes and snaps back to near-zero when a refresh completes. The card reports the instantaneous value at poll time, so a healthy account on a 60-second refresh schedule will oscillate between roughly 0s and 60s; the alert at `> 10s` is therefore tuned for accounts that expect sub-10-second freshness (frequent refresh or a tight RPO), and you should set the threshold to match your refresh cadence rather than the generic default.
+
+Two things are deliberately excluded. First, the in-flight refresh duration is not counted as "lag" until it overruns the next scheduled slot; a refresh that takes 8s to move 50GB is working as intended. Second, replication of account-level objects (users, roles, warehouses) under a replication group is tracked separately from database data lag; this card is the data freshness number.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A retail data team runs a primary Snowflake account in `AWS eu-west-1` and a disaster-recovery secondary in `AWS eu-central-1`. The customer-360 database `PRD_ANALYTICS` is in a replication group refreshing every 60 seconds. Their stated RPO is 60 seconds, so they alert at `> 10s` only because they want early warning well before the schedule itself slips. Snapshot taken on 14 Apr 26 at 09:42 BST.
+
+| Database | Refresh schedule | Last refresh completed | Lag at poll | Status |
+| --- | --- | --- | --- | --- |
+| PRD_ANALYTICS | every 60s | 09:42:38 | 4s | healthy |
+| PRD_FINANCE | every 5 min | 09:39:10 | 172s | within plan |
+| STG_SANDBOX | manual | 12 Apr 26 | 168,000s | expected, manual |
+
+At 11:05 BST the team gets a Nerve Centre page: `PRD_ANALYTICS` lag has climbed to **310s** and is still rising. The 60-second schedule is no longer snapping the value back to near-zero, which means refreshes are failing or overrunning.
+
+```text
+Diagnosis trail:
+  - SHOW REPLICATION DATABASES shows PRD_ANALYTICS last_refresh state = FAILED.
+  - REPLICATION_GROUP_REFRESH_HISTORY: last two refreshes errored with
+    "secondary refresh exceeded available compute".
+  - Root cause: a 2.1TB backfill on the primary overnight created a delta
+    far larger than a 60s refresh window can copy.
+
+Exposure while lag = 310s and rising:
+  - If eu-west-1 failed over now, up to ~5 minutes of committed
+    customer-360 updates would be lost on the secondary.
+  - The reporting account reading the secondary is showing data
+    that is 5+ minutes stale and the gap is widening.
+```
+
+The platform team's response is not to "fix replication" blindly; it is to (1) confirm the refresh is making forward progress at all (a stuck refresh is worse than a slow one), (2) let the oversized backfill delta drain by allowing one long refresh to complete rather than cancelling and retrying, and (3) decide whether to temporarily widen the refresh schedule so each cycle has enough compute headroom. Lag returns to single digits at 11:31 once the backfill delta clears.
+
+Three takeaways for the team:
+
+1. **A sawtooth is normal; a ramp is not.** Lag that rises and resets on schedule is healthy. Lag that climbs without resetting means refreshes are failing or the delta exceeds what one cycle can move.
+2. **Lag equals data loss on failover.** The number is not abstract. At the instant of a regional outage, the lag value is your worst-case data loss in seconds. Tie the alert threshold to your contractual RPO.
+3. **Big primary writes are the usual culprit.** Bulk loads, large `CTAS`, and reclustering on the primary inflate the delta the next refresh must copy. Schedule heavy primary writes with replication headroom in mind.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Cross-Account Replication Lag | What the combination tells you |
+| --- | --- | --- |
+| [Snowflake Health Score](/nerve-centre/kpi-cards/snowflake/snowflake-health-score) | The composite that folds replication lag into overall account health. | A rising lag is one of the inputs that can drag the health gauge below 70. |
+| [Last Snapshot Age (hours)](/nerve-centre/kpi-cards/snowflake/last-snapshot-age-hours) | The other recovery-posture card: Time Travel retention floor. | Lag covers cross-account RPO; snapshot age covers point-in-time recovery. Read both for full data-protection posture. |
+| [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) | Replication refreshes consume credits on both ends. | A spike in refresh frequency to chase lag shows up as extra credit burn here. |
+| [Storage Used (TB)](/nerve-centre/kpi-cards/snowflake/storage-used-tb) | Large deltas that inflate lag also inflate replicated storage. | A backfill that spiked lag will also bump replicated storage on the secondary. |
+| [Active Warehouses](/nerve-centre/kpi-cards/snowflake/active-warehouses) | Refreshes need available compute to run. | If refreshes stall for "available compute", correlate with warehouse availability here. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/snowflake/query-error-rate) | Failed refreshes can surface as errors. | A replication failure window often coincides with an error-rate bump. |
+| [Snowflake Health Score](/nerve-centre/kpi-cards/snowflake/snowflake-health-score) | Executive read on whether lag is hurting overall posture. | Lets leadership see replication risk without reading raw seconds. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake's own tooling:**
+
+> Run `SHOW REPLICATION DATABASES;` in a worksheet or `snowsql` to see each secondary's `is_primary`, `last_refresh` state, and refresh timestamps.
+> Query `SNOWFLAKE.ACCOUNT_USAGE.REPLICATION_GROUP_REFRESH_HISTORY` (and `DATABASE_REPLICATION_USAGE_HISTORY`) for refresh start/end times and bytes transferred.
+> In Snowsight, open **Admin to Accounts to Replication** (or the Replication Groups view) to read refresh schedules and last-refresh status per group.
+
+**Why our number may legitimately differ from Snowflake's view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **ACCOUNT_USAGE latency** | Vortex IQ may lead or lag | The `ACCOUNT_USAGE` views have their own latency (up to ~3 hours for some views, ~45 min for replication usage). The card blends near-real-time refresh state with these views, so a historical reconcile against `ACCOUNT_USAGE` will not match the instantaneous card value. |
+| **Poll timing within the sawtooth** | Variable | Our poll and your manual `SHOW` are at different instants in the refresh cycle, so the second-count differs even when nothing is wrong. |
+| **Time zone** | Timestamps shift | Snowflake stores and displays in the account/session timezone; Vortex IQ renders in your profile timezone. Compare the underlying UTC instants. |
+| **Refresh vs apply boundary** | Marginal | Our lag uses last successfully applied change; a refresh in flight is not counted until it completes or overruns. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does the lag bounce between near-zero and my refresh interval even when everything is fine?**
+That sawtooth is the expected shape of asynchronous, scheduled replication. Between refreshes the secondary falls behind by up to one refresh interval; when the next refresh completes, lag snaps back toward zero. Set your alert threshold above your refresh interval plus normal refresh duration, otherwise you will page on healthy behaviour.
+
+**The card shows a huge lag (days) for one database. Is replication broken?**
+Not necessarily. A database with a manual refresh schedule, or a paused replication group, will show a large lag because nothing has refreshed recently. Check `SHOW REPLICATION DATABASES` for the schedule and last-refresh state. If it is intentionally manual or paused, exclude it from alerting or scope the card to the databases that have an RPO.
+
+**Does this measure failover readiness or just data freshness?**
+Both, indirectly. The lag in seconds is your worst-case data loss (RPO) at the instant of a primary outage. It does not, however, prove that failover itself will succeed: that depends on the secondary's grants, warehouses, and client connection strings being ready. Pair this card with a periodic failover drill; the number tells you the data cost, not the operational readiness.
+
+**Refreshes are failing with "exceeded available compute". What changed?**
+The delta to copy grew larger than one refresh cycle can move with the compute it has. The usual triggers are overnight bulk loads, large `CREATE TABLE AS SELECT`, or reclustering on the primary. Either give heavy primary writes more replication headroom (a longer refresh interval), or stage large loads so each refresh delta stays within budget.
+
+**Can I get sub-second lag?**
+No. Snowflake replication is asynchronous and batch-oriented, not synchronous streaming. The practical floor is your refresh interval plus refresh duration. If you need a tighter RPO than scheduled refresh allows, you are looking at a different architecture (for example application-level dual-write), which is outside what this card measures.
+
+**Why does my ACCOUNT_USAGE query not match the live card number?**
+The `ACCOUNT_USAGE` and `REPLICATION_GROUP_REFRESH_HISTORY` views are themselves delayed by up to a few hours. The card blends those historical views with near-real-time refresh state to produce an instantaneous estimate, so a same-instant comparison against the lagged views will not line up. Reconcile shape and trend over a window, not the single live value.
+
+**Does replication lag cost me credits?**
+The refreshes do. Each refresh consumes compute on the source to serialise changes and on the target to apply them, plus replication data-transfer charges across regions/clouds. Chasing lower lag by refreshing more often raises that cost; you will see it on [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h). Balance freshness against spend rather than minimising lag at any price.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Cross-Account Replication Lag (s)* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

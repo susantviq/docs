@@ -1,0 +1,159 @@
+---
+title: "Connection Pool Saturation %, ClickHouse"
+sidebarTitle: "Connection Pool Saturation %"
+description: "Connection Pool Saturation % for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Connection Pool Saturation % is the share of available client connection slots currently in use on the ClickHouse instance. For a platform team, this is "how close are we to refusing new queries?" ClickHouse caps concurrent connections via `max_connections` (and the HTTP/native listener backlog). When the pool fills, new client connections are queued or rejected, so dashboards stall, ingest workers retry, and downstream services see timeouts even though CPU and disk look fine. At 90% saturation you are one traffic burst away from refused connections.
+
+| | |
+| --- | --- |
+| **What it tracks** | The ratio of currently held connections to the configured connection ceiling, expressed as a percentage. Pulled from `system.metrics` (`TCPConnection`, `HTTPConnection`, `MySQLConnection`, `PostgreSQLConnection`, `InterserverConnection`) against the server's `max_connections` setting. |
+| **Data source** | Connection Pool Saturation % for the selected period, computed live from `system.metrics` connection gauges divided by the `max_connections` value read from `system.server_settings`. |
+| **Metric basis** | Live connection count, not query count. A single connection can run many queries; a connection held open by an idle client still occupies a slot. This card measures slots, not work. |
+| **Aggregation window** | Real-time gauge, sampled every minute (`RT/1m`). The headline shows the latest sample; the sparkline shows the 1-minute trend. |
+| **Time window** | `RT/1m` (real-time, 1-minute sampling) |
+| **Alert trigger** | `> 90%`, sustained saturation above 90% pages the platform on-call because connection refusals are imminent. |
+| **What counts** | All active client-facing connections (native TCP on 9000, HTTP on 8123, plus MySQL/PostgreSQL wire-protocol listeners if enabled) and interserver connections. |
+| **What does NOT count** | Closed/idle-reaped connections, background merge threads, and replication fetches that do not occupy a client connection slot. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine reads the current connection gauges from `system.metrics` and divides by the configured ceiling:
+
+```sql
+WITH (
+    SELECT value
+    FROM system.server_settings
+    WHERE name = 'max_connections'
+) AS max_conn
+SELECT round(100 * sum(value) / max_conn, 1) AS pool_saturation_pct
+FROM system.metrics
+WHERE metric IN (
+    'TCPConnection',
+    'HTTPConnection',
+    'MySQLConnection',
+    'PostgreSQLConnection',
+    'InterserverConnection'
+);
+```
+
+The numerator is the sum of live connection gauges; the denominator is `max_connections` (default 1024 on self-managed builds, often tuned higher on ClickHouse Cloud services). The card refreshes the sample every 60 seconds. On ClickHouse Cloud the ceiling is set by the service tier rather than a directly editable setting, so the engine reads the effective limit reported by the service. See the At a glance summary for what the metric tracks and the worked example below for a typical reading.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A DBA team runs a 3-node ClickHouse cluster backing a real-time analytics product. `max_connections` is set to 1024 per node. The application uses a connection pool of 200 per app instance, with 6 app instances, plus a fleet of BI dashboards that each hold a long-lived HTTP connection. Snapshot taken on 14 Apr 26 at 09:42 BST during the morning reporting peak.
+
+| Connection type | Live count | Notes |
+| --- | --- | --- |
+| `TCPConnection` (native) | 612 | App pool plus ingest workers |
+| `HTTPConnection` | 318 | BI dashboards, ad-hoc analysts |
+| `InterserverConnection` | 21 | Replication and distributed query fan-out |
+| **Total in use** | **951** | |
+| `max_connections` | 1024 | |
+
+Saturation = 100 × 951 / 1024 = **92.9%**. The card renders amber-to-red and, because it sustained above 90% for a full minute, the alert fires.
+
+What the platform team should read into this:
+
+1. **The headline is a leading indicator, not a failure yet.** At 92.9% the server is still serving every connection. But the next dashboard refresh wave (BI tools tend to refresh on the hour) will push it past 1024, at which point native clients get `DB::Exception: Too many simultaneous queries / connections` and HTTP clients get connection resets. The team has minutes, not hours.
+
+2. **Idle dashboard connections are the cheapest win.** 318 HTTP connections for a team of 40 analysts means roughly 8 long-lived connections per analyst, most idle. Lowering the BI tool's pool size or enabling idle-connection reaping (`idle_connection_timeout`) frees slots without touching the application.
+
+3. **Pool saturation rarely tracks CPU.** Check [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) and [Queries per Second (live)](/nerve-centre/kpi-cards/clickhouse/queries-per-second-live) alongside this card. If QPS is flat but saturation is climbing, the problem is connection leakage (clients opening connections and not returning them to the pool), not load. If QPS is spiking too, it is genuine demand and you should scale the connection ceiling or add a node.
+
+```text
+Headroom framing at the moment of the snapshot:
+  - Ceiling:            1024 connections
+  - In use:             951 connections
+  - Free slots:         73
+  - Typical BI refresh wave adds: ~120 connections in <10s
+  - Conclusion: next refresh wave exhausts the pool. Act now.
+```
+
+The correct immediate action is to (a) raise `max_connections` if RAM allows (each connection has a modest memory cost), or (b) shed idle connections by tightening client-side pool limits and idle timeouts, or (c) front the cluster with a connection-pooling proxy (such as chproxy) so thousands of clients share a bounded set of server connections.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards platform teams should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Connection Pool Saturation | What the combination tells you |
+| --- | --- | --- |
+| [Connections In Use](/nerve-centre/kpi-cards/clickhouse/connections-in-use) | The raw numerator behind this percentage. | Absolute count plus ceiling tells you exactly how many free slots remain, not just the ratio. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/clickhouse/connection-pool-at-90-saturation) | The alert-list companion that records each breach. | A single spike is noise; repeated breaches in the alert list mean a structural capacity problem. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/clickhouse/queries-per-second-live) | Demand context for the saturation. | Saturation rising with QPS equals genuine load; saturation rising with flat QPS equals connection leakage. |
+| [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) | Each connection costs memory; raising the ceiling has a memory cost. | Tells you whether you have headroom to raise `max_connections` safely. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) | The downstream symptom when the pool is contended. | Latency climbing alongside saturation means clients are queuing for connection slots. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that weights saturation as a capacity input. | Sustained saturation drags the overall health score down. |
+| [ClickHouse Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/clickhouse/clickhouse-pool-saturation-vs-traffic-burst) | The cross-channel view tying saturation to storefront traffic. | Confirms whether a saturation spike lines up with a real demand burst or a runaway client. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> **`system.metrics`** for the live connection gauges. Run `SELECT metric, value FROM system.metrics WHERE metric LIKE '%Connection%'` to see every connection counter the server exposes.
+> **`system.server_settings`** to confirm the effective `max_connections` ceiling: `SELECT name, value, changed FROM system.server_settings WHERE name = 'max_connections'`.
+> **`SHOW PROCESSLIST`** or `system.processes` to see what each live connection is actually doing right now.
+> **ClickHouse Cloud console** (managed service): the Metrics tab surfaces connection counts per service; the ceiling is governed by the service tier rather than a user-editable setting.
+
+**Why our number may legitimately differ from a direct query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sampling lag** | Brief gaps | The card samples every 60 seconds; a `system.metrics` query you run by hand reflects the exact instant, which may differ from the last sample. |
+| **Per-node vs cluster** | Variable | On a multi-node cluster the card reports the worst-case node by default; a single-node query reflects only that node. |
+| **Ceiling source on Cloud** | Variable | On ClickHouse Cloud `max_connections` is not always directly readable; the engine uses the service's effective limit, which the console may display differently. |
+| **Interserver connections** | Our number slightly higher | The card includes `InterserverConnection` in the numerator; some manual queries count only client-facing listeners. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ClickHouse Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/clickhouse/clickhouse-pool-saturation-vs-traffic-burst) | Saturation spikes should line up with storefront traffic bursts. | Saturation high with flat traffic means an internal client leak, not shopper demand. |
+| Storefront traffic / order-rate cards | A genuine demand surge raises both saturation and order rate together. | Saturation alone, with no order surge, points at a dashboard storm or runaway BI job. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My CPU and disk look fine but this card is red. How can the server be saturated?**
+Connection saturation is independent of compute. The pool measures slots, not work. A few hundred idle BI dashboard connections can fill the pool while CPU sits at 10%. The fix is not more compute; it is fewer held connections (tighten client pools, enable idle reaping) or a higher ceiling.
+
+**What is the difference between connection saturation and concurrent-query limits?**
+`max_connections` caps open connections; `max_concurrent_queries` caps queries running at once. You can hit either independently. A client can hold a connection without running a query (idle), or one connection can submit many queries. This card tracks the connection ceiling; concurrency limits surface as query-side errors instead.
+
+**How do I safely raise `max_connections`?**
+Each connection carries a memory cost (thread stack plus buffers). Before raising the ceiling, check [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage). On self-managed builds, edit `max_connections` in the server config and reload; on ClickHouse Cloud the ceiling is tied to the service tier, so you scale the service rather than the setting. A connection-pooling proxy (chproxy) is often a better answer than a higher ceiling because it bounds server connections regardless of client count.
+
+**Does this card cover the HTTP interface as well as native?**
+Yes. The numerator sums `TCPConnection` (native, port 9000), `HTTPConnection` (port 8123), and the MySQL/PostgreSQL wire-protocol listeners if you have them enabled, plus interserver connections. If your fleet is HTTP-heavy (most BI tools), the `HTTPConnection` gauge usually dominates.
+
+**On ClickHouse Cloud I cannot find `max_connections`. What is the denominator?**
+ClickHouse Cloud manages the connection ceiling per service tier, so it is not always a directly editable setting. The card uses the effective limit reported by the service. If you need more headroom on Cloud, scale the service up rather than editing a config value.
+
+**The alert fired once at 91% then cleared. Should I worry?**
+A single brief spike to 91% that clears on its own is usually a refresh wave, not a problem. The alert is tuned to sustained saturation above 90% for a full minute. Use the [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/clickhouse/connection-pool-at-90-saturation) alert list to see whether breaches are isolated or recurring; recurring breaches mean you are running too close to the ceiling and should add headroom.
+
+**Why does the multi-node cluster show one number when nodes differ?**
+By default the card reports the worst-case (highest-saturation) node, because the cluster refuses connections when any single node fills. To see per-node detail, query `system.metrics` on each node directly or use the cluster breakdown in the Cloud console.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connection Pool Saturation %* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

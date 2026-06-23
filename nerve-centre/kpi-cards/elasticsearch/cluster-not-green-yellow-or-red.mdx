@@ -1,0 +1,152 @@
+---
+title: "Cluster Not Green (yellow or red), Elasticsearch"
+sidebarTitle: "Cluster Not Green (yellow or red)"
+description: "Cluster Not Green (yellow or red) for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> An alert card that fires when the Elasticsearch cluster health status leaves `green` and stays at `yellow` or `red` for a sustained window. This is the single most Elasticsearch-defining signal on the board. `green` means every primary and every replica shard is allocated. `yellow` means all primaries are allocated but one or more replicas are missing, so you are running without redundancy. `red` means at least one primary shard is unallocated, which means data on that shard is unavailable to reads and writes right now. A red cluster is a page-the-on-call event because part of your index is simply not answering.
+
+| | |
+| --- | --- |
+| **What it tracks** | The cluster-level `status` field returned by the Elasticsearch cluster health API, surfaced as an alert when it is not `green`. The card lists the affected indices, the count of unassigned shards, and the duration the cluster has been off-green. |
+| **Data source** | `GET /_cluster/health` (and `GET /_cluster/health?level=indices` for the per-index breakdown). The `status` field is the canonical traffic-light value Elasticsearch computes from shard allocation state. Detail: "Elasticsearch-distinctive, RED = data unavailable on affected indexes. Page on-call." |
+| **Time window** | `RT` (real-time, polled on the standard fast cadence for alert cards). |
+| **Alert trigger** | `status in (yellow, red)` sustained for 5 minutes. The 5-minute sustain is deliberate: brief yellow flaps during a rolling restart or a routine relocation are normal and should not page anyone. |
+| **Severity split** | `yellow` is a warning (redundancy lost, data still served). `red` is critical (data unavailable, page on-call immediately). The card renders red status outlined in red. |
+| **What does NOT trigger it** | A green cluster with high heap, high disk, or slow queries. Those are separate cards. This card is purely the shard-allocation traffic light. |
+| **Roles** | platform, SRE, DBA, on-call |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Elasticsearch computes the cluster status itself; Vortex IQ does not derive it. The engine polls `GET /_cluster/health` and reads the `status` string, which Elasticsearch sets according to these rules:
+
+- **green:** all primary shards and all replica shards are allocated.
+- **yellow:** all primary shards are allocated, but at least one replica is unallocated. Reads and writes still succeed; you have simply lost redundancy for the affected indices.
+- **red:** at least one primary shard is unallocated. Any document that lives on that shard cannot be read or written until the shard recovers.
+
+The cluster status is the worst status of any index in the cluster: a single red index makes the whole cluster red, a single yellow index (with no red) makes it yellow. The alert evaluates the status on every poll and starts a timer when it first leaves green. If the status is still non-green after 5 continuous minutes, the alert fires. If the status returns to green inside the window, the timer resets and nothing pages.
+
+To find which indices are responsible, the engine also calls `GET /_cluster/health?level=indices` and surfaces the indices whose own status is yellow or red, along with `unassigned_shards` per index. That is what turns "the cluster is red" into "the `products-v7` primary is unallocated".
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 6-node Elasticsearch cluster (3 data, 3 master-eligible) backing product search and a logging pipeline for a mid-size retailer. Snapshot taken on 14 Apr 26 at 02:18 BST, during an overnight maintenance window.
+
+A data node (`es-data-02`) ran out of disk after a log-index rollover went wrong and was evicted from the cluster. The cluster health API now returns:
+
+```json
+{
+  "cluster_name": "prod-search",
+  "status": "red",
+  "number_of_nodes": 5,
+  "number_of_data_nodes": 2,
+  "active_primary_shards": 411,
+  "active_shards": 798,
+  "unassigned_shards": 14
+}
+```
+
+The per-index drill (`?level=indices`) shows:
+
+| Index | Status | Unassigned shards | Notes |
+| --- | --- | --- | --- |
+| `products-v7` | **red** | 2 | One primary + one replica unallocated; the primary lived on `es-data-02` and has no in-sync copy elsewhere |
+| `logs-2026.04.14` | yellow | 8 | Primaries intact on the surviving nodes; replicas gone |
+| `categories-v3` | yellow | 4 | Replicas gone, primaries fine |
+
+The Nerve Centre headline reads **RED, 1 index red, 2 yellow, off-green for 6m**, outlined in red, and the on-call engineer is paged. The story is clear from the card alone:
+
+1. **`products-v7` is red, so product search is partly broken.** Any query hitting the missing primary's shard returns partial results or a shard-failure error. Storefront search for the SKUs on that shard is degraded. Pair with [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) to see the 14 unassigned shards and with [Active Node Count](/nerve-centre/kpi-cards/elasticsearch/active-node-count), which dropped from 6 to 5 at 02:12.
+2. **The yellow indices are not the emergency.** `logs-2026.04.14` and `categories-v3` lost replicas only; their data is still fully served. They will go green again automatically once `es-data-02` rejoins and shards re-replicate.
+3. **Root cause is disk, not the shard layer.** [Storage Usage %](/nerve-centre/kpi-cards/elasticsearch/storage-usage) on `es-data-02` had crossed the flood-stage watermark before the node dropped. The fix is to free disk or add capacity, after which the unallocated primary recovers from its translog.
+
+```text
+Decision path for the on-call engineer:
+  1. Is any index RED? Yes (products-v7) -> data is unavailable -> this is the priority.
+  2. Why is the primary unallocated? Use GET /_cluster/allocation/explain.
+     -> "node left, no in-sync replica" because replica was on the same lost node.
+  3. Can the lost node come back? es-data-02 is disk-full -> free disk, restart node.
+  4. Once node rejoins, primary recovers from translog; replicas re-replicate.
+  5. Cluster goes yellow (recovering), then green. Alert clears automatically.
+```
+
+The actionable lesson: a red cluster is about shard allocation, but the cause is almost always one layer down (a lost node, a full disk, a watermark breach). The card tells you data is unavailable; the sibling cards tell you why.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Cluster Not Green | What the combination tells you |
+| --- | --- | --- |
+| [Cluster Status (green / yellow / red)](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) | The always-on KPI version of the same `status` field. | This alert is the paging wrapper around that KPI; the KPI shows the steady-state colour. |
+| [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) | The direct cause of yellow/red. | Any unassigned shard explains the colour; zero unassigned with non-green means a transient relocation. |
+| [Active Node Count](/nerve-centre/kpi-cards/elasticsearch/active-node-count) | A lost node is the most common trigger. | Node count dropping at the same instant the cluster went red points straight at the missing node. |
+| [Storage Usage %](/nerve-centre/kpi-cards/elasticsearch/storage-usage) | A full disk evicts nodes and blocks shard allocation. | A watermark breach just before red means disk is the root cause. |
+| [Initializing / Relocating Shards](/nerve-centre/kpi-cards/elasticsearch/initializing-relocating-shards) | Recovery from red passes through initialising shards. | High initialising count after a red event means the cluster is healing; falling to zero means recovery is done. |
+| [Elasticsearch Health Score](/nerve-centre/kpi-cards/elasticsearch/elasticsearch-health-score) | The composite that weights cluster status heavily. | A red cluster alone drags the health score well below the 70 alert line. |
+| [Pending Cluster Tasks](/nerve-centre/kpi-cards/elasticsearch/pending-cluster-tasks) | Master-node backlog during mass reallocation. | A red event plus a high pending-task queue means the master is busy reassigning shards. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> `GET /_cluster/health` returns the authoritative `status` field. This is the exact value the card reads.
+> `GET /_cluster/health?level=indices` breaks the status down per index so you can see which index is responsible.
+> `GET /_cat/shards?v&h=index,shard,prirep,state,unassigned.reason` lists every shard and the reason any are unassigned, in human-readable rows.
+> `GET /_cluster/allocation/explain` explains in plain terms why a specific shard cannot be allocated.
+
+On a managed service, the same value appears in the console: Elastic Cloud surfaces it under the deployment Health view, and AWS OpenSearch Service / managed Elasticsearch offerings expose it as the `ClusterStatus.green / .yellow / .red` CloudWatch metrics. The console may lag the live API by a minute or two because it samples on its own schedule.
+
+**Why our number may legitimately differ from a manual `_cluster/health` call:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sustain window** | Card lags a raw API call | A bare `_cluster/health` shows yellow the instant a replica drops; the card only fires after 5 minutes of sustained non-green, so a brief flap shows in the API but not as an alert. |
+| **Poll cadence** | Up to one poll interval | The card samples on a fixed interval; a status that flips green between polls may never be captured. |
+| **Per-index drill timing** | Index list can lag the colour | The headline colour and the per-index breakdown are two API calls; during fast recovery the colour can update before the index list refreshes. |
+| **Managed-console sampling** | Console can lag both | Elastic Cloud and CloudWatch sample on their own cadence, so the vendor console can show green while the live API still reports yellow for a few seconds. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why did the cluster go yellow during a routine node restart, and is that a problem?**
+When you stop a node for a rolling restart, the replicas that lived on it become unallocated, so the cluster goes yellow until those replicas re-replicate elsewhere or the node returns. This is expected and harmless: all primaries are still allocated, so reads and writes succeed. The 5-minute sustain window is designed to swallow short restarts; if you do slow rolling restarts, consider raising the sustain window or using `cluster.routing.allocation.enable: primaries` during the maintenance so replicas are not reshuffled needlessly.
+
+**The cluster is yellow but everything works fine. Why page anyone?**
+Yellow does not page on-call; only red does in the default configuration. Yellow is a warning that you have lost redundancy: if a second node fails while you are yellow, you risk going red. Treat yellow as "fix soon", red as "fix now". A cluster that sits yellow for days usually has a real allocation problem (a disk watermark, a stuck shard, or `index.number_of_replicas` set higher than the number of available nodes).
+
+**Can a single-node cluster ever be green?**
+No, not for any index with replicas. A replica shard can never be allocated to the same node as its primary, so a single-node cluster with the default 1 replica is permanently yellow. This is by design, not a fault. For a deliberate single-node setup, set `index.number_of_replicas: 0` and the cluster can be green, but then you have no redundancy at all.
+
+**What is the difference between this alert and the Unassigned Shards card?**
+This card reads the cluster `status` traffic light directly. The [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) card counts the shards behind that colour. They move together: any unassigned replica makes the cluster yellow, any unassigned primary makes it red. Use this card to know "is data unavailable?", use Unassigned Shards to know "how many shards and which ones?".
+
+**The cluster went red but search still returns results. How?**
+Search against a red cluster returns partial results: shards that are allocated answer, the unallocated primary's shard returns a shard-failure, and Elasticsearch merges what it can unless you set `allow_partial_search_results: false`. So the storefront may look mostly fine while silently dropping the SKUs on the missing shard. That silent partiality is exactly why red is a paging event even when the site "looks okay".
+
+**Does this card cover index-level red, or only cluster-level?**
+The headline reflects the cluster `status`, which is the worst of any single index. The per-index drill (sourced from `?level=indices`) names the specific red or yellow indices so you are not left guessing. A single red index makes the whole cluster red even if 500 other indices are green.
+
+**How long does recovery from red usually take?**
+It depends entirely on the cause. If a node rejoins and its primary recovers from the translog, recovery can be seconds to a few minutes. If a primary has to be rebuilt from a replica on another node, it scales with shard size and network throughput, often tens of minutes for large shards. Watch [Initializing / Relocating Shards](/nerve-centre/kpi-cards/elasticsearch/initializing-relocating-shards) trend to zero as the signal that recovery is finishing.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Cluster Not Green (yellow or red)* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

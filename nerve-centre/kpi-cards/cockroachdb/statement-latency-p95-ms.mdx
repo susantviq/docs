@@ -1,0 +1,152 @@
+---
+title: "Statement Latency p95 (ms), CockroachDB"
+sidebarTitle: "Statement Latency p95 (ms)"
+description: "Statement Latency p95 (ms) for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The 95th-percentile service latency for SQL statements across the cluster, in milliseconds. Ninety-five out of every hundred statements completed faster than this number; the slowest five percent took longer. p95 is the tail-sensitive read of cluster health: it moves before the median does when contention, range splits, or an overloaded node start to bite. For an SRE this is the "is the database starting to hurt?" gauge, and it is the first number to check when an application team reports intermittent slowness that the p50 cannot explain.
+
+| | |
+| --- | --- |
+| **Data source** | CockroachDB time-series metric `sql.service.latency` at the p95 quantile, exposed via the `_status/vars` Prometheus endpoint and the `crdb_internal.node_statement_statistics` view. Vortex IQ reads the cluster-wide aggregate, not a single node. |
+| **What it tracks** | Statement Latency p95 (ms) for the selected period: the service-side time CockroachDB spent planning and executing a statement, measured from when the gateway node received it to when the result was ready. Excludes client network round-trip. |
+| **Metric basis** | Service latency, not SQL exec latency alone. It folds in planning, distributed execution across ranges, and KV-layer waits, so it reflects what the application actually experiences inside the cluster. |
+| **Time window** | `RT/5m` (real-time, computed over a rolling 5-minute window and refreshed continuously). |
+| **Alert trigger** | `> 200ms`. A sustained p95 above 200ms means the slow tail is wide enough that a meaningful slice of traffic feels sluggish; the Nerve Centre raises this as a sensitivity event. |
+| **Units** | Milliseconds. CockroachDB stores the underlying histogram in nanoseconds; Vortex IQ converts to ms for display. |
+| **Scope** | Cluster-wide aggregate across all live nodes. Per-node and per-statement breakdowns are available via the siblings below. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+CockroachDB maintains an HDR histogram of statement service latency on every node, exported as the `sql.service.latency` metric family. The p95 quantile is the value below which 95 percent of recorded statements fall within the window.
+
+Vortex IQ derives the displayed number as follows:
+
+1. Poll `sql.service.latency-p95` from each live node's `_status/vars` endpoint over the rolling 5-minute window described by `RT/5m`.
+2. Take the cluster-wide quantile, not a naive average of per-node p95 values. Averaging percentiles understates the tail; Vortex IQ requests the merged-histogram quantile from the cluster status layer so the figure matches what the DB Console reports.
+3. Convert nanoseconds to milliseconds and round to one decimal place.
+4. Compare against the `> 200ms` sensitivity threshold; if the rolling value stays above it for the configured dwell, the card flips to an alert state and feeds the sensitivity layer.
+
+Because p95 is a percentile and not a mean, it is not additive: you cannot sum or average two windows' p95 figures to get a combined p95. To reason across a longer period, read the histogram, which Vortex IQ retains, rather than arithmetic on the headline.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 6-node CockroachDB cluster (v23.2) backing an order-management service. Baseline p95 sits around 38ms during business hours. Snapshot taken on 14 Apr 26 at 09:42 BST during a morning traffic ramp.
+
+| Node | Live | p50 (ms) | p95 (ms) | Statements/s |
+| --- | --- | --- | --- | --- |
+| n1 | yes | 9.1 | 41 | 1,240 |
+| n2 | yes | 9.4 | 44 | 1,210 |
+| n3 | yes | 31.0 | 268 | 1,330 |
+| n4 | yes | 9.0 | 39 | 1,190 |
+| n5 | yes | 9.6 | 46 | 1,260 |
+| n6 | yes | 8.8 | 40 | 1,205 |
+
+The cluster-wide p95 headline reads **214ms**, above the 200ms threshold, so the card is in an alert state. The p50 sibling barely moved (it reads 11ms cluster-wide), which is the tell: this is a tail problem, not a broad slowdown. Everything looks fine "on average".
+
+Reading across the nodes, n3 is the outlier: its p50 and p95 are both roughly 6x the rest. That points to a hot node, a single node carrying a disproportionate share of leaseholders for a contended range. The team confirms by opening [Range Lease Balance Skew %](/nerve-centre/kpi-cards/cockroachdb/range-lease-balance-skew) (reads 31%, above its own 25% threshold) and [Replicas per Node](/nerve-centre/kpi-cards/cockroachdb/replicas-per-node), which shows n3 holding more leaseholders than its peers.
+
+```text
+Tail-latency framing for this snapshot:
+  - Cluster p50:  11ms   (healthy, unchanged from baseline)
+  - Cluster p95:  214ms  (alerting, ~5.6x baseline)
+  - Cluster p99:  430ms  (see p99 sibling; tail is wide)
+  - Hot node:     n3, carrying skewed leaseholders for a contended range
+  - Likely cause: a single contended range (a sequence-like counter row,
+                  or a frequently-updated status row) whose leaseholder
+                  landed on n3 and is serialising writes
+```
+
+Three takeaways:
+
+1. **p95 moving while p50 holds is a tail signature, not a capacity signature.** If both rose together you would suspect overall load or undersized nodes. p95-only points at a subset of statements (a contended range, a missing index on one query, a single hot node).
+2. **Find the node, then find the range.** The per-node view localised it to n3; the next step is `SHOW RANGES` plus the contention siblings to find which range's leaseholder is the bottleneck. A manual lease transfer or a range split often clears it in minutes.
+3. **200ms is a default, not a law.** A reporting cluster running heavy analytical statements may legitimately sit at p95 of 800ms and be perfectly healthy. Tune the sensitivity threshold in the Sensitivity tab to your workload's real baseline so the card alerts on regressions, not on normality.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Statement Latency p95 | What the combination tells you |
+| --- | --- | --- |
+| [Statement Latency p50 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p50-ms) | The median, the typical-statement view. | p95 high with p50 flat equals a tail problem (contention, one hot query); both high equals a capacity or cluster-wide problem. |
+| [Statement Latency p99 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p99-ms) | The extreme tail. | p99 far above p95 means a small but painful slice of statements is very slow; pair to size the worst case. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/cockroachdb/slow-query-rate) | The proportion of statements over your slow threshold. | Rising p95 plus rising slow-rate confirms the tail is widening, not just one outlier statement. |
+| [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) | The statement-level culprit list from contention events. | The single most common cause of a tail-only p95 spike; names the statements to fix. |
+| [Range Lease Balance Skew %](/nerve-centre/kpi-cards/cockroachdb/range-lease-balance-skew) | Detects a hot node holding skewed leaseholders. | A hot node from lease skew is a classic p95-without-p50 cause. |
+| [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live) | The throughput context. | p95 rising while QPS is flat means a regression, not load; both rising means you may be at capacity. |
+| [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) | Retries inflate service latency for contended transactions. | High retries plus high p95 points at write contention as the latency driver. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The composite that weights latency. | A p95 breach alone can pull the health score down; confirms cluster-level impact. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in CockroachDB's own tooling:**
+
+> **DB Console → Metrics → SQL dashboard → "Service Latency: SQL, 95th percentile"** is the canonical chart. Confirm the time range matches the Vortex IQ window.
+> **DB Console → SQL Activity → Statements** sorts by statement-level latency so you can find the contributing statements.
+> **`SELECT * FROM crdb_internal.node_statement_statistics`** gives the raw per-statement latency stats from SQL.
+> **`curl http://<node>:8080/_status/vars | grep sql_service_latency`** exposes the raw Prometheus histogram buckets if you want to compute the quantile yourself.
+> For **CockroachDB Cloud** (Serverless or Dedicated), the same chart lives in the Cloud Console under **Monitoring → SQL**, and the Metrics export endpoint feeds Prometheus/Datadog with the identical metric name.
+
+**Why our number may legitimately differ from the DB Console:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window length** | Variable | Vortex IQ uses a rolling 5-minute window (`RT/5m`); the DB Console default chart may be showing a 10-minute or 1-hour range, which smooths the tail. Match ranges before comparing. |
+| **Quantile merge method** | Vortex IQ usually higher | Vortex IQ requests the merged-histogram cluster quantile; if you eyeball a single node's chart you see a lower per-node p95. |
+| **Service vs exec latency** | Vortex IQ slightly higher | This card uses `sql.service.latency` (includes planning); the "SQL exec latency" chart excludes planning and reads lower. |
+| **Time zone** | Axis labels shift | The DB Console renders in the node's local time; Vortex IQ renders in your reporting time zone. |
+| **Internal statements** | Vortex IQ lower | Background internal statements are excluded from the displayed application-facing figure where the metric labels allow it; the DB Console may include them. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`crdb_xc_slow_query_during_checkout`](/nerve-centre/kpi-cards/cockroachdb/slow-statements-during-checkout-window-5m) | A p95 spike during a checkout window should co-occur with slow checkout statements. | If p95 spikes but checkout stays fast, the slow tail is on a non-customer path (analytics, batch). |
+| Application APM p95 | The app-side p95 should sit above the DB p95 by roughly the network round-trip. | A large gap means the latency is in the app or network, not the database. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does p95 spike while my average latency looks fine?**
+Because the average is dominated by the fast majority. p95 is a percentile: it deliberately reports the slow tail. A handful of contended or badly-planned statements can push p95 to 200ms while the mean stays in single digits. That is exactly why the tail percentiles, not the average, are the early-warning gauges. Read p95 alongside [Statement Latency p50 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p50-ms): a wide p50-to-p95 gap is the diagnostic signal.
+
+**Can I add per-node or per-statement p95 figures together to get a cluster figure?**
+No. Percentiles are not additive. You cannot sum or average per-node p95 values to get a cluster p95, nor average two time windows. Vortex IQ computes the cluster figure from the merged histogram for this reason. If you need a combined period, read the underlying histogram rather than doing arithmetic on headlines.
+
+**My cluster runs heavy analytical statements and p95 is always above 200ms. Is it broken?**
+Probably not. The 200ms default suits OLTP workloads. Analytical and reporting workloads legitimately run long statements and will sit higher. Retune the threshold in the Sensitivity tab to your real baseline so the card alerts on regressions from your normal, not against a generic default.
+
+**The DB Console shows a lower p95 than Vortex IQ. Which is right?**
+Both, usually. The most common causes are (1) you are looking at one node's chart rather than the cluster merge, (2) you are looking at "SQL exec latency" rather than "Service latency", which excludes planning, or (3) the chart window is longer than the rolling 5-minute window and has smoothed the tail. Align all three and the numbers converge.
+
+**Does this include the client-to-cluster network time?**
+No. `sql.service.latency` is measured inside the gateway node, from request receipt to result ready. Client network round-trip is not included. If application-side p95 is much higher than this card, the extra time is in the network or the application driver, not in CockroachDB. Compare against your APM's database-span timing.
+
+**A single node shows a much higher p95 than the others. What does that mean?**
+Almost always a hot node holding skewed leaseholders for a contended range, or a node with a disk or CPU problem. Check [Range Lease Balance Skew %](/nerve-centre/kpi-cards/cockroachdb/range-lease-balance-skew) and [Replicas per Node](/nerve-centre/kpi-cards/cockroachdb/replicas-per-node) first. A manual lease transfer or a range split usually rebalances the load and clears the tail within minutes.
+
+**Does Vortex IQ count internal/background statements?**
+The headline targets application-facing statements where the metric labelling allows the split. CockroachDB runs internal statements (jobs, schema changes, stats collection) that can be noisy; the DB Console may include them. If your figures diverge during a schema change or a large job, that is the likely reason.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Statement Latency p95 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

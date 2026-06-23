@@ -1,0 +1,150 @@
+---
+title: "Credit Burn vs Ecom Order Volume, Snowflake"
+sidebarTitle: "Credit Burn vs Ecom Order Volume"
+description: "Credit Burn vs Ecom Order Volume for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Cross-Channel](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Credit Burn vs Ecom Order Volume** plots Snowflake credit consumption against ecommerce order volume on a dual axis over the last seven days. The premise is simple and Snowflake-distinctive: in a healthy data estate, compute spend should roughly track business activity. More orders means more events to ingest, more dashboards refreshed, more models retrained, so credits and orders should rise and fall together. When the two lines diverge (credits climbing while orders stay flat), you are paying for compute that is not doing proportionally more useful work: a runaway query, a scheduled job stuck in a retry loop, an over-provisioned warehouse, or a dashboard storm. This card turns "the Snowflake bill went up" into "the bill went up but the business did not", which is the only version of that sentence a platform owner can act on.
+
+| | |
+| --- | --- |
+| **What it tracks** | Two series over 7 days: Snowflake credit burn (compute consumption) and ecommerce order volume from the connected store, overlaid on a dual axis to expose divergence. |
+| **Data source** | `detail`: Snowflake-distinctive cross-channel. Credit burn should track ecom volume (more data to analyse equals more credits). Divergence equals cost inefficiency. Credits from `METERING_HISTORY` / `WAREHOUSE_METERING_HISTORY`; orders from the connected commerce platform (Shopify, BigCommerce, Adobe Commerce). |
+| **Time window** | `7d` (rolling seven-day comparison, day-grain). |
+| **Alert trigger** | `credits +50% WoW with orders flat` (the inefficiency signal). A 50% week-on-week rise in credits without a matching rise in orders pages the platform owner: spend grew, business did not. |
+| **Why it matters** | It is the cost-efficiency early-warning system. Compute is the largest controllable Snowflake cost, and the most common way it runs away is silently, with no business reason behind it. This card makes the silent divergence loud. |
+| **Roles** | owner, platform, SRE, finance |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card builds two daily series for the trailing seven days and overlays them:
+
+```text
+credits_per_day = SUM(CREDITS_USED) from METERING_HISTORY, grouped by day
+orders_per_day  = COUNT(orders) from the connected commerce connector, grouped by day
+
+efficiency_signal (alert):
+  credits_wow_pct = (credits_this_week - credits_last_week) / credits_last_week * 100
+  orders_wow_pct  = (orders_this_week  - orders_last_week)  / orders_last_week  * 100
+  fire if credits_wow_pct >= 50 AND orders_wow_pct is roughly flat
+```
+
+Credit burn comes from Snowflake's `METERING_HISTORY` (account-level) or `WAREHOUSE_METERING_HISTORY` (per-warehouse), which record credits consumed per hour; the card aggregates to daily totals. A credit is Snowflake's unit of compute: dollars burned in compute time, so this axis is effectively a spend axis. Order volume comes from the commerce connector paired with this account in your Vortex IQ profile, counted per day on the same calendar boundary and time zone so the two series line up honestly.
+
+The alert is intentionally a *ratio* signal, not an absolute one. Credits rising is not a problem if orders rose too; that is the estate scaling with the business, exactly as designed. The card fires only when the two diverge: a 50% or greater week-on-week credit increase while order volume stays flat (or falls). That pattern almost always means the extra credits bought no extra business value, which is the textbook definition of cost inefficiency. Note the two axes are independent scales (dual axis), so the lines are not meant to overlap numerically; what you read is the *shape*: parallel lines equal healthy, scissoring lines equal a problem.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team supports a Shopify Plus store whose analytics, marketing-attribution, and inventory models all run in Snowflake. Their normal pattern is tight: credits and orders move together, because the store's data pipelines scale with order events. Alert set to the default: credits +50% WoW with orders flat. Snapshot taken on 18 Apr 26.
+
+| Day | Orders | Credits burned | Notes |
+| --- | --- | --- | --- |
+| Mon 07 Apr (prev wk) | 4,180 | 92 | baseline |
+| Mon 14 Apr (this wk) | 4,240 | 158 | orders flat, credits up |
+| Tue 15 Apr | 4,090 | 161 | divergence holds |
+| Wed 16 Apr | 4,310 | 167 | divergence widening |
+
+Week-on-week, orders are essentially flat (+1.4%) but credits are up 71%. Nerve Centre fires the efficiency alert. The dual-axis chart shows the two lines scissoring apart from Mon 14 Apr onward: the orders line is level, the credits line is climbing.
+
+```text
+Diagnosis trail:
+  - Credits by warehouse (7d) shows the rise is entirely on TRANSFORM_WH.
+  - QUERY_HISTORY on TRANSFORM_WH: a dbt model dim_customer_sessions was
+    changed on 14 Apr; its incremental logic broke and it now full-refreshes
+    every run instead of merging a delta.
+  - Each scheduled run (hourly) now scans the full 1.4B-row sessions table
+    rather than the last hour's delta.
+
+Cost framing (illustrative at ~$3/credit):
+  - Excess credits/day: ~66 - 0 useful = ~66 extra credits.
+  - 66 credits x $3 = ~$198/day of pure waste.
+  - Over a week unnoticed: ~$1,386, all to produce the same model output
+    that the incremental version produced for a fraction of the cost.
+```
+
+The fix is to restore the incremental materialisation on `dim_customer_sessions` so each run merges only the last hour's delta. Credits on `TRANSFORM_WH` fall back to baseline within a day, the two lines snap back to parallel, and the alert clears. The business saw zero benefit from the extra spend; the only thing that changed was the model accidentally doing 60x the work for the same result.
+
+Three takeaways for the team:
+
+1. **Parallel lines are health; scissoring lines are waste.** You are not reading the absolute numbers (the axes are independent). You are reading the shape. When credits climb and orders do not, the estate is doing more work for no more business value.
+2. **The most expensive bugs are invisible without this overlay.** A broken incremental model, a retry loop, or a left-on warehouse does not throw an error. It just bills. Tying credits to order volume is what makes silent waste visible.
+3. **Divergence the other way is also a signal.** Orders climbing while credits stay flat can mean pipelines are not keeping up (stalled ingest, models not refreshing), which risks stale data behind the storefront. Read divergence in both directions, and pair with [Snowflake Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/snowflake/snowflake-event-ingest-vs-ecom-orders).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Credit Burn vs Ecom Order Volume | What the combination tells you |
+| --- | --- | --- |
+| [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) | The raw daily spend behind the credits axis. | Confirms the absolute burn driving the divergence. |
+| [Credits by Warehouse (7d)](/nerve-centre/kpi-cards/snowflake/credits-by-warehouse-7d) | Attributes the rise to a specific warehouse. | Tells you *where* the extra credits are going. |
+| [Avg Cost per Query ($)](/nerve-centre/kpi-cards/snowflake/avg-cost-per-query) | Efficiency at the per-query grain. | Rising cost-per-query plus flat orders confirms inefficient SQL, not more SQL. |
+| [Credit Burn +50% Week-over-Week](/nerve-centre/kpi-cards/snowflake/credit-burn-50-week-over-week) | The standalone anomaly alert for the same pattern. | This card adds the order-volume context the anomaly alert lacks. |
+| [Snowflake Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/snowflake/snowflake-event-ingest-vs-ecom-orders) | The ingest-side cross-channel peer. | Confirms whether divergence is on the spend side or the data-flow side. |
+| [Snowflake QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/snowflake/snowflake-qps-spike-vs-ecom-order-rate) | Query-volume cross-channel peer. | A QPS spike with flat orders points at a dashboard storm or bot driving the credits. |
+| [Slow Analytics Queries During Checkout Window](/nerve-centre/kpi-cards/snowflake/slow-analytics-queries-during-checkout-window) | The revenue-at-risk cross-channel peer. | Shows when analytics load is actively threatening the storefront, not just the bill. |
+| [Idle Warehouse Credits Wasted (24h)](/nerve-centre/kpi-cards/snowflake/idle-warehouse-credits-wasted-24h) | One common cause of credits with no work. | A left-on warehouse burns credits while orders (and queries) stay flat. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake's own tooling (credits axis):**
+
+> Query `SNOWFLAKE.ACCOUNT_USAGE.METERING_HISTORY` or `WAREHOUSE_METERING_HISTORY` and sum `CREDITS_USED` by day to reproduce the credits series.
+> In Snowsight, open **Admin to Cost Management to Consumption** and view daily credit usage by warehouse.
+
+**Where to look for the orders axis:** the connected commerce platform's own reporting (Shopify Analytics, BigCommerce Analytics, or Adobe Commerce reports) for daily order counts on the same calendar boundary.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **METERING_HISTORY latency** | Vortex IQ may trail | The metering views update with their own latency; the most recent hours of credits may not yet be reflected, so a same-instant recompute can differ. |
+| **Time-zone alignment** | Day buckets shift | Snowflake meters in UTC; the commerce platform reports in store time zone. The card aligns both to your profile time zone, which can move a day's totals at the boundary. |
+| **Order definition** | Variable | "Orders" may include or exclude test, cancelled, or draft orders depending on the commerce connector's filter; match the definition before comparing axes. |
+| **Dual-axis scaling** | Not a discrepancy | The two axes are independent; the lines are not meant to coincide numerically. Read shape (parallel vs scissoring), not overlap. |
+| **Credit price** | Cost framing only | Credits are unitless; converting to dollars uses your contract rate, which the card may not know. Dollar figures are illustrative unless your rate is configured. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Credits and orders both went up together. Should I worry?**
+No, that is the healthy pattern this card is designed to confirm. More orders means more events, more dashboard refreshes, and more model runs, so credits scaling with orders is the estate doing its job. The alert fires only on divergence: credits up 50%+ while orders stay flat. Parallel lines are good news.
+
+**The two lines never sit on top of each other. Is the chart broken?**
+No. This is a dual-axis chart with independent scales: one axis for credits, one for orders. The lines are not meant to align numerically. You read the *shape*, not the gap. Parallel movement (both rising, both falling) is healthy; scissoring (one rising while the other is flat) is the signal.
+
+**What are the usual causes of credits rising without orders rising?**
+The common four: (1) a broken incremental model or pipeline that now full-refreshes instead of merging a delta; (2) a scheduled job stuck in a retry loop; (3) a warehouse left on without auto-suspend, or sized too large; (4) a dashboard storm or BI bot firing far more queries than usual. The card flags the divergence; pair with [Credits by Warehouse (7d)](/nerve-centre/kpi-cards/snowflake/credits-by-warehouse-7d) to localise it.
+
+**Orders rose but credits stayed flat. Is that good?**
+It can be efficiency, but it can also be a warning. If pipelines are not scaling with order volume, your analytics may be falling behind: ingest stalling, models not refreshing, dashboards going stale behind a growing storefront. Read this alongside [Snowflake Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/snowflake/snowflake-event-ingest-vs-ecom-orders) to tell efficient scaling from a stalled pipeline.
+
+**Which commerce platform feeds the orders axis?**
+Whichever store connector is paired with this Snowflake account in your Vortex IQ profile (Shopify, BigCommerce, or Adobe Commerce). If you run multiple stores, the orders axis reflects the connector configured for this cross-channel view. Confirm the pairing in your connector settings if the orders line looks wrong.
+
+**Can I change the +50% WoW threshold?**
+Yes. The divergence threshold is configurable per profile in the Sensitivity tab. A small, spiky estate may need a higher threshold to avoid noise; a large, steady estate where credits should be very predictable may want a tighter one. Tune it to your normal week-on-week variance rather than relying on the generic default.
+
+**Does this account for seasonal order spikes (sales, peak)?**
+The card compares week on week, so a genuine order surge (a flash sale, Black Friday) will raise the orders axis too, and as long as credits rise proportionally the alert stays quiet. The risk window is when a promotion drives a one-off analytics push (heavy ad-hoc reporting) that outlives the order spike; you may see a brief, legitimate divergence that resolves once the reporting settles. Read sustained divergence, not a single peak day.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Credit Burn vs Ecom Order Volume* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

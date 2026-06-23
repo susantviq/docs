@@ -1,0 +1,176 @@
+---
+title: "GC Pause Time (5m total ms), Elasticsearch"
+sidebarTitle: "GC Pause Time (5m total ms)"
+description: "GC Pause Time for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Total time the JVM spent paused for garbage collection across the cluster in the last 5 minutes, in milliseconds. Garbage collection is unavoidable, but a "stop-the-world" GC pause freezes the node: during a pause it cannot serve searches, accept indexing, or even answer the master's health pings. Short, frequent young-generation collections are normal and cheap. Long old-generation pauses are the warning sign: they mean the JVM is under heap pressure and is working hard to reclaim memory. Sustained long pauses make a node intermittently unavailable, drive search latency spikes, and in the worst case lead to the master declaring the node dead.
+
+| | |
+| --- | --- |
+| **Data source** | JVM GC stats from `GET /_nodes/stats/jvm`, the `jvm.gc.collectors` section (young and old collectors), summed over the 5-minute window. |
+| **Metric basis** | Delta of `collection_time_in_millis` across collectors over the window, totalled across nodes. It is wall-clock pause time, not collection count. |
+| **Aggregation window** | 5-minute rolling total. A spiky workload is best read over a window rather than instantaneously. |
+| **Young vs old GC** | Young-gen collections are frequent and short (often single-digit ms) and are healthy. Old-gen (CMS/G1 mixed/full) collections are the ones that produce long pauses and signal heap pressure. |
+| **Why a pause hurts** | A stop-the-world pause freezes all threads on that node: searches queue, indexing stalls, and if the pause exceeds the master's fault-detection timeout the node can be dropped from the cluster. |
+| **Almost always downstream of heap** | High GC pause time is the symptom; high JVM heap usage is the cause. Read this card together with [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used). |
+| **Managed-service note** | Elastic Cloud and AWS OpenSearch/Elasticsearch Service surface GC collection time per node (CloudWatch `JVMGCYoungCollectionTime` / `JVMGCOldCollectionTime`); the same numbers feed this card. |
+| **Time window** | `5m` (rolling 5-minute total) |
+| **Alert trigger** | `> 1000ms in 5m window`. More than one second of accumulated pause in five minutes raises the card; sustained high pause time pages on-call. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The value is the increase in JVM GC collection time over the 5-minute window, summed across collectors and nodes:
+
+```text
+per node, per collector (young, old):
+  pause_delta = collection_time_in_millis(now)
+              - collection_time_in_millis(5 minutes ago)
+
+card value = sum of pause_delta across all collectors and data nodes
+           (total milliseconds spent paused for GC in the last 5 minutes)
+
+interpretation:
+  < ~200ms / 5m    healthy   (mostly cheap young-gen collections)
+  200 to 1000ms    elevated  (heap pressure building, watch heap)
+  > 1000ms / 5m    ALERT     (long old-gen pauses; node intermittently frozen)
+```
+
+Because `collection_time_in_millis` is a monotonic lifetime counter, the card takes the delta between two samples rather than reading it absolutely. The 1000ms alert is a total across the window: it can be one 1.2-second old-gen pause (one bad event) or many smaller pauses adding up (chronic pressure). Both matter, but a single long pause is usually the more acute signal because that is the node-freeze your users actually felt. The young/old split, available in the native stats, tells you which: dominated by young-gen is benign churn, dominated by old-gen is the heap-pressure red flag.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 3-node Elasticsearch cluster with 16 GB heap per node, serving storefront search. Snapshot taken on 05 May 26 at 13:20 BST. The card reads **1,840ms** for the trailing 5 minutes and has raised. At the same moment [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) has jumped from 140ms to 610ms.
+
+The on-call pulls the native per-node GC breakdown:
+
+```text
+GET /_nodes/stats/jvm?filter_path=nodes.*.jvm.gc,nodes.*.jvm.mem.heap_used_percent
+
+es-data-01  heap 91%  old-gc count +4  old-gc time +1,510ms   young-gc time +120ms
+es-data-02  heap 67%  old-gc count +0  old-gc time +0ms       young-gc time +95ms
+es-data-03  heap 70%  old-gc count +0  old-gc time +0ms       young-gc time +115ms
+```
+
+The story is clear from the split: **es-data-01 is at 91% heap and ran four old-generation collections totalling 1.5 seconds of pause**, while the other two nodes are healthy with only cheap young-gen activity. This is not a cluster-wide problem; it is one node under heap pressure, and that node hosting search shards is why p95 spiked (requests routed to it kept freezing).
+
+The on-call's decision tree:
+
+1. **Young or old?** Old-gen dominates (1,510ms of 1,840ms). This is heap pressure, not benign churn. Confirmed by es-data-01 at 91% heap.
+2. **What is filling the heap?** They check for a runaway query. `GET /_nodes/stats/breakers` shows the fielddata and request breakers on es-data-01 near their limits, and the tasks API reveals a large aggregation with a high-cardinality `terms` field running against that node. A single expensive aggregation was loading huge fielddata into heap.
+3. **Relieve the pressure.** They cancel the runaway task. Old-gen GC frees the reclaimed memory, heap on es-data-01 drops to 64%, GC pause time falls back under 200ms/5m on the next window, and p95 returns to 150ms.
+4. **Prevent recurrence.** They add a `search.max_buckets` guard and route heavy analytics aggregations to a dedicated index/alias so a single bad query cannot freeze the search-serving node again.
+
+```text
+Why the 5m window and the young/old split mattered:
+  - A single instantaneous reading might have missed the four discrete
+    old-gc pauses; the 5m total (1,840ms) captured the cumulative freeze.
+  - The young/old breakdown told the team this was heap pressure on ONE
+    node, not normal GC churn across all three. That pointed straight at
+    a node-local cause (the runaway aggregation), not a cluster sizing issue.
+  - Time from alert to recovery: 11 minutes, because the card pointed at
+    the right node and the heap card confirmed the cause.
+```
+
+Three takeaways:
+
+1. **GC pause time is a symptom; heap is the cause.** Never treat a GC alert in isolation. Always pull [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) at the same time; the fix is almost always relieving heap pressure, not tuning the collector.
+2. **The young/old split is the diagnosis.** Young-gen-dominated pause time is normal churn; old-gen-dominated is the red flag. The headline number alone does not tell you which, so check the native breakdown before acting.
+3. **Long pauses can cost you a node.** If a pause exceeds the master's fault-detection timeout, the node is declared dead and its shards reallocate, turning a memory problem into a [Cluster Status](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) yellow and a shard-rebuild storm. Catching sustained pauses early prevents that escalation.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards platform teams should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with GC Pause Time | What the combination tells you |
+| --- | --- | --- |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | The root cause behind almost every long pause. | High heap plus high GC pause equals memory pressure; relieving heap fixes both. |
+| [Circuit Breaker Trips (24h)](/nerve-centre/kpi-cards/elasticsearch/circuit-breaker-trips-24h) | The next thing that fires under heap pressure. | GC pauses plus breaker trips equals the JVM rejecting requests to avoid OOM; you are at the edge. |
+| [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) | The user-facing effect of a frozen node. | A p95 spike that lines up with a GC pause means searches queued behind the stop-the-world freeze. |
+| [Active Node Count](/nerve-centre/kpi-cards/elasticsearch/active-node-count) | The worst-case escalation. | A pause longer than fault detection drops the node; node count falling after a pause confirms it. |
+| [Cluster Status (green / yellow / red)](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) | What a dropped node does to allocation. | GC-driven node loss turns the cluster yellow as the lost node's replicas go unassigned. |
+| [Elasticsearch Health Score](/nerve-centre/kpi-cards/elasticsearch/elasticsearch-health-score) | The composite that GC pressure helps drag down. | Sustained pauses show up as falling heap and latency sub-scores in the rollup. |
+| [Search Error Rate %](/nerve-centre/kpi-cards/elasticsearch/search-error-rate) | Errors that follow a freeze. | Requests timing out during a long pause surface as a search-error bump. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> **`GET /_nodes/stats/jvm`** for the authoritative `jvm.gc.collectors` section: per-collector `collection_count` and `collection_time_in_millis`. The card derives its 5-minute delta from this.
+> **`GET /_cat/nodes?v&h=name,heap.percent,heap.current`** for a quick per-node heap view to find the pressured node.
+> **`GET /_nodes/stats/breakers`** to see whether circuit breakers are near their limits (the companion symptom).
+> **The node's GC log** (`gc.log`, enabled by default in the JVM options) for the ground-truth pause durations and causes (Allocation Failure, Ergonomics, etc.).
+
+On managed services the same data appears as the JVM GC young/old collection-time metrics: AWS OpenSearch/Elasticsearch Service CloudWatch (`JVMGCYoungCollectionTime`, `JVMGCOldCollectionTime`) and the Elastic Cloud monitoring JVM panels.
+
+**Why our value may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window alignment** | Variable | The card's 5-minute window may not line up with the period you eyeball in the GC log; the totals will differ unless you sum the same interval. |
+| **Counter delta vs absolute** | Card lower | The card reports the delta over 5 minutes; reading `collection_time_in_millis` raw gives the lifetime total, which is always much larger. |
+| **Per-collector summing** | Depends on view | The card sums young and old collectors and all nodes; a single-node, single-collector view in the API will read lower. |
+| **Poll timing** | Brief lag | Sampled every 60 seconds; a pause that falls right between samples is still captured in the next window's delta, but the timestamp may shift slightly. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ES Search Pool Saturation vs Ecom Burst](/nerve-centre/kpi-cards/elasticsearch/es-search-pool-saturation-vs-ecom-burst) | GC freezes worsen pool saturation. | A GC pause plus rising pool saturation during a burst means the frozen node is backing up the search queue. |
+| [Slow Searches During Checkout Window (5m)](/nerve-centre/kpi-cards/elasticsearch/slow-searches-during-checkout-window-5m) | A pause during checkout traffic is the worst-case timing. | GC pause coinciding with slow checkout searches links a node freeze directly to a revenue-sensitive window. |
+
+<details>
+<summary><em>Documentation cross-reference (same-concept peer)</em></summary>
+
+GC pause time is a property of any JVM-based system, so the concept is shared rather than reconciled.
+
+- OpenSearch equivalent: identical `jvm.gc.collectors` stats and CloudWatch GC collection-time metrics.
+- Generic JVM-app equivalent: any JVM service exposes GC pause via JMX / GC logs; the interpretation (young = cheap, old = pressure) is the same.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows GC pause time but my searches feel fine. Should I worry?**
+Check the young/old split first. If the pause time is dominated by young-generation collections it is normal churn and harmless even at a few hundred ms over 5 minutes. Worry when old-generation pauses dominate and the total crosses the 1000ms alert, especially if it coincides with a [Search Latency p95](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) spike. The number alone is not enough; the collector breakdown is the signal.
+
+**Can I fix this by tuning the garbage collector?**
+Almost never, and you usually should not try. Elasticsearch ships with a well-tuned default collector (G1 on modern versions) and the official guidance is not to change GC settings. Long pauses are a heap-pressure symptom; the fix is reducing what is loaded into heap (cap expensive aggregations, avoid huge fielddata, right-size shards) or adding heap/nodes, not collector flags.
+
+**Why does one node show high GC pause while the others are fine?**
+GC is per-JVM, so pressure is node-local. A single node can host a hot shard, receive a runaway aggregation, or load large fielddata while its peers stay idle. The native `GET /_nodes/stats/jvm` and a per-node heap check (`GET /_cat/nodes?v&h=name,heap.percent`) pinpoint the node; the cause is usually a query routed to that node's shards.
+
+**A long pause caused my node to drop out of the cluster. How?**
+If a stop-the-world pause exceeds the master's fault-detection timeout (the node cannot answer health pings while frozen), the master concludes the node has failed and removes it. Its shards then reallocate, turning the cluster yellow and triggering a rebuild. This is why sustained long pauses are dangerous: a memory problem becomes an availability problem. Relieve heap pressure before pauses reach that length.
+
+**My heap is set above 31 GB. Could that be making GC worse?**
+Yes, this is a classic pitfall. Heaps above roughly 30 to 32 GB lose compressed object pointers (compressed oops), so the JVM uses more memory per object and GC works harder for less effective heap. The standard guidance is to keep heap under ~31 GB and set Xms equal to Xmx. An oversized heap can paradoxically produce longer, more frequent old-gen pauses.
+
+**The pause time spikes briefly then returns to normal on its own. Is that a problem?**
+A single isolated old-gen pause that clears is worth noting but not alarming; it may have been a one-off expensive query that has since finished. The alert exists for the sustained case. If you see repeated 1000ms+ windows, that is chronic heap pressure and needs the heap-relief actions above. Use the trend, not a single window, to tell a blip from a pattern.
+
+**Does this card include the time spent on circuit-breaker rejections?**
+No. GC pause time measures only JVM garbage-collection stop-the-world time. Circuit-breaker trips are a separate, related symptom of heap pressure (the JVM rejecting requests before they cause OOM). They often fire together, which is why this card pairs with [Circuit Breaker Trips (24h)](/nerve-centre/kpi-cards/elasticsearch/circuit-breaker-trips-24h), but they are distinct measurements.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*GC Pause Time (5m total ms)* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

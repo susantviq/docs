@@ -1,0 +1,156 @@
+---
+title: "Connections Rejected Due to maxclients, Redis"
+sidebarTitle: "Connections Rejected Due to maxclients"
+description: "Connections Rejected Due to maxclients alert for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Redis accepts at most `maxclients` simultaneous connections (default 10000). Once that ceiling is hit, every new connection attempt is refused: the client gets `ERR max number of clients reached` and Redis bumps its `rejected_connections` counter. This card watches that counter for any upward movement. A rising `rejected_connections` means application servers cannot get a connection to Redis right now, which translates directly to failed reads, failed writes, and errors in front of users. For a platform or SRE team this is a saturation alarm: the instance is full and turning callers away.
+
+| | |
+| --- | --- |
+| **Data source** | `INFO clients` and `INFO stats`: `connected_clients` and `maxclients` for the ceiling, and the cumulative `rejected_connections` counter for refusals. |
+| **Metric basis** | Movement of the `rejected_connections` counter, not its absolute value (the counter only resets on restart). Any sustained increase fires. |
+| **Why the ceiling exists** | `maxclients` protects the instance from running out of file descriptors. Redis reserves ~32 descriptors for internal use, so the effective client limit may be slightly below the configured value if the OS `ulimit` is lower. |
+| **Aggregation window** | `RT` (real-time). The card raises the alert as soon as `rejected_connections` starts climbing between polls. |
+| **Alert trigger** | `rejected_connections increasing`. The headline shows the count of new refusals since the previous poll plus the current `connected_clients` against `maxclients`. |
+| **What does NOT count** | (1) Connections closed normally by the client; (2) connections dropped for idle timeout (`timeout` config); (3) connections killed by `CLIENT KILL`; (4) auth failures, those are refused for a different reason and counted elsewhere. Only refusals caused by hitting `maxclients` increment this counter. |
+| **Topology scope** | Per node. On a cluster each node has its own `maxclients` and its own counter; the card reads the worst node and can break down per node. |
+| **Time window** | `RT` (real-time, evaluated on every poll) |
+| **Alert trigger** | `rejected_connections increasing` |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calc */}
+Redis exposes a monotonic counter `rejected_connections` in the `# Stats` section of `INFO`. The card samples it each poll and watches the delta:
+
+```text
+new_rejections = rejected_connections_now - rejected_connections_prev
+```
+
+Any `new_rejections > 0` between consecutive polls fires the alert, because in a healthy steady state this counter never moves: an instance that is not at its ceiling never refuses a connection on `maxclients` grounds. The card also reads `connected_clients` and `maxclients` from `INFO clients` so the headline can show how close the instance is to the cap (`connected_clients / maxclients`) and confirm that the refusals are saturation, not a transient.
+
+Because the counter resets to zero on restart, a delta across a restart would be negative; the card detects the reset (current < previous) and treats it as no new rejections rather than reporting a nonsensical value.
+{/* /HUMAN_AUTHORED:calc */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Redis primary backing session storage and a rate-limiter for a storefront fleet of application servers. `maxclients` is left at the default 10000. Each app server runs a connection pool of up to 50 connections. Normally 30 app servers are online, so connection use sits around 1500, comfortably under the cap. Snapshot taken on 03 Jun 26 from 12:00 to 12:08 BST during an autoscaling event triggered by a flash sale.
+
+| Time (BST) | App servers | `connected_clients` | `rejected_connections` (cumulative) |
+| --- | --- | --- | --- |
+| 12:00 | 30 | 1,490 | 0 |
+| 12:03 | 120 (autoscaled) | 6,200 | 0 |
+| 12:05 | 200 (autoscaled) | 9,980 | 0 |
+| 12:06 | 220 | **10,000 (at cap)** | **0 -> 740** |
+| 12:08 | 240 | 10,000 (at cap) | **740 -> 3,160** |
+
+A flash sale triggered aggressive autoscaling. Each new app server opened its full pool, and by 12:06 the fleet demanded more than 10000 connections. Redis hit `maxclients` and began refusing every connection beyond the cap.
+
+```text
+INFO snapshot at 12:08:
+  connected_clients:10000
+  maxclients:10000              # at the ceiling
+  rejected_connections:3160    # climbing fast
+  -> new_rejections this interval: 2,420  -> ALERT
+  saturation: 10000 / 10000 = 100%
+```
+
+The Vortex IQ headline reads **3,160 rejected connections, 10000/10000 clients** in red. What the on-call engineer reads from this:
+
+1. **App servers cannot reach Redis.** Every refused connection is an app server that could not open (or re-open) its pool. Requests on those servers that need a session lookup or a rate-limit check fail or fall back to an error path. During a flash sale this is the worst possible time to start failing.
+2. **The cause is more clients than the cap allows, not a slow Redis.** Latency and OPS may look fine; the instance is healthy but full. The mismatch is between the fleet's total connection demand (240 servers x 50 = up to 12000) and the 10000 ceiling.
+3. **The fix is raising the cap or shrinking pools, both fast.** `CONFIG SET maxclients 20000` takes effect immediately (provided the OS file-descriptor `ulimit` allows it). Equally, reducing each app server's max pool size from 50 to 30 brings demand under 7200. The durable fix is sizing pools to the cap on purpose.
+
+```text
+Mitigation framing during the storm:
+  - Demand: 240 servers x 50 = up to 12,000 connections
+  - Ceiling: maxclients = 10,000  (saturated)
+  - Immediate: CONFIG SET maxclients 20000  (check OS ulimit -n first)
+  - Equally fast: cut app-server pool max from 50 to 30 -> demand 7,200
+  - Durable: cap pool size so fleet-max stays below maxclients with headroom
+  - Cross-check: confirm ulimit -n on the Redis host exceeds maxclients + 32
+```
+
+Three takeaways for the on-call DBA:
+
+1. **A rejection is a hard failure, not a slowdown.** Unlike a slow command, a refused connection gives the client nothing; the request fails outright. That is why any movement on this counter pages immediately rather than waiting for a sustained window.
+2. **Saturation is a sizing problem, not a performance problem.** Redis can be perfectly fast and still refuse connections. The fix lives in `maxclients`, the OS `ulimit`, and your client pool sizes, not in query tuning.
+3. **Watch the OS file-descriptor limit too.** Raising `maxclients` above what `ulimit -n` permits will not help, Redis caps the effective limit to the descriptors it actually has, reserving ~32 for itself. A `maxclients` bump that does not stop rejections almost always means the OS limit is the real ceiling.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside this one
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Connections Rejected | What the combination tells you |
+| --- | --- | --- |
+| [Clients vs maxclients %](/nerve-centre/kpi-cards/redis/clients-vs-maxclients) | The saturation gauge behind this alert. | At 100% plus rising rejections equals a confirmed connection-ceiling outage. |
+| [Connected Clients](/nerve-centre/kpi-cards/redis/connected-clients) | The raw count climbing toward the cap. | A steep climb here precedes the first rejection; an early-warning leading indicator. |
+| [Rejected Connections (24h)](/nerve-centre/kpi-cards/redis/rejected-connections-24h) | The trended daily total this alert thresholds. | Recurring daily spikes equal a chronic sizing problem, not a one-off. |
+| [Blocked Clients (BLPOP / BRPOP / WAIT)](/nerve-centre/kpi-cards/redis/blocked-clients-blpop-brpop-wait) | Blocked clients hold connection slots open. | Many blocked clients can consume the slot budget and bring on the ceiling faster. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live) | Throughput when callers are being refused. | OPS plateauing while rejections climb confirms the instance is full, not idle. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The executive composite this alert hits. | Rising rejections drag the health score down sharply; this card is the why. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis itself:**
+
+> **`INFO clients`** shows `connected_clients` and `maxclients`: `redis-cli INFO clients`. This tells you how close to the ceiling you are right now.
+> **`INFO stats`** holds the cumulative `rejected_connections` counter: `redis-cli INFO stats | grep rejected_connections`.
+> **`CONFIG GET maxclients`** confirms the configured ceiling, and `CONFIG SET maxclients <n>` raises it live.
+> **`CLIENT LIST`** enumerates every open connection (address, age, idle time, last command) so you can see which app servers or which command types are holding slots.
+> **`ulimit -n`** on the host (or `/proc/<pid>/limits`) confirms the OS file-descriptor cap, the true upper bound on `maxclients`.
+
+**Why our number may legitimately differ from a raw counter read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Delta vs total** | We show new rejections; `INFO` shows cumulative | `rejected_connections` only grows. Our headline is the increase since the last poll, so it will be smaller than the raw counter. |
+| **Restart reset** | Our delta ignores the reset | The counter resets to 0 on restart; we detect that and report no new rejections rather than a negative number. |
+| **Effective vs configured cap** | Saturation may hit below `maxclients` | If `ulimit -n` is below `maxclients`, Redis refuses connections before reaching the configured number; our saturation gauge reflects the effective limit, not just the config. |
+| **Per-node view** | Cluster totals differ | On a cluster we report the worst node, not the cluster sum; adding every node's counter exceeds our headline. |
+
+**Managed-service note:** AWS ElastiCache exposes `CurrConnections` and a per-node connection limit in CloudWatch; Azure Cache for Redis surfaces `Connected Clients` and a tier-based maximum in Azure Monitor; Redis Cloud shows connection counts and the plan's connection limit in its console. Managed tiers often set `maxclients` according to the plan and may not allow `CONFIG SET maxclients`, in which case the fix is scaling the plan or shrinking client pools. Reconcile our rejection count against the console's connection-limit metric for the same node and minute.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**I raised `maxclients` but rejections kept happening. Why?**
+Almost always the OS file-descriptor limit. Redis cannot accept more connections than it has descriptors, and it reserves about 32 for its own use. If `ulimit -n` on the host is 10240, setting `maxclients 20000` will not help, the effective ceiling is still ~10208. Raise the OS limit (`ulimit -n` for the process, plus systemd `LimitNOFILE` or the container's nofile setting) and then raise `maxclients`. Check `/proc/<pid>/limits` to confirm what the running process actually has.
+
+**My connection count is well below `maxclients` but I still saw rejections. How?**
+Two common causes. First, a brief burst pushed you to the cap momentarily between polls, then connections closed, so the live count looks fine but the counter moved. Second, the OS descriptor limit is below `maxclients`, so the effective ceiling is lower than the configured one. Use `CLIENT LIST` during the event and check `ulimit -n` to tell them apart.
+
+**What is the difference between a rejected connection and a dropped connection?**
+A rejected connection never gets established, Redis refuses it at accept time with `ERR max number of clients reached` because it is at the ceiling. A dropped connection was established and then closed later, by the client, by an idle `timeout`, or by `CLIENT KILL`. Only ceiling refusals increment `rejected_connections`; drops do not. This card is specifically the saturation signal.
+
+**Should I just set `maxclients` very high to be safe?**
+Not blindly. Each connection costs memory (an output buffer and bookkeeping) and a file descriptor. Setting `maxclients` far above what your host can support means Redis advertises a ceiling it cannot honour, and you hit the OS limit instead, with worse error behaviour. Size `maxclients` to comfortably exceed your fleet's peak pool demand, ensure `ulimit -n` exceeds `maxclients + 32`, and leave headroom for autoscaling, rather than picking an arbitrarily large number.
+
+**My connection pool churns constantly. Could that cause rejections without my fleet actually being large?**
+Yes. A pool that opens and closes connections rapidly (or short-lived clients that do not pool at all) can keep many half-closed connections in `TIME_WAIT` and momentarily exceed the cap even though steady-state demand is modest. The fix is persistent pooling: open a bounded pool once and reuse it, rather than connecting per request. `CLIENT LIST` showing thousands of very young connections is the tell.
+
+**On a cluster, only one node rejects connections. Why just one?**
+Connection demand is not evenly spread across a cluster. Clients connect to the node that owns the slots they need, so a hot key prefix or an uneven client-side routing can concentrate connections on one node while others sit idle. The card reports the worst node so the hot one surfaces. The fix is either raising that node's `maxclients`, smoothing the key distribution, or balancing client connections across nodes.
+
+**Does an idle-connection `timeout` help here?**
+It can. Setting the `timeout` config closes connections that have been idle for that many seconds, freeing slots held by app servers that opened a connection and went quiet. This is useful when a large fleet keeps many mostly-idle connections open. Be careful with it for clients that rely on long-lived connections (pub/sub subscribers, blocking consumers); a too-aggressive timeout will disconnect them mid-wait.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connections Rejected Due to maxclients* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,147 @@
+---
+title: "Replica Lag (seconds), kpi"
+sidebarTitle: "Replica Lag (seconds)"
+description: "Replica Lag (seconds) for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication & Cluster](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How many seconds behind the primary each replica is. Redis replication is asynchronous, so a replica always trails the primary by some amount; the question is how much. A few hundred milliseconds is normal. Ten seconds or more means the replica has fallen so far behind that promoting it during a failover would lose the last ten seconds of writes, and any reads served from it are stale by that much. For a platform team this is "if my primary dies right now, how much data do I lose, and how stale is everything my read-replicas are serving?"
+
+| | |
+| --- | --- |
+| **What it tracks** | The lag, in seconds, of each replica behind its primary. Reported per replica; the headline shows the worst (most lagged) replica. |
+| **Data source** | Redis `INFO replication` run *on each replica*: the `master_last_io_seconds_ago` field, the seconds since the replica last received data from the primary. The detail line: `master_last_io_seconds_ago from INFO replication on each replica.` |
+| **Time window** | `RT` (real-time, polled continuously per replica). |
+| **Alert trigger** | `> 10s`. A replica more than ten seconds behind is flagged: failover would lose writes and reads are materially stale. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card connects to each replica (not the primary) and reads `master_last_io_seconds_ago` from `INFO replication`. This field is the number of seconds since the replica last received any data, ping or command, from the primary. Under healthy streaming replication the primary sends a `PING` to replicas every `repl-ping-replica-period` seconds (default 10), so a healthy replica's `master_last_io_seconds_ago` oscillates between 0 and that ping interval and the card reports a low number.
+
+```text
+replica_lag_seconds = master_last_io_seconds_ago   (read on the replica)
+```
+
+Redis-specific nuances:
+
+- **`master_last_io_seconds_ago` is a connectivity proxy, not a byte-offset.** It tells you the replica heard from the primary recently; it does not directly measure how many bytes behind it is. For exact byte lag you compare `master_repl_offset` on the primary against the replica's offset. The card uses `master_last_io_seconds_ago` because it is the field exposed *on the replica* and rises sharply the instant the replication link stalls, which is the failure mode that matters most.
+- **`master_link_status` gates the reading.** If `master_link_status:down` the replica is not connected at all; the card surfaces that as a broken link rather than a lag number, because "lag" is meaningless when the stream is severed.
+- **A value of -1 or a very large number** indicates the replica has never synced or has lost the link entirely. The engine treats these as the maximum-severity case, not as "0 seconds behind".
+- **Per-replica reporting.** A primary with three replicas yields three readings; one slow replica (often a cross-region one) can be lagged while the others are healthy. The headline is the worst replica, but all are available for drill-down.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a primary in eu-west-1 with two replicas: one in-region for read scaling and failover, one in us-east-1 for a read-only reporting workload. Redis 7.2, self-hosted on EC2. Snapshot taken on 02 May 26 at 13:40 BST during a heavy write batch (a nightly catalogue reindex pushing several hundred thousand writes).
+
+| Replica | Region | `master_last_io_seconds_ago` | `master_link_status` |
+| --- | --- | --- | --- |
+| replica-a | eu-west-1 | 0 | up |
+| replica-b | us-east-1 | **23** | up |
+
+The headline shows **23s** in red (the worst replica), tripping the `> 10s` alert. The engineer reads it:
+
+1. **replica-a is healthy at 0 seconds.** In-region, low network latency, keeping pace with the write batch.
+2. **replica-b is 23 seconds behind.** The link is up, so this is not a disconnect, it is genuine lag. The cross-region link (eu-west-1 to us-east-1, around 70 to 90 ms RTT) cannot keep up with the burst of writes from the reindex, so the replication buffer is draining slower than it fills.
+3. **What is the impact?** The reporting workload reading from replica-b is serving data 23 seconds stale. For a reporting dashboard that is usually fine. But if replica-b were a failover candidate, promoting it now would lose 23 seconds of writes, which for an order or session store is unacceptable.
+
+```text
+Risk framing:
+  - replica-b lag: 23s and climbing during the batch
+  - Cross-region RTT ~80ms; write burst ~few hundred thousand keys
+  - Failover safety: replica-a (0s) is the correct promotion target,
+    NOT replica-b (23s) which would lose ~23s of writes
+  - Read staleness: reporting on replica-b is acceptable; serving
+    user sessions from it would not be
+
+Action:
+  1. Ensure replica-a (in-region) is the configured failover priority
+     (replica-priority lower number = higher priority)
+  2. Confirm the lag drains back toward 0 after the batch completes
+  3. If replica-b lag is chronic, raise repl-backlog-size or move the
+     reporting workload to a same-region replica
+```
+
+Three takeaways:
+
+1. **Lag is the data-loss budget for a failover.** N seconds of lag means promoting that replica loses up to N seconds of writes. For order and session stores, set `replica-priority` so the lowest-lag replica is always promoted first.
+2. **Cross-region replicas lag during write bursts, and that is physics.** An 80 ms link cannot stream a burst as fast as an in-region one. Size `repl-backlog-size` so a transient burst does not trigger a full resync, and do not put failover-critical or session reads on a cross-region replica.
+3. **Link up plus high lag is different from link down.** Up plus lag means the stream is flowing but slowly (network or write-rate bound). Down means the replica must resync from scratch (a partial or full sync), which is a far more severe event. Pair with [Connected Replicas](/nerve-centre/kpi-cards/redis/connected-replicas) to see if the link dropped entirely.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Replica Lag | What the combination tells you |
+| --- | --- | --- |
+| [Connected Replicas](/nerve-centre/kpi-cards/redis/connected-replicas) | The count of attached replicas and whether the link is up. | Lag high plus a replica dropping out equals a resync event, not just slow streaming. |
+| [Cluster Slots Assigned (of 16384)](/nerve-centre/kpi-cards/redis/cluster-slots-assigned-of-16384) | In cluster mode, replica health affects slot failover readiness. | A lagged replica on an unhealthy slot range means that slot has no safe failover target. |
+| [Cluster Slot Coverage Gap](/nerve-centre/kpi-cards/redis/cluster-slot-coverage-gap-16384-slots-assigned) | The cluster-level consequence of a failed failover. | A lagged replica that gets promoted (or cannot be) can leave a slot gap. |
+| [Last RDB Save (minutes ago)](/nerve-centre/kpi-cards/redis/last-rdb-save-minutes-ago) | Persistence is the other half of durability. | Lag plus a stale RDB equals weak durability: neither replica nor snapshot is current. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/redis/last-successful-backup-hours-ago) | The disaster-recovery backstop behind replication. | If both replica and backup are stale, the recovery point objective is at risk. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live) | Write rate is what the replica has to keep up with. | A write spike on the primary explains a corresponding lag spike on replicas. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The composite that weights replication health. | Sustained replica lag pulls the health score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis's own tooling:**
+
+> `redis-cli INFO replication` *run on the replica* shows `role:slave`, `master_link_status`, `master_last_io_seconds_ago`, and `slave_repl_offset`. The `master_last_io_seconds_ago` line is exactly what the card reads.
+> `redis-cli INFO replication` *run on the primary* lists each replica with `slaveN:ip=...,offset=...,lag=...`. Compare the primary's `master_repl_offset` against each replica's reported offset for the exact byte lag.
+> The offset difference in bytes (`master_repl_offset` on primary minus the replica's offset) is the precise lag; `master_last_io_seconds_ago` is the time-based proxy the card surfaces.
+
+For managed services:
+
+> **ElastiCache / MemoryDB:** the CloudWatch metric `ReplicationLag` (in seconds) is the direct equivalent and the canonical figure for AWS-managed clusters. Compare it node by node against the card.
+> **Azure Cache for Redis:** geo-replication lag is reported in Azure Monitor for the geo-replica link.
+> **Redis Cloud (Redis Enterprise):** the Active-Active / replica-of lag is reported in the database metrics view.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Time proxy vs byte offset** | Variable | `master_last_io_seconds_ago` measures time since last I/O; CloudWatch `ReplicationLag` and the offset diff measure the actual backlog. They agree directionally but not to the millisecond. |
+| **Ping interval flooring** | Ours floors near `repl-ping-replica-period` | On a quiet primary the field cycles up to the ping interval (default 10s) even with zero real lag; the engine accounts for this so an idle replica is not falsely flagged. |
+| **Per-replica vs aggregate** | Ours per replica | We report each replica; a managed-service single number may be the worst or an average. |
+| **Polling instant** | Marginal | Lag is dynamic during write bursts; two tools sampling seconds apart see different values. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My primary is idle and the replica shows 8 to 10 seconds of "lag". Is that bad?**
+No, that is the ping interval, not real lag. On a quiet primary, `master_last_io_seconds_ago` rises until the next periodic `PING` (every `repl-ping-replica-period` seconds, default 10) resets it to 0. The engine accounts for this so a low-traffic replica is not falsely alerted. Real lag shows as a *sustained* high value under active writes, not a sawtooth on an idle instance.
+
+**Is `master_last_io_seconds_ago` the same as how many writes I would lose on failover?**
+Not exactly, but it is the right alarm. The precise data-loss figure is the byte offset difference (`master_repl_offset` on the primary minus the replica's offset). `master_last_io_seconds_ago` is the time-based proxy that spikes the instant the link stalls, which is the failure you most need to catch. Use the offset diff for the exact recovery-point figure.
+
+**The link status says `down`. Why does the card not just show a huge lag number?**
+Because lag is meaningless when the stream is severed. A `down` link means the replica must resync (partial if the backlog covers the gap, full if not), which is a categorically more severe event than slow streaming. The card surfaces a broken link distinctly rather than as "infinity seconds behind".
+
+**How do I control which replica gets promoted on failover?**
+Set `replica-priority` (lower number equals higher priority; 0 means never promote). Configure your lowest-lag, in-region replica with the highest priority so a failover always promotes the replica with the smallest data-loss budget. Sentinel and Cluster both honour this.
+
+**My cross-region replica is chronically 20+ seconds behind. How do I fix it?**
+Cross-region lag during write bursts is largely network physics. Mitigations: raise `repl-backlog-size` so a transient burst does not force a full resync; do not put failover-critical or user-facing reads on the cross-region replica (use it only for reporting where staleness is acceptable); or add an in-region replica for failover and keep the cross-region one for analytics.
+
+**Does diskless replication change these numbers?**
+Diskless replication (`repl-diskless-sync yes`) changes how the *initial* full sync is transferred (streamed over the socket rather than via an RDB file on disk), which affects resync time. Steady-state streaming lag, what this card measures, is unaffected; `master_last_io_seconds_ago` behaves the same once the replica is in sync.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Replica Lag (seconds)* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

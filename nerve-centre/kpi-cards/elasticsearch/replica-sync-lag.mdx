@@ -1,0 +1,170 @@
+---
+title: "Replica Sync Lag, Elasticsearch"
+sidebarTitle: "Replica Sync Lag"
+description: "Replica Sync Lag for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication & Shards](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How far behind, in seconds, the replica shards are trailing their primaries. Elasticsearch replicates writes synchronously at acknowledgement time, but a replica can still fall behind on becoming searchable when it is slow to refresh, recovering, or starved of I/O. Lag matters because searches are served from primaries and replicas alike: when a replica trails, two identical queries that happen to land on a primary versus a lagging replica can return different (stale) results. Sustained lag also signals a replica that may fail to keep up under failover, undermining the redundancy you are paying for.
+
+| | |
+| --- | --- |
+| **API basis** | Derived from per-shard replication and refresh state: `GET /_stats` (`refresh` and `indexing` counters per shard), `GET /<index>/_segments` for searchable checkpoints, and recovery/seq-no progress via `GET /<index>/_recovery` and shard-level seq-no stats. Lag is the time gap between a primary's latest visible state and its replicas' latest visible state. |
+| **Metric basis** | A time delta in seconds, taken as the worst replica across the monitored indices so a single lagging replica is not averaged away. |
+| **Aggregation window** | Real-time (`RT`), polled on the standard cadence. The value is the current gap, not a rolling average. |
+| **Alert threshold** | `> 10s`. A replica more than ten seconds behind risks serving visibly stale results and is unlikely to be a healthy failover target. |
+| **Replication model** | Elasticsearch uses primary-backup replication: a write is acknowledged only after the primary and all in-sync replicas have it. "Lag" here is therefore mostly about search visibility and recovery progress, not lost durability. |
+| **What counts** | The visibility/recovery gap between primary and replica for the same shard: a replica refreshing slowly, a replica still recovering after reallocation, or a replica I/O-starved on a busy node. |
+| **What does NOT count** | Cross-cluster replication (CCR) follower lag, which is a separate feature with its own metric, and primary-to-primary divergence (there is only one primary per shard). |
+| **Time window** | `RT` (real-time, current gap) |
+| **Alert trigger** | `> 10s`, a replica trailing this far risks stale reads and weak failover. |
+| **Roles** | platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+For each replica shard the engine compares the latest searchable/applied state on the replica with that of its primary and expresses the gap in seconds:
+
+```text
+shard_lag_s = primary_latest_visible_time - replica_latest_visible_time
+replica_sync_lag = max(shard_lag_s across all monitored replica shards)   # worst replica
+```
+
+In a steady-state cluster every replica is at or within one refresh interval of its primary, so the value hovers near zero (or near the configured `refresh_interval`). Lag opens up in three situations. First, refresh skew: a replica on a slower or busier node refreshes later than its primary, so its latest segment is older. Second, recovery: a replica that was reallocated (node loss, rebalance) is still replaying operations to catch up and reports a recovery-progress gap. Third, I/O starvation: a node hosting both heavy indexing primaries and replicas cannot refresh replicas promptly.
+
+The card reports the worst replica because failover and stale-read risk are per-shard problems: one badly lagging replica on one shard is enough to serve stale results for that slice of data. The `> 10s` threshold sits above normal refresh-interval skew (typically 1s) but below the point where a replica is effectively useless as a search source or failover target.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 3-data-node Elasticsearch cluster serving product search, with 1 primary and 1 replica per shard. On 18 Mar 26 at 14:05 the Replica Sync Lag card jumps from a steady `~1s` to **34s** and pages the on-call SRE, who also notices the cluster has just gone yellow then back to green.
+
+Investigating with `GET /_cat/recovery?v&active_only=true` and `GET /_cat/shards?v`:
+
+| index | shard | prirep | state | node | recovery % |
+| --- | --- | --- | --- | --- | --- |
+| products | 2 | r | INITIALIZING | es-data-3 | 61% |
+| products | 2 | p | STARTED | es-data-1 | - |
+| reviews | 0 | r | STARTED | es-data-2 | - |
+
+The lagging shard is `products[2]`'s replica: 14 minutes earlier `es-data-2` had been restarted for an OS patch, the replica was reallocated to `es-data-3`, and it is now mid-recovery, replaying operations to catch up to the primary on `es-data-1`. Until recovery completes, that replica's searchable state trails the primary by tens of seconds.
+
+```text
+What the 34s gap means in practice:
+  - Searches for products served from products[2]'s replica may miss the last 34s
+    of catalogue updates (price changes, stock edits) that the primary already has.
+  - Two shoppers running the same search can see slightly different results depending
+    on whether their query lands on the primary or the recovering replica.
+  - The replica is NOT yet a safe failover target: if es-data-1 died now, promoting
+    this replica would lose nothing durable (writes were acked synchronously) but the
+    search-visible state would briefly regress to the replica's older refresh point.
+```
+
+The SRE confirms this is benign, expected recovery rather than a chronic problem: recovery is progressing (61% and climbing) and the cause (a planned node restart) is known. They let it finish. By 14:11 `products[2]`'s replica reaches `STARTED`, the lag falls back to ~1s, and the cluster is fully green with healthy redundancy.
+
+```text
+Contrast: when the SAME card stays high for hours
+  - If lag held at 30s+ with NO active recovery, the cause is refresh skew or I/O
+    starvation, not recovery. The fix is different:
+      - Rebalance so a single node is not hosting too many hot primaries + replicas.
+      - Raise refresh_interval on heavy-write indices so replicas refresh on a calmer cadence.
+      - Check disk I/O on the lagging replica's node.
+```
+
+Three takeaways:
+
+1. **Always check for active recovery first.** Most large lag spikes are a replica catching up after a node restart or rebalance, which is normal and self-healing. `GET /_cat/recovery?active_only=true` answers this in one call.
+2. **Lag is a search-consistency and failover-readiness signal, not a durability one.** Elasticsearch acks writes synchronously to in-sync replicas, so you are not losing data; you are risking stale reads and a replica that briefly is not a clean failover source.
+3. **Chronic lag with no recovery means resource skew.** If the number stays high without an active recovery, the node hosting the lagging replica is overloaded or I/O-starved, or the refresh cadence is too aggressive for the write volume.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Replica Sync Lag | What the combination tells you |
+| --- | --- | --- |
+| [Initializing / Relocating Shards](/nerve-centre/kpi-cards/elasticsearch/initializing-relocating-shards) | Recovery is the most common benign cause of lag. | Lag plus active initializing shards equals normal catch-up; lag with none equals resource skew. |
+| [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) | A replica that cannot allocate cannot sync at all. | Lag alongside unassigned shards means redundancy is genuinely degraded, not just delayed. |
+| [Cluster Status (green / yellow / red)](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) | Yellow often coincides with a recovering, lagging replica. | A yellow flash with a lag spike is the signature of a node restart and replica re-sync. |
+| [Avg Index Refresh Time (ms)](/nerve-centre/kpi-cards/elasticsearch/avg-index-refresh-time-ms) | Slow refresh on replicas directly widens lag. | High refresh time plus chronic lag points at segment/merge pressure on the replica's node. |
+| [Total Shards (primary + replica)](/nerve-centre/kpi-cards/elasticsearch/total-shards-primary-replica) | Too many shards per node starves replicas of I/O. | Chronic lag with a high shard count suggests over-sharding and node overload. |
+| [Active Node Count](/nerve-centre/kpi-cards/elasticsearch/active-node-count) | A lost node forces replica reallocation and recovery. | A node-count dip followed by a lag spike is the reallocation recovery story. |
+| [Elasticsearch Health Score](/nerve-centre/kpi-cards/elasticsearch/elasticsearch-health-score) | The composite that folds replication health in. | A health dip driven by replication shows up here first. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch itself:**
+
+> `GET /_cat/recovery?v&active_only=true` is the first call: it shows any replica mid-recovery, the usual cause of a lag spike, with per-shard percentage progress.
+> `GET /_cat/shards?v&h=index,shard,prirep,state,node,docs` reveals replica states and doc-count differences between a primary and its replica (a doc-count gap is the bluntest evidence of lag).
+> `GET /<index>/_stats?level=shards` exposes per-shard `refresh` and `indexing` counters so you can compare primary and replica refresh progress; `GET /<index>/_recovery` gives detailed translog/operations recovery numbers.
+
+**Why our number may legitimately differ from a manual reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Worst-replica vs per-shard** | Card higher | We report the single worst-lagging replica; inspecting one healthy shard by hand will look fine. |
+| **Refresh-interval skew baseline** | Card non-zero at rest | Even a perfectly healthy cluster shows ~1 refresh interval of skew; we report it rather than rounding to zero. |
+| **Polling instant** | Either | Recovery progresses second by second; your manual call and the card's last poll bracket different moments. |
+| **CCR confusion** | Large divergence | If you are reading a cross-cluster-replication follower-lag metric, that is a different feature; this card is intra-cluster replica visibility. |
+| **Managed service abstraction** | Either | Elastic Cloud and AWS-managed consoles may expose replication health as a status rather than a second-precise lag, so direct numeric comparison is not always possible. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Initializing / Relocating Shards](/nerve-centre/kpi-cards/elasticsearch/initializing-relocating-shards) | A lag spike should coincide with active recovery. | Lag with zero active recovery points at resource skew, not catch-up. |
+| [Avg Index Refresh Time (ms)](/nerve-centre/kpi-cards/elasticsearch/avg-index-refresh-time-ms) | Chronic lag should track slow replica refresh. | Lag while refresh is fast suggests recovery or network, not refresh cadence. |
+
+<details>
+<summary><em>Same-concept peer on other engines</em></summary>
+
+"How far behind is the replica" is a universal replication concern; only the unit and mechanism differ. This is **not** a reconciliation against a parallel system.
+
+- PostgreSQL equivalent: replication lag in bytes/seconds (`pg_stat_replication`, `replay_lag`).
+- MySQL equivalent: `Seconds_Behind_Master` / `Seconds_Behind_Source` from replica status.
+- MongoDB equivalent: replication lag from `rs.printSecondaryReplicationInfo()`.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Does replica lag mean I am losing data?**
+No. Elasticsearch uses primary-backup replication and acknowledges a write only after the primary and all in-sync replicas have received it, so the data is durable across copies. Lag here is about *search visibility* (a replica that has the data but has not yet refreshed it into a searchable segment) and *recovery progress* (a replica still catching up after reallocation). The risk is stale reads and a momentarily imperfect failover source, not lost writes.
+
+**My lag spiked to 30 seconds then recovered on its own. What happened?**
+Almost certainly a replica recovery. A node restart, rebalance, or brief network drop causes a replica to be reallocated and then replay operations to catch up to its primary. During catch-up it reports lag; when recovery completes, lag returns to baseline. Confirm with `GET /_cat/recovery?active_only=true`. This is normal, self-healing behaviour and does not need action beyond noting the trigger.
+
+**The lag is chronic but there is no active recovery. Why?**
+That points at resource skew rather than catch-up. The most common causes are: a single node hosting too many hot primaries and their replicas, so replicas cannot refresh promptly; disk I/O starvation on the replica's node; or a refresh interval too aggressive for the write volume. Rebalance the shards, check node-level disk I/O, and consider raising `refresh_interval` on heavy-write indices.
+
+**Can two users really see different search results because of this?**
+Yes, briefly. Elasticsearch routes a search to either the primary or a replica of each shard for load balancing. If a replica is lagging, a query landing on it can miss the most recent updates the primary already shows. For most catalogues a few seconds of skew is invisible, but for fast-moving data (live pricing, stock) it can matter. If strict read consistency is required for a query, you can route it with a preference such as `_primary` at the cost of losing replica load-balancing.
+
+**Is this the same as cross-cluster replication (CCR) lag?**
+No. This card measures intra-cluster replica visibility within a single cluster. CCR follower lag measures how far a follower index in a *different* cluster trails its leader, and it has its own dedicated metric and failure modes. If you run CCR, monitor follower lag separately; do not read this card as your CCR health.
+
+**How do I reduce normal baseline lag?**
+Some baseline skew equal to roughly one refresh interval is inherent and healthy; chasing it to absolute zero is not worth it. To reduce genuine excess lag: ensure shards are balanced so no node is overloaded, give heavy-write indices a longer `refresh_interval` so replicas refresh on a calmer cadence, provision adequate disk I/O, and avoid co-locating many hot primaries with replicas of other hot shards on the same node.
+
+**Why does the card show the worst replica rather than an average?**
+Because the risks (stale reads, weak failover) are per-shard. One replica lagging 30 seconds on one shard means that slice of your data is serving stale results and has a compromised failover copy, regardless of how healthy every other shard is. An average would hide that single problem. Reporting the worst replica makes the alert fire when any one shard's redundancy is degraded.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Replica Sync Lag* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

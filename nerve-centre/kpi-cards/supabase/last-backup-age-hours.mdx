@@ -1,0 +1,148 @@
+---
+title: "Last Backup Age (hours), Supabase"
+sidebarTitle: "Last Backup Age (hours)"
+description: "Last Backup Age (hours) for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Backup](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How many hours have passed since your most recent successful Supabase backup completed. This is your recovery insurance, measured in time. If disaster strikes (a bad migration, accidental `DELETE` without a `WHERE`, a corrupted table), this number tells you how much data you stand to lose: everything written since the last good backup. Supabase takes daily logical backups on Pro and above, with Point-in-Time Recovery (PITR) available as an add-on on higher tiers. The Free tier has no backups at all. A healthy Pro project should read under 24 hours; anything over 72 hours means the backup schedule has silently stopped and your recovery window is widening by the minute.
+
+| | |
+| --- | --- |
+| **What it tracks** | Elapsed wall-clock hours between now and the completion timestamp of the most recent successful backup recorded for the project. |
+| **Data source** | Supabase backup records: the daily logical backup history exposed in the project Database → Backups page, and the PITR recovery window where the add-on is enabled. The card reads the latest successful backup completion time. |
+| **Time window** | `RT` (real-time): the age is recomputed continuously against the current clock, so it ticks upward until the next backup lands and resets it. |
+| **Alert trigger** | `>72h`. Past 72 hours, the card turns red and feeds the Nerve Centre incident feed: it means at least two scheduled daily backups have failed to complete or were never taken. |
+| **Why it matters** | Backup age is the upper bound on your data-loss exposure. A project with a 6-hour age can lose at most 6 hours of writes; a project at 90 hours can lose nearly four days. The number only matters on the worst day, but on that day it is the single most important figure on the dashboard. |
+| **Reading the value** | Under 24h: healthy daily cadence (or PITR, which makes the age effectively minutes). 24 to 72h: a backup was skipped, investigate. Over 72h: backups have stalled or the project is on a tier with no backup; act now. |
+| **Roles** | platform/SRE, owner, engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card is a straightforward age computation:
+
+```text
+Last Backup Age (hours) = (now − last_successful_backup_completed_at) / 3600
+```
+
+The reference point is the **completion** timestamp of the most recent backup that finished successfully, not when it started and not when it was scheduled. A backup that started but failed (ran out of time, hit a lock, errored mid-dump) does not reset the clock; only a confirmed-good backup does. This matters because a partial or failed backup is worse than useless: it gives false comfort while the age keeps climbing.
+
+Two backup mechanisms feed the timestamp depending on your tier:
+
+- **Daily logical backups (Pro and above):** Supabase runs a scheduled `pg_dump`-style logical backup once per day. The completion time of the latest one sets the age. On a healthy project this number sits between 0 and 24 hours and saws back to near zero each day when the new backup lands.
+- **Point-in-Time Recovery (PITR add-on, higher tiers):** PITR continuously ships write-ahead log (WAL) segments, so the effective recovery point is only seconds to minutes old. Where PITR is enabled, the card reflects the edge of the PITR window, which is why a PITR project reads a very low age almost all the time.
+
+On the **Free tier there is no backup mechanism at all**, so there is no completion timestamp to measure against. The card surfaces this explicitly rather than showing a misleadingly large number: there is nothing to age because nothing is being captured.
+
+The age is real-time: it is `now` minus a fixed past timestamp, so it increments every second until a fresh backup resets the base. That continuous tick is deliberate, it makes a stalled schedule visible as a number that keeps growing past its normal daily ceiling.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs the production database for a subscription box service on Supabase Pro (daily backups, no PITR add-on). They expect the age to saw between roughly 0 and 24 hours. Snapshot reviewed on 18 Apr 26 at 08:00 BST.
+
+| Date | Scheduled backup | Completed at | Age at 08:00 next day | Card state |
+| --- | --- | --- | --- | --- |
+| 15 Apr 26 | 02:00 | 02:14 (success) | ~6h | green |
+| 16 Apr 26 | 02:00 | 02:11 (success) | ~6h | green |
+| 17 Apr 26 | 02:00 | **failed** (lock timeout) | ~30h | amber |
+| 18 Apr 26 | 02:00 | **failed** (lock timeout) | **~54h and climbing** | amber, heading red |
+
+On the morning of 18 Apr the card reads **~54 hours**. The team had been running a long migration each night that held an exclusive lock past 02:00, so the backup could not start and timed out. Two nights in a row the daily backup never completed, and the age has climbed past one full day and is heading for the 72-hour red line.
+
+```text
+Exposure if a disaster hit at 08:00 on 18 Apr 26:
+  - Last good backup completed:   16 Apr 26 02:11
+  - Current time:                 18 Apr 26 08:00
+  - Data at risk on restore:      everything written since 16 Apr 02:11
+                                  ≈ 54 hours of orders, sign-ups, and updates
+  - With PITR enabled instead:    exposure would be seconds, not 54 hours
+```
+
+What the team should do, in order:
+
+1. **Restore the backup schedule first, diagnose second.** Move the nightly migration window so it does not overlap 02:00, or run it with a lock timeout so it yields. Get a clean backup tonight to stop the bleed; the migration scheduling fix can follow.
+2. **Take a manual backup now.** Do not wait for the next scheduled slot. A manual logical backup immediately resets the age and caps the exposure at the present moment.
+3. **Consider the PITR add-on.** For a revenue database, a 24-hour exposure ceiling is the wrong risk posture. PITR drops the realistic loss to minutes. The cost of PITR is far smaller than the cost of replaying 54 hours of orders by hand.
+
+Three takeaways:
+
+1. **A failed backup does not reset the clock.** The age tracks the last *successful* completion. A schedule that runs but fails every night looks busy and is silently useless; this card exposes it because the number keeps climbing.
+2. **The daily saw-tooth is the healthy shape.** On a daily-backup project the number should rise to roughly 24 hours and drop back to near zero every day. A flat-but-low number means PITR; a number that never drops means a stalled schedule.
+3. **Age is your recovery-point objective in disguise.** If your business cannot tolerate losing more than an hour of data, a daily-backup tier cannot meet that RPO no matter how healthy the card looks. The age ceiling is the RPO; if 24 hours is too much, you need PITR.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Last Backup Age | What the combination tells you |
+| --- | --- | --- |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/supabase/database-disk-usage) | A near-full disk can block or slow backups and push the project into restricted mode. | High disk plus a climbing backup age often share a root cause: the backup cannot complete because the instance is constrained. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite that takes backup recency as a durability input. | A stale backup drags the health score; use the score for the executive headline and this card for the detail. |
+| [Database Query Error Rate %](/nerve-centre/kpi-cards/supabase/database-query-error-rate) | A backup that fails on locks or errors often coincides with query-layer trouble. | Both moving together points at instance-level stress rather than a pure scheduling miss. |
+| [Read Replica Lag (seconds)](/nerve-centre/kpi-cards/supabase/read-replica-lag-seconds) | Replicas are a recovery and availability sibling, not a backup substitute. | A replica protects against instance failure but not against bad writes; pair the two to reason about full DR coverage. |
+| [Memory Usage %](/nerve-centre/kpi-cards/supabase/memory-usage) | Memory pressure can starve a backup job mid-run. | High memory during the backup window plus a failed backup explains the climbing age. |
+| [Project Uptime](/nerve-centre/kpi-cards/supabase/project-uptime) | Availability sibling. | Good uptime with a stale backup is a false sense of safety: the project is up but undefended against data loss. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase's own tooling:**
+
+> **Project Dashboard → Database → Backups** for the list of daily logical backups with their completion timestamps and status. The most recent successful entry is what the card measures against.
+> **Project Dashboard → Database → Backups → Point in Time** (where the PITR add-on is enabled) for the recovery window edge, which is the effective "age" on PITR projects.
+> **Project Settings → Add-ons** to confirm whether PITR is enabled, since that changes how the age behaves (continuous WAL versus daily snapshots).
+
+**Why our number may legitimately differ from the Supabase UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Completion versus schedule time** | Vortex IQ may read slightly older | We anchor on the backup completion timestamp; if you read the age off the scheduled slot, the completion may be minutes later, so our age is marginally larger. |
+| **PITR window edge** | Vortex IQ reads very low | On PITR projects the card reflects the WAL recovery edge (seconds to minutes), whereas the daily-backup list still shows day-old snapshots. Both are correct; they measure different mechanisms. |
+| **Time zone** | Display only | Supabase shows backup times in the dashboard's timezone; Vortex IQ stores UTC and renders the age (a duration), so the absolute timestamps may look offset while the elapsed hours match. |
+| **Free tier** | No value | There is no backup record on Free, so there is nothing to age. The card flags the absence rather than computing a number. |
+| **Failed backups** | Vortex IQ keeps climbing | A failed or partial backup does not reset the age; if the Supabase list shows a recent *attempted* backup that errored, our number ignores it and keeps counting from the last good one. |
+
+**Cross-connector reconciliation:** treat this card as the durability counterpart to your platform availability metrics. A green uptime number tells you the service is reachable; this card tells you what happens if the data inside it is destroyed. Both must be healthy for a true DR-ready posture. If you also run an external backup or DR pipeline, reconcile its last-run timestamp against this card; a gap means one of the two pipelines has stalled.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My card reads "no backup" or a very large number. What is wrong?**
+Either the project is on the Free tier (which has no backup mechanism, so there is nothing to measure), or every scheduled backup has failed and there has never been a successful completion to anchor on. Check Database → Backups: if the list is empty or every entry shows an error, the schedule has never produced a good backup. Take a manual backup immediately and, if on Free, upgrade to a tier that includes backups before relying on this card.
+
+**The age never drops below ~24 hours even though backups run nightly. Is that a problem?**
+No, that is the expected shape for daily logical backups. The age saws up to roughly 24 hours and resets when the new backup lands. If 24 hours of potential data loss is unacceptable for your business, the fix is the PITR add-on, which drops the effective age to minutes, not a tweak to this card.
+
+**The age keeps climbing past 72 hours. The backup "runs" every night, so why?**
+A backup that runs but fails does not reset the age; only a successful completion does. The most common cause is a long-running migration or batch job holding an exclusive lock through the backup window, so the dump times out. Check the backup status in the dashboard (not just whether one was attempted), move conflicting jobs out of the backup window, and take a manual backup now to stop the exposure growing.
+
+**Does a read replica count as a backup?**
+No. A replica protects against instance or zone failure by holding a live copy, but it faithfully replicates bad writes too. If you run `DELETE` without a `WHERE`, the replica deletes the same rows seconds later. Backups (and PITR) protect against bad data; replicas protect against infrastructure failure. You need both for full coverage, and this card only measures the backup side.
+
+**I enabled PITR but the daily backup list still shows day-old snapshots. Which is my real exposure?**
+With PITR enabled your real recovery point is the PITR window edge (seconds to minutes), and that is what the card reflects. The daily logical snapshots still exist as a coarser fallback, which is why the backup list shows older entries. Trust the PITR window for your true exposure figure.
+
+**Can I change the alert threshold from 72 hours?**
+Yes, in the Sensitivity tab. A project that genuinely cannot take daily backups (rare) might widen it, but most teams should tighten it: on a daily-backup project, alerting at 30 hours catches a single missed backup before it compounds into two. On a PITR project you can set it very low because the age should never exceed minutes.
+
+**The backup completed but I am not sure it is restorable. Does a successful completion guarantee a good restore?**
+A successful completion is necessary but not sufficient. The only way to be confident in a restore is to test it: periodically restore a backup into a scratch project and verify the data. This card tells you a backup *exists and is recent*; it cannot tell you the restore will succeed. Schedule a quarterly restore drill and treat it as part of your DR routine.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Last Backup Age (hours)* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

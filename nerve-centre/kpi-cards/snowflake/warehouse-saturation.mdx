@@ -1,0 +1,146 @@
+---
+title: "Warehouse Saturation %, Snowflake"
+sidebarTitle: "Warehouse Saturation %"
+description: "Warehouse Saturation % for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How full each warehouse is, expressed as the share of its concurrency capacity currently in use: running queries divided by the warehouse's maximum concurrency level. A gauge near 100% means the warehouse is at the edge of what it can run at once, so the next query queues instead of starting. Sustained saturation is the clearest live signal that a warehouse needs to be upsized (more compute per cluster) or made multi-cluster (more clusters to absorb concurrency). For a platform team it answers, in one glance: which warehouse is about to start making everyone wait?
+
+| | |
+| --- | --- |
+| **What it tracks** | Per-warehouse saturation: `running_queries / max_concurrency_level`, shown as a percentage on a gauge. 100% means every concurrency slot is occupied and further queries must queue. |
+| **Data source** | Live warehouse state: running query count from `QUERY_HISTORY` / live monitoring, divided by the warehouse's effective `MAX_CONCURRENCY_LEVEL` (from `SHOW PARAMETERS`). Sustained 100% indicates a need to upsize or go multi-cluster. |
+| **Time window** | `RT/1m`. Real-time, evaluated on a rolling 1-minute basis so a single momentary spike does not trip the gauge. |
+| **Alert trigger** | `> 90%`. When saturation holds above 90% for the rolling minute, the card flags amber/red and the sensitivity rule fires. |
+| **Units** | Percent (0 to 100) per warehouse. The headline shows the most-saturated warehouse; the gauge is per-warehouse on drill-in. |
+| **Concurrency vs size** | `MAX_CONCURRENCY_LEVEL` (default 8) controls how many queries run at once per cluster; warehouse size (X-Small to 6X-Large) controls how much compute each query gets. Saturation is about the former. |
+| **Roles** | owner, platform, dba, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Saturation is concurrency utilisation, not CPU utilisation. Snowflake admits a bounded number of queries to run simultaneously on a warehouse; that ceiling is `MAX_CONCURRENCY_LEVEL` (default 8) per cluster. Per warehouse, over the rolling minute:
+
+```text
+running_queries     = count of queries in 'EXECUTING' state on the warehouse now
+clusters_running    = active cluster count (1 for single-cluster warehouses)
+capacity            = MAX_CONCURRENCY_LEVEL * clusters_running
+
+saturation_pct      = running_queries / capacity * 100
+headline            = max(saturation_pct) across all warehouses, smoothed over 1m
+```
+
+For multi-cluster warehouses, capacity scales with the number of clusters Snowflake has spun up, so a warehouse set to scale out can absorb a concurrency surge by adding clusters rather than queueing, in which case saturation stays moderate even under heavy load. For a single-cluster warehouse there is no relief valve: once `running_queries` reaches `MAX_CONCURRENCY_LEVEL`, saturation pins at 100% and new queries enter the queue (visible as `QUEUED_OVERLOAD_TIME` in `QUERY_HISTORY`). The 1-minute smoothing prevents a brief burst from tripping the `> 90%` alert; only sustained saturation flags.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs Snowflake behind an Adobe Commerce store's reporting layer. The reporting warehouse `BI_WH` is a Medium, single-cluster, `MAX_CONCURRENCY_LEVEL = 8`. Snapshot at 09 Jun 26, 09:05 UTC, during the Monday morning dashboard rush.
+
+| Warehouse | Size | Clusters | `MAX_CONCURRENCY_LEVEL` | Running queries | Saturation |
+| --- | --- | --- | --- | --- | --- |
+| `BI_WH` | Medium | 1 | 8 | 8 | **100%** |
+| `TRANSFORM_WH` | Large | 1 | 8 | 3 | 38% |
+| `INGEST_WH` | Small | 1 | 8 | 1 | 13% |
+| `ADHOC_WH` | X-Small | 1 | 8 | 2 | 25% |
+
+The headline gauge reads **100% on `BI_WH`**, well past the 90% trigger, so the card is red.
+
+What is happening: every Monday at 09:00 the whole analytics team opens their dashboards at once. `BI_WH` admits 8 queries, the 9th onwards queue. Analysts experience this as dashboards that "hang" for 10 to 40 seconds before painting. The warehouse is not slow, it is full: each individual query runs fine, but there are more concurrent queries than concurrency slots.
+
+The fix is concurrency, not size. Upsizing `BI_WH` from Medium to Large would give each query more compute (faster individual runtime) but `MAX_CONCURRENCY_LEVEL` stays 8, so the 9th query still queues. The right lever is multi-cluster:
+
+```text
+Option A (wrong lever): Medium -> Large
+  - Each query ~30% faster, but capacity still 8.
+  - 9th+ query still queues. Saturation still pins at 100% during the rush.
+
+Option B (right lever): convert BI_WH to multi-cluster, MIN 1 / MAX 3, ECONOMY
+  - 09:00 surge: Snowflake spins up cluster 2 and 3 automatically.
+  - Capacity 8 -> up to 24. Saturation drops to ~33% at the same load.
+  - Off-peak: scales back to 1 cluster, so no idle credit penalty.
+  - Queueing (QUEUED_OVERLOAD_TIME) falls to near zero.
+```
+
+Three takeaways:
+
+1. **Saturation is a concurrency problem, so the cure is usually more clusters, not a bigger warehouse.** Upsizing helps single slow queries; multi-cluster helps too many queries at once.
+2. **Read the gauge with the queue card.** Sustained 100% saturation and rising [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse) together confirm real queueing, not just a healthy busy warehouse.
+3. **Multi-cluster on ECONOMY mode is cheap insurance.** It only adds clusters when concurrency demands it and scales back when the rush passes, so you pay for the surge, not for keeping it warm all day.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Warehouse Saturation | What the combination tells you |
+| --- | --- | --- |
+| [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse) | The direct consequence of saturation: queries waiting. | 100% saturation with deep queueing equals real concurrency starvation, not a healthy busy warehouse. |
+| [Warehouse Queueing Sustained (>5 queries queued)](/nerve-centre/kpi-cards/snowflake/warehouse-queueing-sustained-5-queries-queued) | The alert that fires when saturation translates into a backlog. | Sustained saturation is the leading indicator; sustained queueing is the confirmed impact. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/snowflake/query-latency-p95-ms) | Queue time inflates end-to-end latency even when execution is fast. | Rising p95 with high saturation means the wait, not the compute, is the bottleneck. |
+| [Queries per Hour (live)](/nerve-centre/kpi-cards/snowflake/queries-per-hour-live) | The load driving saturation up. | A QPS surge plus rising saturation pinpoints the concurrency pressure source. |
+| [Credits by Warehouse (7d)](/nerve-centre/kpi-cards/snowflake/credits-by-warehouse-7d) | The cost side of any upsize or multi-cluster decision. | Confirms which warehouse to invest concurrency budget in. |
+| [Snowflake Health Score](/nerve-centre/kpi-cards/snowflake/snowflake-health-score) | The composite that takes saturation as a capacity input. | Sustained saturation pulls the capacity dimension of the score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake:**
+
+> **Snowsight → Admin → Warehouses** shows each warehouse's live load, running and queued query counts, and cluster count.
+> `SHOW PARAMETERS LIKE 'MAX_CONCURRENCY_LEVEL' IN WAREHOUSE <name>;` confirms the concurrency ceiling.
+> Query `SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY` (columns `AVG_RUNNING`, `AVG_QUEUED_LOAD`, `AVG_QUEUED_PROVISIONING`) for the historical load profile.
+> `SHOW WAREHOUSES;` reveals current state, size, and `MIN`/`MAX_CLUSTER_COUNT`.
+
+**Why our number may legitimately differ from Snowflake's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Capacity definition** | Variable | We compute saturation against `MAX_CONCURRENCY_LEVEL * active_clusters`; `WAREHOUSE_LOAD_HISTORY` reports `AVG_RUNNING` as a fractional load, not a percentage of a fixed ceiling. |
+| **Smoothing window** | Vortex IQ steadier | Snowsight shows instantaneous load; we smooth over a rolling minute, so a sub-minute spike shows higher in Snowsight than on our gauge. |
+| **Multi-cluster timing** | Brief divergence | When a cluster is mid-spin-up, capacity is changing; our value uses the cluster count at sample time. |
+| **`WAREHOUSE_LOAD_HISTORY` latency** | Historical lag | That `ACCOUNT_USAGE` view trails real time; the live gauge uses fresher monitoring, so do not expect minute-exact agreement against the historical table. |
+| **Query admission edge cases** | Marginal | Snowflake may admit small queries beyond the nominal level under some conditions; counts can momentarily read slightly above 100%. |
+
+**Cross-connector reconciliation:** if [Snowflake QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/snowflake/snowflake-qps-spike-vs-ecom-order-rate) shows a query surge with no matching order spike, the saturation may be driven by a dashboard storm or a runaway scheduled job rather than genuine business load.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Is 100% saturation always bad?**
+No. A warehouse running at 100% with no meaningful queue is simply well-utilised, which is efficient. The concern is *sustained* 100% with queries piling into the queue, because that is when users feel the wait. Always read this gauge with [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse).
+
+**My warehouse is saturated. Should I make it bigger?**
+Usually not for saturation alone. Warehouse size (X-Small to 6X-Large) gives each query more compute; it does not raise `MAX_CONCURRENCY_LEVEL`, which is what saturation measures. To absorb more concurrent queries, convert to multi-cluster (raise `MAX_CLUSTER_COUNT`) so Snowflake adds clusters during surges. Upsize only if individual queries are also slow.
+
+**What is the difference between saturation and CPU utilisation?**
+Saturation here is concurrency utilisation: how many of the warehouse's query slots are in use. It is not a CPU or memory percentage. A warehouse can be 100% saturated (all 8 slots busy) while each query is light, or 25% saturated while two heavy queries hammer the compute. Snowflake does not expose raw CPU per warehouse, so concurrency is the meaningful saturation signal.
+
+**Why does the gauge sometimes read just over 100%?**
+Snowflake can briefly admit additional lightweight queries beyond the nominal `MAX_CONCURRENCY_LEVEL` under certain conditions, and there is a small timing window when a cluster is spinning up or down. We surface the real ratio, so transient readings slightly above 100% are expected and harmless.
+
+**Does multi-cluster scaling make saturation disappear?**
+It moves the ceiling. A multi-cluster warehouse adds clusters during a surge, multiplying capacity, so saturation drops as long as you have not hit `MAX_CLUSTER_COUNT`. If you are pinned at max clusters and still saturated, you genuinely need a higher cluster cap or workload separation.
+
+**Why the 90% trigger and not 100%?**
+Because 90% sustained is the early-warning point: it means you are one or two queries away from queueing on the next surge. Waiting for 100% means waiting until users are already feeling lag. Adjust the threshold per warehouse in the Sensitivity tab to match how bursty that workload is.
+
+**Should every warehouse be multi-cluster as a precaution?**
+No. Multi-cluster suits warehouses with spiky concurrency (interactive BI, analyst pools). For steady, serialised pipelines (ELT, ingest) where queries run one or two at a time, a single cluster is cheaper and never saturates. Match the topology to the workload shape, which [Credits by Warehouse (7d)](/nerve-centre/kpi-cards/snowflake/credits-by-warehouse-7d) helps you reason about.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Warehouse Saturation %* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

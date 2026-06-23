@@ -1,0 +1,175 @@
+---
+title: "Elasticsearch Health Score, Elasticsearch"
+sidebarTitle: "Elasticsearch Health Score"
+description: "Elasticsearch Health Score for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A single 0 to 100 composite that rolls the cluster's most important signals into one number a platform lead can glance at without reading a dozen cards. It blends cluster status, shard allocation, JVM heap pressure, disk headroom, search latency and error rate into a weighted score, then renders it as a gauge. Think of it as the cluster's overall vital sign: 90+ is healthy, 70 to 89 is "watch it", and below 70 means at least one underlying system is in trouble and the score is telling you to drill in. It is deliberately a summary, not a diagnosis; when it drops, the component cards tell you why.
+
+| | |
+| --- | --- |
+| **Data source** | A Vortex IQ composite computed from `GET /_cluster/health`, `GET /_nodes/stats` (JVM, HTTP, thread pools) and indices stats (search latency, error rate). No single Elasticsearch field returns this; it is derived. |
+| **Metric basis** | Weighted blend of cluster colour, unassigned-shard ratio, JVM heap %, disk usage vs watermark, search p95 latency and search error rate. Each component is normalised to 0 to 100, then weighted and summed. |
+| **Aggregation window** | Real-time poll (every 60 seconds) for the live gauge, with a 7-day trend line so you can see slow degradation, not just the instant value. |
+| **Scale** | 0 to 100. Higher is healthier. The gauge bands are green (90+), amber (70 to 89), red (below 70). |
+| **Biggest single drivers** | Cluster status is the heaviest weight: a red cluster caps the score low regardless of other components. JVM heap above 90% and disk above the flood-stage watermark are the next hardest hits. |
+| **What it is not** | Not an Elasticsearch-native metric and not a capacity forecast. It is a present-moment health summary. For sizing and trends use the component cards directly. |
+| **Managed-service note** | Elastic Cloud's deployment health and AWS OpenSearch's cluster-health metrics cover the same ground but as separate signals; this card is the one-number rollup. |
+| **Time window** | `RT/7D` (live gauge plus 7-day trend) |
+| **Alert trigger** | `< 70`. Dropping below 70 raises the card; a sustained sub-70 reading pages the platform on-call. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The score is a weighted average of normalised component sub-scores. Each input is mapped to a 0 to 100 health value (100 = ideal, 0 = critical), then combined:
+
+```text
+component sub-scores (each normalised 0..100, 100 = best):
+  cluster_status   green=100, yellow=60, red=0
+  shard_health     100 - (unassigned_shards / total_shards * 100)
+  heap_health      100 above ~75% heap it ramps down; 90%+ approaches 0
+  disk_health      100 until high watermark, ramps to 0 at flood stage (95%)
+  search_latency   100 at/under target p95; ramps down past the latency alert
+  error_health     100 at 0% search errors; ramps down past the 1% alert
+
+health_score = round(
+    cluster_status * w1 + shard_health * w2 + heap_health * w3
+  + disk_health * w4 + search_latency * w5 + error_health * w6 )
+
+where the weights sum to 1 and cluster_status carries the largest weight.
+```
+
+The cluster-status term is weighted hardest because shard availability is the most consequential failure mode: a red cluster (data unavailable) should never produce a healthy headline even if every other signal is fine. The result is clamped to 0 to 100 and the gauge colour follows the bands (green 90+, amber 70 to 89, red below 70). The 7-day trend line is the same calculation sampled over time so you can distinguish a one-off dip from a slow slide.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team owns a 5-node Elasticsearch cluster serving storefront search and an internal logging index. Snapshot taken on 22 Apr 26 at 14:40 BST. The gauge reads **64** and the card has raised because it crossed below 70 about 20 minutes earlier. The on-call opens the component cards to decompose it:
+
+| Component | Reading | Sub-score | Weight | Contribution |
+| --- | --- | --- | --- | --- |
+| Cluster status | yellow (replicas missing on logging index) | 60 | 0.30 | 18.0 |
+| Shard health | 6 unassigned of 120 shards | 95 | 0.20 | 19.0 |
+| JVM heap | 88% on two nodes | 35 | 0.20 | 7.0 |
+| Disk | 71% of capacity, under watermark | 95 | 0.10 | 9.5 |
+| Search p95 | 240ms (alert is 200ms) | 70 | 0.10 | 7.0 |
+| Error rate | 0.3% | 90 | 0.10 | 9.0 |
+| **Composite** | | | | **~69.5 → 70 (rounds to 64 after live re-poll)** |
+
+The story the components tell: the logging index lost a replica (cluster yellow) and, more importantly, **JVM heap is sitting at 88% on two nodes**, which is the real reason the score is low. High heap is dragging two sub-scores at once because it also slows queries (p95 has crept to 240ms). This is not a shard-allocation crisis, it is memory pressure.
+
+The on-call's path:
+
+1. **Read the composite, then ignore it.** The 64 is the trigger; the component cards are the diagnosis. Heap is the dominant cause here.
+2. **Attack the heaviest negative contributor.** [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) at 88% is one bad query or fielddata load away from circuit breakers tripping. The team checks [GC Pause Time (5m total ms)](/nerve-centre/kpi-cards/elasticsearch/gc-pause-time-5m-total-ms) and finds GC running hot, confirming memory pressure.
+3. **Clear the cheap win.** The yellow status is just a missing replica on a non-critical logging index; they let it auto-reallocate (disk headroom exists) and the cluster returns to green, lifting the score by roughly 12 points on its own.
+
+```text
+After mitigation (heap relieved by clearing a runaway aggregation, replica reallocated):
+  cluster status  green   -> 100  (was 60)
+  heap            62%     -> 85   (was 35)
+  search p95      150ms   -> 100  (was 70)
+  new composite   ~91     -> back in the green band
+Time from alert to recovery: 38 minutes.
+```
+
+Three takeaways:
+
+1. **The score is a trigger, not a fix.** A low number tells you to look; the component cards tell you where. Never act on the composite alone.
+2. **One component can pull two sub-scores.** High heap hurt both the heap term and the latency term here. Watch for a single root cause masquerading as several problems.
+3. **The 7-day trend matters as much as the instant value.** A score that drifts from 92 to 78 over a week (gradual heap creep, disk filling) is a capacity-planning signal you can act on calmly; a sudden drop to 64 is an incident. Same number, different urgency, told apart by the trend line.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards platform teams should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with the Health Score | What the combination tells you |
+| --- | --- | --- |
+| [Cluster Status (green / yellow / red)](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) | The single heaviest-weighted component. | A red cluster alone caps the score low; this card tells you whether allocation is the cause. |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | A frequent dominant negative driver. | Heap above 90% can drag the composite below 70 by itself, even with everything else green. |
+| [Storage Usage %](/nerve-centre/kpi-cards/elasticsearch/storage-usage) | The disk component, and a hard cliff. | Crossing the flood-stage watermark collapses the disk sub-score and turns indexes read-only. |
+| [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) | The latency component, customer-facing. | A rising p95 lowers the score and is the metric shoppers actually feel. |
+| [Search Error Rate %](/nerve-centre/kpi-cards/elasticsearch/search-error-rate) | The error component. | Errors above 1% pull the score down and indicate shard failures or query problems. |
+| [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) | The shard-health component. | A high unassigned ratio lowers the shard sub-score and signals lost redundancy or data. |
+| [GC Pause Time (5m total ms)](/nerve-centre/kpi-cards/elasticsearch/gc-pause-time-5m-total-ms) | The early warning behind heap-driven dips. | Long GC pauses explain why a high-heap cluster's score is falling before it OOMs. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> **`GET /_cluster/health`** for the cluster-status and shard inputs.
+> **`GET /_nodes/stats/jvm,http,thread_pool`** for heap, connection and rejection inputs.
+> **`GET /_stats/search`** (or `GET /_nodes/stats/indices/search`) for the search latency and error inputs.
+> **`GET /_cat/nodes?v&h=name,heap.percent,disk.used_percent`** for a quick per-node view of the heaviest drivers.
+
+Because this score is a Vortex IQ composite, there is no single native command that returns the same number. You reconcile it by checking the component inputs above and confirming each sub-score matches what the source reports. On managed services, Elastic Cloud's deployment health page and AWS OpenSearch/Elasticsearch Service CloudWatch metrics cover the same inputs, but again as separate signals rather than one rollup.
+
+**Why our value may legitimately differ from a manual estimate:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **It is composite** | No native equal | No Elasticsearch command returns this number; only the component inputs can be reconciled individually. |
+| **Weighting** | Your mental model | Two clusters with the same component readings can intuitively feel different; the score applies fixed weights, with cluster status heaviest. |
+| **Poll timing** | Brief lag | The gauge samples every 60 seconds; a sub-component that spikes between polls may not move the score until the next sample. |
+| **Sensitivity profile** | Configurable | The 70 alert line and the latency/heap normalisation points are tunable per profile, so two deployments can score the same inputs differently. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ES Search Pool Saturation vs Ecom Burst](/nerve-centre/kpi-cards/elasticsearch/es-search-pool-saturation-vs-ecom-burst) | A falling health score during a traffic burst points to capacity, not a defect. | Score drops with saturation rising means the cluster is under-provisioned for peak, not broken. |
+| [Search QPS Spike vs Ecom Traffic](/nerve-centre/kpi-cards/elasticsearch/search-qps-spike-vs-ecom-traffic) | Distinguishes real load from bot crawls. | A score dip driven by a QPS spike with no matching ecom-traffic spike points to a bot, not genuine demand. |
+
+<details>
+<summary><em>Documentation cross-reference (same-concept peer)</em></summary>
+
+A composite cluster health score is a Vortex IQ construct, not a native database feature. These references map the idea across engines for teams running more than one.
+
+- OpenSearch equivalent: no native composite; would be assembled from the same `_cluster/health` and `_nodes/stats` inputs.
+- Generic database equivalent: closest analogue is an APM "service health" rollup that blends latency, error rate and saturation.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The score dropped below 70 but every component card looks fine to me. What happened?**
+Check the heaviest-weighted components first: cluster status and JVM heap. A yellow cluster (60 sub-score at 0.30 weight) plus heap in the high 80s is enough to push the composite under 70 even when nothing is in an obvious red state. The score reacts to "several things slightly off" the same way it reacts to "one thing badly off". Open the cards and look for the largest negative contributions, not just the red ones.
+
+**Can the score be high while the cluster is actually struggling?**
+Rarely, but yes, if the struggle is in a dimension the score does not weight, for example a specific index with a hot shard while overall metrics look fine. The score is a cluster-wide rollup; per-index pathologies can hide in the average. Pair it with [Shard Size Skew %](/nerve-centre/kpi-cards/elasticsearch/shard-size-skew) and [Top 10 Slow Searches](/nerve-centre/kpi-cards/elasticsearch/top-10-slow-searches) for index-level detail.
+
+**Is there a single Elasticsearch command that returns this number?**
+No. This is a Vortex IQ composite. The closest native single call is `GET /_cluster/health`, but that only covers shard allocation; it knows nothing about heap, latency or errors. To reconcile the score you check each component input separately against its native source.
+
+**Why is cluster status weighted so heavily?**
+Because shard availability is the most consequential failure mode. A red cluster means some data is not searchable right now; no amount of good latency or low heap should let the headline say "healthy" in that state. Weighting status heaviest ensures a genuine data-availability problem always drags the score into the warning band.
+
+**The score is stable at 85. Should I be worried?**
+85 sits in the amber band, so something is persistently a little off, most often heap running in the high 70s or a chronically yellow non-critical index. It is not an incident, but it is the score telling you there is a standing issue worth a calm look. Use the 7-day trend: stable at 85 is a known limitation to schedule work for; sliding from 92 to 85 is creeping degradation to investigate now.
+
+**Can I change the alert threshold or the weights?**
+The 70 alert line and the component normalisation points are configurable per profile in the Sensitivity tab. The weighting is fixed in the engine so the score is comparable across deployments, but you can tune what counts as "bad" for heap, latency and disk to match your baseline. Adjust the threshold to your tolerance rather than chasing the generic default.
+
+**Does the 7-day trend smooth out real incidents?**
+No. The live gauge always shows the current instantaneous score; the 7-day line is a separate trend view alongside it. A sharp incident shows as a sharp drop on both. The trend exists to surface slow creep (disk filling, heap drifting up) that a single live reading would not reveal.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Elasticsearch Health Score* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

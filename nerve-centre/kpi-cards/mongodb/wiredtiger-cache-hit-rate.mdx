@@ -1,0 +1,156 @@
+---
+title: "WiredTiger Cache Hit Rate %, MongoDB"
+sidebarTitle: "WiredTiger Cache Hit Rate %"
+description: "WiredTiger Cache Hit Rate % for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [WiredTiger](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The share of page reads that WiredTiger, MongoDB's default storage engine, served from its in-memory cache rather than going to disk. WiredTiger keeps recently used data and index pages in RAM; when a query needs a page that is already cached, the read is fast and cheap, and when it is not, WiredTiger must fault the page in from disk, which is orders of magnitude slower. This gauge is the single best summary of whether your working set fits in memory. A healthy deployment sits comfortably above 95%; the card turns red at `<95%` because a falling hit rate means more disk reads, climbing query latency, and a working set that has outgrown the cache.
+
+| | |
+| --- | --- |
+| **What it tracks** | The percentage of WiredTiger cache page requests satisfied from RAM rather than served by faulting a page in from disk, shown as a live gauge from 0% to 100%. |
+| **Data source** | Derived from the `wiredTiger.cache` sub-document of `serverStatus`: `1 - (cache."bytes read into cache" / cache."bytes currently in the cache")`. This is the MongoDB-distinctive cache surface that no generic database metric exposes the same way. |
+| **Time window** | `RT/1h` (real-time gauge, evaluated against a rolling 1-hour baseline). The headline shows the live value; the 1-hour window smooths out short read bursts so the alert reflects a sustained shift. |
+| **Alert trigger** | `<95%`. A hit rate that falls below 95% and stays there raises a sensitivity alert: the working set no longer fits in cache and disk I/O is becoming the bottleneck. |
+| **What counts** | All WiredTiger page reads against this `mongod`, covering both collection data pages and index pages held in the shared cache. |
+| **What does NOT count** | Operating-system page-cache hits below WiredTiger are not separated out here, and reads served by a secondary are counted against that secondary, not the primary. The figure is per-`mongod`, not cluster-wide. |
+| **Roles** | owner, platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The gauge is derived from two byte counters inside the `wiredTiger.cache` sub-document of `serverStatus`:
+
+```text
+cache_hit_rate_pct = ( 1 - ( cache."bytes read into cache"
+                             / cache."bytes currently in the cache" ) )
+                     x 100
+```
+
+What the inputs mean:
+
+- **`bytes read into cache`** is the cumulative volume WiredTiger has had to pull in from disk because the page was not already resident. Growth in this counter is the cost of cache misses.
+- **`bytes currently in the cache`** is the volume of data presently held in the WiredTiger cache, bounded by the configured cache size (by default roughly 50% of RAM minus 1 GB, or 256 MB, whichever is larger).
+- The ratio of "had to read from disk" against "what we are holding" inverts to a **hit rate**: the closer disk reads are to zero relative to the resident set, the closer the gauge is to 100%.
+
+Important framing points:
+
+- **This is the working-set fit signal.** When the data and indexes your queries touch comfortably fit inside the cache, almost every page request is a hit and the gauge sits in the high nineties. When the working set exceeds the cache, WiredTiger constantly evicts and refaults pages, and the hit rate falls.
+- **Per-member.** On a replica set the gauge reflects the member polled. A read-heavy secondary can have a very different hit rate from the primary because it is serving a different mix of queries.
+- **Counters are cumulative since last restart**, so the live value is computed from the rate of change, not the absolute lifetime totals. A freshly restarted member shows a cold cache warming up: a temporarily low hit rate that recovers as pages fault in.
+
+The output is a single live percentage rendered on a gauge, with the underlying cache byte counters available on drill-down.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MongoDB 6.0 primary on a host with 32 GB RAM, leaving WiredTiger a default cache of roughly 15 GB. The deployment backs a product-catalogue and session service. Readings taken across a catalogue-import job on 11 Jun 26.
+
+| Time (UTC) | bytes in cache | bytes read into cache (delta/min) | Hit rate | State |
+| --- | --- | --- | --- | --- |
+| 08:00 | 14.6 GB | 12 MB/min | **99.4%** | Normal, working set fits |
+| 13:30 | 14.9 GB | 90 MB/min | **97.1%** | Import warming new pages |
+| 14:10 | 15.0 GB | 410 MB/min | **94.2%** | Red, alert fires |
+| 14:40 | 15.0 GB | 620 MB/min | **91.5%** | Thrashing, sustained misses |
+
+At 08:00 the working set fits comfortably inside the 15 GB cache and almost every read is a hit. When the catalogue import begins loading a large batch of previously cold documents, WiredTiger has to fault those pages in, so disk reads climb and the hit rate dips. By 14:10 the cache is full and the import is touching more distinct data than the cache can hold, so the engine evicts a page only to refault it moments later: classic cache thrashing. The gauge crosses 95% and the alert fires; by 14:40 the deployment is reading 620 MB/min from disk and query latency has roughly doubled.
+
+```text
+Why it fell:
+  Cache size                 ~ 15 GB
+  Working set during import  ~ 19 GB (catalogue + sessions + import batch)
+  Conclusion: the active data set temporarily exceeds the cache, forcing
+              WiredTiger to evict-and-refault. Hit rate falls and disk I/O
+              becomes the bottleneck until the import completes or the
+              cache is enlarged.
+```
+
+The DBA's response has an immediate lever and a structural fix:
+
+1. **Immediate:** if the dip is import-driven and transient, throttle or schedule the import off-peak so it does not evict the live working set during business hours. The hit rate recovers as soon as the cold batch finishes.
+2. **Structural:** if the hit rate sits below 95% even at baseline, the working set has genuinely outgrown the cache. Add RAM (and let the default cache sizing grow with it), or shrink the working set by adding or refining indexes so queries touch fewer pages, or shard to spread the working set across more cache.
+
+Three takeaways:
+
+1. **A low hit rate is a memory problem, not a query problem.** The queries may be perfectly indexed; if the pages they need are not in cache, every read still pays the disk tax. Pair this with [WiredTiger Dirty Cache %](/nerve-centre/kpi-cards/mongodb/wiredtiger-dirty-cache) and the latency cards to confirm the cause.
+2. **A cold cache after a restart is expected.** A member that has just restarted or failed over reads from disk until its cache warms, so a temporary dip right after a maintenance event is normal and self-corrects.
+3. **95% is a meaningful line for OLTP workloads.** Below it, the disk-read rate climbs fast enough to move user-facing latency. Treat a sustained red reading as "the working set no longer fits", which is a capacity decision, not a tuning tweak.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with WiredTiger Cache Hit Rate | What the combination tells you |
+| --- | --- | --- |
+| [WiredTiger Dirty Cache %](/nerve-centre/kpi-cards/mongodb/wiredtiger-dirty-cache) | The write-side companion to this read-side gauge. | A falling hit rate together with a high dirty percentage means the cache is under pressure from both reads and pending writes. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) | The user-facing symptom of cache misses. | Hit rate falling while p95 rises confirms disk I/O is now the latency driver. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p99-ms) | The tail that cache misses inflate first. | A widening p99 with a dropping hit rate points to occasional very slow page faults. |
+| [Memory Resident (MB)](/nerve-centre/kpi-cards/mongodb/memory-resident-mb) | The RAM footprint behind the cache. | Resident memory pinned at the host ceiling alongside a low hit rate confirms the cache cannot grow to fit the working set. |
+| [COLLSCAN Operations (24h)](/nerve-centre/kpi-cards/mongodb/collscan-operations-24h) | Collection scans pull large volumes of cold pages into cache. | A spike in scans is a common reason the hit rate suddenly drops. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | The composite that weights cache efficiency. | A sustained sub-95% hit rate should pull the health score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to confirm the number in MongoDB's own tooling:**
+
+> **`mongosh`:** `db.serverStatus().wiredTiger.cache` returns the full cache document, including `"bytes read into cache"`, `"bytes currently in the cache"`, `"maximum bytes configured"`, and the dirty-byte counters. Sample it twice and compute the ratio on the deltas to reproduce this gauge.
+> **`mongostat`:** does not show hit rate directly, but the `used` and `dirty` cache-percentage columns give a quick read on cache pressure alongside this card.
+> **Atlas:** the **Metrics** tab has **Cache Activity** and **Cache Usage** charts; the "bytes read into cache" series is the disk-fault rate that drives this hit rate down.
+> **`db.serverStatus().wiredTiger`:** the broader document also exposes eviction and page-fault counters that explain why a hit rate is falling.
+
+**Why our number may legitimately differ from the native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Rate vs lifetime** | Either | Vortex IQ computes the hit rate from the change in counters over the window; a hand calculation on the raw lifetime totals reads the all-time average, which is usually higher. |
+| **Member polled** | Either | The gauge reads one `mongod` (normally the primary). A native tool pointed at a read-heavy secondary shows that member's separate hit rate. |
+| **Cold cache after restart** | Vortex IQ lower briefly | Immediately after a restart or failover the cache is warming; both views show a dip, but the timing depends on when each sampled. |
+| **Cache size differences** | Either | If the configured cache size changed recently, the resident set and therefore the ratio shift; confirm `"maximum bytes configured"` matches expectations. |
+| **Time zone** | Axis only | Chart axes use your profile zone; the ratio itself is zone-independent. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [MongoDB OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mongodb/mongodb-ops-spike-vs-ecom-order-rate) | A genuine traffic spike that grows the working set can lower the hit rate. | A hit-rate drop with no matching ecom activity suggests a background job (import, scan, backup) churning the cache rather than real demand. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | A sustained low hit rate should pull the health score down. | If the score stays green during a breach, check its cache weighting in the sensitivity profile. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is my hit rate low right after a restart or failover?**
+The WiredTiger cache starts empty after the `mongod` process restarts, so the first wave of queries must fault their pages in from disk. This is a cold cache warming up, and the hit rate recovers as the working set becomes resident again. A dip in the minutes following a maintenance event or election is expected and self-correcting; only a hit rate that stays low once traffic has settled is a real signal.
+
+**The hit rate is fine but queries are still slow. Why?**
+A high cache hit rate only tells you reads are being served from memory; it says nothing about whether the queries themselves are efficient. A missing index forcing a collection scan can be fast in the sense that every page is cached, yet still slow because it examines far more documents than it returns. Pair this card with [COLLSCAN Operations (24h)](/nerve-centre/kpi-cards/mongodb/collscan-operations-24h) and the latency cards to separate a memory problem from a query-plan problem.
+
+**Does this include the operating-system page cache?**
+No. This gauge measures the WiredTiger application-level cache only. Below WiredTiger, the operating system maintains its own page cache, so a "miss" at the WiredTiger layer may still be served from OS RAM rather than physical disk. That means real disk I/O can be lower than the raw miss rate implies, but for tuning purposes the WiredTiger hit rate is the actionable layer because it is what MongoDB controls.
+
+**How do I raise the hit rate?**
+Three levers, in order of leverage. First, fit the working set in cache: add RAM (the default cache grows with it) so the data and indexes your queries touch stay resident. Second, shrink the working set: add or refine indexes so queries touch fewer pages, and remove unused indexes that waste cache. Third, isolate churn: schedule large imports, exports, and analytical scans off-peak so they do not evict the live working set during business hours.
+
+**Why does a secondary show a different hit rate from the primary?**
+Cache contents are per-member and reflect the queries each member actually serves. A secondary handling analytical or read-preference traffic warms a different set of pages from a primary handling writes and primary reads, so their hit rates diverge naturally. If you route reads to secondaries, monitor their hit rate separately, because a read-heavy secondary can thrash its cache while the primary looks healthy.
+
+**Can a single large query tank the hit rate?**
+Yes. A query that scans a large collection or rebuilds a big index pulls a large volume of cold pages into the cache, evicting the live working set to make room. The hit rate dips during the operation and recovers afterwards. If this is recurring, the offending operation usually appears in [Top 10 Slow Operations](/nerve-centre/kpi-cards/mongodb/top-10-slow-operations); the fix is to index it so it stops scanning, or to run it off-peak.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*WiredTiger Cache Hit Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,157 @@
+---
+title: "DBU Burn +50% Week-over-Week, Databricks"
+sidebarTitle: "DBU Burn +50% Week-over-Week"
+description: "DBU Burn +50% Week-over-Week for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> An anomaly alert that fires when total DBU consumption for the trailing 7 days is more than 50% above the prior 7 days, without a proportional rise in the underlying workload. DBUs are the unit Databricks bills on, so a 50% week-over-week jump is, directly, a 50% jump in the compute bill. The "without proportional workload" qualifier is what makes this an anomaly rather than just a busy week: if order volume, query volume, and job count all rose 50% too, the spend is justified. If they did not, something is burning money inefficiently.
+
+| | |
+| --- | --- |
+| **Data source** | Databricks billable usage data from the `system.billing.usage` system table (the same data behind the account-level Usage dashboard), aggregated to total DBUs per 7-day window. Workload comparators come from `system.lakeflow.job_run_timeline` (job runs) and `system.query.history` (SQL volume). |
+| **Metric basis** | A week-over-week ratio: `this_7d_DBU / prior_7d_DBU`. The alert is an anomaly verdict, not a raw number, it fires only when the DBU rise outpaces the workload rise. |
+| **Aggregation window** | `7d` trailing versus the immediately prior `7d`, recomputed daily as billable usage settles. |
+| **Alert trigger** | `+50% DBU WoW without proportional workload`. A +50% rise that is matched by a +50% rise in jobs or query volume is suppressed as "expected growth". |
+| **What "proportional workload" means** | The engine compares DBU growth against job-run count growth and SQL query-volume growth. If DBU growth exceeds workload growth by a meaningful margin, the rise is flagged as inefficiency rather than genuine demand. |
+| **What does NOT trigger it** | (1) A spend rise fully explained by more jobs, more queries, or more orders; (2) a one-off backfill that the team has annotated; (3) intra-week spikes that wash out over the 7-day average. |
+| **Time zone** | Workspace time zone for window boundaries; UTC for cross-connector alignment. |
+| **Time window** | `7d` versus prior `7d`. |
+| **Roles** | owner, platform engineering, finance / FinOps |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The alert evaluates two ratios and compares them:
+
+```text
+dbu_growth      = this_7d_total_DBU / prior_7d_total_DBU
+workload_growth = this_7d_workload  / prior_7d_workload
+                  (workload = blended job-run count + SQL query volume)
+
+FIRE when:
+    dbu_growth >= 1.50
+    AND dbu_growth materially exceeds workload_growth
+```
+
+The first condition is the headline: total DBUs for the trailing week are at least 50% above the prior week. Total DBU includes all three SKUs (job compute, SQL warehouse, and all-purpose interactive) so a shift from cheap to expensive compute is caught even if raw job counts are flat.
+
+The second condition is what stops the card crying wolf during legitimate growth. A retailer running a sale week will genuinely process more orders, run more pipelines, and serve more dashboards, of course DBUs rise. The engine only escalates when the DBU curve has decoupled from the workload curve, which is the fingerprint of inefficiency: a Photon downgrade, a cluster that stopped auto-terminating, a notebook left running, a query that lost its partition pruning, or autoscaling that scaled up and never came back down.
+
+Billable usage data in `system.billing.usage` settles over a few hours, so the comparison is recomputed daily rather than minute-by-minute. The alert is intentionally a weekly signal: it is the FinOps tripwire, not the real-time one. For real-time cost runaway, [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) and [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) move faster.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A data platform team supports an ecommerce analytics estate. The FinOps lead reviews this card every Monday morning. Snapshot taken on 11 May 26.
+
+| Window | Total DBU | Job runs | SQL queries | Orders processed |
+| --- | --- | --- | --- | --- |
+| Prior 7d (28 Apr to 04 May) | 9,200 | 4,100 | 612,000 | 88,000 |
+| This 7d (05 May to 11 May) | 14,400 | 4,250 | 631,000 | 90,500 |
+
+The maths:
+
+```text
+dbu_growth      = 14,400 / 9,200      = 1.57  (+57%)
+job_growth      = 4,250 / 4,100       = 1.04  (+4%)
+query_growth    = 631,000 / 612,000   = 1.03  (+3%)
+order_growth    = 90,500 / 88,000     = 1.03  (+3%)
+
+DBU up 57% while workload up ~3 to 4%  ->  ALERT FIRES
+```
+
+The card lights amber with the headline **DBU +57% WoW, workload flat**. This is the textbook decoupling: spend surged but the business did roughly the same amount of work. The platform lead opens the drill-down and works the standard playbook:
+
+1. **Attribute the spend.** [DBU by Cluster (7d)](/nerve-centre/kpi-cards/databricks/dbu-by-cluster-7d) shows the extra 5,200 DBU is concentrated in `analytics-shared`, an all-purpose cluster, not the job clusters. That immediately rules out "the pipelines got heavier".
+2. **Check for idle waste.** [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h) confirms `analytics-shared` ran 24/7 all week. Someone changed its auto-termination from 30 minutes to "never" during a debugging session and forgot to revert it.
+3. **Quantify the bill.** 5,200 extra DBU at an illustrative blended $0.55/DBU is about $2,860 for one week, or roughly $149,000/year if left unchecked.
+4. **Fix and annotate.** Auto-termination is restored to 30 minutes. The lead annotates the week so the following Monday's comparison (which will show a 35% drop back to baseline) is understood as a fix, not a new anomaly.
+
+```text
+Why the workload qualifier earns its keep:
+  - Without it: every Black Friday week, every product launch, every
+    big backfill would fire this alert. The team would learn to ignore it.
+  - With it: the alert stays quiet through the sale week (DBU and orders
+    rise together) and only shouts when spend genuinely decoupled from work.
+```
+
+The lesson the team internalises: a 50% DBU rise is not automatically bad. A 50% DBU rise that your order book, job log, and query log cannot explain almost always is.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with DBU Burn +50% WoW | What the combination tells you |
+| --- | --- | --- |
+| [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) | The faster, real-time cost pulse. | A 24h spike that compounds into the weekly anomaly tells you the runaway started recently. |
+| [DBU by Cluster (7d)](/nerve-centre/kpi-cards/databricks/dbu-by-cluster-7d) | Attributes the extra spend to a specific cluster. | Pinpoints which cluster caused the week-over-week jump. |
+| [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h) | The most common root cause: clusters alive with no work. | High idle DBU is usually the explanation for a decoupled rise. |
+| [Avg DBU per Job Run](/nerve-centre/kpi-cards/databricks/avg-dbu-per-job-run) | Detects per-job efficiency regressions. | If cost per job rose, an individual job got heavier, not the schedule. |
+| [Avg Cluster CPU Utilisation %](/nerve-centre/kpi-cards/databricks/avg-cluster-cpu-utilisation) | Shows whether the extra compute was used. | High DBU with low CPU equals waste; high DBU with high CPU equals genuine load. |
+| [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume) | The cross-channel view of the same decoupling. | Spend up while orders flat is the business-level confirmation of inefficiency. |
+| [Active Clusters](/nerve-centre/kpi-cards/databricks/active-clusters) | The simple count of live compute. | A rising count alongside the alert points at clusters not terminating. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **Account console → Usage** dashboard for the canonical DBU spend by day, SKU, and workspace. This is the authoritative source the alert is built on.
+> **`system.billing.usage`** system table in Unity Catalog: query DBU per day directly to reproduce the 7-day windows exactly.
+> **`system.lakeflow.job_run_timeline`** and **`system.query.history`** for the workload comparators (job runs and SQL volume) that determine the "proportional workload" verdict.
+
+**Why our verdict may legitimately differ from the Usage dashboard:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Usage settlement lag** | Brief | `system.billing.usage` settles over a few hours; the latest day in the window may still be filling in. Vortex IQ recomputes daily as it settles. |
+| **Window definition** | Variable | This card uses trailing 7d vs prior 7d; the Usage dashboard defaults to calendar months. Match the date range to reconcile. |
+| **SKU inclusion** | Vortex IQ broader | The card totals all DBU SKUs (jobs, SQL, all-purpose). If you filter the Usage dashboard to one SKU you will see a smaller figure. |
+| **Workload qualifier** | Vortex IQ may stay quiet | The Usage dashboard shows raw spend with no anomaly logic; it has no notion of "proportional workload", so it cannot suppress a legitimate growth week the way this card does. |
+| **Workspace scope** | Variable | This card scopes to the connected workspace; the account Usage dashboard can aggregate across all workspaces. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume) | When this alert fires for inefficiency, order volume will be flat. | If orders also rose 50%, the spend was demand-driven and this card should not have fired; check the workload comparator config. |
+| Shopify / BigCommerce / Adobe Total Revenue | A sale week lifts both revenue and DBU together. | Revenue flat but DBU up 50% is the business-level signature of the inefficiency this alert catches. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**We ran a one-off historical backfill this week and the alert fired. Is that wrong?**
+No, it is working correctly: a backfill is a genuine spend spike that the recurring workload comparators do not see (a backfill is extra job runs against old data, not the normal schedule). Annotate the week so the next comparison treats it as expected, and so the following week's drop back to baseline is not read as a new anomaly in reverse.
+
+**Why 50% and not a smaller threshold?**
+50% is the level at which a week-over-week move is almost never noise and almost always a real change worth a human's attention. A lower threshold (say 15%) would fire most weeks for ordinary fluctuation and the team would tune it out. If your estate is very stable and you want earlier warning, lower the threshold in the Sensitivity tab; if you run a spiky workload, raise it.
+
+**The alert fired but our order volume genuinely went up 50% for a sale. Why was it not suppressed?**
+The suppression depends on the workload comparators being correctly wired. By default the engine compares DBU growth against job-run and SQL-query growth, not ecommerce order volume directly. If your DBU scales with orders but your job and query counts stayed flat (for example, the same jobs simply processed more rows each), the comparator can miss it. In that case, add the ecom order-volume comparator via [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume) so the sale is recognised.
+
+**Does this catch a spike that lasted only a day?**
+Not reliably, and that is by design. A single bad day is diluted across the 7-day average and may not reach +50% for the week. The day-level signal lives on [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h), which uses a 24h-versus-prior comparison. Read the two together: the 24h card catches the spike, this card catches the sustained drift.
+
+**Can the alert tell me what caused the rise?**
+This card tells you that spend decoupled from work; it does not name the root cause by itself. The drill-down points you to [DBU by Cluster (7d)](/nerve-centre/kpi-cards/databricks/dbu-by-cluster-7d) for attribution and [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h) for the most common cause. Vortex Mind can run the attribution chain automatically when the alert fires.
+
+**Will fixing the problem trigger a second, opposite alert next week?**
+No. The card only fires on increases, not decreases. The week after a fix will show a drop back toward baseline, which is silent. Annotating the original week keeps the audit trail clean for finance.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*DBU Burn +50% Week-over-Week* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

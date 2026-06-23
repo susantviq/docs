@@ -1,0 +1,165 @@
+---
+title: "CRDB Pool Saturation vs Traffic Burst, CockroachDB"
+sidebarTitle: "CRDB Pool Saturation vs Traffic Burst"
+description: "CRDB Pool Saturation vs Traffic Burst for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **CRDB Pool Saturation vs Traffic Burst** lays your CockroachDB connection-pool saturation alongside front-of-store traffic, row by row, over a rolling 15-minute window. It answers the one question a DBA cannot answer from the database alone: "is the pool filling up because real shoppers arrived, or because something is leaking sessions?" When saturation climbs in lockstep with a genuine traffic burst, the cluster is doing its job and you scale. When saturation climbs while traffic is flat, you have a connection leak or a runaway client pool, and adding capacity just delays the wall. This is the card that stops a team raising the connection ceiling against a leak.
+
+| | |
+| --- | --- |
+| **What it tracks** | CRDB Pool Saturation vs Traffic Burst, broken down by row: each row pairs a time bucket's pool-saturation percentage with the matching front-end traffic reading (sessions or requests per minute) from the linked ecommerce or analytics connector. |
+| **Data source** | CockroachDB side: the same saturation series behind [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation), the ratio of `sql.conns` (summed across live nodes) to the configured connection ceiling (`server.max_connections_per_gateway` across gateways, or the CockroachDB Cloud plan limit). Traffic side: live sessions or request rate from the joined storefront connector (Shopify / BigCommerce / Adobe Commerce, or Google Analytics). |
+| **Metric basis** | Correlation, not a single number. The card is a two-series table so you can read saturation and traffic in the same buckets. Saturation is a percentage of the ceiling; traffic is sessions or requests per minute. |
+| **Time window** | `15m`, a rolling 15-minute window bucketed so each row covers a short interval (typically 1 minute). Short enough to catch a flash-sale ramp, long enough to show the shape of the climb. |
+| **Alert trigger** | `>90% during traffic burst`: saturation above 90% at the same time as an elevated traffic reading. A breach with traffic flat is surfaced separately as a likely leak rather than a capacity event. |
+| **What this distinguishes** | (1) Real demand: saturation and traffic rise together; (2) Connection leak: saturation rises, traffic flat; (3) Over-provisioned headroom: traffic bursts, saturation barely moves (pooler working well). |
+| **What does NOT fire** | Saturation spikes shorter than the bucket, traffic bursts that the pool absorbs comfortably under 90%, and BI / batch session churn that the engine can attribute to a non-storefront pool. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card joins two independent series on a shared time axis and renders them per bucket:
+
+```text
+row[t] = {
+  bucket:       t  (rolling 15m window, ~1-minute buckets)
+  saturation%:  (open SQL connections at t / configured connection ceiling) * 100
+  traffic:      front-end sessions or requests per minute at t (joined connector)
+  correlated?:  saturation breach AND traffic elevated in the same bucket
+}
+```
+
+The CockroachDB numerator is the cluster-wide sum of the `sql.conns` gauge; the denominator is the connection ceiling (`server.max_connections_per_gateway` applied across gateway nodes on self-hosted clusters, or the plan limit on CockroachDB Cloud). The traffic series comes from whichever storefront or analytics connector is linked in the same Nerve Centre profile, normalised to a per-minute rate so the two series share a cadence.
+
+The alert opens only when a saturation breach above 90% coincides with an elevated traffic reading in the same bucket: that pairing is the expected, scalable case and tells the team capacity is the lever. The more interesting signal is the anti-correlation: saturation above 90% with traffic flat. The engine surfaces that row distinctly because it points at a leak or a misbehaving client pool, where raising the ceiling is the wrong move. Each correlated row carries peak saturation, the busiest gateway nodes, and the matching traffic figure so the on-call engineer can size the response in one read.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 5-node CockroachDB self-hosted cluster behind the order and inventory APIs for a high-traffic retailer on Shopify. `server.max_connections_per_gateway` is 500 across all 5 gateways, giving a 2,500-connection ceiling. The storefront connector feeds live session rate. Snapshot taken on 14 Apr 26 at 20:00 BST, during the opening minutes of a scheduled flash sale.
+
+| Bucket (BST) | Saturation | Open conns | Storefront sessions/min | Correlated? |
+| --- | --- | --- | --- | --- |
+| 19:56 | 56% | 1,400 | 1,180 | no (healthy) |
+| 19:59 | 71% | 1,775 | 2,640 | no (climbing) |
+| 20:01 | 88% | 2,200 | 4,910 | no (just under) |
+| 20:03 | 92% | 2,300 | 6,050 | **yes (real burst)** |
+| 20:04 | 94% | 2,360 | 6,400 | **yes (real burst)** |
+
+Saturation and sessions rise together: every percentage point of pool fill is matched by more shoppers arriving. This is the scalable case. The card flags the 20:03 to 20:04 rows as a correlated breach, and the team reads it as "we are genuinely out of headroom because the sale worked", not "something is broken".
+
+What the on-call SRE does with this:
+
+1. **Confirm the correlation is tight.** Because saturation tracks traffic almost linearly, this is real demand. Contrast with the alternative below, where the same 94% would mean a leak.
+2. **Scale the right lever.** Real demand means widen capacity: raise `server.max_connections_per_gateway` if node memory allows ([Memory Usage %](/nerve-centre/kpi-cards/cockroachdb/memory-usage) is comfortable here), add a gateway node, or, structurally, front the cluster with a connection pooler so app threads multiplex onto a bounded server pool.
+3. **Watch the downstream pulse.** Cross-read [Statement Latency p95 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms): if it has not moved, the pool is full but not yet hurting users, and you have a few minutes to act cleanly.
+
+Now the contrast that makes this card valuable. Same cluster, a different evening:
+
+| Bucket (BST) | Saturation | Open conns | Storefront sessions/min | Correlated? |
+| --- | --- | --- | --- | --- |
+| 02:10 | 61% | 1,525 | 240 | no |
+| 02:25 | 78% | 1,950 | 235 | no (traffic flat) |
+| 02:40 | 91% | 2,275 | 238 | **leak signal** |
+| 02:55 | 96% | 2,400 | 241 | **leak signal** |
+
+Saturation marches to 96% while traffic sits at roughly 240 sessions/min all night. This is not demand; it is a service opening connections and never returning them to its pool. Raising the ceiling here would simply move the wall a few hours later. The fix is to find and restart the leaking client (or fix its pool configuration), confirmed by pairing with [Connections In Use](/nerve-centre/kpi-cards/cockroachdb/connections-in-use) showing a flat-traffic climb.
+
+```text
+Why the comparison matters financially:
+  - Real burst at 94%: scaling now keeps a flash sale converting; doing nothing risks refused checkouts.
+  - Leak at 96% with flat traffic: scaling wastes money AND hides the bug; the wall returns.
+  - Same saturation number, opposite correct action. Only the traffic pairing tells them apart.
+```
+
+Three takeaways for the team:
+
+1. **Saturation alone is ambiguous; saturation paired with traffic is a decision.** 94% means "scale" or "find the leak" depending entirely on whether traffic moved with it.
+2. **A correlated breach is a capacity win, not a failure.** It means the sale drove real load. Plan capacity ahead of known peaks so you are not scaling reactively at 94%.
+3. **The anti-correlated row is the one to fear.** Saturation up, traffic flat, is the leak signature, and it is the case a database-only view would misread as "we need more capacity".
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with CRDB Pool Saturation vs Traffic Burst | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation) | The database-only saturation gauge this card joins to traffic. | The gauge gives the live percentage; this card tells you whether traffic explains it. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/cockroachdb/connection-pool-at-90-saturation) | The alert that fires on the saturation series alone. | The alert says "we crossed 90%"; this card says whether real demand or a leak drove it. |
+| [Connections In Use](/nerve-centre/kpi-cards/cockroachdb/connections-in-use) | The raw numerator behind saturation. | A climb with flat storefront traffic confirms a leak rather than load. |
+| [Statement Latency p95 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms) | Where a full pool first hurts users. | p95 rising during a correlated breach means workers are already queuing for sessions. |
+| [Memory Usage %](/nerve-centre/kpi-cards/cockroachdb/memory-usage) | Each connection consumes memory. | High saturation plus high memory means raising the ceiling is unsafe; add nodes instead. |
+| [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live) | The workload the connections are carrying. | QPS rising with saturation equals active load; QPS flat while saturation climbs equals idle, leaked sessions. |
+| [CRDB Statements Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/cockroachdb/crdb-statements-spike-vs-ecom-order-rate) | The sibling cross-channel card on the query-volume axis. | Saturation and statements both tracking order rate confirms healthy end-to-end scaling. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The executive composite a sustained breach feeds. | A correlated breach during peak is expected; a leak-driven breach drags the score down without a business reason. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look natively:**
+
+> **DB Console SQL dashboard** ("Open SQL Sessions" panel) for the live `sql.conns` series per node, the database side of this card.
+> **`SELECT count(*) FROM crdb_internal.cluster_sessions;`** for the exact open-connection count at a moment.
+> **`SHOW CLUSTER SETTING server.max_connections_per_gateway;`** to confirm the ceiling the saturation percentage divides by.
+> **CockroachDB Cloud Metrics tab** plots the same connection series; the cluster Overview shows the plan connection limit.
+> The traffic side has no CockroachDB equivalent: confirm it against your storefront or analytics connector's own session / request reports.
+
+**Why our number may legitimately differ from the native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Two-connector join** | N/A | The DB Console shows only the saturation series. The traffic pairing exists only in Vortex IQ because it joins a second connector; there is no native panel to reconcile the correlation against. |
+| **Bucket alignment** | Brief lag | Saturation and traffic are polled independently and snapped to shared buckets. Near a sharp ramp the two series can land a bucket apart before they realign. |
+| **Ceiling source** | Either way | If `max_connections_per_gateway` was changed but not reloaded, the native panel may divide by a stale denominator while Vortex IQ uses the configured value. |
+| **Per-node vs cluster** | Vortex IQ may read lower | This card uses cluster-wide saturation; the DB Console can show one hot gateway at a higher local percentage. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [CRDB Statements Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/cockroachdb/crdb-statements-spike-vs-ecom-order-rate) | A correlated saturation breach should accompany a statements and order-rate rise. | Saturation up with statements flat means idle sessions accumulating, not active queries: a leak. |
+| [Slow Statements During Checkout Window (5m)](/nerve-centre/kpi-cards/cockroachdb/slow-statements-during-checkout-window-5m) | A correlated breach plus slow statements during checkout points at the same pressure. | Slow checkout statements with no saturation breach means the bottleneck is query plans or contention, not connections. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Saturation hit 94% but the card did not raise the correlated alert. Why?**
+The alert fires on saturation above 90% paired with an elevated traffic reading in the same bucket. If traffic was flat when saturation climbed, the engine surfaces the row as a likely leak rather than a capacity alert, because the correct action is different. Read the traffic column: if it is flat, treat it as a connection leak and pair with [Connections In Use](/nerve-centre/kpi-cards/cockroachdb/connections-in-use).
+
+**Traffic clearly spiked but saturation barely moved. Is the card broken?**
+No, that is the healthiest possible reading. It means your connection pooler (or a generous ceiling) absorbed the burst without the server-side pool filling. A storefront burst that does not move saturation is the goal; it tells you that you have real headroom for the next, larger peak.
+
+**Which traffic series does the card use?**
+Whichever storefront or analytics connector is linked in the same Nerve Centre profile: storefront sessions or request rate from Shopify, BigCommerce, or Adobe Commerce, or session rate from Google Analytics. If no front-end connector is linked, the card shows the saturation series alone and cannot classify breaches as demand vs leak; link a storefront connector to unlock the comparison.
+
+**The two series look offset by a minute near a sharp ramp. Should I worry?**
+No. Saturation and traffic are polled independently and snapped to shared buckets, so during a steep climb one can lead the other by a single bucket before they realign. The shape of the correlation over the 15-minute window is what matters, not a single-bucket offset.
+
+**On CockroachDB Cloud I cannot set `max_connections_per_gateway`. Does the comparison still work?**
+Yes. On Cloud the connection limit is set by your plan and enforced by the managed proxy; Vortex IQ divides by that plan limit instead of the cluster setting. The traffic pairing is unchanged, so the demand-vs-leak distinction works identically.
+
+**A correlated breach fired during a flash sale. Do I need to do anything?**
+A correlated breach means real demand, so the lever is capacity, not bug-hunting. If [Statement Latency p95 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms) has not climbed, the pool is full but not yet hurting users and you have a short window to widen the ceiling (memory permitting) or add a gateway. The durable answer for recurring peak breaches is a connection pooler in front of the cluster.
+
+**Can a single hot gateway create a false leak signal?**
+The card uses cluster-wide saturation, so a single hot gateway that averages out below 90% will not register at all. If you suspect uneven distribution, check the per-node spread on [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation) and confirm your load balancer is spreading connections evenly across gateways.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*CRDB Pool Saturation vs Traffic Burst* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

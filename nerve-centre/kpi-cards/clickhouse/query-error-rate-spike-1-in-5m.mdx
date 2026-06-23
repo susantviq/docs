@@ -1,0 +1,161 @@
+---
+title: "Query Error Rate Spike (>1% in 5m), ClickHouse"
+sidebarTitle: "Query Error Rate Spike (>1% in 5m)"
+description: "Query Error Rate Spike (>1% in 5m) alerts for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The alert feed for moments when more than 1% of queries fail over a rolling five-minute window. ClickHouse logs every query in `system.query_log`, and a sudden rise in `ExceptionWhileProcessing` rows means something has broken: a bad deploy shipping malformed SQL, memory limits killing heavy queries, a table gone read-only, or the parts cap halting ingest. A healthy instance sits well under 1%, so crossing that line for a sustained window is a real signal, not noise. This card lists each spike with its start time, peak error rate, and the dominant exception code so the DBA can go straight to the cause.
+
+| | |
+| --- | --- |
+| **Data source** | `system.query_log`, comparing `type = 'ExceptionWhileProcessing'` rows against total finished queries over a rolling 5-minute window. Each sustained breach is recorded as one alert row with its top exception code. |
+| **What it tracks** | Error-rate spike events, not a continuous gauge. The live percentage lives on [Query Error Rate %](/nerve-centre/kpi-cards/clickhouse/query-error-rate); this card is the incident history of when that rate crossed 1%. |
+| **Why it matters** | At analytical query volumes, 1% failure is a lot of broken queries: at 500 QPS that is 5 failed queries every second, every one a stalled dashboard, a dropped ingest batch, or a failed report. The exception code on each row points straight at the cause (code 241 memory, code 252 too many parts, code 60 unknown table, and so on). |
+| **Time window** | `5m` (rolling five-minute window; the rate must stay above 1% across the window to fire). |
+| **Alert trigger** | `>1% sustained 5m`. The error-to-total ratio must hold above 1% for the full window, filtering out single-query blips. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The detector computes the failure ratio over a rolling five-minute window directly from `system.query_log`:
+
+```sql
+SELECT
+    countIf(type = 'ExceptionWhileProcessing') AS failed,
+    countIf(type IN ('QueryFinish','ExceptionWhileProcessing')) AS total,
+    round(failed / total * 100, 2) AS error_rate_pct,
+    topK(3)(exception_code) AS top_codes
+FROM system.query_log
+WHERE event_time >= now() - INTERVAL 5 MINUTE
+  AND type IN ('QueryFinish','ExceptionWhileProcessing')
+```
+
+The denominator counts queries that actually completed (`QueryFinish`) plus those that threw (`ExceptionWhileProcessing`). `QueryStart` rows are excluded so in-flight queries do not distort the ratio. An alert row is created when `error_rate_pct > 1` holds across the window.
+
+The sustained-window requirement is what separates a real incident from background noise. Individual queries fail all the time for benign reasons (a user typos a column name, a one-off query exceeds a memory limit), and at high volume that produces a constant trickle of exceptions well under 1%. Requiring the rate to hold above 1% for a full five minutes means the failures are systemic: a deploy, a resource exhaustion, or a structural fault, not one unlucky query. Each alert row also captures the dominant `exception_code` so triage starts with the cause already identified.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs ClickHouse behind a reporting API and an ingest pipeline at roughly 480 QPS steady state. Snapshot of the alert feed on 18 Apr 26.
+
+| Started | Peak error rate | Top exception code | Likely cause |
+| --- | --- | --- | --- |
+| 18 Apr 26 13:22 BST | **4.8%** | 241 (MEMORY_LIMIT_EXCEEDED) | A new dashboard shipped an un-aggregated full-table scan |
+| 17 Apr 26 02:10 BST | 2.1% | 252 (TOO_MANY_PARTS) | Ingest hit the parts cap on `events.clickstream_raw` |
+| 16 Apr 26 19:44 BST | 1.4% | 60 (UNKNOWN_TABLE) | A deploy referenced a table before its migration ran |
+
+The Nerve Centre headline reads **1 active error-rate spike, peak 4.8%, code 241**, outlined red. The DBA reads the feed:
+
+1. **The 13:22 event is a memory problem from a deploy.** Code 241 (`MEMORY_LIMIT_EXCEEDED`) at 4.8% means heavy queries are being killed by `max_memory_usage`. The timing next to a release strongly suggests a new query that scans without aggregating. Cross-check [MEMORY_LIMIT_EXCEEDED (24h)](/nerve-centre/kpi-cards/clickhouse/memory-limit-exceeded-24h) to confirm the count and find the query text.
+2. **The 02:10 event was an ingest break, not a query break.** Code 252 (`TOO_MANY_PARTS`) means inserts were rejected because a table hit the parts cap. Those rejected inserts show as errors here too. The fix lives in the ingest pipeline, traceable via [Too Many Parts Errors (24h)](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h).
+3. **The 16 Apr event was a deploy-order bug.** Code 60 (`UNKNOWN_TABLE`) means application code referenced a table that did not exist yet, a classic migration-ran-after-deploy race. It self-resolved once the migration completed.
+
+```text
+Triaging the 13:22 memory spike:
+  - Find the offending queries in the alert window:
+      SELECT query, exception, memory_usage
+      FROM system.query_log
+      WHERE type = 'ExceptionWhileProcessing'
+        AND exception_code = 241
+        AND event_time >= '2026-04-18 13:22:00'
+      ORDER BY memory_usage DESC LIMIT 5
+  - Short-term: kill the offending query, raise max_memory_usage for that user only
+  - Real fix: add aggregation / a GROUP BY / a date filter so the query
+              stops scanning the whole table
+```
+
+The exception code is the shortcut. Rather than guessing, the DBA reads code 241 and goes straight to the memory question, code 252 and goes straight to ingest, code 60 and goes straight to the deploy. The window timestamp lines up the spike with whatever changed.
+
+Three takeaways:
+
+1. **The exception code is the diagnosis.** Do not treat "error rate up" as a single problem. 241, 252, and 60 have completely different fixes. Always read the dominant code on the row first.
+2. **1% is a lot at analytical volume.** At hundreds of QPS, 1% is several failed queries per second. The threshold is low on purpose because the blast radius is high.
+3. **This card is the timeline; the per-code cards are the depth.** Use this feed to spot *when* and *what kind*, then drill into [MEMORY_LIMIT_EXCEEDED (24h)](/nerve-centre/kpi-cards/clickhouse/memory-limit-exceeded-24h), [Too Many Parts Errors (24h)](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h), or [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h) for the detail.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this alert | What the combination tells you |
+| --- | --- | --- |
+| [Query Error Rate %](/nerve-centre/kpi-cards/clickhouse/query-error-rate) | The live gauge this alert watches. | The gauge shows current rate; this card shows when it spiked and why. |
+| [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h) | The 24-hour absolute count of exceptions. | A spike here plus a high daily count equals a persistent fault, not a one-off. |
+| [MEMORY_LIMIT_EXCEEDED (24h)](/nerve-centre/kpi-cards/clickhouse/memory-limit-exceeded-24h) | The code-241 detail. | Spike with code 241 dominant equals heavy queries swamping memory. |
+| [Too Many Parts Errors (24h)](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h) | The code-252 detail. | Spike with code 252 dominant equals ingest break, not query break. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/clickhouse/slow-query-rate) | Slow queries often precede memory kills. | Rising slow-query rate before an error spike equals queries degrading toward failure. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/clickhouse/queries-per-second-live) | The denominator context. | A spike at low QPS is more alarming per-query than the same percentage at high QPS. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that weights error rate. | A sustained error spike drags the composite below 70. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> Compute the same rate directly from `system.query_log` in `clickhouse-client`:
+> ```sql
+> SELECT
+>   countIf(type='ExceptionWhileProcessing') / count() * 100 AS error_pct,
+>   exception_code, any(exception)
+> FROM system.query_log
+> WHERE event_time >= now() - INTERVAL 5 MINUTE
+>   AND type IN ('QueryFinish','ExceptionWhileProcessing')
+> GROUP BY exception_code ORDER BY count() DESC
+> ```
+> Decode any exception code with `SELECT name, code FROM system.errors WHERE code = 241`.
+> On **ClickHouse Cloud**, the same `system.query_log` query runs in the SQL console, and the managed monitoring view surfaces query error rate over time.
+
+**Why our number may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window alignment** | Either | The card uses a rolling 5-minute window; a manual query with a fixed `now() - 5 MINUTE` boundary samples a slightly different slice. |
+| **log_queries setting** | Card lower if logging is sampled | If `log_queries_probability < 1`, `system.query_log` samples queries and both the card and a manual query undercount. Set it to 1 for accurate rates. |
+| **Denominator choice** | Either | Including or excluding `QueryStart` rows changes the ratio. The card counts only finished and failed queries; a query that counts all `type` values will read lower. |
+| **Async inserts** | Card may differ | Failures inside async-insert flushes are logged differently; the card accounts for them, a naive query may miss them. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ClickHouse QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/clickhouse/clickhouse-qps-spike-vs-ecom-order-rate) | An error spike that coincides with a QPS spike but no order spike points to a dashboard storm or bot. | Errors rising while orders flow normally means the failures are query-side, not affecting the storefront pipeline. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card fired but every query in the window looks like a user typo. Is it a false positive?**
+Not necessarily, but read the exception codes. A burst of code 47 (`UNKNOWN_IDENTIFIER`) or code 62 (`SYNTAX_ERROR`) from a single user usually is a person fat-fingering queries in a console, and is harmless. The codes that matter are the systemic ones: 241 (memory), 252 (too many parts), 60 (unknown table), 159 (timeout). If those dominate, it is real. The card surfaces the top codes precisely so you can tell the difference at a glance.
+
+**Why 1%? My instance fails more than that all day on bad ad-hoc queries.**
+Then your baseline is unusually high and you should tune the threshold in the Sensitivity tab. 1% is the default because a well-behaved production instance, where applications send validated SQL, sits far below it. If interactive ad-hoc usage routinely pushes you over 1%, consider routing those users to a separate instance or profile so their typos do not mask real application-side faults.
+
+**The rate is over 1% but my QPS is tiny right now. Should I worry?**
+Read it carefully. At very low query volume the percentage is volatile: 1 failure out of 30 queries is over 3% but may just be one bad query. The sustained-5-minute gate helps, but at genuinely low volume always look at the absolute count too via [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h). The percentage is most meaningful at production query volumes.
+
+**My `system.query_log` is sampled, so the rate looks lower than reality. How do I fix it?**
+Set `log_queries_probability = 1` (the default) so every query is logged. If a profile or query has lowered it for performance reasons, both this card and any manual query will undercount failures proportionally. Accurate error-rate measurement depends on a complete query log.
+
+**Does this include failed inserts and failed background merges?**
+Failed inserts that throw (including code 252 when the parts cap is hit) appear in `system.query_log` and are counted. Failed *background* merges are a different mechanism: they are logged in `system.part_log` and surfaced through the merge and parts cards, not here. This card is specifically the query-and-insert error rate.
+
+**On ClickHouse Cloud, is the query log available?**
+Yes. `system.query_log` is populated on ClickHouse Cloud the same way, and the rate query runs in the SQL console. The Cloud monitoring view also charts query error rate over time, which you can use to confirm the card's spike windows against the managed service's own readings.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Error Rate Spike (>1% in 5m)* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

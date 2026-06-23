@@ -1,0 +1,181 @@
+---
+title: "ES Search Pool Saturation vs Ecom Burst, Elasticsearch"
+sidebarTitle: "ES Search Pool Saturation vs Ecom Burst"
+description: "ES Search Pool Saturation vs Ecom Burst for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Cross-Channel](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This card overlays Elasticsearch's search thread-pool saturation against your ecommerce traffic, row by row, so you can see the moment the database becomes the bottleneck for shoppers. The search thread pool is a fixed-size queue: each node has a bounded number of search threads plus a bounded queue, and when both fill, new searches are **rejected**. Saturation is the share of that capacity in use. The danger window is a traffic burst (a sale launch, an email blast, a paid-media spike) when search demand outruns pool capacity: saturation climbs toward 100%, queue depth rises, rejections start, and storefront search begins to fail or stall right when the most shoppers are trying to buy. This is the cross-channel card that connects "the cluster is busy" to "we are losing sales".
+
+| | |
+| --- | --- |
+| **API endpoint** | Search thread-pool stats from `GET /_nodes/stats/thread_pool/search` (active threads, queue depth, rejected count, pool size), overlaid with ecommerce session/order volume from the connected storefront connector. |
+| **Metric basis** | A paired series, not a single number. Left: ES search-pool saturation `% = (active + queued) / (pool_size + queue_capacity)`. Right: ecommerce traffic (sessions or orders per minute) over the same minutes. Plus the rejected-search count. |
+| **Aggregation window** | `15m` rolling, minute-by-minute rows so a short burst is visible. |
+| **Why it matters** | Pool saturation during a traffic burst is the most direct "search is about to fail and cost revenue" signal. Rejected searches mean shoppers get empty or errored search results during your highest-intent window. |
+| **What turns it high** | A traffic burst (sale, email, ad spike), an expensive query mix (big aggregations) consuming threads longer, a hot shard concentrating load on one node, or undersized search thread pools relative to peak demand. |
+| **What does NOT change it** | Indexing load uses the write pool, not the search pool, so indexing on its own does not saturate search (though it competes for CPU). Cluster colour does not change pool saturation. |
+| **Cross-channel pairing** | Reads the storefront connector (Shopify, BigCommerce or Adobe Commerce) for the traffic series; the value is the *overlap* of high ES saturation with high shopper demand. |
+| **Managed-service note** | Elastic Cloud, AWS OpenSearch/Elasticsearch Service (the `ThreadpoolSearchRejected` / `ThreadpoolSearchQueue` CloudWatch metrics) and Bonsai all expose search-pool stats via the same API. |
+| **Time window** | `15m` (rolling 15-minute overlay) |
+| **Alert trigger** | `> 90% during traffic burst`. Saturation above 90% while ecommerce traffic is bursting raises the card. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card computes search-pool saturation per node from the thread-pool stats and overlays it on the storefront traffic series for the same minutes:
+
+```text
+per node, per minute:
+  saturation% = (active_search_threads + search_queue_depth)
+                / (search_pool_size + search_queue_capacity) * 100
+  rejections  = delta of thread_pool.search.rejected
+
+cluster saturation = max(saturation%) across nodes
+                     (the busiest node is the bottleneck)
+
+ecom traffic = sessions/min (or orders/min) from the
+               connected storefront connector
+
+card row = { minute, cluster_saturation%, rejections, ecom_traffic }
+```
+
+Two design choices matter. First, the headline uses the **busiest node's** saturation (a `max`, not an average), because the search pool is per node: one saturated node rejects searches even while others have headroom, especially with a hot shard. Second, the alert fires on the **overlap** of high saturation and a traffic burst, not on saturation alone. A saturated pool at 03:00 with no shoppers is a capacity note; the same saturation during a sale launch is revenue at risk. The engine flags the condition critical when saturation exceeds 90% and rejections are non-zero during an identified traffic burst.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 4-node Elasticsearch 8.x cluster behind storefront search for a beauty retailer on BigCommerce. Each node has a search pool of 13 threads and a queue capacity of 1,000 (typical 8.x defaults sized to CPU). A flash sale email goes out at 19:00 on 06 Jun 26. Snapshot of the overlay around the burst:
+
+| Minute (BST) | ES search saturation (busiest node) | Search rejections | BigCommerce sessions/min |
+| --- | --- | --- | --- |
+| 18:58 | 41% | 0 | 1,180 |
+| 19:00 | 67% | 0 | 3,640 |
+| 19:01 | 88% | 0 | 6,920 |
+| 19:02 | **97%** | 142 | 9,310 |
+| 19:03 | **99%** | 1,418 | 10,470 |
+| 19:04 | 94% | 760 | 9,880 |
+
+The card crosses the 90% alert line at 19:02 with rejections starting, exactly as BigCommerce sessions triple off the email. The story is unambiguous: the email landed, shoppers poured in, every one of them hit search, and the search pool on the busiest node filled. From 19:02 to 19:04 roughly 2,320 searches were rejected: those shoppers saw an empty or errored search box during the single highest-intent window of the week.
+
+The decision tree:
+
+1. **Is the cluster otherwise healthy?** Yes, status is green, heap is fine. This is not a fault, it is a capacity shortfall against peak demand. The pool is correctly sized for normal load but not for a 9x burst.
+2. **Why the busiest node first?** The `products` index has mild shard skew, so one node carries the heaviest shard and saturates before the others. Pair with [Shard Size Skew %](/nerve-centre/kpi-cards/elasticsearch/shard-size-skew) confirms the imbalance.
+3. **Immediate vs structural fix?** Immediate: shed load (serve a cached "popular products" view to logged-out users so not every session hits live search), and confirm the storefront retries rejected searches gracefully rather than showing an error. Structural: scale out search capacity (more data nodes or a dedicated search tier) ahead of known sale events, and reindex `products` to remove the skew.
+
+```text
+Why this matters in numbers:
+  - Rejected searches 19:02 to 19:04: ~2,320
+  - At a 2.3% search-to-order rate, ~53 orders likely lost
+  - Avg order value GBP 38 -> ~GBP 2,014 of at-risk revenue
+    in a 3-minute window, during the most expensive traffic
+    the brand will buy all month.
+  - Neither cluster status nor heap moved: only the pool
+    saturation overlay caught it, and only because it was
+    read against the traffic burst.
+```
+
+Three takeaways:
+
+1. **Saturation only means money when it lines up with shoppers.** The whole point of this cross-channel card is the overlay. High saturation off-peak is a capacity note; high saturation during a burst is revenue leaking in real time.
+2. **Rejections are the hard floor, watch them, not just saturation.** Saturation of 88% is busy but fine; the damage starts when the queue fills and `rejected` increments. Once rejections are non-zero, shoppers are being turned away. Treat the first non-zero rejection during a burst as the alarm.
+3. **The busiest node sets the ceiling.** Because the search pool is per node, an average hides the problem. One saturated node (often the hot-shard node) rejects searches while the cluster average still looks comfortable. Always read the max.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards platform teams should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with ES Search Pool Saturation | What the combination tells you |
+| --- | --- | --- |
+| [Search QPS Spike vs Ecom Traffic](/nerve-centre/kpi-cards/elasticsearch/search-qps-spike-vs-ecom-traffic) | The demand side of the same burst. | A QPS spike that drives saturation past 90% is the direct cause-and-effect chain for rejections. |
+| [Slow Searches During Checkout Window (5m)](/nerve-centre/kpi-cards/elasticsearch/slow-searches-during-checkout-window-5m) | The other revenue-window risk. | Pool saturation plus slow checkout-window searches equals "search is failing exactly when shoppers are buying". |
+| [HTTP Connection Saturation %](/nerve-centre/kpi-cards/elasticsearch/http-connection-saturation) | The connection-layer counterpart. | Both saturating together during a burst points to a cluster-wide capacity ceiling, not just the search pool. |
+| [Shard Size Skew %](/nerve-centre/kpi-cards/elasticsearch/shard-size-skew) | The reason one node saturates first. | High skew plus single-node saturation equals "the hot-shard node is the bottleneck during the burst". |
+| [Search Latency p99 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p99-ms) | The latency symptom before rejections start. | p99 climbing as saturation approaches 90% is the early warning before the queue fills. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/elasticsearch/slow-query-rate) | An expensive query mix worsens saturation. | A high slow rate during a burst means each query holds a thread longer, saturating the pool sooner. |
+| [Elasticsearch Health Score](/nerve-centre/kpi-cards/elasticsearch/elasticsearch-health-score) | The composite that weights pool pressure. | Sustained burst-time saturation pulls the composite down even with a green cluster. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> **`GET /_nodes/stats/thread_pool/search`** for per-node active threads, queue depth, rejected count and pool size. This is the raw data behind the saturation series.
+> **`GET /_cat/thread_pool/search?v&h=node_name,active,queue,rejected,size`** for a quick human-readable per-node view.
+> **`GET /_nodes/stats/jvm,os`** to confirm CPU and heap headroom during the burst.
+
+For the traffic side, reconcile against the storefront connector's own analytics: BigCommerce Analytics, the Shopify admin live view, or Adobe Commerce reporting for sessions/orders per minute in the same window.
+
+In managed services the pool stats appear as metrics: Elastic Cloud's deployment metrics, AWS OpenSearch/Elasticsearch Service's `ThreadpoolSearchRejected`, `ThreadpoolSearchQueue` and `ThreadpoolSearchThreads` CloudWatch metrics, and Bonsai's cluster metrics.
+
+**Why our value may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Max vs average** | Our value may look higher | The card reports the busiest node's saturation; a manual average across nodes reads lower because it dilutes the hot node. |
+| **Rejected is cumulative** | Direction matters | The `rejected` counter is monotonic since node start; the card shows the per-minute delta, so a raw read of `rejected` is a lifetime total, not a rate. |
+| **Window alignment** | Variable | The overlay aligns ES minutes with storefront minutes; if the connectors' clocks or reporting windows differ slightly, peak rows can shift by a minute. |
+| **Time zone** | Timestamp display only | Saturation is timezone-independent; the overlay axis renders in your Vortex IQ display timezone, which must match the storefront connector's for the burst to line up. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) / [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`adobe_commerce.total_revenue`](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | A saturation-plus-rejection window should correspond to a conversion dip. | Rejections during a burst with no revenue dip can mean the storefront cached or retried gracefully; a dip confirms shoppers were turned away. |
+| [Search QPS Spike vs Ecom Traffic](/nerve-centre/kpi-cards/elasticsearch/search-qps-spike-vs-ecom-traffic) | QPS and saturation should rise together during a burst. | Saturation high but QPS flat points to expensive queries holding threads, not raw demand. |
+
+<details>
+<summary><em>Documentation cross-reference (same-concept peer)</em></summary>
+
+The bounded search thread pool with rejection is specific to Elasticsearch and OpenSearch. It is **not** a reconciliation against a parallel system; these references exist only so a team running both engines can map the same concept across docs.
+
+- OpenSearch equivalent: identical search thread-pool stats and rejection semantics.
+- Generic equivalent on SQL databases: closest analogue is connection-pool or worker saturation with queueing and rejection (for example a maxed `max_connections`), but the per-node search-pool model differs.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Saturation hit 95% but there were no rejections. Was anything actually wrong?**
+Not yet. Saturation measures how full the pool plus queue is; rejections only start when both are completely full. A 95% reading means you are close to the edge with little headroom left, so the next small increase in demand or one slow query could tip you into rejections. Treat high saturation during a burst as the warning and the first non-zero rejection as the alarm.
+
+**Why does the card use the busiest node, not the cluster average?**
+Because the search thread pool is per node. A search routed to a saturated node is rejected even if three other nodes are idle, which is exactly what happens with a hot shard: one node carries the heavy shard and saturates first. An average would hide this by diluting the busy node against the quiet ones. The max is the honest ceiling.
+
+**My cluster is green and heap is fine, so how can search be failing?**
+Cluster status reflects shard allocation, not throughput, and heap reflects memory, not the thread pool. The search pool can be fully saturated and rejecting searches while the cluster is perfectly green with comfortable heap. This card exists precisely to catch that blind spot: a healthy-looking cluster that cannot keep up with burst demand.
+
+**Indexing was heavy during the burst. Did that fill the search pool?**
+Not directly. Indexing uses the write thread pool, which is separate from the search pool, so heavy indexing does not consume search threads. It does, however, compete for CPU, so a CPU-bound node under heavy indexing can make each search take longer, holding search threads longer and pushing saturation up indirectly. Check CPU via `GET /_nodes/stats/os` if both are heavy at once.
+
+**Can I just increase the search thread-pool size to stop rejections?**
+Rarely the right fix. The default search pool is sized to the node's CPU count (roughly `int((cores * 3) / 2) + 1`); making it larger than CPU can support means more threads contending for the same cores, which often increases latency rather than reducing rejections. The better levers are: add capacity (more data nodes or a search tier), reduce per-query cost (smaller aggregations, no deep pagination), cache popular searches, and fix shard skew so load spreads evenly.
+
+**The rejected count looks huge but the cluster recovered fine. Why?**
+The `rejected` field in the thread-pool stats is cumulative since node start, so a raw read shows a lifetime total that can be large even after a brief incident. The card shows the per-minute delta, which is the meaningful rate. If you are reading the native API, take the difference between two snapshots, do not read the absolute number as "rejections right now".
+
+**The traffic series and the saturation series do not line up by a minute. Is the card wrong?**
+Usually a clock or window-alignment artefact. The overlay aligns Elasticsearch minutes with the storefront connector's minutes; if the two connectors report on slightly offset windows or time zones, peak rows can appear shifted by a minute. Confirm both connectors use the same display time zone in their Vortex IQ profile. The shapes will match even if a single peak row is off by one.
+
+**Does this card work without a connected storefront?**
+The saturation series works on its own (it is pure Elasticsearch thread-pool data), but the "vs ecom burst" overlay needs a connected Shopify, BigCommerce or Adobe Commerce connector to supply the traffic series. Without it, you get saturation but lose the revenue-at-risk context that makes the alert meaningful. Connect the storefront connector to unlock the overlay.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*ES Search Pool Saturation vs Ecom Burst* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

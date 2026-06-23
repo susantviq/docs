@@ -1,0 +1,158 @@
+---
+title: "MongoDB Product Doc Count vs Ecom Catalog Size, MongoDB"
+sidebarTitle: "MongoDB Product Doc Count vs Ecom Catalog Size"
+description: "MongoDB Product Doc Count vs Ecom Catalog Size for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The gap between how many product documents your MongoDB collection holds and how many products your live ecommerce catalogue actually has. Many merchants store their full product catalogue in MongoDB (as a fast read store, a search index source, or a custom storefront backend) and sync it from the commerce platform. When those two counts diverge, the sync has failed: products exist in one system but not the other. This is a MongoDB-distinctive cross-channel check, because the database holding a parallel copy of the catalogue is exactly the pattern where silent drift costs sales. The card alerts on `>0 drift`: any difference at all means the systems are out of step.
+
+| | |
+| --- | --- |
+| **What it tracks** | The difference (drift) between the product document count in the MongoDB collection and the live product count reported by the connected ecommerce platform. |
+| **Data source** | MongoDB side: the document count of the configured product collection (`db.<collection>.countDocuments()` or the fast `estimatedDocumentCount()`). Ecom side: the live product count from the connected commerce connector (Shopify, BigCommerce or Adobe Commerce). The card subtracts one from the other. |
+| **Time window** | `RT/24h` (live count with a 24-hour comparison baseline). The headline shows the current drift; the 24-hour baseline shows whether drift is new or persistent. |
+| **Alert trigger** | `>0 drift between doc count and ecom product count`. Because a healthy sync should be exact, any non-zero gap raises a sensitivity alert rather than waiting for a percentage threshold. |
+| **What counts** | Product documents in the configured MongoDB collection, matched against the products the commerce platform considers part of the catalogue (subject to the scope rules below). |
+| **What does NOT count** | Non-product collections, and ecom products outside the configured scope (for example draft / archived products if the commerce connector excludes them). Variants are counted per the configured granularity (product-level vs variant-level), which must match on both sides. |
+| **Roles** | owner, platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+This is a cross-channel reconciliation card: it takes one count from each system and reports the difference.
+
+```text
+mongo_count = db.<product_collection>.countDocuments( <scope filter> )
+ecom_count  = live product count from the connected commerce connector
+
+drift = mongo_count - ecom_count        ( 0 = in sync )
+```
+
+What the inputs mean:
+
+- **`mongo_count`** is the number of product documents in the configured collection. For large collections the engine can use `estimatedDocumentCount()` (which reads collection metadata and is near-instant) or `countDocuments()` with a filter (which is exact but scans). The choice and any scope filter are part of the connector configuration.
+- **`ecom_count`** is the authoritative product count from the commerce platform: what the storefront actually sells.
+- **`drift`** is the signed difference. A positive drift means MongoDB has more documents than the catalogue (stale products that were deleted upstream but never removed, or duplicates). A negative drift means MongoDB is missing products the catalogue has (a sync that failed to insert new products).
+
+Important framing points:
+
+- **Definitions must match on both sides.** The counts are only comparable if both systems count the same thing: product-level vs variant-level, and the same status scope (active only, or active plus draft). A constant non-zero drift that never changes is usually a definition mismatch, not a sync failure.
+- **The alert is zero-tolerance by design.** Unlike a performance gauge with a percentage threshold, a catalogue sync is meant to be exact, so the meaningful signal is "any drift at all". The 24-hour baseline distinguishes a new drift (sync just broke) from a persistent one (definition mismatch to be reconciled once).
+- **This is the MongoDB-distinctive case.** The check exists because the database is holding a parallel copy of the catalogue. The whole risk is that the copy silently goes stale while the storefront keeps reading from it.
+
+The output is a single KPI value (the drift), with both source counts available on drill-down.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a custom storefront that reads product data from a MongoDB `products` collection, kept in sync from BigCommerce by a nightly sync job plus a webhook for live changes. Readings taken on 14 Jun 26.
+
+| Time (UTC) | mongo_count | ecom_count | Drift | What it means |
+| --- | --- | --- | --- | --- |
+| 02:00 | 48,210 | 48,210 | **0** | In sync after nightly job |
+| 09:30 | 48,210 | 48,265 | **-55** | 55 new products added upstream, not yet in MongoDB |
+| 11:00 | 48,210 | 48,265 | **-55** | Drift persisting: webhook sync is broken |
+| 14:00 | 48,320 | 48,265 | **+55** | Manual reimport overshot: 55 stale duplicates |
+
+At 02:00 the nightly job has just run and the two counts match exactly: zero drift, healthy. By 09:30 the merchandising team has added 55 new products in BigCommerce for a launch, but those products have not appeared in MongoDB, so drift is -55. The card fires immediately. By 11:00 the drift has not closed on its own, which proves the live webhook sync (not just the nightly job) is broken: the new products will not appear on the custom storefront until someone fixes it, so 55 sellable products are invisible to shoppers.
+
+At 14:00 someone runs a manual reimport to fix it, but the import inserts the 55 new products without de-duplicating against the existing set, so now MongoDB has 55 too many: drift flips to +55. The sign of the drift told the operator exactly what happened at each step.
+
+```text
+Reading the sign:
+  drift < 0   MongoDB is MISSING products the catalogue has
+              -> sync failed to insert; products invisible on the MongoDB-backed surface
+  drift > 0   MongoDB has EXTRA products the catalogue dropped
+              -> sync failed to delete, or a reimport created duplicates
+  drift = 0   in sync (assuming definitions match)
+```
+
+The DBA's response depends on the sign:
+
+1. **Negative drift (missing products):** the sync pipeline failed to insert. Check the webhook delivery log and the sync job's error output, then reconcile by re-running the sync for the affected products. The business impact is immediate: those products cannot be sold on the MongoDB-backed surface.
+2. **Positive drift (extra products):** the sync failed to delete upstream-removed products, or a reimport created duplicates. The risk is showing discontinued or duplicate products to shoppers. Reconcile by removing the orphaned documents, ideally with a sync job that deletes documents absent from the source.
+
+Three takeaways:
+
+1. **Zero drift is the only healthy reading for a synced catalogue.** Any persistent non-zero value means the database copy and the storefront disagree about what is for sale, which is a revenue and trust problem.
+2. **The sign tells you the failure mode.** Negative means missing inserts (lost sales); positive means failed deletes or duplicates (showing the wrong products). You do not need to investigate blind: the sign points you at the right half of the pipeline.
+3. **A constant non-zero drift is usually a definition mismatch, not a live failure.** If the gap never moves and equals, say, your exact count of draft products, the two systems are simply counting different scopes. Align the definitions once, then a non-zero value genuinely means a broken sync.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Product Doc Count vs Catalog Size | What the combination tells you |
+| --- | --- | --- |
+| [MongoDB OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mongodb/mongodb-ops-spike-vs-ecom-order-rate) | The other catalogue-and-commerce cross-channel check. | Drift plus an ops anomaly can point to a sync job hammering the database while still leaving it out of step. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | Shows whether a sync job is actually running. | Drift that never closes while ops are flat suggests the sync job is not running at all. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mongodb/query-error-rate) | Sync inserts that fail surface as write errors. | Drift growing alongside a write-error spike pinpoints the sync as the failing writer. |
+| [Slow Ops (15m, >100ms)](/nerve-centre/kpi-cards/mongodb/slow-ops-15m-100ms) | Large reimports can show up as slow bulk operations. | A reimport that overshoots into positive drift often coincides with a slow-ops spike. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/mongodb/last-successful-backup-hours-ago) | Reconciling drift may mean restoring or re-importing. | Confirm a recent backup before any bulk delete to fix positive drift. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | The composite that can weight data-integrity signals. | Persistent drift should register as a data-integrity concern in the score. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to confirm the number in MongoDB's own tooling:**
+
+> **`mongosh`:** `db.<collection>.countDocuments({})` gives the exact count with any filter you apply; `db.<collection>.estimatedDocumentCount()` gives the fast metadata-based count. Use the same scope filter the connector uses to reproduce the MongoDB side.
+> **`db.stats()` / `db.<collection>.stats()`:** the `count` field gives a quick (estimated) document count for the collection without a full scan.
+> **Atlas:** the **Collections** browser shows the document count per collection in the data explorer.
+> **Ecom side:** the connected commerce platform's own admin (Shopify, BigCommerce or Adobe Commerce) holds the authoritative product count this card subtracts against; check it under the platform's product / catalogue listing.
+
+**Why our number may legitimately differ from the native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Estimated vs exact count** | Either | `estimatedDocumentCount()` reads collection metadata and can lag immediately after bulk writes; `countDocuments()` is exact but slower. If the connector uses the estimate, it can momentarily disagree with a hand-run exact count. |
+| **Scope filter** | Either | The MongoDB count uses the connector's configured filter; a hand count with no filter (or a different one) reads differently. |
+| **Granularity mismatch** | Either | Product-level vs variant-level counting must match on both sides; a mismatch produces a large, constant drift that is a definition issue, not a sync failure. |
+| **Status scope** | Either | If the ecom connector counts only active products but MongoDB holds drafts too (or vice versa), a steady offset appears. Align the status scope. |
+| **Sync timing** | Transient | A count taken mid-sync catches the pipeline part way through; the drift closes once the sync completes. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) / [`adobe_commerce.total_revenue`](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | A MongoDB-backed storefront missing products (negative drift) should correlate with lost revenue on those products. | Drift with no revenue impact may mean the affected products were not selling anyway, or the storefront falls back to the commerce platform for unknown products. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | Persistent drift should be visible as a data-integrity concern. | If the score ignores drift, check whether data-integrity signals are weighted in the sensitivity profile. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does the card alert on any drift at all, instead of a percentage threshold?**
+Because a catalogue sync is supposed to be exact. A performance gauge tolerates small fluctuations, but a synced product collection either matches the source or it does not, and any mismatch means products are wrong somewhere. A zero-tolerance alert catches the failure the moment it happens rather than waiting for it to grow large enough to cross a percentage line, by which point shoppers may already be seeing missing or stale products. If a small constant offset is expected because of a definition difference, fix the definition rather than raising the threshold.
+
+**What does the sign of the drift tell me?**
+The sign points directly at the failure mode. A negative drift (MongoDB has fewer documents than the catalogue) means the sync failed to insert: new products exist upstream but never made it into MongoDB, so they are invisible on the MongoDB-backed surface, which costs sales. A positive drift (MongoDB has more) means the sync failed to delete upstream-removed products, or a reimport created duplicates, so shoppers may see discontinued or repeated products. Reading the sign saves you investigating the wrong half of the pipeline.
+
+**I have a constant drift that never changes. Is my sync broken?**
+Probably not; a constant, unchanging drift is almost always a definition mismatch rather than a live failure. The usual causes are granularity (one side counts products, the other counts variants) and status scope (one side includes draft or archived products, the other excludes them). Confirm by checking whether the drift equals a known category, such as your exact number of draft products. Align the two definitions once, after which a non-zero drift genuinely indicates a sync problem.
+
+**Does using `estimatedDocumentCount()` make the number unreliable?**
+The estimate reads collection metadata and is near-instant, which is why it is preferred for very large collections, but it can lag for a short window immediately after bulk inserts or deletes because the cached metadata has not caught up. For routine monitoring this is fine. If you see a small transient drift right after a big sync that resolves on its own within minutes, the estimate catching up is the likely cause. For an authoritative figure during reconciliation, use the exact `countDocuments()`.
+
+**My MongoDB-backed storefront falls back to the commerce platform for unknown products. Does drift still matter?**
+It matters less for availability but still matters for performance and correctness. A fallback means a missing product is still sellable, but every request for it bypasses the fast MongoDB read path and hits the slower commerce API, which adds latency and load. Positive drift (stale extras) is worse in this setup because there is no fallback to correct a product that should no longer exist: the storefront will keep showing it. Treat drift as a real defect even with a fallback in place.
+
+**How do I safely fix a positive drift (too many documents)?**
+Carefully, because the fix is a delete. First confirm a recent successful backup exists (see [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/mongodb/last-successful-backup-hours-ago)). Then identify the orphaned documents (products in MongoDB whose IDs no longer exist in the commerce catalogue) rather than deleting blindly by count. The durable fix is a sync job that reconciles both directions: it inserts products missing from MongoDB and removes documents whose source product has been deleted, so positive and negative drift both self-heal on the next run.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*MongoDB Product Doc Count vs Ecom Catalog Size* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

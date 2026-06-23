@@ -1,0 +1,133 @@
+---
+title: "Query Latency p99 (ms), MariaDB"
+sidebarTitle: "Query Latency p99 (ms)"
+description: "Query Latency p99 (ms) for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The 99th-percentile statement execution time on the MariaDB instance, in milliseconds, computed over a real-time 5-minute window. Ninety-nine percent of statements finished at or below this number; the slowest 1% took longer. p99 is the tail-of-the-tail: it exposes the worst sustained query experience the database is delivering. For a DBA, p99 is the percentile that maps to the angriest support tickets and the timeouts: the requests that occasionally hang, retry, or fail. It moves for different reasons than p50 or p95, usually lock contention, a cold buffer pool, an occasional full scan, or a stop-the-world event like a checkpoint flush. When p99 crosses 500ms the card turns amber, because at that point the worst 1% of queries are slow enough to trip application timeouts.
+
+| | |
+| --- | --- |
+| **What it tracks** | Query Latency p99 (ms): the 99th-percentile statement execution time across all statements in the window. The detail line is *Query Latency p99 (ms) for the selected period.* |
+| **Data source** | MariaDB `performance_schema.events_statements_histogram_global` and `events_statements_summary_by_digest`, where per-statement timers (picoseconds) are summarised and the percentile read from the latency histogram, converted to milliseconds. |
+| **Time window** | `RT/5m`: a real-time reading recomputed every poll over the trailing 5-minute window. |
+| **Alert trigger** | `> 500ms`. Above this the card turns amber and surfaces in the Sensitivity feed. |
+| **Distinct from** | p50 (median) and p95 (the body of the tail). p99 isolates the worst 1%, the requests most likely to time out, retry, or be abandoned. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The percentile is read from MariaDB's statement-time distribution, not from an average. The Performance Schema records each statement's wall-clock execution time (`TIMER_WAIT`, in picoseconds) into a latency histogram. The card reads the histogram for the trailing 5 minutes and finds the bucket boundary below which 99% of recorded statement time falls, then converts to milliseconds.
+
+```text
+p99_ms = percentile(statement_execution_time, 0.99) over the trailing 5m
+       = histogram_bucket_at(cumulative_fraction >= 0.99) / 1e9   (ps to ms)
+```
+
+p99 is intentionally sensitive to the extreme tail. Because only 1% of statements sit above it, a small number of very slow statements (a lock wait, a full scan, a temporary-table spill to disk, a checkpoint stall) is enough to move it sharply, even when p50 and p95 stay flat. That sensitivity is the point: p99 is the early-warning percentile for problems that are not yet affecting most users but are already breaking the unlucky few. When `performance_schema` is disabled the engine falls back to a coarser estimate derived from `Slow_queries` and `long_query_time`; the At a glance source line indicates which path produced the reading.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MariaDB 10.6 primary behind an order-management application. Snapshot taken on 09 Apr 26 at 20:05 BST, during an evening batch import.
+
+| Percentile | Value | Card state |
+| --- | --- | --- |
+| p50 (median) | 9 ms | green |
+| p95 | 60 ms | green (threshold `> 200ms`) |
+| **p99** | **820 ms** | **amber (threshold `> 500ms`)** |
+
+The median and p95 are healthy, but p99 has blown past 500ms. This is the classic "one in a hundred queries is terrible while everything else is fine" pattern, which almost always means contention or a stop-the-world event rather than a broken query plan. The DBA checks two native sources. First, lock waits:
+
+```sql
+SELECT * FROM information_schema.INNODB_TRX
+WHERE trx_state = 'LOCK WAIT';
+
+SELECT * FROM performance_schema.data_lock_waits;
+```
+
+These show several transactions blocked behind a long-running `UPDATE` from the batch import holding row locks on the `orders` table. The import runs in one large transaction, so it holds locks for its full duration; any customer-facing write touching the same rows waits behind it, and those waiting statements land in the p99 bucket. p50 and p95 stay low because only the unlucky writes that collide with the import are slow.
+
+The fix is operational, not structural: chunk the batch import into smaller transactions (commit every few thousand rows) so locks are held briefly, and schedule it outside peak hours. After chunking, p99 falls to 70ms.
+
+Three takeaways:
+
+1. **p99 moving alone points at contention or stalls, not bad plans.** When a query plan regresses it usually drags p95 too. A clean p95 with a blown p99 says "most queries are fine but some are waiting on something", which is locks, checkpoints, or I/O bursts.
+2. **Long transactions are the usual culprit.** A single large `UPDATE`/`DELETE` holding locks for seconds will spike p99 for everyone who collides with it. Chunk large DML; never hold locks across a whole batch.
+3. **p99 is your timeout early-warning.** Application timeouts are commonly set around 1 to 2 seconds. When p99 climbs toward that, the worst 1% of requests start failing outright. Treat a rising p99 as a leading indicator of timeout-driven errors.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Latency p99 | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms) | The body of the tail. | p99 spiking while p95 holds means a few pathological queries (often locks); both rising means the slowdown is broadening. |
+| [Query Latency p50 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p50-ms) | The typical request. | A flat p50 with a blown p99 confirms the problem is the tail, not the whole workload. |
+| [InnoDB Deadlocks (last 5m)](/nerve-centre/kpi-cards/mariadb/innodb-deadlocks-last-5m) | Lock contention that stalls the worst statements. | p99 spikes that coincide with deadlocks or lock waits point at contention from long transactions. |
+| [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mariadb/top-10-slowest-queries-digest) | The named statements behind the tail. | The `MAX_TIMER_WAIT` column finds the statement responsible for the p99 outliers. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mariadb/slow-query-rate) | The proportion over `long_query_time`. | A high p99 with a low slow-query rate means rare but extreme outliers, exactly the p99 signature. |
+| [InnoDB / XtraDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mariadb/innodb-xtradb-buffer-pool-hit-rate) | Cold-cache disk reads that lengthen the tail. | A dip in hit rate that coincides with a p99 spike means the slow queries are paying for disk reads. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite that weights latency. | A sustained p99 breach pulls the composite down even when most queries look healthy. |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/mariadb/slow-queries-during-checkout-window-5m) | The revenue-at-risk cross-channel view. | A p99 outlier that lands in the checkout window is the one that abandons a basket. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> `SELECT DIGEST_TEXT, ROUND(MAX_TIMER_WAIT/1e9,1) AS max_ms FROM performance_schema.events_statements_summary_by_digest ORDER BY MAX_TIMER_WAIT DESC;` to find the statements driving the extreme tail.
+> `SELECT * FROM performance_schema.events_statements_histogram_global;` for the raw histogram the percentile is read from.
+> `SELECT * FROM information_schema.INNODB_TRX;` and `SELECT * FROM performance_schema.data_lock_waits;` for the lock waits behind contention-driven p99 spikes.
+> The slow query log plus `pt-query-digest` (Percona Toolkit), which prints its own 95th/99th percentile breakdown for cross-checking.
+
+**Why our number may legitimately differ from a manual digest query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Windowing** | Variable | The digest tables accumulate since the last `TRUNCATE`/restart; our card recomputes over a trailing 5 minutes, so a long-lived `MAX_TIMER_WAIT` need not match a fresh 5-minute p99. |
+| **Percentile vs max** | Ours below the digest max | The digest `MAX_TIMER_WAIT` is the single worst observation ever; p99 is the boundary of the worst 1%, so it normally sits below the recorded max. |
+| **Tail volatility** | Marginal | p99 is sensitive by design; the seconds between the last poll and your manual query can include or exclude an outlier and shift the reading. |
+| **Fallback path** | Coarser | With `performance_schema` off, we estimate from slow-query rate and `long_query_time`, which is less precise than the histogram path. |
+
+**On managed services:** Amazon RDS / Aurora for MariaDB surfaces the worst SQL through Performance Insights and the same `performance_schema` tables; SkySQL and Azure Database for MariaDB expose latency in their own consoles. Vendor percentile definitions and windows differ, so align the 5-minute window and confirm whether their figure is a true p99 before treating a gap as real.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Q: Why track p99 as well as p95? Is it not just a noisier p95?**
+They answer different questions. p95 tracks the body of the slow tail, the experience a real fraction of users get. p99 isolates the worst 1%, the requests that time out, retry, or get abandoned. p99 moves for contention and stall reasons (locks, checkpoints, cold cache, I/O bursts) that often do not touch p95 at all, which makes it the better early-warning signal for timeout-driven failures.
+
+**Q: p99 spiked but p50 and p95 are flat. What is the cause?**
+Almost always contention or a stop-the-world event affecting a small number of statements: a long transaction holding row locks, an InnoDB checkpoint flush, a temporary-table spill to disk, or an occasional cold-cache full scan. Check [InnoDB Deadlocks (last 5m)](/nerve-centre/kpi-cards/mariadb/innodb-deadlocks-last-5m), `information_schema.INNODB_TRX` for long-running transactions, and the digest table's `MAX_TIMER_WAIT` column.
+
+**Q: p99 is very volatile on my instance. Why does it jump around?**
+Because only 1% of statements sit above it, a low-traffic 5-minute window holds few qualifying samples, so a single outlier can move it noticeably. On low-volume instances p99 is naturally choppier than p95. Read it as a trend rather than a single reading, and raise the threshold in the Sensitivity tab if your baseline is genuinely higher.
+
+**Q: Long transactions keep spiking p99. How do I stop it?**
+Chunk large DML so locks are held briefly: commit every few thousand rows instead of wrapping a whole import in one transaction. Schedule heavy batch work outside peak hours. Set a sane `innodb_lock_wait_timeout` so a stuck waiter fails fast rather than hanging. Use [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mariadb/top-10-slowest-queries-digest) and `information_schema.INNODB_TRX` to find the offending transaction.
+
+**Q: Does p99 include replication or background threads?**
+No. The card measures client statement execution times only. Replica SQL-thread apply, purge, and other background work are excluded. If replicas are slow, look at [Async Replication Lag (seconds)](/nerve-centre/kpi-cards/mariadb/async-replication-lag-seconds).
+
+**Q: The card shows a fallback estimate rather than the histogram value. Why?**
+`performance_schema` (or its statement instrumentation) is disabled on this instance, so the histogram is unavailable and the engine estimates p99 from the slow-query rate and `long_query_time`. Enable `performance_schema = ON` and the `events_statements_*` consumers, then restart, to get the precise histogram-derived reading.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Latency p99 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

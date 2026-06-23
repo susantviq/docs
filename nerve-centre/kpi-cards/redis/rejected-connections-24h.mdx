@@ -1,0 +1,150 @@
+---
+title: "Rejected Connections (24h), kpi"
+sidebarTitle: "Rejected Connections (24h)"
+description: "Rejected Connections (24h) for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of client connections Redis refused in the last 24 hours because the instance had already reached `maxclients`. Every value above zero is a connection that was turned away: a web node, a worker, or a health check that could not get in. Unlike most metrics this one has no "acceptable" non-zero band; the alert fires at the first rejection because by the time Redis is refusing connections, some downstream service has already failed to do its job. This is the hard, lagging proof that the connection pool was exhausted, the confirmation event behind the [Clients vs maxclients %](/nerve-centre/kpi-cards/redis/clients-vs-maxclients) gauge.
+
+| | |
+| --- | --- |
+| **What it tracks** | The count of `rejected_connections` accumulated over a rolling 24-hour window. A non-zero value means Redis hit its `maxclients` ceiling and refused new connections during that window. |
+| **Data source** | Redis `INFO stats` section: the `rejected_connections` counter. The detail line: `rejected_connections from INFO stats, clients refused due to maxclients hit.` The card computes the delta across the 24-hour window from this monotonic counter. |
+| **Time window** | `24h` (rolling 24-hour total, so a rejection event stays visible for a full day after it happens). |
+| **Alert trigger** | `> 0`. Any rejection at all turns the card red and pages the on-call. There is no healthy non-zero value. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+`rejected_connections` is a monotonically increasing counter that Redis exposes in `INFO stats`. It starts at zero on instance boot and only ever goes up; it resets only on restart (or `CONFIG RESETSTAT`). The card does not display the lifetime counter, it displays the *delta* over the trailing 24 hours:
+
+```text
+rejected_24h = rejected_connections(now) - rejected_connections(24h_ago)
+```
+
+Redis-specific points the engine handles:
+
+- **Counter reset on restart.** If the instance restarted inside the 24-hour window, the "24h ago" sample is larger than "now", which would yield a negative delta. The engine detects the reset (a decrease in a monotonic counter) and treats the window as starting from the restart, so a freshly booted instance shows the rejections *since boot*, not a nonsense negative.
+- **`rejected_connections` is specifically the `maxclients` refusal.** It does not count connections dropped for other reasons (a client that disconnected, a protocol error, an auth failure). Those have separate accounting. This counter is the clean signal: "I turned someone away because I was full."
+- **Cluster and replica connections.** On a cluster node the counter reflects only the connections that node refused. A fleet-wide total is the sum across nodes; the card reports per instance so you can find the hot node.
+
+Because the counter only moves when the cap is actually hit, a value of zero is a genuine "no rejections" guarantee for the window, not an absence of data.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs self-hosted Redis 7.0 backing session storage for a storefront. `maxclients` is set to 10,000 in `redis.conf`, but the host's `ulimit -n` was left at the default 1,024, so Redis clipped the effective `maxclients` to roughly 992 at start-up and logged a warning nobody read. Snapshot taken on 22 Mar 26 at 09:00 GMT, covering the previous 24 hours.
+
+| Reading | Value |
+| --- | --- |
+| `rejected_connections` (lifetime) | 14,802 |
+| `rejected_connections` 24h ago | 12,610 |
+| **Rejected (24h)** | **2,192** |
+| Configured `maxclients` (`redis.conf`) | 10,000 |
+| Effective `maxclients` (`CONFIG GET`) | 992 |
+
+The card shows **2,192** in red. The on-call engineer works backward:
+
+1. **2,192 connections were refused in 24 hours.** Each one was a real downstream failure: a web request that could not read a session and bounced the user to login, or a worker that crash-looped.
+2. **Why is the cap 992 when the config says 10,000?** `CONFIG GET maxclients` returns 992, not 10,000. The OS file-descriptor limit clipped it. This is the classic mismatch, the team thought they had ten thousand slots and actually had under a thousand.
+3. **When did the rejections cluster?** Cross-referencing the storefront's traffic, the rejections all landed during the 18:00 to 21:00 evening peak, when concurrent sessions briefly exceeded 992.
+
+```text
+Impact framing:
+  - 2,192 rejected connections over 24h
+  - Concentrated in the 18:00-21:00 peak (~730/hour at the worst)
+  - Each rejection = one user session lookup that failed
+  - Storefront conversion dipped ~4% during the affected hours
+  - Root cause: ulimit -n 1024 clipping maxclients to 992
+
+Fix sequence:
+  1. Raise ulimit -n to 65535 (systemd LimitNOFILE or /etc/security/limits.conf)
+  2. Restart Redis so the effective maxclients picks up 10,000
+  3. Confirm CONFIG GET maxclients now returns 10,000
+  4. Watch this card return to 0 over the next 24h
+```
+
+Three takeaways:
+
+1. **Zero is the only good value.** Unlike latency or memory, there is no "a few rejections is fine" band. The first rejection means real traffic was turned away.
+2. **The config value lies; the effective value is truth.** Always confirm `CONFIG GET maxclients` against `redis.conf`. A clipped `maxclients` is one of the most common causes of unexplained rejections.
+3. **This card is the receipt, not the warning.** By the time it is non-zero, the damage is done. Watch [Clients vs maxclients %](/nerve-centre/kpi-cards/redis/clients-vs-maxclients) to act *before* rejections start.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Rejected Connections | What the combination tells you |
+| --- | --- | --- |
+| [Clients vs maxclients %](/nerve-centre/kpi-cards/redis/clients-vs-maxclients) | The leading gauge that predicts rejections. | Gauge at 90%+ then rejections appearing equals the cap was crossed; act on the gauge to prevent the rejection. |
+| [Connections Rejected Due to maxclients](/nerve-centre/kpi-cards/redis/connections-rejected-due-to-maxclients) | The real-time alert version of the same event. | This card is the 24h total; that one fires the instant the counter increments. |
+| [Connected Clients](/nerve-centre/kpi-cards/redis/connected-clients) | The raw connection count over time. | Connected clients pinned at the cap during the rejection window confirms saturation, not a transient. |
+| [Blocked Clients (BLPOP / BRPOP / WAIT)](/nerve-centre/kpi-cards/redis/blocked-clients-blpop-brpop-wait) | Blocked clients still occupy connection slots. | A consumer storm can fill the pool with blocked clients, causing rejections with low real throughput. |
+| [Connected Clients Saturation vs Traffic Burst](/nerve-centre/kpi-cards/redis/connected-clients-saturation-vs-traffic-burst) | Ties rejections to storefront traffic spikes. | Confirms whether rejections coincided with genuine demand or a leak. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The composite that any rejection drags down. | A non-zero rejection count alone can drop the health score below threshold. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live) | Throughput context during the rejection window. | High ops plus rejections equals real demand; low ops plus rejections equals a connection leak. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis's own tooling:**
+
+> `redis-cli INFO stats | grep rejected_connections` returns the lifetime counter. Sample it twice 24 hours apart (or read your monitoring history) to reproduce the card's delta.
+> `redis-cli CONFIG GET maxclients` returns the effective ceiling. If this is lower than your `redis.conf` value, the OS file-descriptor limit clipped it, the usual root cause.
+> `redis-cli INFO clients` shows `connected_clients` so you can see how close you are to the cap right now.
+> The Redis server log records `Warning: max number of clients reached` lines with timestamps, giving you the exact moments rejections happened.
+
+For managed services:
+
+> **ElastiCache / MemoryDB:** CloudWatch does not expose `rejected_connections` directly; watch `CurrConnections` against the node-type `maxclients` ceiling and the engine log file (slow-log / events) for the reached-cap warning.
+> **Azure Cache for Redis:** the `Total Operations` and `Connected Clients` metrics in Azure Monitor; rejections surface as failed connection attempts in client telemetry.
+> **Redis Cloud (Redis Enterprise):** the database metrics view reports connection counts against the subscription limit.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Counter reset on restart** | Ours could be lower | A restart inside the window resets the lifetime counter; we count from the restart, not a negative delta. |
+| **Per-node vs fleet** | Ours per instance | A cluster total is the sum across nodes; we report each node separately to surface the hot one. |
+| **`CONFIG RESETSTAT`** | Ours lower | If someone reset stats inside the window, the baseline moved; the card counts from the reset. |
+| **Sampling cadence** | Marginal | We delta two samples 24h apart; a vendor counter read at a different instant differs by the rejections in between. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows rejections but Clients vs maxclients % is green right now. How?**
+The gauge is real-time with 1-minute smoothing; this card is a 24-hour total. A short, sharp burst hours ago could have hit the cap, refused some connections, and subsided, all before you looked at the gauge. The 24h total preserves the evidence; the live gauge does not. This is exactly why both cards exist.
+
+**My `redis.conf` says `maxclients 10000` but I am getting rejections at under a thousand connections. Why?**
+Almost certainly the OS file-descriptor limit. Redis needs one descriptor per client plus a reserve; if `ulimit -n` is lower than `maxclients + 32`, Redis clips the effective `maxclients` at start-up and logs a warning. Run `CONFIG GET maxclients` to see the real ceiling, then raise `ulimit -n` (systemd `LimitNOFILE`, or `/etc/security/limits.conf`) and restart.
+
+**Can I raise `maxclients` at runtime to stop rejections?**
+On self-hosted Redis, `CONFIG SET maxclients 50000` works immediately *if* the OS file-descriptor limit allows it, otherwise it is clipped silently. On managed services the ceiling is fixed by node type and you must scale to a larger node or add a client-side connection pool. Raising the cap stops rejections only if the underlying demand is genuine; a connection leak will refill any headroom.
+
+**Does this counter include connections dropped for other reasons?**
+No. `rejected_connections` is specifically the `maxclients` refusal. Connections closed for client disconnects, protocol errors, idle timeouts, or auth failures are accounted for separately and do not appear here. That precision is what makes a non-zero value unambiguous.
+
+**Why is the window 24 hours and not real-time?**
+Because rejections are bursty and brief. A 24-hour total ensures a 3-minute rejection storm at 02:00 is still visible at 09:00 when the team reviews dashboards. The real-time view lives in [Connections Rejected Due to maxclients](/nerve-centre/kpi-cards/redis/connections-rejected-due-to-maxclients).
+
+**My instance restarted overnight. Does that hide rejections from before the restart?**
+The lifetime counter resets to zero on restart, so rejections from before the restart are lost from Redis itself. The card detects the reset and reports rejections *since boot* rather than a negative delta. If you need the pre-restart figure, it lives only in the server log (`max number of clients reached` lines) or your external monitoring history.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Rejected Connections (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

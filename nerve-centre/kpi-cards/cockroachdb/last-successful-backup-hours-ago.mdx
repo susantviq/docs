@@ -1,0 +1,105 @@
+---
+title: "Last Successful Backup (hours ago), CockroachDB"
+sidebarTitle: "Last Successful Backup (hours ago)"
+description: "Last Successful Backup (hours ago) for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Backup](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Last Successful Backup (hours ago)** measures the age of your most recent completed CockroachDB backup, in hours. It answers the one question that matters when something goes catastrophically wrong: "if I had to restore right now, how much data would I lose?" The number is your recovery point in plain terms. A small figure means a recent, restorable copy exists; a large or growing figure means your backup pipeline has stalled and your exposure to data loss is widening hour by hour. This is a recoverability card, not a performance card, and it is one of the few metrics whose value only matters on your worst day.
+
+| | |
+| --- | --- |
+| **What it tracks** | The elapsed hours since the last backup job completed successfully. |
+| **Data source** | Self-hosted: the most recent successful `BACKUP` job, read from `SHOW JOBS` / `crdb_internal.jobs` (job type `BACKUP`, status `succeeded`) for backups written to S3, GCS, or other object storage. CockroachDB Cloud: the managed backups view, which records the timestamp of each automated full and incremental backup. |
+| **Time window** | `RT` (real-time; the age recomputes on each poll). |
+| **Alert trigger** | `> 72h`. More than three days since a successful backup means the pipeline has very likely failed silently and your recovery point has drifted dangerously far back. |
+| **Roles** | DBA, platform, SRE, compliance |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card finds the most recent backup job with status `succeeded` and computes `now - finished_at` in hours. The key word is succeeded: a job that started but failed, was cancelled, or is still running does not reset the clock. This is deliberate, because a backup that did not complete is not a recovery point. A half-written backup in object storage is worse than no backup, because it can give false confidence.
+
+On self-hosted clusters the source is the jobs system: `SELECT * FROM crdb_internal.jobs WHERE job_type = 'BACKUP' AND status = 'succeeded' ORDER BY finished DESC LIMIT 1;`. CockroachDB distinguishes full backups from incremental backups; both count as successful backups for the age calculation, because an incremental on top of a recent full still gives you a recent restore point (you restore the full plus the chain of incrementals). On CockroachDB Cloud the managed backup schedule produces automated backups (commonly hourly incrementals with periodic fulls), and the card reads the completion timestamp of the latest one from the managed backups dashboard.
+
+The 72-hour trigger is a deliberately generous backstop. Most teams take backups far more often than every three days, so anything approaching 72 hours almost always means the schedule has broken, not that the policy is that loose.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A DBA runs a self-hosted CockroachDB cluster (v23.2) backing an ecommerce platform, with a scheduled backup chain: a weekly full to GCS every Sunday and hourly incrementals on top. The schedule is created with `CREATE SCHEDULE ... FOR BACKUP INTO 'gs://acme-crdb-backups' RECURRING '@hourly' FULL BACKUP '@weekly'`. Snapshot on 14 Apr 26 at 11:00 BST.
+
+The most recent successful incremental finished at 10:00 BST. The card reads **1 hour ago**: healthy and green. If the cluster were lost right now, the recovery point would be 10:00 BST, so at most an hour of writes would be at risk.
+
+Now a credentials rotation goes wrong. On 16 Apr 26 the service account key used to write to GCS is rotated but the cluster's `kms` / storage credentials are not updated. Every hourly incremental from 16 Apr 26 onward fails with a permission error, but because the schedule keeps firing and the job log is not being watched, nobody notices. On 19 Apr 26 at 11:00 BST the card reads:
+
+```text
+Last successful backup: 18 Apr 26 ... no, last SUCCEEDED job finished 16 Apr 26 09:00 BST
+Age: 74 hours ago
+Status: RED (> 72h trigger)
+```
+
+The card is red because the last job that actually reached `succeeded` was three days ago; every job since has failed. The DBA's exposure is now 74 hours of unbacked-up writes. The remediation is immediate: fix the storage credentials, run a manual `BACKUP INTO LATEST IN 'gs://acme-crdb-backups'` to close the gap, confirm it reaches `succeeded` in `SHOW JOBS`, and only then trust the schedule again. The deeper fix is to alert on backup job failures directly so a broken schedule surfaces in minutes, not days.
+
+Two takeaways:
+
+1. **A firing schedule is not a working backup.** The schedule can keep launching jobs that all fail. Only a job that reaches `succeeded` resets this card, which is exactly why the card watches completion status, not schedule activity.
+2. **The number is your recovery point, stated in plain English.** "74 hours ago" means "I would lose up to three days of data". Treat the trigger as a hard line: a backup older than 72 hours is a recoverability incident, not a warning.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Backup Age | What the combination tells you |
+| --- | --- | --- |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/cockroachdb/database-disk-usage) | Backups need disk and object-storage headroom to stage. | High disk with an ageing backup suggests backups are failing for lack of space. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | Health covers "is it up"; backup age covers "can I recover". | A green cluster with a stale backup is still a serious risk the health score does not capture. |
+| [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count) | Node loss is one of the scenarios you would restore from. | Pair recoverability with availability to size your true blast radius. |
+| [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges) | The worst case where a restore becomes the recovery path. | If ranges go unavailable, a recent backup is your fallback; backup age tells you how good that fallback is. |
+| [Last Successful Backup detail](/nerve-centre/kpi-cards/cockroachdb/last-successful-backup-hours-ago) | The same recoverability lens for the whole cluster. | Confirms the freshness of your restore point at a glance. |
+| [Decommissioning Nodes](/nerve-centre/kpi-cards/cockroachdb/decommissioning-nodes) | Topology changes are a good moment to verify backups. | Take and verify a backup before a downsize so you have a clean restore point. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+On a self-hosted cluster, confirm the figure with the jobs system. Run `SHOW JOBS` and look for the most recent `BACKUP` row with status `succeeded`, or query it directly: `SELECT job_id, status, created, finished FROM crdb_internal.jobs WHERE job_type = 'BACKUP' ORDER BY created DESC LIMIT 20;`. The `finished` timestamp of the latest `succeeded` row is what the card measures against. To inspect the actual backup contents in object storage, use `SHOW BACKUPS IN 'gs://your-bucket'` and `SHOW BACKUP LATEST IN 'gs://your-bucket'`, which list the full and incremental layers and their end times. If you use a backup schedule, `SHOW SCHEDULES` and `SHOW JOBS FOR SCHEDULES (...)` show whether recent runs succeeded or failed.
+
+On CockroachDB Cloud, the managed Backups page lists each automated backup with its completion time and lets you restore to a point in time; the timestamp of the newest entry is the figure to reconcile against. If Vortex IQ shows a larger age than you expect, the usual cause is that recent scheduled jobs are failing (credentials, storage permissions, or quota) while older ones succeeded, so check the failed job rows, not just the schedule definition.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My backup schedule is running, so why does the card say the backup is old?**
+Because the schedule firing is not the same as a job succeeding. The card only counts jobs that reached `succeeded` status. If every recent run is failing (a common cause is rotated or expired storage credentials), the schedule keeps launching jobs that all fail, and the age keeps growing. Check `SHOW JOBS` for failed `BACKUP` rows and fix the underlying error.
+
+**Do incremental backups reset the clock, or only full backups?**
+Both. A successful incremental on top of a recent full gives you a valid, recent recovery point: you restore the full plus the chain of incrementals up to the latest one. So an hourly incremental that succeeds resets this card to roughly an hour, even if the last full backup was days ago. What matters is the completion time of the most recent successful backup of either kind.
+
+**What recovery point does the number actually represent?**
+It is the maximum data loss you would suffer if you had to restore right now. A reading of "1 hour ago" means a failure now would lose at most about an hour of writes (everything since the last successful backup). On CockroachDB Cloud, point-in-time restore can often narrow that window further, but this card reports the conservative figure based on the last completed backup.
+
+**Why is the alert threshold as high as 72 hours?**
+It is a generous backstop, not a recommended backup interval. Most teams back up hourly or daily, so any value approaching 72 hours almost certainly means the pipeline has broken rather than that the policy is that loose. You can and should lower the threshold in the Sensitivity tab to match your own recovery-point objective; a team with an hourly schedule might alert at 3 or 4 hours.
+
+**Does a successful backup guarantee a successful restore?**
+No. A backup that completed is necessary but not sufficient; the only proof a restore works is to perform one. Run periodic restore drills into a scratch cluster and verify row counts and key tables. This card tells you a recent backup exists; only a tested restore tells you it is usable.
+
+**How is this different on CockroachDB Cloud versus self-hosted?**
+The concept is identical, the source differs. Self-hosted clusters run their own `BACKUP` jobs (or schedules) to object storage and the card reads the jobs system. CockroachDB Cloud runs a managed backup schedule on your behalf and the card reads the managed Backups dashboard. On Cloud you generally cannot disable backups, so a stale figure there usually points to a managed-service incident rather than a misconfigured schedule.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Last Successful Backup (hours ago)* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

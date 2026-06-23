@@ -1,0 +1,142 @@
+---
+title: "Failover Readiness, MariaDB"
+sidebarTitle: "Failover Readiness"
+description: "Failover Readiness for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Failover Readiness** answers a single existential question: if the primary MariaDB instance died right now, is there a healthy standby that could safely take over with minimal data loss? It is not a measure of whether the primary is healthy; it is a measure of whether your insurance policy is valid. The card checks that at least one standby (an async replica or a healthy Galera node) is online, caught up within an acceptable lag, configured to be promotable, and not itself at risk (disk, connectivity). When the answer is "no healthy standby", you are running without a safety net: a primary failure means downtime and potential data loss, not a quick promotion.
+
+| | |
+| --- | --- |
+| **What it tracks** | Whether a promotable, caught-up, healthy standby exists for the primary at this moment, for the selected period. A binary-style readiness signal backed by the underlying replica health checks. |
+| **Data source** | Replication state (`SHOW REPLICA STATUS` / `SHOW ALL SLAVES STATUS`), Galera node state (`wsrep_*` status), replica lag, replica disk and connectivity, and read-only / promotability flags. |
+| **Time window** | `RT` (real-time, refreshed on each poll). |
+| **Alert trigger** | `no healthy standby`. When no standby meets the readiness criteria, the card flags red, because the topology has no safe failover target. |
+| **Why it matters** | Failover readiness is the difference between a 2-minute promotion and a multi-hour restore-from-backup outage. It degrades silently: a replica can fall behind, fill its disk, or disconnect without anyone noticing until the primary fails and the standby turns out to be useless. |
+| **Sensitivity** | Sensitivity card: the maximum acceptable replica lag and the readiness criteria are tunable per profile, because the lag a business can tolerate on failover differs by workload. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card evaluates each standby against a set of readiness criteria and reports whether at least one passes all of them. A standby is "ready" only when every check below is green:
+
+| Check | Source signal | Why it gates readiness |
+| --- | --- | --- |
+| Replica is connected and replicating | `Slave_IO_Running` and `Slave_SQL_Running` both `Yes` (async); `wsrep_connected` / node in cluster (Galera) | A disconnected replica cannot take over; its data is frozen. |
+| Replica lag within tolerance | `Seconds_Behind_Master` (async); `wsrep_local_recv_queue` (Galera) | A replica far behind means promoting it loses the transactions it has not yet applied. |
+| Replica has capacity to run as primary | replica disk usage, memory headroom | A standby at 95% disk cannot serve write load once promoted; it would fail immediately. |
+| Replica is promotable | not blocked by errant transactions / GTID gaps; `read_only` flippable | A replica with conflicting transactions or GTID divergence cannot be cleanly promoted. |
+| Replica node is healthy | no replication errors, no SQL thread stoppage | An errored SQL thread means the replica's data is incomplete. |
+
+If at least one standby passes all checks, the card reads ready. If none do, it reads `no healthy standby` and alerts. The card does not depend on the primary being unhealthy; it is a continuous audit of the insurance policy, evaluated in real time so a degraded standby is caught before, not during, an actual failover. Calculated automatically from your MariaDB topology data; see the worked example for a typical reading.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MariaDB primary with two async replicas behind an Adobe Commerce storefront. Replica A serves read traffic for reporting; Replica B is reserved as the failover standby. Snapshot taken on 09 May 26 at 16:20 BST.
+
+| Standby | Connected | Lag | Disk | Promotable | Readiness verdict |
+| --- | --- | --- | --- | --- | --- |
+| Replica A | Yes | 3s | 64% | Yes | Ready |
+| Replica B | I/O thread stopped | n/a (frozen) | 58% | No | NOT ready |
+
+The card headline reads **Ready** (Replica A passes), but the on-call engineer notices the designated failover standby is the one that has failed. Three observations:
+
+1. **The card is green, but the intended plan is broken.** Replica B, the dedicated failover target, has a stopped I/O thread and has not replicated for hours. The card still reads Ready only because Replica A happens to qualify. If Replica A had not existed, this would be a red `no healthy standby`.
+2. **A reporting replica is a poor failover target.** Replica A is caught up and healthy, so it could be promoted in an emergency, but it carries heavy read load and was never sized to be the primary. Promoting it would move all writes onto a box already busy serving reports. It works, but it is a degraded outcome, not the planned one.
+3. **The real fix is to repair Replica B.** The stopped I/O thread usually means a network blip, an expired binary log on the primary, or a credentials change. The engineer runs the replica status, finds the error, and restarts replication so the dedicated standby is ready again before it is ever needed.
+
+```text
+Readiness framing for this snapshot:
+  - Headline: Ready (one qualifying standby)
+  - Designated standby (Replica B): NOT ready, I/O thread stopped
+  - Qualifying standby (Replica A): healthy but carries reporting load
+  - Effective state: insured, but by the wrong node, at a performance cost
+  - Action: restart replication on Replica B to restore the intended plan
+  - If both had failed: card reads "no healthy standby" -> failover = restore from backup
+```
+
+Three takeaways:
+
+1. **A green readiness card does not mean your failover plan is intact.** It means at least one node qualifies, which might not be the node you intended. Pair this card with the replica-count and lag cards to confirm the right standby is the one keeping you green.
+2. **Readiness degrades silently.** A standby can stop replicating, fall behind, or fill its disk with no impact on the primary, so nothing else alerts. This card is the only signal that your insurance has lapsed before you try to claim on it.
+3. **The cost of a red card is measured in hours.** With a healthy standby, failover is a promotion measured in minutes. With no healthy standby, recovery means restoring from the last backup, which is bounded by [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/mariadb/last-successful-backup-hours-ago) and can mean real data loss.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Failover Readiness | What the combination tells you |
+| --- | --- | --- |
+| [Async Replication Lag (seconds)](/nerve-centre/kpi-cards/mariadb/async-replication-lag-seconds) | Lag is a direct readiness gate. | A standby with high lag is not safely promotable; this card explains a red readiness. |
+| [Active Async Replicas](/nerve-centre/kpi-cards/mariadb/active-async-replicas) | Counts how many replicas exist. | Readiness ready but replica count 1 equals a single point of failure; no redundancy. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/mariadb/last-successful-backup-hours-ago) | The fallback when readiness is red. | No healthy standby plus stale backup equals worst-case recovery; both must be fixed urgently. |
+| [Galera Cluster Status](/nerve-centre/kpi-cards/mariadb/galera-cluster-status) | On Galera, quorum is the readiness equivalent. | A Primary cluster with 3 nodes is inherently failover-ready; a non-Primary state is not. |
+| [Galera Cluster Size](/nerve-centre/kpi-cards/mariadb/galera-cluster-size) | Node count determines how many failures the cluster survives. | Size dropping toward the quorum minimum erodes readiness on a Galera topology. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mariadb/database-disk-usage) | A standby low on disk cannot take over. | Standby disk high equals a node that will fail on promotion; readiness is illusory. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | Readiness feeds the resilience picture. | A high health score with red readiness means the primary is fine but unprotected. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look on the server:**
+
+> On each replica, `SHOW REPLICA STATUS\G` (or `SHOW ALL SLAVES STATUS\G` for multi-source) and confirm `Slave_IO_Running: Yes`, `Slave_SQL_Running: Yes`, `Seconds_Behind_Master` within tolerance, and `Last_Error` empty. These four fields are the core of the readiness check.
+> `SHOW VARIABLES LIKE 'read_only';` and `SHOW VARIABLES LIKE 'gtid_%';` to confirm the replica is promotable (read-only is flippable, GTID position is consistent with the primary).
+> On Galera, `SHOW STATUS LIKE 'wsrep_cluster_status';` should be `Primary`, `wsrep_local_state_comment` should be `Synced`, and `wsrep_ready` should be `ON`.
+> `df -h` on each standby's data volume to confirm it has the capacity to take write load once promoted.
+> If you orchestrate failover with a tool (MaxScale, Orchestrator, MariaDB Replication Manager), its own status command reports the candidate master it would pick; that candidate should be the same node this card considers ready.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Lag tolerance** | Variable | The card uses your configured maximum-acceptable lag; a replica you consider "ready" at 8s lag may differ from the default tolerance. |
+| **Promotability nuance** | Card stricter | The card gates on errant transactions and GTID gaps that a quick `SHOW REPLICA STATUS` glance might miss; it can read NOT ready when the basic threads look green. |
+| **Orchestrator opinion** | Possible mismatch | A dedicated failover tool may apply extra rules (data-centre affinity, semi-sync acknowledgement) the card does not; treat the orchestrator as authoritative where one is configured. |
+| **Poll timing** | Brief | A replica that briefly reconnected between the card poll and your manual check can show different states. |
+
+**Managed-service note:** On Amazon RDS Multi-AZ / Aurora and Azure Database for MariaDB, failover is managed by the provider and the equivalent signal is the replica/standby health and replica-lag metric in the provider console (for example `ReplicaLag` and the Multi-AZ standby state). On those platforms the provider, not a manual promotion, performs failover; the card reconciles against the provider's reported standby health.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card says Ready, so I am safe, right?**
+You have a safety net, but check it is the net you planned. Ready means at least one standby qualifies, which may not be your designated failover target. A reporting replica that happens to be caught up can keep the card green while your intended standby is broken. Pair with [Active Async Replicas](/nerve-centre/kpi-cards/mariadb/active-async-replicas) and confirm the qualifying node is the one you want to promote.
+
+**Why does it say "no healthy standby" when my replica is clearly running?**
+Running is not the same as ready. A replica fails the readiness check if it is lagging beyond tolerance, has a stopped SQL thread, has errant transactions or GTID gaps that block clean promotion, or is low on disk. Run `SHOW REPLICA STATUS\G` and check every field, not just whether the process is up. The most common culprit is lag beyond the configured tolerance.
+
+**How is this different from the replication-lag card?**
+Replication lag measures one input (how far behind a replica is). Failover readiness is the composite verdict that combines lag with connectivity, promotability, capacity, and error state across all standbys. A replica can have zero lag and still be NOT ready (for example, its disk is full or it has an errant transaction). Read both: lag explains the most common reason readiness fails.
+
+**We run Galera, not async replication. Does this card apply?**
+Yes, but the meaning shifts. On Galera every node is effectively a standby, so readiness maps to quorum: a `Primary` cluster with more than the minimum quorum size is inherently failover-ready because any surviving node can serve writes. The card reads the `wsrep_*` state instead of replica threads. A non-Primary cluster reads NOT ready because no node will accept writes.
+
+**The standby is healthy but it serves heavy read traffic. Is that a problem?**
+Functionally it can be promoted, so the card may read Ready, but operationally it is a degraded plan. Promoting a read-loaded replica moves all writes onto a box already busy, which can fail immediately under load. The card checks capacity headroom, but if the standby is sized only for reads, plan to scale it on promotion or keep a dedicated, lightly loaded failover node.
+
+**How quickly does this card catch a standby that just broke?**
+In real time, on the next poll. That is the point of the card: a standby can break silently, with no effect on the primary, so nothing else would alert. This card surfaces the lapse within a poll cycle so you can repair the standby before a primary failure forces you to rely on it.
+
+**What is the worst case when this card is red?**
+With no healthy standby, a primary failure means you cannot promote; recovery is a restore from your most recent backup. The data loss is bounded by how old that backup is, which is exactly what [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/mariadb/last-successful-backup-hours-ago) tracks. A red readiness card plus a stale backup is the single most dangerous combination in the Replication category; treat it as a priority incident.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Failover Readiness* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

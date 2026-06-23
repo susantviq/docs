@@ -1,0 +1,124 @@
+---
+title: "Redis Session Keys vs Active Ecom Users, Redis"
+sidebarTitle: "Redis Session Keys vs Active Ecom Users"
+description: "Redis Session Keys vs Active Ecom Users for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> When Redis is the session store, the number of session keys it holds should track the number of active shoppers on the storefront. This card puts the two side by side: session-key count from the Redis keyspace against active users from the linked ecommerce connector. They will never match exactly, but they should move together. Drift between them is the alarm. Too few session keys for the live user count means sessions are being lost (evicted, expired early, or never written), which logs shoppers out mid-journey. Too many means orphaned sessions are piling up and wasting memory. Either way the gap is a direct, Redis-distinctive read on whether your session layer is keeping pace with real demand.
+
+| | |
+| --- | --- |
+| **What it tracks** | Live session-key count in Redis compared against the storefront's active-user count, with the drift between them as the headline signal. |
+| **Data source** | Redis side: count of session keys, derived from the configured session key prefix (for example a `SCAN MATCH sess:*` style count) and corroborated by `INFO keyspace`. Ecommerce side: active / live users from the linked Shopify, BigCommerce or Adobe Commerce connector. |
+| **Time window** | `RT/24h` (real-time headline with a 24-hour trend). |
+| **Alert trigger** | `>0 drift between session-key count and active sessions` (any sustained, material gap between the two counts). |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+The card counts the session keys Redis is holding, scoped to the application's session key prefix so it ignores caches, queues, and counters living in the same instance. On the other side it reads the active-user count from the linked ecommerce connector for the same moment. It then computes the drift, the signed gap between the two, and flags a sustained, material divergence. The signal is Redis-distinctive: because Redis often serves as the session backend behind a storefront, the session-key population is an independent, infrastructure-side confirmation of how many people are genuinely mid-journey. A healthy store keeps the two curves close. A persistent negative drift (fewer keys than users) is the revenue-relevant case because it means real shoppers are silently being logged out.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A fashion retailer on Adobe Commerce stores PHP sessions in Redis with a 30-minute TTL and a `sess:` key prefix. The instance is shared with the page cache. On 18 Apr 26 a marketing push lifts traffic, the cache grows, and `maxmemory` is reached. The eviction policy is left at the default `noeviction` on the session DB but `allkeys-lru` on the cache DB, except the two share one instance. The platform team watches the drift.
+
+| Time (BST) | Session keys (sess:*) | Active users | Drift | Reading |
+| --- | --- | --- | --- | --- |
+| 10:00 | 4,210 | 4,350 | -140 | normal (in-flight TTL lag) |
+| 10:30 | 5,980 | 6,100 | -120 | normal |
+| 11:00 | 6,400 | 9,800 | **-3,400** | sessions being lost |
+| 11:15 | 6,350 | 10,200 | **-3,850** | sessions being lost |
+
+Up to 10:30 the small negative drift is expected: a session key lives slightly longer than the user is active (the TTL has not lapsed yet), and some users open multiple tabs. At 11:00 the drift blows out. Active users nearly doubled but session keys barely grew, which means session writes are failing or session keys are being evicted under memory pressure from the shared cache. Shoppers who were logged in are suddenly anonymous: their carts empty, and any who were partway through checkout are bounced back to a guest state.
+
+```text
+Why the drift opened up:
+  - The shared instance hit maxmemory.
+  - LRU eviction on the cache keyspace spilled over and evicted session keys too
+    (sessions and cache should not share an eviction-policy fate).
+  - Lost session keys = logged-out shoppers = abandoned carts.
+
+Mitigations, in order:
+  1. Move sessions to a dedicated Redis (or a dedicated logical DB with its own policy)
+     so cache pressure can never evict a live session.
+  2. Set the session keyspace to a policy that protects keys with a TTL (volatile-* )
+     rather than allkeys-lru.
+  3. Raise maxmemory / scale the node so the cache stops competing with sessions.
+```
+
+The owner's reading is direct: for the busiest 45 minutes of the day, a large block of shoppers was being logged out mid-shop, which shows up downstream as a cart-abandonment spike and a conversion dip. The drift card caught the cause (sessions evicted) before the conversion report even refreshed.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this card | What the combination tells you |
+| --- | --- | --- |
+| [Total Keys (db0)](/nerve-centre/kpi-cards/redis/total-keys-db0) | The full keyspace count behind the session subset. | A flat total with rising users confirms sessions are not being written. |
+| [Evicted Keys / minute](/nerve-centre/kpi-cards/redis/evicted-keys-minute) | The eviction signal that explains lost sessions. | Negative drift co-occurring with evictions equals sessions being evicted, the worst case. |
+| [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) | The memory-pressure context. | Drift opening as memory nears maxmemory confirms cache is starving sessions. |
+| [Expired Keys / minute](/nerve-centre/kpi-cards/redis/expired-keys-minute) | The TTL-expiry rate. | A spike here means sessions are timing out faster than expected, an alternative cause of negative drift. |
+| [Connected Clients Saturation vs Traffic Burst](/nerve-centre/kpi-cards/redis/connected-clients-saturation-vs-traffic-burst) | The connection-side cross-channel join. | Confirms whether session writes are failing because connections were refused. |
+| [Redis OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/redis/redis-ops-spike-vs-ecom-order-rate) | The throughput-side cross-channel join. | Helps tell real user growth from bot traffic that inflates the active-user count without real sessions. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live) | The raw throughput baseline. | Flat ops with rising users hints that session writes are not even being attempted. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look natively:**
+
+> `redis-cli --scan --pattern 'sess:*' | wc -l` to count session keys by prefix (use `SCAN`, never `KEYS`, on a live instance, as `KEYS` blocks the server).
+> `redis-cli INFO keyspace` for the `keys=` and `expires=` totals on db0, which bound the session count from above.
+> `redis-cli DBSIZE` for the total key count if all sessions live in one DB.
+> `redis-cli TTL sess:<id>` to confirm individual session lifetimes match the application's configured timeout.
+
+**On the application side:** compare against the storefront's own active-session or concurrent-user figure (Adobe Commerce admin, Shopify / BigCommerce analytics) for the same minute.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| TTL lag | Keys slightly exceed users | A session key persists until its TTL lapses, so it outlives the user's last action by minutes; a small positive cushion of keys over active users is normal. |
+| Multiple tabs / devices | Keys exceed users | One shopper across two tabs or a phone and laptop can hold more than one session key, inflating the count relative to unique active users. |
+| Bot traffic | Users exceed keys | Bots can register as active "users" on the storefront connector without ever creating a real server-side session, widening apparent negative drift. |
+| Prefix scope | Variable | If the configured session prefix does not match every session key (multiple apps, legacy prefixes), the count understates the true session population. |
+| Definition of "active" | Variable | The connector's active-user window (for example last 5 minutes) may differ from the session TTL, so the baseline drift shifts with that window. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**A small negative drift is permanent on my store. Is that a problem?**
+Usually not. A steady small gap, where active users slightly exceed session keys, is often just bot traffic or analytics counting visitors who never created a server-side session. The card cares about a sustained, material change in drift, not the constant background offset. Set the threshold in the Sensitivity tab to your normal baseline so routine noise does not alert.
+
+**My drift is positive, more session keys than active users. Should I act?**
+Mild positive drift is expected from TTL lag and multi-tab users. A large, growing positive drift means orphaned sessions are accumulating: keys whose users left but whose TTL is too long, or sessions written without a TTL at all. That wastes memory and can eventually contribute to eviction pressure. Check that every session key is written with an expiry and that the TTL matches your intended timeout.
+
+**We do not use Redis for sessions. Does this card apply?**
+No. This card is meaningful only when Redis is the session backend. If sessions live in the database or another store, the session-key count will be zero or unrelated to active users, and you should disable or ignore the card. The prefix scope it uses is configured per connector.
+
+**Why scope to a key prefix instead of counting all keys?**
+A production Redis usually mixes sessions with caches, queues, and counters. Counting all keys would drown the session signal. Scoping to the application's session prefix (for example `sess:` or `PHPREDIS_SESSION:`) isolates exactly the keys that should track active users.
+
+**Active users doubled but session keys did not move at all. What does that mean?**
+Session writes are failing outright, not just being evicted. Common causes: the connection pool is saturated so the app cannot write to Redis (check [Connected Clients Saturation vs Traffic Burst](/nerve-centre/kpi-cards/redis/connected-clients-saturation-vs-traffic-burst)), the instance is read-only after a failover, or a recent deploy changed the session prefix so new sessions are written under a name the card is not counting.
+
+**How do I confirm the count without hurting the live instance?**
+Use `SCAN` with a pattern, never `KEYS`. `KEYS sess:*` blocks the single-threaded server for the duration of the scan and can itself cause an incident on a busy instance. `redis-cli --scan --pattern 'sess:*'` iterates in safe batches.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Redis Session Keys vs Active Ecom Users* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,157 @@
+---
+title: "Credits by Warehouse (7d), Snowflake"
+sidebarTitle: "Credits by Warehouse (7d)"
+description: "Credits by Warehouse over the last 7 days for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Credit Burn](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A bar chart of credit consumption broken out per warehouse over the last 7 days. Where [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) tells you how much the account spent, this card tells you where the spend lives. That distinction is the whole point: a Snowflake account is rarely uniformly expensive; cost concentrates in one or two warehouses, and the shape of the bars is what drives every sizing and scheduling decision you will make. A tall `BI_WH` bar says your dashboards are the cost centre. A tall `AD_HOC_WH` bar says exploratory work is. A `LOAD_WH` bar that creeps up week on week says your ingest is scaling with the business. Reading the distribution, not just the total, is how a platform team decides what to right-size, what to schedule off-peak, and where a multi-cluster or a smaller default would pay back.
+
+| | |
+| --- | --- |
+| **Data source** | `SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY`, grouped by warehouse name, summed over the trailing 7 days. Each bar is one warehouse's total `credits_used`. |
+| **Metric basis** | Per-warehouse `sum(credits_used)` over 7 days, rendered as a ranked bar chart (highest consumer first). The dollar tooltip multiplies credits by the connector's contracted `$/credit` rate. |
+| **What each bar includes** | All compute the warehouse accrued: query execution plus idle-but-running time before auto-suspend. A warehouse left running idle shows a bar even with low query activity. |
+| **What is not broken out** | Serverless credits (Snowpipe, automatic clustering, materialised-view maintenance) are not tied to a named warehouse, so they do not appear as bars; they live in the account total on [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h). |
+| **Aggregation window** | `7d`, a 7-day total per warehouse, long enough to smooth daily noise and reveal the steady-state distribution rather than a single busy day. |
+| **Latency** | `WAREHOUSE_METERING_HISTORY` updates within minutes; the chart reflects consumption close to real-time, with the usual `ACCOUNT_USAGE` settling on the most recent hour. |
+| **Time window** | `7d` (trailing 7 days, per warehouse) |
+| **Alert trigger** | None. This is a diagnostic distribution card, not an alerting metric; the acute alerts live on [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) and [Credit Burn +50% Week-over-Week](/nerve-centre/kpi-cards/snowflake/credit-burn-50-week-over-week). |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card groups credit consumption by warehouse over the window:
+
+```text
+per_warehouse_credits =
+  SELECT name, SUM(credits_used)
+  FROM WAREHOUSE_METERING_HISTORY
+  WHERE start_time >= now − 7d
+  GROUP BY name
+  ORDER BY SUM(credits_used) DESC
+
+bar_height_$  = credits_per_warehouse × dollar_per_credit
+```
+
+What shapes the bars on a Snowflake account:
+
+- **Size sets the rate, runtime sets the bar.** A warehouse's credit rate doubles per size step (X-Small 1/hr through 4X-Large 128/hr). A small warehouse that runs constantly can out-burn a large one that runs briefly, so a tall bar is the product of size and uptime, not size alone.
+- **Idle time inflates bars.** Credits accrue until `AUTO_SUSPEND` fires. A warehouse with a long auto-suspend and a sparse, bursty workload shows a taller bar than its query count would suggest; cross-reference [Idle Warehouse Credits Wasted (24h)](/nerve-centre/kpi-cards/snowflake/idle-warehouse-credits-wasted-24h) to split working from idling.
+- **Multi-cluster warehouses sum their clusters.** A multi-cluster warehouse bills for every active cluster. Its bar is the total across all clusters that ran during the window, so a multi-cluster scaling out under concurrency pressure shows a step up even at the same nominal size.
+- **The ranking is the actionable part.** The top one or two bars almost always account for the majority of spend (a Pareto distribution is typical). Right-sizing the top bar moves the account total far more than tuning the long tail.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs Snowflake for an ecommerce data stack on Enterprise edition at $3.00 per credit. The weekly distribution, read on 14 Apr 26 for the trailing 7 days (07 to 14 Apr 26):
+
+| Warehouse | Size | Credits (7d) | Dollars | Share |
+| --- | --- | --- | --- | --- |
+| `BI_WH` | Medium (multi-cluster, max 3) | 1,180 | $3,540 | 56% |
+| `AD_HOC_WH` | Large | 520 | $1,560 | 25% |
+| `LOAD_WH` | Small | 310 | $930 | 15% |
+| `TRANSFORM_WH` | Small | 90 | $270 | 4% |
+| **Total** | | **2,100** | **$6,300** | 100% |
+
+The shape tells the story before any drill-down: `BI_WH` alone is 56% of the bill. This is a dashboard-cost-centre account, which is common for retailers running Looker or Tableau on Snowflake where every viewer interaction fires queries. The team's read, in order of leverage:
+
+1. **The top bar is where the money is.** Tuning `TRANSFORM_WH` (4%) is irrelevant; halving `BI_WH` (56%) saves more than the bottom two warehouses cost combined. Open [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) for `BI_WH`: it shows the multi-cluster scaling to 3 clusters every weekday 09:00 to 11:00 (the morning dashboard rush) and sitting at 1 cluster otherwise.
+2. **Is the multi-cluster earning its keep or masking inefficiency?** Check [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse). If the queue is near zero even at peak, the third cluster is rarely needed and `MAX_CLUSTER_COUNT` could drop to 2. If the queue spikes, the scale-out is genuinely serving concurrency and should stay.
+3. **Schedule the controllable bar off-peak.** `AD_HOC_WH` at 25% is exploratory. Much of it is data-team work that has no deadline. Encouraging heavy exploratory queries onto a scheduled window, or onto a smaller default warehouse, trims the second-biggest bar without affecting the business-facing dashboards.
+
+```text
+Right-sizing leverage, ranked:
+  BI_WH       56% → 1% saved here = $35/wk; realistic 20% trim = $700/wk
+  AD_HOC_WH   25% → schedule off-peak / default smaller = ~$300/wk
+  LOAD_WH     15% → ingest scales with business; leave it
+  TRANSFORM   4%  → not worth touching
+```
+
+The action that came out of this reading: drop `BI_WH` `MAX_CLUSTER_COUNT` from 3 to 2 (the queue data showed the third cluster fired for under 4% of the week), and set a smaller default warehouse for ad-hoc exploration. Combined, the two changes trimmed roughly $1,000/week with no impact on dashboard responsiveness.
+
+Three things worth remembering:
+
+1. **Always tune the top bar first.** Credit distributions are Pareto-shaped; the top one or two warehouses dominate. Effort spent on the long tail is wasted effort.
+2. **A tall bar is not automatically waste.** A warehouse that is large and busy because it is genuinely serving load is doing its job. Pair every tall bar with [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) and queue depth before assuming the size is wrong.
+3. **Watch for week-on-week creep in the load bar.** `LOAD_WH` rising steadily is usually healthy (the business is generating more data), but it is also the early signal that ingest will need its own attention before it becomes the top bar.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Credits by Warehouse | What the combination tells you |
+| --- | --- | --- |
+| [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) | The account total this card decomposes. | A 24h spike sends you straight here to find which bar moved. |
+| [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) | Tells you if a tall bar is justified. | Tall bar plus high saturation = right-sized; tall bar plus low saturation = downsize candidate. |
+| [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse) | Decides scale-up vs scale-out vs leave-alone. | A queue on a tall bar argues for multi-cluster; no queue argues for a smaller size. |
+| [Idle Warehouse Credits Wasted (24h)](/nerve-centre/kpi-cards/snowflake/idle-warehouse-credits-wasted-24h) | Splits a bar into working vs idling. | A bar that is mostly idle is an auto-suspend fix, not a sizing fix. |
+| [Avg Cost per Query ($)](/nerve-centre/kpi-cards/snowflake/avg-cost-per-query) | The efficiency view per warehouse scope. | A tall bar with high cost per query is inefficient queries, not just volume. |
+| [Credit Burn +50% Week-over-Week](/nerve-centre/kpi-cards/snowflake/credit-burn-50-week-over-week) | The acute alert for a bar that jumps. | A fired alert localises to whichever bar grew most here. |
+| [Active Warehouses](/nerve-centre/kpi-cards/snowflake/active-warehouses) | The count behind the bars. | A new bar appearing means a new warehouse was created; confirm it was intended. |
+| [Snowflake Health Score](/nerve-centre/kpi-cards/snowflake/snowflake-health-score) | The composite cost feeds into. | A cost-driven score change traces to a growing bar here. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake's own tooling:**
+
+> **Per-warehouse credits, last 7 days:** `SELECT name, SUM(credits_used) AS credits FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY WHERE start_time >= DATEADD('day', -7, CURRENT_TIMESTAMP()) GROUP BY name ORDER BY credits DESC;`
+> **Compute vs cloud-services split per warehouse:** the same view exposes `credits_used_compute` and `credits_used_cloud_services` if you need to see which warehouses are metadata-heavy.
+> **Size-change history:** `SELECT * FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_EVENTS_HISTORY WHERE event_name = 'ALTER_WAREHOUSE' ORDER BY timestamp DESC;` to date any resize that changed a bar.
+> **Managed console:** Snowsight under **Admin -> Cost Management -> Consumption**, grouped by warehouse, is the native bar chart this card mirrors. It is the canonical view your account team uses to attribute the invoice across warehouses.
+
+**Why our bars may legitimately differ from a native query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Rolling 7 days vs calendar week** | Variable | We use a trailing 7 days; Snowsight may default to a calendar week (Mon to Sun). A busy day at the boundary shifts which bar leads. Match the window. |
+| **Warehouse scope** | Some bars missing | If the connector is scoped to specific warehouses, out-of-scope warehouses do not appear; a native account-wide query shows them all. |
+| **Serverless not bar-attributed** | Our bars sum to less than the account total | Snowpipe / clustering credits are not tied to a warehouse, so the bars deliberately exclude them; they live in the account total. |
+| **Multi-cluster aggregation** | Variable | We sum all clusters of a multi-cluster warehouse into one bar; if you query per-cluster, you will see the split. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`snow_credits_burned_24h`](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) | The bars should sum to roughly the account total (minus serverless). | Bars summing well below the total = serverless credits are a large share; check clustering / Snowpipe. |
+| [Ecom order volume](/nerve-centre/kpi-cards/snowflake/credit-burn-vs-ecom-order-volume) | The load / ingest bar should track data volume, which tracks orders. | A load bar growing faster than orders = ingest inefficiency or a backfill, not organic growth. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**One warehouse is most of my spend. Is that a problem?**
+Not inherently. Credit distributions are almost always Pareto-shaped: one or two warehouses dominate because that is where the load is. A dominant `BI_WH` simply means dashboards are your primary workload. It becomes a problem only if that bar is tall for the wrong reason (oversized, idling, or running inefficient queries). Pair the top bar with [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) and [Idle Warehouse Credits Wasted (24h)](/nerve-centre/kpi-cards/snowflake/idle-warehouse-credits-wasted-24h) before deciding.
+
+**Why do my bars not add up to the total on the Credits Burned card?**
+Because serverless features (Snowpipe ingest, automatic clustering, materialised-view refresh, search optimisation) consume credits that are not attributed to any named warehouse, so they cannot appear as bars. They are still in the account total. If the gap between your summed bars and the account total is large, a serverless feature is a significant cost; query `AUTOMATIC_CLUSTERING_HISTORY` and `PIPE_USAGE_HISTORY` to see it.
+
+**A new bar appeared this week. What does that mean?**
+A new warehouse was created and ran during the window. This is usually intentional (a new team or pipeline got its own warehouse) but is worth confirming, because an unexpected new bar can be a forgotten test warehouse, an over-provisioned dbt run, or a warehouse spun up by a tool with its own defaults. Check [Active Warehouses](/nerve-centre/kpi-cards/snowflake/active-warehouses) and `WAREHOUSE_EVENTS_HISTORY` for the creation event.
+
+**Should I downsize a tall bar?**
+Only if it is tall for the wrong reason. Open [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) and [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse) for that warehouse. Low saturation and no queue means the size is wasted and you can step it down. High saturation or a persistent queue means the size (or a multi-cluster) is genuinely needed, and downsizing would just create queueing and slow queries.
+
+**Why is there no alert on this card?**
+Because it is a distribution, not a single value: there is no natural threshold for "the shape of spend across warehouses". The acute cost alerts live where a threshold makes sense, on [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) (`+50% vsP`) and [Credit Burn +50% Week-over-Week](/nerve-centre/kpi-cards/snowflake/credit-burn-50-week-over-week). This card is the diagnostic you open once one of those fires.
+
+**Can I see the dollar figure rather than credits?**
+Yes, the bar tooltip shows the dollar equivalent using your contracted `$/credit` rate set in the connector. Credits are Snowflake's native unit and are comparable across warehouses regardless of edition, but for budget conversations the dollar view is usually what a platform owner wants to present.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Credits by Warehouse (7d)* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

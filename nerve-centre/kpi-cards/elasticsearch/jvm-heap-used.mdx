@@ -1,0 +1,140 @@
+---
+title: "JVM Heap Used %, Elasticsearch"
+sidebarTitle: "JVM Heap Used %"
+description: "JVM Heap Used % for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of each node's Java heap currently in use, surfaced as a live gauge with the hottest node driving the headline. JVM heap is the single most load-bearing capacity signal on an Elasticsearch node. Above roughly 75% the garbage collector starts working hard, GC pauses lengthen, and the parent circuit breaker begins rejecting expensive requests to protect the node. Above 90% the node is one heavy aggregation away from an OutOfMemory crash. For a DBA, this gauge is the early-warning light for the most common cause of node instability.
+
+| | |
+| --- | --- |
+| **Metric basis** | `jvm.mem.heap_used_percent` from `GET /_nodes/stats/jvm`, read per node. The gauge shows the highest node value (the bottleneck); the detail view lists all nodes. |
+| **What it measures** | Old-generation plus young-generation heap occupancy as a percentage of the configured max heap (`-Xmx`). It is the live post-GC working set plus transient allocations, sampled at the moment of the call. |
+| **What it excludes** | Off-heap memory (Lucene's memory-mapped segments live outside the JVM heap and are managed by the OS page cache), and the filesystem cache. A node can have low heap and still be memory-pressured at the OS level; that is a different signal. |
+| **Aggregation window** | `RT/1m`: live reading, charted as a 1-minute series so the sawtooth of GC cycles is visible. |
+| **Distinctiveness** | Elasticsearch-distinctive. Heap above 75% triggers GC pressure and circuit breakers; above 90% a node may OOM and drop out of the cluster. There is no relational-database equivalent with this exact failure curve. |
+| **Time zone** | Node clock for sampling; rendered in the team's Vortex IQ display time zone. |
+| **Time window** | `RT/1m` (real-time value, 1-minute series) |
+| **Alert trigger** | `> 75%`: any node sustaining heap above 75% raises the sensitivity alarm, because that is where GC pressure and circuit-breaker rejections begin. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card reads `jvm.mem.heap_used_percent` directly from each node's JVM stats. Elasticsearch already computes the percentage as:
+
+```text
+heap_used_percent = heap_used_in_bytes / heap_max_in_bytes * 100
+```
+
+where `heap_max_in_bytes` is the configured `-Xmx` ceiling, not the physical RAM of the host. This distinction matters: a node with 64 GB of RAM but a 30 GB heap (the recommended cap to stay under the compressed-oops threshold) is at 100% heap when it has used 30 GB, even though 34 GB of RAM sits free for the OS page cache. The gauge is measuring the JVM ceiling, not the machine ceiling.
+
+The headline is the maximum across all nodes, because Elasticsearch stability is gated by its hottest node: a single node at 92% can OOM and leave the cluster even if the cluster average is a comfortable 60%. The 1-minute chart deliberately preserves the GC sawtooth. Heap rises as the node allocates, then drops sharply when a garbage collection reclaims old-generation space. A healthy node shows a steady sawtooth with the troughs (post-GC baseline) well below 75%. The danger sign is not the peaks but the troughs creeping upward: when post-GC heap no longer falls back down, the node is accumulating live data it cannot reclaim, and OOM is approaching.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 5-node Elasticsearch cluster (each node with a 31 GB heap) serving an analytics and product-search workload. A new dashboard ships on 18 Apr 26 that runs a heavy `terms` aggregation with a high `size` on a high-cardinality field. Snapshot at 14:20 BST:
+
+| Node | Post-GC heap (trough) | Peak heap | Heap used % (headline sample) | Reading |
+| --- | --- | --- | --- | --- |
+| es-data-1 | 18 GB | 24 GB | 77% | Above threshold. |
+| es-data-2 | 17 GB | 22 GB | 71% | Warm. |
+| es-data-3 | 25 GB | 29 GB | **94%** | Critical, GC thrashing. |
+| es-data-4 | 16 GB | 21 GB | 68% | Healthy. |
+| es-data-5 | 17 GB | 23 GB | 74% | Warm. |
+
+The gauge headline reads **94%** (driven by es-data-3) outlined in red. The sensitivity alert fired when the first node crossed 75%. The on-call DBA's read:
+
+```text
+Heap-pressure triage:
+  1. Headline 94% on one node -> GC is now running continuously; that node's search/indexing is intermittently stalling on pauses.
+  2. Check Circuit Breaker Trips (24h): if climbing, the parent breaker is already rejecting requests with a 429 -> protecting against OOM.
+  3. Check GC Pause Time (5m total ms): if > 1000ms, the node is spending real wall-clock frozen in collection.
+  4. Identify the cause: GET /_nodes/stats/breaker shows which breaker (fielddata, request, in_flight) is loaded; the heavy terms aggregation is the prime suspect.
+  5. The post-GC trough on es-data-3 is 25 GB and not falling -> live data, not transient. This node is genuinely close to OOM.
+```
+
+The cause was the new aggregation loading a high-cardinality field into the request circuit breaker's accounting and inflating fielddata on the hot shard that happened to live on es-data-3. Short-term mitigation: the team capped the aggregation `size` and added a `search.max_buckets` guard. Heap on es-data-3 dropped back to a 60% post-GC trough within minutes. Medium-term: they spread the hot shard and reviewed whether the field should be `keyword` with `eager_global_ordinals` to amortise the cost.
+
+Three takeaways for an ops team:
+
+1. **Watch the troughs, not the peaks.** Peaks above 75% are uncomfortable but survivable if GC reclaims them. Troughs that stop falling mean the node is holding live data it cannot release, and that is the true OOM precursor.
+2. **One hot node is the whole cluster's problem.** The headline is the max for a reason. A node that OOMs leaves the cluster, its shards go unassigned, and you inherit a recovery storm on top of the original heap issue.
+3. **Heap pressure has upstream causes, not just "add RAM".** Unbounded aggregations, large fielddata on text fields, oversized bulk requests, and too many shards per node all drive heap. Raising `-Xmx` past 31 GB is usually the wrong answer (it loses compressed oops); fixing the workload or adding nodes is right.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with JVM Heap Used % | What the combination tells you |
+| --- | --- | --- |
+| [Circuit Breaker Trips (24h)](/nerve-centre/kpi-cards/elasticsearch/circuit-breaker-trips-24h) | The protective rejection heap pressure triggers. | High heap plus rising breaker trips equals the node is actively rejecting requests to avoid OOM. |
+| [GC Pause Time (5m total ms)](/nerve-centre/kpi-cards/elasticsearch/gc-pause-time-5m-total-ms) | The wall-clock cost of high heap. | Heap above 85% plus pauses above 1000ms equals the node is freezing for real, stalling search and indexing. |
+| [JVM Heap >85% Sustained or Circuit Breaker Tripped](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-85-sustained-or-circuit-breaker-tripped) | The paging alert built on this metric. | This gauge is the trend; that alert is the page when it crosses the critical line. |
+| [Active Node Count](/nerve-centre/kpi-cards/elasticsearch/active-node-count) | The OOM consequence. | A heap spike to ~95% followed by a node-count drop equals a node that OOMed and left the cluster. |
+| [Bulk Rejections (24h)](/nerve-centre/kpi-cards/elasticsearch/bulk-rejections-24h) | The write-side symptom of breaker pressure. | High heap can cause the parent breaker to reject bulk writes, stalling indexing. |
+| [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) | The user-facing symptom of GC pauses. | Heap-driven GC pauses surface as periodic p95 spikes for storefront search. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> **`GET /_nodes/stats/jvm`** returns `jvm.mem.heap_used_percent`, `heap_used_in_bytes`, and `heap_max_in_bytes` per node; this is the authoritative source.
+> **`GET /_cat/nodes?v&h=name,heap.percent,heap.current,heap.max`** gives a quick per-node heap table.
+> **`GET /_nodes/stats/breaker`** shows circuit-breaker limits and tripped counts, the partner signal to heap.
+> **`GET /_nodes/stats/jvm` -> `gc.collectors`** exposes GC counts and collection times for diagnosing pause behaviour.
+> On Elastic Cloud, **Stack Monitoring** plots "JVM Heap" per node; on AWS OpenSearch, the CloudWatch metric is `JVMMemoryPressure`, which tracks the same percentage.
+
+**Why our number may legitimately differ from a raw stats read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **GC sawtooth timing** | Variable | Heap oscillates continuously between GC cycles; our sample and your manual call may land on different points of the sawtooth, so a single reading can differ by 10 to 20 points. Compare post-GC troughs, not instantaneous peaks. |
+| **Headline is the max node** | Vortex IQ may read higher | The gauge shows the hottest node; a cluster-average view (some dashboards default to this) reads lower because it dilutes the hot node across healthy ones. |
+| **Heap vs RAM** | Conceptual | Our percentage is against `-Xmx`, not host RAM. A node can show 90% heap with plenty of free system RAM; the gauge is correct, the off-heap page cache is simply separate. |
+
+**Cross-connector reconciliation:** a heap spike that coincides with a traffic burst on the storefront is capacity, not a leak. Compare with [ES Search Pool Saturation vs Ecom Burst](/nerve-centre/kpi-cards/elasticsearch/es-search-pool-saturation-vs-ecom-burst); if heap climbs only during ecom peaks, the cluster is undersized for peak search load rather than misconfigured.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My heap regularly touches 80% but the cluster is fine. Is that a problem?**
+Not necessarily. What matters is whether garbage collection reclaims it. If the post-GC trough falls back below 75%, the node is breathing normally and the peaks are just the GC sawtooth. The alarm at 75% is a watch threshold, not a crash threshold; combine it with [GC Pause Time (5m total ms)](/nerve-centre/kpi-cards/elasticsearch/gc-pause-time-5m-total-ms) to judge whether the pressure is harmful.
+
+**Why is the gauge the maximum node and not the average?**
+Because Elasticsearch stability is gated by its hottest node. A single node at 93% can OOM and leave the cluster even when the average is 60%. Showing the average would hide the node that is actually at risk.
+
+**Should I just raise `-Xmx` to give the node more heap?**
+Usually not. The recommended ceiling is around 30 to 32 GB to stay under the JVM's compressed-ordinary-object-pointer threshold; above that, pointers become 64-bit and you lose memory efficiency, often making things worse. Fix the workload (cap aggregations, reduce fielddata, lower shard count per node) or add nodes instead.
+
+**Heap is low but the node still feels memory-pressured. Why?**
+Elasticsearch relies heavily on off-heap memory: the OS page cache holds Lucene segment data via memory-mapped files. That memory is not on the JVM heap and does not appear in this gauge. If the host is short on free RAM for the page cache, search slows even with healthy heap. Check host-level memory separately.
+
+**What actually causes a heap spike?**
+The usual culprits are unbounded `terms` aggregations on high-cardinality fields, loading fielddata on analysed `text` fields, very large bulk or search requests, too many shards per node (each shard carries overhead), and large scroll or PIT contexts left open. The breaker stats (`GET /_nodes/stats/breaker`) tell you which category is loaded.
+
+**The circuit breaker tripped before heap hit 100%. Is that a bug?**
+No, that is the breaker doing its job. The parent circuit breaker rejects requests once their projected allocation would push heap past its limit (default 95% of heap), specifically to prevent the OOM that hitting 100% would cause. A trip is a protective rejection, not a failure. See [Circuit Breaker Trips (24h)](/nerve-centre/kpi-cards/elasticsearch/circuit-breaker-trips-24h).
+
+**One node sits much higher than the others. Why?**
+Almost always an uneven shard layout: a hot shard (high write or query volume) or an oversized shard lives on that node. Check [Shard Size Skew %](/nerve-centre/kpi-cards/elasticsearch/shard-size-skew) and rebalance, or split the hot index so its load spreads across more nodes.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*JVM Heap Used %* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

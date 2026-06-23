@@ -1,0 +1,144 @@
+---
+title: "Galera Cluster Size, MariaDB"
+sidebarTitle: "Galera Cluster Size"
+description: "Galera Cluster Size for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Galera Cluster](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of nodes currently participating in the Galera synchronous-replication cluster, read straight from the `wsrep_cluster_size` status variable. For a DBA, this is the single most important "is my cluster whole?" signal that MariaDB has and that standalone MySQL does not. Galera keeps every node in lock-step, so the cluster only stays writable while a majority (quorum) of the configured nodes can see each other. If this number drops below what you provisioned, you have lost redundancy and may be one more node-loss away from the whole cluster going read-only.
+
+| | |
+| --- | --- |
+| **Status variable** | `wsrep_cluster_size` from `SHOW GLOBAL STATUS LIKE 'wsrep_cluster_size'`. The integer count of nodes the local node currently considers part of the Primary Component. |
+| **Metric basis** | Node-membership count, NOT connection count or replica count. It reflects Galera group-communication membership, not async replicas (those are tracked separately by [Active Async Replicas](/nerve-centre/kpi-cards/mariadb/active-async-replicas)). |
+| **Aggregation window** | Real-time, polled on the Nerve Centre refresh cycle. The value is instantaneous: it is whatever the node reports at poll time. |
+| **Expected value** | The node count you provisioned (commonly 3 or 5 for an odd-number quorum). Vortex IQ stores the expected count per connector so the card can flag a shortfall. |
+| **What it counts** | Nodes in the Primary Component that the polled node can reach over the Galera replication channel (port 4567 by default). |
+| **What does NOT count** | (1) Async/binlog replicas attached downstream; (2) nodes that have been gracefully removed from the cluster; (3) a node that is up but partitioned away (it will report its own smaller cluster size); (4) MaxScale or ProxySQL routers in front of the cluster. |
+| **Time window** | `RT` (real-time, polled each refresh cycle) |
+| **Alert trigger** | `< expected node count`, the card turns amber/red the moment membership falls below what you provisioned. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card runs `SHOW GLOBAL STATUS LIKE 'wsrep_cluster_size'` against the connected node and reads the integer it returns. There is no averaging or smoothing: Galera maintains this value internally as nodes join and leave the Primary Component, and the card surfaces it verbatim.
+
+The headline compares the live value against the **expected node count** stored on the connector:
+
+```text
+displayed = wsrep_cluster_size (live integer)
+expected  = configured cluster size (e.g. 3)
+state     = healthy   if live == expected
+            degraded  if 0 < live < expected
+            critical  if live <= floor(expected / 2)   (quorum lost or about to be)
+```
+
+The quorum boundary matters: a 3-node cluster keeps quorum at 2 nodes but loses it at 1; a 5-node cluster keeps quorum at 3 but loses it at 2. When membership reaches the quorum floor, surviving nodes that cannot form a majority transition out of Primary state and stop accepting writes, which is exactly the condition the partner card [Galera Cluster Status](/nerve-centre/kpi-cards/mariadb/galera-cluster-status) watches.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 3-node MariaDB 10.11 Galera cluster behind MaxScale for a high-traffic ecommerce backend. Expected `wsrep_cluster_size` is **3**. Snapshot taken on 14 Apr 26 at 02:10 BST during an overnight kernel-patching window.
+
+| Node | Role in cluster | `wsrep_cluster_size` reported | `wsrep_local_state_comment` |
+| --- | --- | --- | --- |
+| db-galera-01 | donor / reference | 2 | Synced |
+| db-galera-02 | active | 2 | Synced |
+| db-galera-03 | being patched | (offline) | n/a |
+
+The Vortex IQ headline displays **2 of 3** with an amber ring. The DBA reads three things:
+
+1. **Membership has dropped to 2.** Node db-galera-03 was taken down for the kernel patch. Quorum is intact (2 of 3 is a majority), so the cluster is still writable. This is the planned, healthy-degraded state during maintenance.
+2. **Redundancy is gone.** With only 2 nodes live, a single further failure (db-galera-01 or db-galera-02 crashing now) would drop membership to 1, below the quorum floor of 2, and the survivor would go **Non-Primary** and refuse writes. The maintenance window is therefore a no-second-failure zone.
+3. **The clock is running.** When db-galera-03 rejoins, it must State-Snapshot-Transfer (SST) or Incremental-State-Transfer (IST) to catch up. Until it reports `Synced` and membership returns to 3, the team should not start patching a second node.
+
+```text
+Risk framing during the maintenance window:
+  - Provisioned nodes: 3
+  - Live nodes:        2   (quorum floor = 2)
+  - Failures to outage: 1   (one more loss => Non-Primary => read-only)
+  - Action: hold all further node maintenance until size returns to 3
+```
+
+When db-galera-03 finishes IST at 02:24, all three nodes report `wsrep_cluster_size = 3`, the card returns to green, and the team safely proceeds to patch the next node. The lesson the team should carry: never patch a second node while the card shows a shortfall, because rolling maintenance is the most common way to accidentally walk a cluster into quorum loss.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Galera Cluster Size | What the combination tells you |
+| --- | --- | --- |
+| [Galera Cluster Status](/nerve-centre/kpi-cards/mariadb/galera-cluster-status) | The Primary / Non-Primary verdict that size feeds into. | Size below quorum floor plus status Non-Primary equals the cluster is read-only right now. |
+| [Galera Flow Control Paused %](/nerve-centre/kpi-cards/mariadb/galera-flow-control-paused) | Shows whether a slow surviving node is throttling the cluster. | Reduced size plus rising flow control equals the remaining nodes are struggling to keep up. |
+| [Galera Cluster Not in Primary State or Node Lost](/nerve-centre/kpi-cards/mariadb/galera-cluster-not-in-primary-state-or-node-lost) | The alert-list card that fires on exactly this drop. | A size shortfall should always correlate with a row in this alert feed. |
+| [Failover Readiness](/nerve-centre/kpi-cards/mariadb/failover-readiness) | Confirms a healthy standby exists to absorb the next failure. | Low size plus no healthy standby equals a fragile cluster one fault from outage. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite that weights cluster membership. | A node loss visibly drags the composite down. |
+| [InnoDB / XtraDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mariadb/innodb-xtradb-buffer-pool-hit-rate) | A rejoining node has a cold buffer pool. | Size returns to full but hit rate dips on the fresh node until it warms. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation) | Fewer nodes means the same traffic lands on fewer servers. | Size drop plus saturation climb equals overloaded survivors. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> Run `SHOW GLOBAL STATUS LIKE 'wsrep_cluster_size';` on any node, this is the exact variable the card reads.
+> Run `SHOW GLOBAL STATUS LIKE 'wsrep_%';` for the full Galera picture (`wsrep_cluster_status`, `wsrep_local_state_comment`, `wsrep_connected`, `wsrep_ready`).
+> On a managed service, check the provider console (for example the SkySQL cluster topology view, or your cloud provider's MariaDB cluster page) for the same membership count.
+
+**Why our number may legitimately differ from a manual query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Which node you query** | Can differ during a partition | A partitioned node reports its own (smaller) view. Vortex IQ polls the configured connection endpoint; a manual query against a different node may show a different number. |
+| **Poll timing** | Brief lag | The card value is from the last poll; a node join/leave between polls is not reflected until the next cycle. |
+| **Router in the path** | None | MaxScale / ProxySQL do not change `wsrep_cluster_size`; the value comes from the backend node regardless of router. |
+| **Graceful vs ungraceful leave** | None to value | Both reduce the count; only the recovery path (IST vs SST) differs. |
+
+**Cross-source reconciliation:**
+
+| Source | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| Async replica count ([Active Async Replicas](/nerve-centre/kpi-cards/mariadb/active-async-replicas)) | Independent of cluster size. | Galera nodes and async replicas are different replication mechanisms; do not expect them to match. |
+| Provider console node list | Should equal `wsrep_cluster_size` when all nodes are in the Primary Component. | A console may still list a fenced node that Galera has already evicted, so the console can read higher transiently. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows 2 but my provider console lists 3 nodes. Which is right?**
+For the question "is my cluster writable and redundant?", `wsrep_cluster_size` is authoritative because it reflects live Galera group membership, not provisioning. A console can list a node that exists but has been evicted from the Primary Component (crashed, partitioned, or mid-SST). Trust the status variable; investigate why the third node is provisioned but not a member.
+
+**Does a higher number always mean healthier?**
+No. The healthy value is the number you provisioned, no more, no less. A reading above your expected count usually means a node you thought was removed is still a member, or a split cluster has merged unexpectedly. Galera quorum maths assumes a stable, odd node count; surprises in either direction deserve a look.
+
+**Why odd numbers (3 or 5) and not 4?**
+Quorum is a strict majority. A 4-node cluster splitting 2-and-2 leaves neither side with a majority, so both go Non-Primary and the whole cluster stops. An odd count guarantees one side can always win a split, which is why production Galera clusters are almost always 3 or 5 nodes (or use a lightweight `garbd` arbitrator to make an even count effectively odd).
+
+**A node is up and the OS is healthy but it is not counted. Why?**
+Being up at the OS level is not the same as being in the Primary Component. The node may be performing an SST (still joining), partitioned by a firewall or network fault on the Galera ports (4567 group comms, 4568 IST, 4444 SST), or it may have gone Non-Primary itself. Check `wsrep_local_state_comment` and `wsrep_connected` on that node.
+
+**Will the card warn me before the cluster goes read-only?**
+Yes, that is its purpose. The alert fires as soon as size falls below the expected count, which is strictly earlier than quorum loss. A 3-node cluster alerts at 2 (still writable) long before it would lose quorum at 1. Treat any shortfall as a warning to stop further maintenance and restore membership.
+
+**Does this card work for a single standalone MariaDB server?**
+No. `wsrep_cluster_size` only exists when the Galera (wsrep) provider is loaded. On a standalone server the variable is absent or zero, and this card is not applicable; use the async [Replication](/nerve-centre/kpi-cards/mariadb/async-replication-lag-seconds) and capacity cards instead.
+
+**Does a rolling restart trip the alert every time?**
+Yes, and that is expected. Any time you take a node down for maintenance, size drops and the card goes amber for the duration. The signal is still valuable: it reminds you that you are running without redundancy and must not take a second node down until the first has rejoined and the card returns to green.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Galera Cluster Size* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

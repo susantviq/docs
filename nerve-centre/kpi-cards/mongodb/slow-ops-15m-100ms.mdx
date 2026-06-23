@@ -1,0 +1,144 @@
+---
+title: "Slow Ops (15m, >100ms), MongoDB"
+sidebarTitle: "Slow Ops (15m, >100ms)"
+description: "Slow Ops (15m, >100ms) for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How many database operations took longer than the slow-query threshold in the last 15 minutes. MongoDB's database profiler records any operation whose execution time exceeds the `slowms` setting (100 milliseconds by default), capturing the query shape, the collection, the duration, and whether an index was used. This card counts those profiler entries over a rolling 15-minute window. A handful of slow operations is normal on any busy cluster; a rising count is the earliest, cheapest signal that something is degrading, whether a missing index, a collection scan, lock contention, or cache pressure, usually well before it shows up as user-visible latency or errors. The card raises a sensitivity alert at `>10`: more than ten slow operations in fifteen minutes means the slowness is no longer an occasional outlier but a pattern worth investigating now.
+
+| | |
+| --- | --- |
+| **What it tracks** | The number of operations recorded by the database profiler whose execution time exceeded the `slowms` threshold, counted over the most recent 15 minutes. |
+| **Data source** | Profiler entries with `millis > slowms` threshold (default 100ms). The profiler writes one document per slow operation to the capped `system.profile` collection in each profiled database; Vortex IQ counts the entries whose `millis` field exceeds the configured `slowms`. |
+| **Time window** | `15m` (rolling 15-minute window). The count covers slow operations recorded in the last fifteen minutes, so it reflects current behaviour rather than a lifetime total. |
+| **Alert trigger** | `>10`. More than ten slow operations within the 15-minute window raises a sensitivity alert: the slowness is sustained enough to be a pattern, not a one-off. |
+| **What counts** | Any profiled operation over threshold: finds, updates, deletes, aggregations, getmores, and commands. The duration measured is the operation's total time including any waiting for locks. |
+| **What does NOT count** | Operations on databases where the profiler is off (profiling is per-database, not cluster-wide), operations faster than `slowms`, and operations that were evicted from the capped `system.profile` collection before they were read (a very high slow-op rate can roll the cap). |
+| **Roles** | owner, engineering, platform, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The value is a count of profiler documents over the slow threshold within the window:
+
+```text
+slow_op_count = count( system.profile entries
+                       where millis > slowms
+                       and ts within the last 15 minutes )
+```
+
+Two settings govern what lands in the count:
+
+- **`slowms`** is the threshold in milliseconds above which an operation is considered slow. The default is 100ms. It is set per `mongod` (and visible via the profiling status), so the card reflects whatever threshold the deployment actually uses. If a team has lowered `slowms` to 50ms to catch more, the count will be higher; if raised to 200ms, lower.
+- **The profiling level** controls what gets written. Level 1 logs only operations slower than `slowms` (the usual production setting and exactly what this card needs). Level 2 logs every operation regardless of speed; the card still only counts those over `slowms`. Level 0 disables profiling, in which case `system.profile` is empty and this card reads zero.
+
+The profiler writes to a capped collection (`system.profile`, 1 MB by default), so on a deployment generating a very high rate of slow operations, the oldest entries can be overwritten before they are read. In that scenario the true slow-op rate is higher than the count shown; the card surfaces a lower bound. This is rare in practice because a deployment producing enough slow ops to roll a 1 MB cap inside 15 minutes is already deep in the red on the alert.
+
+This card is the leading indicator for the Performance category. It moves before [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) and well before [Query Error Rate %](/nerve-centre/kpi-cards/mongodb/query-error-rate), because a query is slow long before it is slow enough to time out and error.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a replica set behind a catalogue and search service. Profiling is at level 1 with the default `slowms` of 100ms. Snapshot taken on 16 Apr 26 at 14:05 BST.
+
+| 15-minute window | Slow ops | Top offending shape | Reading |
+| --- | --- | --- | --- |
+| 13:20 to 13:35 | 3 | `find` on `orders` by `customerId` | Normal background noise |
+| 13:35 to 13:50 | 6 | `find` on `products` by `tags` | Edging up |
+| 13:50 to 14:05 | 17 | `find` on `products` by `tags` (COLLSCAN) | Alert fires; one shape dominates |
+
+The card reads **17 slow ops** and turns red. The team drills in:
+
+1. **One query shape accounts for most of it.** Fourteen of the seventeen slow operations are the same `find` on the `products` collection filtering by `tags`. The profiler entries show `COLLSCAN` in the plan, meaning every one of these queries is scanning the whole collection because there is no index on `tags`. This lines up with [COLLSCAN Operations (24h)](/nerve-centre/kpi-cards/mongodb/collscan-operations-24h) also climbing.
+
+2. **Why now?** A marketing change started linking to tag-filtered product pages an hour ago, so a query shape that was previously rare is now running on every page load. The collection is large enough that the scan crosses 100ms every time.
+
+3. **The fix is an index, not more hardware.** Each slow `find` reads the entire `products` collection from cache (or disk if it spills), which is why [WiredTiger Cache Hit Rate %](/nerve-centre/kpi-cards/mongodb/wiredtiger-cache-hit-rate) is also dipping: the repeated full scans are churning the working set. An index on `tags` turns each scan into an index lookup, dropping the per-query time from ~140ms to single-digit milliseconds.
+
+```text
+Triage path from the alert:
+  - 17 slow ops, 14 share one shape -> not random; one query is the culprit.
+  - Profiler plan shows COLLSCAN -> missing index, confirmed by COLLSCAN card.
+  - Cache hit rate dipping -> the scans are evicting the working set.
+  - Action: add index { tags: 1 } on products, build in the background.
+  - Expected result: slow-op count falls back to single digits within
+    one window once the index is live and queries stop scanning.
+```
+
+The takeaway: a slow-ops alert is most useful when you immediately group the entries by query shape. If one shape dominates, the fix is usually a single index or a query rewrite. If the entries are spread across many shapes with no clear leader, the cause is more likely systemic, namely cache pressure, lock contention, or an under-provisioned member, and you escalate to the capacity and WiredTiger cards rather than chasing individual queries.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow Ops | What the combination tells you |
+| --- | --- | --- |
+| [Top 10 Slow Operations](/nerve-centre/kpi-cards/mongodb/top-10-slow-operations) | The detailed breakdown behind the count. | The count tells you how many; this table tells you which shapes, so you know what to index or rewrite. |
+| [COLLSCAN Operations (24h)](/nerve-centre/kpi-cards/mongodb/collscan-operations-24h) | The most common cause of slow ops. | A slow-ops spike that tracks a COLLSCAN spike equals a missing index, the easiest class of fix. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) | The user-facing consequence. | Slow ops is the leading indicator; p95 latency is the lagging confirmation that users are feeling it. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p99-ms) | The tail that slow ops feeds. | A handful of very slow operations inflate p99 long before they move the median. |
+| [WiredTiger Cache Hit Rate %](/nerve-centre/kpi-cards/mongodb/wiredtiger-cache-hit-rate) | The cache pressure that slow scans cause. | Repeated full scans evict the working set; a falling hit rate alongside slow ops points at scan-driven cache churn. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mongodb/query-error-rate) | The end-stage when slow becomes failed. | Slow ops that keep climbing eventually time out and convert to errors; watch both during an incident. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | The composite that factors slow operations. | A sustained slow-ops breach drags the composite down before any single user complains. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MongoDB's own tooling:**
+
+> **`db.system.profile.find({ millis: { $gt: 100 } }).sort({ ts: -1 })`** in `mongosh` against a profiled database returns the raw slow-operation entries this card counts, with the query shape, duration, plan summary, and timestamp.
+> **`db.getProfilingStatus()`** confirms the profiling level and the `slowms` value in effect, so you can verify the threshold the card is counting against.
+> **The `mongod` log** also records slow operations (lines tagged `Slow query`) independently of the profiler, controlled by the same `slowms`; this is a useful cross-check if profiling is off but logging is on.
+> **`db.currentOp({ "secs_running": { $gte: 1 } })`** shows operations that are slow right now and still running, which the profiler only records once they finish.
+
+On **MongoDB Atlas**, the Performance Advisor and the Profiler tab surface slow queries with the same `slowms` basis, and the Query Profiler view groups them by shape, which is the managed equivalent of the [Top 10 Slow Operations](/nerve-centre/kpi-cards/mongodb/top-10-slow-operations) card.
+
+**Why our number may legitimately differ from the profiler:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **`slowms` value** | Variable | If the deployment's `slowms` differs from 100ms, the count reflects that threshold, not the nominal 100ms in the card title. Confirm with `db.getProfilingStatus()`. |
+| **Profiling per database** | Our value lower | Profiling is enabled per database; operations on a database with profiling off are not counted. The mongod log may still show them. |
+| **Capped collection roll** | Our value lower | A very high slow-op rate can overwrite the capped `system.profile` before entries are read, so the count is a lower bound during a severe event. |
+| **Window edges** | Marginal | Our 15-minute window and your manual `find` time range rarely align to the second; entries near the boundary may be in one and not the other. |
+
+**Cross-connector reconciliation:** a slow-ops spike during a checkout or campaign window is a high-value pattern. Pair with [Slow Ops During Checkout Window (5m)](/nerve-centre/kpi-cards/mongodb/slow-ops-during-checkout-window-5m) and the ecommerce order-rate cards to confirm whether the slow operations are hitting the revenue path or a background workload.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card reads zero but I know my queries are slow. Why?**
+The most likely reason is that profiling is disabled (level 0) on the database in question. Profiling is set per database, not cluster-wide, so a newly created database inherits the default and may not be profiled. Check with `db.getProfilingStatus()` and enable level 1 with `db.setProfilingLevel(1)` to capture operations over `slowms`. The `mongod` log records slow queries independently, so cross-check there too.
+
+**Does enabling the profiler slow my database down?**
+Profiling at level 1 has negligible overhead because it only writes a document for operations that were already slow; the cost is one small insert per slow op into a capped collection. Level 2 (log everything) does add measurable overhead on a busy database because it writes a document for every operation, so it is a diagnostic setting, not a production one. This card works with level 1, the recommended production setting.
+
+**My `slowms` is set to 50ms, not 100ms. Does the card still make sense?**
+Yes, the card counts against whatever `slowms` the deployment actually uses; the 100ms in the title is the MongoDB default. A lower `slowms` will produce a higher count because it captures operations between 50ms and 100ms that the default would ignore. If you want the count to mean the same thing across deployments, standardise `slowms` and adjust the alert threshold accordingly.
+
+**Many different query shapes are slow, not just one. What does that mean?**
+A single dominant shape usually points at one missing index or a bad query, an easy fix. A count spread across many unrelated shapes points at a systemic cause: cache pressure (the working set no longer fits, so everything reads from disk), lock contention, replication lag stealing resources from a secondary, or an under-provisioned member. Escalate to [WiredTiger Cache Hit Rate %](/nerve-centre/kpi-cards/mongodb/wiredtiger-cache-hit-rate), [Connections In Use](/nerve-centre/kpi-cards/mongodb/connections-in-use), and the capacity cards rather than chasing individual queries.
+
+**The count keeps climbing and now I am seeing errors. Are they the same problem?**
+Usually yes, in sequence. A query that is slow can become a query that times out as load increases or the working set grows; the slow op converts to an error. This is why [Query Error Rate %](/nerve-centre/kpi-cards/mongodb/query-error-rate) often follows a slow-ops spike with a lag. Fix the slow operations (index, rewrite, or capacity) and the errors typically resolve with them.
+
+**Can I change the alert threshold of 10?**
+Yes. Ten slow ops per 15 minutes is the generic default. Sensitivity thresholds are configurable per profile in the Sensitivity tab. A small, lightly loaded cluster may want a lower threshold so it catches degradation earlier; a large, high-throughput cluster that always carries some slow tail may want a higher one so the alert reflects a genuine change rather than its normal baseline.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow Ops (15m, >100ms)* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

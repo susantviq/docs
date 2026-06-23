@@ -1,0 +1,130 @@
+---
+title: "Aborted Connects (24h), MariaDB"
+sidebarTitle: "Aborted Connects (24h)"
+description: "Aborted Connects (24h) for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of client connections that MariaDB started to accept but then aborted during the last 24 hours. This is the server's `Aborted_connects` status counter, sampled and differenced over the window. A connection is "aborted" before the client ever runs a query: the handshake failed, the credentials were wrong, the client gave up mid-authentication, or `max_connect_errors` tripped. For a DBA, a steady trickle is normal background noise (port scanners, health-check probes, the odd typo). A spike is a signal: a misconfigured application node, a credential rotation that did not propagate, or an early sign that something is hammering the auth path.
+
+| | |
+| --- | --- |
+| **What it tracks** | Aborted Connects (24h): the delta in the global `Aborted_connects` status variable over a rolling 24-hour window. Counts connection attempts that failed *before* a successful authenticated session was established. |
+| **Data source** | MariaDB `SHOW GLOBAL STATUS LIKE 'Aborted_connects'` (or `information_schema.GLOBAL_STATUS`), polled on the Nerve Centre sampling interval and differenced to produce a per-window count. |
+| **Distinct from** | `Aborted_clients`, which counts sessions that connected successfully but were then dropped (client died, `wait_timeout` fired, packet too large). Aborted *connects* are pre-auth failures; aborted *clients* are post-auth disconnects. Do not conflate them. |
+| **Time window** | `24h` rolling. The headline is the count of aborted connects across the trailing 24 hours. |
+| **Alert trigger** | `> 100` aborted connects in the 24-hour window. Above this the card turns amber and surfaces in the Sensitivity feed. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+MariaDB maintains a monotonic global counter, `Aborted_connects`, that increments every time a connection attempt fails before authentication completes. It is reset only on server restart (or an explicit `FLUSH STATUS`). Because the raw counter only ever grows, the card does not display its absolute value; it displays the *difference* between the counter now and the counter 24 hours ago.
+
+```text
+aborted_connects_24h = Aborted_connects(now) - Aborted_connects(now - 24h)
+```
+
+If the server restarted inside the window, the counter resets to zero, so the engine clamps any negative delta to the value of the current counter (treating a restart boundary as "everything since restart"). The detail line for this card is simply: *Aborted Connects (24h) for the selected period.* The underlying counter increments for, among others: bad username or password, a client that disconnects during the handshake, SSL/TLS negotiation failure, a host blocked by `max_connect_errors`, and `init_connect` statement failures.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 3-node MariaDB 10.6 cluster behind an application tier of 12 web nodes. Snapshot taken on 14 Apr 26 at 09:00 BST.
+
+| Reading | Value |
+| --- | --- |
+| `Aborted_connects` now | 4,820 |
+| `Aborted_connects` 24h ago | 4,690 |
+| **Aborted Connects (24h)** | **130** |
+| Card state | Amber (threshold `> 100`) |
+
+130 over 24 hours is roughly one every 11 minutes, which has tripped the amber threshold. The DBA's first move is to find *where* the failures come from, because the counter itself does not record the offending host. Two native paths:
+
+```sql
+-- Per-host connect errors (resets with FLUSH HOSTS)
+SELECT * FROM performance_schema.host_cache
+WHERE COUNT_AUTHENTICATION_ERRORS > 0
+   OR COUNT_HANDSHAKE_ERRORS > 0
+ORDER BY SUM_CONNECT_ERRORS DESC;
+```
+
+The host cache shows 118 of the 130 failures came from a single application node (`10.2.4.17`) with `COUNT_AUTHENTICATION_ERRORS = 118`. The team checks that node: it was redeployed at 02:00 with a stale Kubernetes secret after a password rotation. The application retried its connection pool every 10 seconds, each retry adding one aborted connect.
+
+Three takeaways:
+
+1. **The count is a symptom; the host cache is the diagnosis.** Always pair the headline with `performance_schema.host_cache` (or the older `SHOW STATUS LIKE 'Connection_errors%'`) to attribute the failures.
+2. **A retrying connection pool is a multiplier.** A single bad credential on one node can generate hundreds of aborted connects per day because pools reconnect aggressively. Fix the source, do not just raise the threshold.
+3. **Watch for `max_connect_errors` lockout.** Once a host accumulates `max_connect_errors` failures (default 100), MariaDB blocks it entirely with `Host '...' is blocked`. At that point the application sees hard connection failures, not slow ones. Run `FLUSH HOSTS` (or `FLUSH PRIVILEGES`) after fixing the credential to clear the block.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Aborted Connects | What the combination tells you |
+| --- | --- | --- |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mariadb/connection-errors-24h) | The broader connection-error counter family (`Connection_errors_*`). | Aborted connects rising with `Connection_errors_max_connections` rising equals capacity exhaustion, not bad credentials. |
+| [Connections In Use](/nerve-centre/kpi-cards/mariadb/connections-in-use) | The live count of established threads. | Aborted connects high while connections-in-use is near `max_connections` points at saturation refusing new clients. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation) | How close threads are to `max_connections`. | Aborts at high saturation are capacity-driven; aborts at low saturation are auth or network-driven. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/mariadb/connection-pool-at-90-saturation) | The real-time exhaustion alert. | If both fire together, the pool is full and turning clients away. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mariadb/query-error-rate) | Post-auth query failures. | Aborts are pre-auth; query errors are post-auth. Together they bracket the request lifecycle. |
+| [Instance Uptime](/nerve-centre/kpi-cards/mariadb/instance-uptime) | Detects restarts that reset the counter. | A recent restart explains a sudden drop (or a clamped delta) in this card. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite that weights connection health. | A sustained abort spike pulls the composite down even when queries look healthy. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> `SHOW GLOBAL STATUS LIKE 'Aborted_connects';` for the raw monotonic counter.
+> `SELECT * FROM performance_schema.host_cache;` to attribute failures to specific client hosts.
+> `SHOW GLOBAL STATUS LIKE 'Connection_errors_%';` for the breakdown by failure reason (max connections, accept, internal, peer address, select, tcpwrap).
+
+**Why our number may legitimately differ from a raw `SHOW STATUS`:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Windowing** | Ours is smaller | `SHOW GLOBAL STATUS` shows the cumulative count since startup; our card shows only the trailing 24 hours. |
+| **Restart inside the window** | Ours may read low | When the counter resets to zero at restart, we clamp the negative delta and report from the restart point, not the lost history. |
+| **Sampling interval** | Marginal lag | The card differences two samples; failures in the seconds between the last poll and your manual `SHOW STATUS` are not yet reflected. |
+| **`FLUSH STATUS` run manually** | Ours may read low | If an operator ran `FLUSH STATUS`, the underlying counter resets and our delta restarts from zero. |
+
+**On managed services:** Amazon RDS / Aurora for MariaDB exposes `Aborted_connects` via the same `SHOW GLOBAL STATUS` and via Enhanced Monitoring; SkySQL and Azure Database for MariaDB surface it through their own metrics consoles. The number should agree once you align the window. For per-host attribution you still need `performance_schema.host_cache`, which the managed consoles do not summarise.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Q: What is the difference between Aborted_connects and Aborted_clients?**
+`Aborted_connects` counts attempts that failed *before* authentication completed (bad password, handshake timeout, TLS failure, blocked host). `Aborted_clients` counts sessions that authenticated successfully but were later dropped without a clean `mysql_close()` (the client process died, `wait_timeout`/`interactive_timeout` fired, or `max_allowed_packet` was exceeded). This card tracks the former. Post-auth disconnects belong to the client counter.
+
+**Q: A spike appeared but the host cache is empty. Why?**
+`performance_schema.host_cache` is itself capped at `host_cache_size` rows and is cleared by `FLUSH HOSTS`, `FLUSH PRIVILEGES`, or `FLUSH STATUS`. If someone ran one of those after the failures, the attribution is gone even though the cumulative `Aborted_connects` counter persists. Enable the `general_log` or audit plugin temporarily to capture future offenders, or check application logs on the suspected nodes.
+
+**Q: We see a steady ~5 aborts per hour with no application errors. Is that a problem?**
+Usually not. A low constant rate is typical of load-balancer TCP health checks that open and close the port without authenticating, port scanners, and monitoring probes. Establish your own baseline; the `> 100` per 24h default is a generic starting point. If your background noise sits at 120/day and nothing is broken, raise the threshold in the Sensitivity tab rather than chasing the noise.
+
+**Q: Why does the count suddenly drop to near zero?**
+The most common cause is a server restart (or `FLUSH STATUS`), which resets the underlying counter. Cross-check [Instance Uptime](/nerve-centre/kpi-cards/mariadb/instance-uptime): a low uptime explains the reset. The card clamps the negative delta so you will not see a misleading negative number.
+
+**Q: Could a single failing application cause this?**
+Yes, and it is the most common real cause. Connection pools reconnect on a fixed interval (commonly every 5 to 30 seconds). One node with a stale credential after a password rotation can generate hundreds of aborted connects per day on its own. Fix the secret on that node and run `FLUSH HOSTS` to clear any `max_connect_errors` block.
+
+**Q: Does this counter include connections refused because max_connections was reached?**
+Those are counted in `Connection_errors_max_connections`, surfaced by the [Connection Errors (24h)](/nerve-centre/kpi-cards/mariadb/connection-errors-24h) card, and depending on the failure stage may or may not increment `Aborted_connects`. When the abort spike coincides with high [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation), treat it as a capacity problem rather than an auth problem.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Aborted Connects (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

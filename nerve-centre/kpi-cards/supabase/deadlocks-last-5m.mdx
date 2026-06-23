@@ -1,0 +1,154 @@
+---
+title: "Deadlocks (last 5m), Supabase"
+sidebarTitle: "Deadlocks (last 5m)"
+description: "Deadlocks (last 5m) for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of deadlocks Postgres has detected and resolved in the last five minutes. A deadlock is two or more transactions each holding a lock the other needs, a circular wait that can never resolve itself, so Postgres breaks it by killing one transaction with a `deadlock detected` error. On a healthy database this number is zero, effectively always. Any non-zero reading means application transactions are colliding over the same rows in incompatible lock orders, and at least one user's write just failed. This is why the alert fires at the first deadlock, not at some tolerance band: deadlocks are a code-shaped problem, not a capacity one, and even one is a bug worth chasing.
+
+| | |
+| --- | --- |
+| **What it tracks** | The count of deadlocks Postgres detected and aborted in the trailing 5-minute window. |
+| **Data source** | `detail`: Deadlocks (last 5m) for the selected period. Derived from the `deadlocks` counter in `pg_stat_database` on the Supabase project, sampled by the Vortex IQ Supabase connector. |
+| **Calculation basis** | The delta of `pg_stat_database.deadlocks` across the 5-minute window. Each deadlock Postgres resolves increments this counter by one. |
+| **Time window** | `5m`: a short window because deadlocks are bursty and you want to see the spike, not have it averaged away. |
+| **Alert trigger** | `> 0`. Any deadlock at all is worth a look; sustained or repeating deadlocks are a real application defect. |
+| **Chart type** | KPI (single integer count). |
+| **Roles** | owner, engineering, operations (DBA / platform / SRE) |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calc */}
+Postgres maintains a cumulative `deadlocks` counter per database in `pg_stat_database`. Every time the deadlock detector fires (by default after a transaction has waited on a lock for one second, the `deadlock_timeout`), it identifies the circular wait, picks a victim transaction, aborts it with SQLSTATE `40P01` (`deadlock detected`), and increments the counter by one.
+
+The card reports the delta of that counter over the trailing 5 minutes:
+
+```text
+deadlocks_last_5m = deadlocks(now) - deadlocks(now - 5 minutes)
+```
+
+A few properties worth understanding:
+
+- **It counts resolved deadlocks, not lock waits.** Ordinary lock contention (transactions queuing politely for a lock and getting it) does not increment the counter. Only a true circular wait that Postgres had to break does. So a non-zero reading is unambiguous: a transaction was killed.
+- **The window is deliberately short.** Deadlocks arrive in bursts (a hot-path code path under concurrency), so a 5-minute window surfaces the spike clearly. A longer average would dilute three deadlocks in one minute into a near-zero rate and hide the incident.
+- **One deadlock equals at least one failed user action.** The aborted transaction's work is rolled back. Whether the user sees an error depends on whether the application retries; many do not, which is why a deadlock often shows up first as a customer complaint.
+
+The card does not, by itself, tell you *which* tables or statements collided. For that you need the Postgres log, where each deadlock writes a detailed entry naming the two processes, the queries they were running, and the locks they each held and wanted.
+{/* /HUMAN_AUTHORED:calc */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Supabase project behind an order-management system. On 18 Apr 26 at 12:31 BST the card jumps from 0 to **4** in a single 5-minute window during a lunchtime sales spike. The alert fires.
+
+Pulling the Postgres log for the window, every entry follows the same shape:
+
+```text
+ERROR: deadlock detected
+DETAIL: Process 18432 waits for ShareLock on transaction 99214; blocked by process 18519.
+        Process 18519 waits for ShareLock on transaction 99220; blocked by process 18432.
+        Process 18432: UPDATE inventory SET qty = qty - 1 WHERE sku = 'A';
+                       UPDATE inventory SET qty = qty - 1 WHERE sku = 'B';
+        Process 18519: UPDATE inventory SET qty = qty - 1 WHERE sku = 'B';
+                       UPDATE inventory SET qty = qty - 1 WHERE sku = 'A';
+```
+
+The cause is textbook: two concurrent order transactions decrement stock for the same two SKUs but in opposite order. Transaction one locks row A then waits for B; transaction two locks B then waits for A. Neither can proceed, so Postgres kills one. Under low traffic the odds of the two interleaving are tiny, which is why this never appeared in testing; at lunchtime concurrency it surfaces several times in five minutes.
+
+```text
+The fix is in application code, not the database:
+  - Enforce a consistent lock order. Sort the SKUs before updating:
+      UPDATE inventory ... WHERE sku = ANY(ARRAY['A','B'] ORDER BY sku)
+    so every transaction acquires A before B, breaking the cycle.
+  - Add a bounded retry on SQLSTATE 40P01 so a victim transaction
+    automatically retries once rather than surfacing an error to the user.
+  - Result: deadlock count returns to 0; the lunchtime spike no longer
+    produces failed orders.
+```
+
+Three takeaways a platform team should remember:
+
+1. **A deadlock is a code defect, not a capacity problem.** Sizing up compute will not fix it; in fact more compute means more concurrency, which can make deadlocks *more* frequent. The cure is consistent lock ordering and retries in the application.
+2. **They appear under concurrency, so they hide in testing.** A deadlock needs two transactions to interleave at just the wrong moment. That is rare at low load and common at peak, which is exactly when it hurts most. Treat the first production deadlock as a real bug even if you cannot reproduce it locally.
+3. **The count tells you it happened; the log tells you why.** The card is the alarm. The Postgres deadlock log entry (which names both queries and both lock sets) is the diagnosis. Always pull the log for the window before changing anything.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Deadlocks | What the combination tells you |
+| --- | --- | --- |
+| [Database Query Error Rate %](/nerve-centre/kpi-cards/supabase/database-query-error-rate) | Deadlocks surface as aborted statements. | A deadlock spike co-occurring with an error-rate bump confirms the deadlocks are reaching users as failed actions. |
+| [Postgres Query Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgres-query-latency-p95-ms) | Lock waits precede deadlocks. | Rising p95 just before a deadlock spike shows transactions were already queuing on locks. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate) | Long transactions hold locks longer, widening the deadlock window. | Slow queries plus deadlocks points at a long-running transaction holding rows others need. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/supabase/top-10-slowest-queries) | Identifies the long lock-holders. | Names the statement that is holding locks long enough to create the collision. |
+| [Database Queries per Second (live)](/nerve-centre/kpi-cards/supabase/database-queries-per-second-live) | Concurrency context. | A deadlock spike at a QPS peak confirms the collision is concurrency-driven. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The executive roll-up. | Repeating deadlocks pull the composite into its error band. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to confirm this in Supabase's own tooling:**
+
+> **SQL Editor / `psql`** is the ground truth for the counter:
+> ```sql
+> SELECT datname, deadlocks FROM pg_stat_database WHERE datname = current_database();
+> ```
+> **Supabase Studio → Logs → Postgres** holds the detailed deadlock entries (search for `deadlock detected`), which name both colliding queries and the locks each held.
+> **`pg_locks` joined to `pg_stat_activity`** shows *current* lock waits, useful for catching contention before it becomes a deadlock.
+
+**Why our number may legitimately differ from a raw counter read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window vs lifetime** | Vortex IQ lower | The bare `pg_stat_database.deadlocks` value is cumulative since the last stats reset. The card reports the 5-minute delta, so it shows recent deadlocks, not the lifetime total. |
+| **Stats reset** | Vortex IQ unaffected | A `pg_stat_reset()` zeroes the lifetime counter; the windowed delta keeps counting across the reset. |
+| **Sampling boundary** | Off by one possible | A deadlock that lands exactly on a sample boundary may be attributed to the adjacent window; over any real incident the totals reconcile. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`supabase.database-query-error-rate`](/nerve-centre/kpi-cards/supabase/database-query-error-rate) | Each deadlock is one aborted statement, so deadlocks should be visible inside the error rate. | If error rate stays flat during a deadlock spike, the application is silently retrying, which is healthy but masks the user impact. |
+| [`supabase.postgres-query-latency-p95-ms`](/nerve-centre/kpi-cards/supabase/postgres-query-latency-p95-ms) | Lock-wait latency often rises in the minute before deadlocks appear. | Flat latency with deadlocks means the collisions are instantaneous, typically tight hot-path writes. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Is a single deadlock really worth alerting on?**
+Yes. Unlike capacity metrics, where a small breach can be noise, a deadlock is binary: it happened, and a transaction was killed. Even one means two code paths are acquiring locks in incompatible orders, which is a defect that will recur and worsen under load. The `> 0` threshold treats the first deadlock as the signal to investigate, not to panic, but to look.
+
+**The count went back to zero on its own. Is the problem gone?**
+Probably not; it has gone quiet. Deadlocks need concurrent transactions to interleave at exactly the wrong moment, which is load-dependent. A return to zero usually just means traffic eased, not that the underlying lock-ordering bug is fixed. Pull the log entry from the spike window and fix the ordering before the next peak.
+
+**Can I prevent deadlocks by sizing up compute?**
+No, and it can make them worse. Deadlocks are about lock ordering, not resources. More compute allows more concurrency, which increases the chance of two transactions colliding. The fix is always in the application: enforce a consistent lock order (for example, always update rows sorted by primary key) and add a bounded retry on the `40P01` error code.
+
+**Why does the card not tell me which tables deadlocked?**
+Because `pg_stat_database` only exposes a count, not the detail. The full picture (both queries, both processes, both lock sets) lives in the Postgres log, which Supabase surfaces under Studio → Logs → Postgres. The card is the alarm; the log is the diagnosis. Always read the log entry for the window before changing code.
+
+**My ORM retries automatically, so users never see the error. Do I still care?**
+Somewhat less, but yes. Automatic retry is the correct mitigation and means the deadlocks are not reaching users as failures, which is good. But every retry is wasted work and added latency, and a heavy deadlock rate means a meaningful fraction of your transactions are doing their work twice. The lock-ordering fix removes the cause; retry only papers over it.
+
+**What is `deadlock_timeout` and should I change it?**
+It is how long Postgres waits on a lock before running the (relatively expensive) deadlock-detection check; the default is one second. Lowering it makes detection faster but adds CPU overhead on every lock wait, and it does not reduce the number of deadlocks, only how quickly they are resolved. On Supabase the default is almost always right; fix the lock ordering instead of tuning the timeout.
+
+**Could a deadlock spike be caused by a long-running transaction rather than bad ordering?**
+Yes, indirectly. A transaction that holds locks for a long time widens the window in which another transaction can collide with it, so long transactions amplify any latent ordering bug. If you see deadlocks alongside a high [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate), shortening the long transactions (smaller batches, committing sooner) reduces the collision window even before you fix the ordering.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Deadlocks (last 5m)* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

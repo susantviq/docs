@@ -1,0 +1,160 @@
+---
+title: "Database Queries per Second (live), Supabase"
+sidebarTitle: "Database Queries per Second (live)"
+description: "Database Queries per Second for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This card reports how many SQL statements your Supabase Postgres database is executing per second, live. Where the PostgREST request rate measures how many API calls arrive, this measures the database work those calls (plus Edge Functions, scheduled jobs, Auth, and anything else with a connection) actually generate. It is the single best headline for "how hard is the database working right now?". For a platform or SRE team it is the load gauge that sits beneath every latency, cache, and capacity card: a latency change is a regression or a load story depending on whether QPS moved with it. It carries no fixed alert because raw throughput is neither healthy nor unhealthy on its own; it is the denominator that makes the rest of the connector interpretable.
+
+| | |
+| --- | --- |
+| **What it tracks** | The rate at which Postgres executes SQL statements, in queries per second, for the live window. Counts all statements across all clients (PostgREST, Edge Functions, cron jobs, Auth, direct connections). |
+| **Data source** | Postgres cumulative statement counters: the `xact_commit + xact_rollback` and `tup_*` activity in `pg_stat_database`, combined with `pg_stat_statements` `calls`. The card reads the delta between polls and divides by the elapsed time to produce a live rate. |
+| **Time window** | `RT` (live, refreshed continuously). |
+| **Alert trigger** | None by default. QPS is load context, not a pass/fail signal. Add a custom ceiling or floor in the Sensitivity tab to catch a runaway surge or a drop to zero. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+QPS is a delta of cumulative counters divided by elapsed time:
+
+```text
+qps = (statements executed since last poll) / seconds since last poll
+plotted live: read as the database load context for every other card
+no fixed alert: throughput alone is neither good nor bad
+```
+
+Postgres exposes cumulative activity counters that only ever increase: per-database transaction counts in `pg_stat_database` (`xact_commit`, `xact_rollback`) and per-statement call counts in `pg_stat_statements` (`calls`). The lifetime totals are dominated by history and barely move, so the card takes the difference between two polls and divides by the time between them. That delta is what makes the reading "live": a fresh surge or a sudden idle shows up promptly rather than being buried under months of accumulated counts.
+
+Two points shape how to read it:
+
+1. **This is broader than the API.** PostgREST is one source of queries, but Edge Functions, scheduled jobs (pg_cron), the Auth service, Storage metadata, and any direct database connection all execute statements that count here. That is why database QPS is usually higher than [PostgREST Request Rate (req/sec)](/nerve-centre/kpi-cards/supabase/postgrest-request-rate-reqsec), and why a QPS spike with a flat API request rate points at a non-API source: a cron job, a migration, or a background worker.
+2. **The ratio to API requests is diagnostic.** Divide database QPS by PostgREST request rate to get queries-per-request. A creeping ratio is the classic signature of an N+1 pattern, where one API call quietly fans out into many database round trips (embedded resources, RLS policies that query other tables, app code looping over rows). Watching the ratio, not just the absolute QPS, catches efficiency regressions early.
+
+The natural companions are [PostgREST Request Rate (req/sec)](/nerve-centre/kpi-cards/supabase/postgrest-request-rate-reqsec) (how much of this QPS is API-driven?), [Buffer Cache Hit Rate %](/nerve-centre/kpi-cards/supabase/buffer-cache-hit-rate) (is the load fitting in memory?), and [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) (is the load exhausting connections?).
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Supabase project for a SaaS product. Database QPS normally tracks the API request rate at roughly 4 queries per request and peaks around 1,200 QPS. Snapshot taken on 05 May 26 at 10:50 BST after the on-call dashboard flagged an unusual climb.
+
+| Window | DB QPS | PostgREST req/sec | Queries/request | Cache hit rate | State |
+| --- | --- | --- | --- | --- | --- |
+| 10:00 (baseline) | 760 | 190 | 4.0 | 99.3% | healthy |
+| 10:45 | 2,400 | 205 | 11.7 | 97.1% | elevated |
+| 10:50 | 2,950 | 210 | 14.0 | 95.8% | degrading |
+
+There is no alert on this card, but the shape is the lead signal. The team reads it together with the siblings:
+
+1. **QPS nearly quadrupled while the API request rate barely moved.** PostgREST went 190 to 210 req/sec (normal) but database QPS went 760 to 2,950. The extra work is not coming from more API calls; each call is now generating far more queries. The queries-per-request ratio jumped from 4.0 to 14.0.
+2. **That ratio is the smoking gun.** A request that used to make 4 queries now makes 14. That is the textbook signature of an N+1 regression: a recent change introduced a loop that fetches related rows one at a time instead of in a single joined query. Cross-referencing [PostgREST API Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgrest-api-latency-p95-ms), latency has started creeping up as the extra round trips add overhead and the cache hit rate slips.
+3. **It is a code regression, not a load event.** Because the API request rate is flat, scaling the tier or the pool would only paper over it. The fix is to collapse the N+1 back into a single query (a PostgREST embedded select, or a join), which restores both QPS and latency.
+
+```text
+Spotting an N+1 from this card:
+  queries_per_request = DB QPS / PostgREST req/sec
+  - stable ratio                -> healthy, load scales linearly
+  - rising ratio at flat req/sec -> N+1 / chatty endpoint regression
+  - QPS spike at zero req/sec    -> non-API source (cron, migration, worker)
+
+Find the offending statement:
+  SELECT query, calls, mean_exec_time,
+         calls / GREATEST(extract(epoch FROM (now() - stats_reset)),1) AS calls_per_sec
+  FROM pg_stat_statements
+  ORDER BY calls DESC
+  LIMIT 10;
+  -- the N+1 query shows a sudden jump in calls with low mean_exec_time each.
+```
+
+```text
+Fix order:
+  1. Replace the per-row loop with one joined query / PostgREST embed.
+  2. If the fan-out is unavoidable, batch it (IN-list, single round trip).
+  3. Add the missing index if the now-collapsed query needs one.
+```
+
+The team identified the N+1 in `pg_stat_statements` (a low-cost query whose `calls` had exploded), shipped a fix that fetched the related rows in one embedded select, and QPS dropped back to its normal ratio while latency recovered. The absolute QPS number was the alarm; the queries-per-request ratio was the diagnosis.
+
+Three takeaways:
+
+1. **Database QPS is broader than API load.** It counts every statement from every connection: API, Edge Functions, cron, Auth, direct clients. A QPS spike with flat API traffic points at a non-API source.
+2. **Watch the ratio to request rate, not just the number.** Queries-per-request rising at constant API load is the cleanest early sign of an N+1 or chatty-endpoint regression, long before latency makes it obvious.
+3. **Scaling does not fix a code regression.** If the extra QPS comes from more queries per request rather than more requests, a bigger tier just delays the problem. Collapse the fan-out at the source.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Database Queries per Second | What the combination tells you |
+| --- | --- | --- |
+| [PostgREST Request Rate (req/sec)](/nerve-centre/kpi-cards/supabase/postgrest-request-rate-reqsec) | The API-side denominator for queries-per-request. | QPS rising faster than request rate equals an N+1 or chatty-endpoint regression. |
+| [PostgREST API Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgrest-api-latency-p95-ms) | Latency interpreted against database load. | Latency up with QPS up equals capacity; latency up with QPS flat equals a query regression. |
+| [Buffer Cache Hit Rate %](/nerve-centre/kpi-cards/supabase/buffer-cache-hit-rate) | More queries can push the working set past cache. | QPS up and hit rate down equals load outgrowing memory or a new scan-heavy query. |
+| [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) | High QPS pressures the connection pool. | Rising QPS driving saturation toward 90% predicts the next latency breach. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate) | Distinguishes more queries from slower queries. | QPS flat but slow-query rate up equals a plan regression, not a load change. |
+| [Database Query Error Rate %](/nerve-centre/kpi-cards/supabase/database-query-error-rate) | Counts how much of the QPS is failing. | QPS steady with error rate climbing equals the same load failing more often. |
+| [Supabase QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/supabase/supabase-qps-spike-vs-ecom-order-rate) | Ties QPS to downstream business activity. | A QPS spike with no order spike equals bots, retries, or a runaway job, not real demand. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite that reads load against capacity. | Sustained QPS beyond safe capacity erodes the composite before any single gauge breaches. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase's own tooling:**
+
+> In the Supabase dashboard, open **Reports → Database** for the query-throughput and transaction charts. The dashboard load charts and this card draw on the same Postgres activity counters.
+> Compute it yourself from the system catalogs: `SELECT xact_commit + xact_rollback AS txns FROM pg_stat_database WHERE datname = current_database();` sampled twice and differenced gives transactions per second; `pg_stat_statements` `sum(calls)` differenced gives statements per second (the closer match to QPS).
+> To attribute the QPS, order `pg_stat_statements` by `calls` to see which statements dominate, and check `pg_stat_activity` for what is currently running and from which application.
+> The managed-service console exposes equivalent throughput charts under the project's observability section; confirm the chart is counting statements (not transactions or connections) over a matching interval before comparing.
+
+**Why our number may legitimately differ from Supabase's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Statements vs transactions** | Card may read higher | The card counts SQL statements; a chart counting transactions (`xact_commit + xact_rollback`) reads lower because one transaction can contain many statements. |
+| **Delta vs lifetime** | Card more responsive | The card uses the between-poll delta; a hand-run `pg_stat_database` snapshot shows lifetime totals that barely move and hide a fresh surge. |
+| **pg_stat_statements scope** | Possible undercount | `pg_stat_statements` tracks normalised statements up to its configured limit; very high-cardinality query text can be capped, slightly under-counting. |
+| **Poll interval** | Variable | A short poll interval surfaces instantaneous spikes that a longer dashboard bucket averages away. |
+| **Stats reset** | Temporary mismatch | `pg_stat_reset()` zeroes the counters; the card's delta is unaffected but a lifetime-based source query restarts from zero. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does this card have no alert?**
+Because raw QPS is neither healthy nor unhealthy on its own: 3,000 QPS is excellent on a well-provisioned project and a crisis on a tiny one. The card stays alert-free so it can act as neutral load context for the latency, cache, and capacity gauges, which is where the pass/fail judgement lives. If you want to catch a runaway surge or a drop to zero, add a custom ceiling or floor in the Sensitivity tab tuned to your project's real pattern.
+
+**My QPS spiked but my PostgREST request rate did not. What happened?**
+Something other than the API is generating queries. The common sources are a scheduled job (pg_cron), a migration or backfill, a background worker, an Auth-heavy event, or a direct database connection from a script. Order `pg_stat_statements` by `calls` to see which statement jumped, and check `pg_stat_activity` for the `application_name` behind it. A QPS spike at flat API traffic almost always traces to a non-API client.
+
+**Database QPS is much higher than my API request rate. Is that a problem?**
+Not inherently, one API call legitimately makes several queries. It becomes a problem when the ratio rises over time at constant API load, which signals an N+1 pattern: an endpoint quietly fanning out into more and more queries (embedded resources, RLS policies that query other tables, app loops). Track queries-per-request, not just absolute QPS, and investigate when the ratio climbs.
+
+**Does this count queries from Edge Functions and cron jobs?**
+Yes. The card counts statements from every connection to Postgres: PostgREST, Edge Functions, pg_cron, the Auth service, Storage metadata, and any direct client. That breadth is the point, it is the true database load, not just the API slice. To isolate the API portion, compare against [PostgREST Request Rate (req/sec)](/nerve-centre/kpi-cards/supabase/postgrest-request-rate-reqsec).
+
+**Why is the card's QPS different from my pg_stat_database query?**
+Most likely you are comparing statements with transactions. `pg_stat_database` exposes transaction counts (`xact_commit + xact_rollback`); the card counts statements, and one transaction can hold many statements, so the card reads higher. Also, a hand-run query on `pg_stat_database` shows lifetime totals since the last reset, which move slowly, whereas the card uses the live delta. For a like-for-like statement rate, difference `sum(calls)` from `pg_stat_statements` across two samples.
+
+**My QPS dropped to near zero. Is the database down?**
+Possibly, but check the benign causes first. A drop to zero can mean the application stopped sending traffic (a broken deploy, a gateway dropping requests upstream), a maintenance window, or, on a Free-tier project, the project pausing after inactivity. Confirm with [Project Uptime](/nerve-centre/kpi-cards/supabase/project-uptime) and [PostgREST Request Rate (req/sec)](/nerve-centre/kpi-cards/supabase/postgrest-request-rate-reqsec) before assuming a database outage.
+
+**Can high QPS by itself cause problems even if every query is fast?**
+Yes. Very high QPS pressures connections (each query needs one), CPU, and the cache even when individual statements are cheap. Watch [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) and [Buffer Cache Hit Rate %](/nerve-centre/kpi-cards/supabase/buffer-cache-hit-rate) alongside QPS; a sustained climb toward your tier's limits is the signal to optimise the chattiest endpoints or move up a tier before latency breaks.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Database Queries per Second (live)* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

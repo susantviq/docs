@@ -1,0 +1,146 @@
+---
+title: "Read Replica Lag (seconds), Supabase"
+sidebarTitle: "Read Replica Lag (seconds)"
+description: "Read Replica Lag (seconds) for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of seconds a Supabase read replica trails behind the primary database. Read replicas are a paid, region-pinned feature: they exist to serve read-routed traffic closer to users and to offload reporting queries from the primary. Replication is asynchronous, so a replica is always a little behind. Small lag (under a second) is normal and harmless. Sustained lag means read-routed queries return stale rows: a user updates their profile, reads it back from a lagging replica, and sees the old value. For an ops team, this card answers "can I trust what my read replicas are returning right now?"
+
+| | |
+| --- | --- |
+| **What it tracks** | Replication lag in seconds for each Supabase read replica, measured as the delay between a write committing on the primary and that write being visible on the replica. The headline shows the worst (highest-lag) replica; the drill-down lists each replica by region. |
+| **Data source** | Supabase read replicas are a paid, regional feature. The value is derived from Postgres streaming replication state: the gap between `pg_current_wal_lsn()` on the primary and the replica's `pg_last_wal_replay_lsn()`, expressed in seconds via `pg_last_xact_replay_timestamp()`. Surfaced through the Supabase project metrics endpoint and the replica's own stats. |
+| **Time window** | `RT` (real-time, polled on the live refresh cycle). Lag is an instantaneous reading, not an average. |
+| **Alert trigger** | `> 10s`. A replica trailing the primary by more than 10 seconds is flagged. Sub-second lag is healthy; single-digit seconds is tolerable under write bursts; double-digit sustained lag is a problem. |
+| **Why it matters** | Lag affects read-routed queries. If your app sends reads to a replica (via the dedicated read-replica connection string or a load-balanced pooler), a lagging replica serves stale data. This breaks read-your-own-writes expectations and any logic that assumes the replica is current. |
+| **What counts** | Each provisioned read replica in the project, across all regions. |
+| **What does NOT count** | The primary database (lag against itself is always zero); replicas that are still initialising (they report a separate "catching up" state); projects on tiers without read replicas (the card shows "not provisioned"). |
+| **Roles** | platform, dba, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Supabase read replicas use Postgres streaming replication, which is asynchronous: the primary commits a transaction, writes it to the Write-Ahead Log (WAL), and ships WAL records to each replica, which then replays them. Lag is the time between a commit landing on the primary and being replayed on the replica.
+
+The value is computed per replica as:
+
+```text
+lag_seconds = now() - pg_last_xact_replay_timestamp()
+```
+
+evaluated on the replica. `pg_last_xact_replay_timestamp()` returns the commit timestamp of the most recent transaction the replica has applied. Subtracting it from the current time gives how far behind "now" the replica is in wall-clock terms. The card polls each replica in real time and reports the maximum across all of them, because a single lagging replica is enough to serve stale reads.
+
+A subtlety: on a perfectly idle primary (no writes at all) the replica has nothing to replay, so `pg_last_xact_replay_timestamp()` stops advancing and naive lag appears to climb even though the replica is fully current. The engine corrects for this by cross-checking the WAL LSN positions: if the replica's replay LSN equals the primary's current LSN, lag is reported as zero regardless of the timestamp gap. This avoids false alerts during quiet periods (overnight, low-traffic windows).
+
+The 10-second alert threshold is deliberately generous. Streaming replication within a single region typically holds sub-second lag; cross-region replicas (the primary in one region, the replica in another) carry network round-trip overhead and may sit at one to three seconds under load. Ten seconds is the point at which read-your-own-writes breakage becomes user-visible and worth paging on.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A SaaS platform team runs a Supabase project on the Team tier with the primary in London (eu-west-2) and two read replicas: one in London for offloading reporting queries, and one in Virginia (us-east-1) to serve North American users with lower read latency. Snapshot taken on 14 Apr 26 at 09:40 BST during a batch import.
+
+| Replica | Region | Lag (s) | State |
+| --- | --- | --- | --- |
+| replica-lon-1 | eu-west-2 (London) | 0.4 | streaming |
+| replica-iad-1 | us-east-1 (Virginia) | 14.2 | streaming |
+
+The Nerve Centre headline displays **14.2s** (the worst replica) outlined amber, with the alert tripped because it exceeds the 10s threshold.
+
+Reading the situation:
+
+1. **The London replica is healthy (0.4s).** Same region as the primary, sub-second lag, no concern. Reporting queries routed here are effectively current.
+2. **The Virginia replica is lagging (14.2s).** A batch import started at 09:35 is pushing a heavy write stream through the primary. The cross-region replica cannot replay WAL fast enough over the transatlantic link, so it has fallen 14 seconds behind. North American users reading from this replica during the import window will see data up to 14 seconds stale: a user who just saved a setting and refreshes may see the old value.
+
+```text
+Impact framing for the lagging replica:
+  - Read-routed traffic to us-east-1: ~120 req/s during business hours
+  - Window of staleness: import runs 09:35 to 09:48 (13 minutes)
+  - Affected reads: ~120 x 60 x 13 = ~93,600 read responses potentially stale
+  - User-visible symptom: "I saved it but it didn't save" support tickets
+```
+
+What the team should do:
+
+1. **Confirm it is the import, not a broken replica.** Lag that rises with a known write burst and recovers afterwards is expected behaviour, not a fault. Pair with [Database Queries per Second (live)](/nerve-centre/kpi-cards/supabase/database-queries-per-second-live): if QPS spiked at 09:35, the lag is import-driven.
+2. **Route read-your-own-writes traffic to the primary during imports.** Any flow where a user reads back something they just wrote should target the primary (or the same-region replica) so the staleness window never shows. Pure reporting and analytics reads can tolerate the lag.
+3. **Watch for recovery.** Once the import finishes, lag should drain back to baseline within a minute or two as the replica catches up. If it stays high after writes stop, that is a replica problem (network saturation, undersized replica instance), not a load problem, and warrants raising with Supabase support.
+
+The key lesson: cross-region replicas trade freshness for read latency. A 14-second blip during a planned batch import is acceptable; the same lag at 14:00 on a normal trading afternoon is not, and would mean the replica or its network link is degraded.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Read Replica Lag | What the combination tells you |
+| --- | --- | --- |
+| [Read Replicas](/nerve-centre/kpi-cards/supabase/read-replicas) | The count of provisioned replicas. | Lag only matters if replicas exist; this confirms how many and where. |
+| [Database Queries per Second (live)](/nerve-centre/kpi-cards/supabase/database-queries-per-second-live) | The write/read load on the primary. | A QPS spike that coincides with rising lag means load-driven (expected); lag without a QPS spike means a replica fault. |
+| [Memory Usage %](/nerve-centre/kpi-cards/supabase/memory-usage) | Resource pressure on the replica. | A memory-starved replica replays WAL slowly; high memory plus high lag points at an undersized replica. |
+| [Buffer Cache Hit Rate %](/nerve-centre/kpi-cards/supabase/buffer-cache-hit-rate) | How much the replica is hitting disk. | Low cache hit on a replica slows replay, which inflates lag. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite that folds replication lag in as a component. | Sustained lag drags the health score; this is the headline that flags it. |
+| [Postgres Query Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgres-query-latency-p95-ms) | Read-side latency that replicas are meant to improve. | If replicas lag badly, you may be better routing reads to the primary, trading latency for freshness. |
+| [Connections In Use](/nerve-centre/kpi-cards/supabase/connections-in-use) | Connection load split across primary and replicas. | Helps confirm how much traffic is actually being read-routed. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase and Postgres:**
+
+> **Supabase project Reports / Database section** for the per-replica replication lag chart, broken down by region.
+> **`SELECT now() - pg_last_xact_replay_timestamp() AS lag;`** run on the replica connection for the live timestamp-based lag.
+> **`SELECT * FROM pg_stat_replication;`** run on the primary for `sent_lsn`, `replay_lsn`, and the per-replica `replay_lag` interval (the authoritative server-side view).
+> **`SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS bytes_behind FROM pg_stat_replication;`** for lag measured in WAL bytes rather than seconds.
+
+**Why our number may legitimately differ from Supabase's own chart:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Idle-primary correction** | Vortex IQ lower | On a quiet primary, the timestamp method overstates lag because nothing is being replayed; Vortex IQ cross-checks LSN positions and reports zero, while a naive chart may show a rising sawtooth. |
+| **Sampling moment** | Either | Lag is instantaneous and bursty. A sample taken mid-burst reads high; one taken seconds later reads low. Two tools polling at slightly different instants will not match exactly. |
+| **Bytes vs seconds** | Not directly comparable | `pg_stat_replication` exposes lag in WAL bytes; this card converts to seconds. A large byte gap on a fast replica can still be sub-second. |
+| **Worst-replica vs per-replica** | Vortex IQ higher | The headline reports the single worst replica; a Supabase chart filtered to one region shows only that region. |
+| **Time zone** | Display only | Chart axes render in your Vortex IQ display timezone; Supabase renders in UTC. |
+
+The most authoritative single check is `pg_stat_replication` on the primary, which Postgres maintains directly. If that view's `replay_lag` agrees with this card, the reading is sound.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My project has no read replicas. What does this card show?**
+"Not provisioned" or a dash. Read replicas are a paid feature available on the Pro tier and above, provisioned per region. If you have not added any, there is nothing to lag and the card is informational only. Once you add a replica, the card begins reporting immediately.
+
+**Lag spikes every night around 02:00 then clears. Is something broken?**
+Almost certainly a scheduled batch job (an import, a nightly aggregation, a `VACUUM`, or a large `UPDATE`) pushing a burst of WAL through the primary. The replica falls behind during the burst and catches up after. This is normal asynchronous-replication behaviour. Only worry if the lag does not recover once the write burst ends.
+
+**The number climbs even though there are no writes happening.**
+This is the idle-primary artefact. `pg_last_xact_replay_timestamp()` stops advancing when there is nothing to replay, so naive timestamp lag appears to grow. Vortex IQ corrects for this by checking WAL LSN positions and reports zero when the replica's replay LSN matches the primary. If you query the replica directly with the raw timestamp method, you will see the inflated number; trust `pg_stat_replication` on the primary instead.
+
+**What is the difference between lag in seconds and lag in bytes?**
+Bytes (`pg_wal_lsn_diff`) measure how much un-replayed WAL the replica is holding; seconds measure how far behind in wall-clock terms. A replica can hold a large byte backlog but still be sub-second behind if it is replaying fast. Seconds is the user-facing metric because it maps directly to "how stale is the data my users see"; this card reports seconds.
+
+**Does lag cause data loss?**
+No. Asynchronous replication delays visibility, it does not lose committed data. Every transaction committed on the primary is durable on the primary regardless of replica state. The replica eventually catches up and applies every WAL record in order. Lag is a freshness problem, not a durability problem. (Data loss is only a risk in a failover scenario where a lagging replica is promoted, but Supabase manages failover and does not promote a replica that is significantly behind.)
+
+**Why is my cross-region replica always more lagging than my same-region one?**
+Network round-trip time. WAL must travel from the primary to the replica before it can be replayed. A same-region replica is a few milliseconds away; a transatlantic or trans-Pacific replica is tens of milliseconds away, and under heavy write volume that overhead compounds. Cross-region replicas trade a little freshness for much lower read latency for distant users. Budget for a baseline of one to three seconds on cross-region replicas under normal load.
+
+**Should I route all my reads to replicas to take load off the primary?**
+Only the reads that tolerate staleness. Reporting, analytics, dashboards, and search results are fine on a replica. Read-your-own-writes flows (a user saves something then reads it back, a checkout that re-reads the cart it just wrote) must go to the primary, or you will surface stale rows during any lag window. The usual pattern is "writes and read-after-write to primary; everything else to replicas".
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Read Replica Lag (seconds)* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

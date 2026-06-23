@@ -1,0 +1,174 @@
+---
+title: "Memory Usage %, ClickHouse"
+sidebarTitle: "Memory Usage %"
+description: "Memory Usage % for ClickHouse deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The proportion of ClickHouse's configured memory ceiling that is currently in use, as a percentage. It is computed from the live `MemoryTracking` metric (the total RAM ClickHouse believes it is using across all queries, caches, and background work) divided by `max_server_memory_usage` (the ceiling it will not knowingly cross). This is your real-time headroom gauge: how close is the whole instance to the wall? When this climbs and stays high, the next heavy query is at risk of being killed for memory, and the entire instance is one bad `GROUP BY` away from instability.
+
+| | |
+| --- | --- |
+| **Data source** | `MemoryTracking` from `system.metrics` (current tracked bytes) as the numerator, and `max_server_memory_usage` (the server memory ceiling) as the denominator. The card renders the ratio as a percentage on a gauge. |
+| **Metric basis** | Tracked memory, not OS `RSS`. `MemoryTracking` is ClickHouse's own accounting of what it has allocated; it is usually close to, but not identical to, what `top` shows for the process. |
+| **What it includes** | Memory held by in-flight queries, the mark cache, the uncompressed cache, primary-key indexes in memory, dictionaries, and background merge/mutation buffers. All of it counts against `max_server_memory_usage`. |
+| **Aggregation window** | Real-time. The card samples `MemoryTracking` on each refresh and recomputes the percentage against the configured ceiling. |
+| **Alert threshold** | `> 85%`. Sustained usage above 85% means very little headroom: the next concurrent heavy query may push the server-wide ceiling and start triggering `MEMORY_LIMIT_EXCEEDED` kills on whatever query crosses the line. |
+| **What does NOT count toward "danger"** | Brief spikes during a known heavy batch that drain immediately are normal. The risk is *sustained* high usage, where there is no slack to absorb the next concurrent query. |
+| **Denominator note** | If `max_server_memory_usage` is `0` (unbounded), ClickHouse derives an effective limit from `max_server_memory_usage_to_ram_ratio` and physical RAM; the card uses that effective ceiling so the percentage stays meaningful. |
+| **Sensitivity note** | This is a Sensitivity card: 85% is a deliberately conservative default so teams get warned before kills begin, not after. |
+| **Time window** | `RT` (real-time, recomputed on each refresh) |
+| **Alert trigger** | `> 85%` of the configured memory ceiling in use. |
+| **Roles** | owner, platform, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine reads the live tracked-memory metric and the configured ceiling, then divides:
+
+```sql
+SELECT
+    (SELECT value FROM system.metrics WHERE metric = 'MemoryTracking') AS used_bytes,
+    (SELECT toUInt64(value) FROM system.settings WHERE name = 'max_server_memory_usage') AS limit_bytes,
+    round(100.0 * used_bytes / nullIf(limit_bytes, 0), 1) AS memory_usage_pct;
+```
+
+`MemoryTracking` in `system.metrics` is ClickHouse's authoritative count of currently allocated, tracked bytes. `max_server_memory_usage` is the hard ceiling above which ClickHouse refuses new allocations and begins aborting queries with `MEMORY_LIMIT_EXCEEDED`.
+
+When `max_server_memory_usage` is `0` (the common "let ClickHouse decide" setting), the real ceiling is `physical_RAM x max_server_memory_usage_to_ram_ratio` (default ratio 0.9). In that case the engine substitutes the derived effective limit:
+
+```sql
+SELECT
+    (SELECT value FROM system.asynchronous_metrics WHERE metric = 'OSMemoryTotal') AS ram_total,
+    (SELECT toFloat64(value) FROM system.settings WHERE name = 'max_server_memory_usage_to_ram_ratio') AS ratio
+;  -- effective_limit = ram_total * ratio
+```
+
+so the gauge always reads against the ceiling ClickHouse will actually enforce, not against `0`. On a cluster, the card reports per node (the metric is node-local); the headline shows the busiest node so the gauge reflects the most at-risk member.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs ClickHouse on a 64 GB box with `max_server_memory_usage` set to ~52 GB (the 0.8 ratio). The card normally sits around 35 to 45% during business hours. Snapshot taken on 03 Jun 26 at 14:20 UTC.
+
+The gauge has climbed to **88%** and held there for 12 minutes (amber/red). The team drills in and correlates with `system.processes`:
+
+| Metric | Reading |
+| --- | --- |
+| `MemoryTracking` | 45.8 GB |
+| `max_server_memory_usage` | 52.0 GB |
+| **Memory Usage %** | **88%** |
+| Concurrent running queries | 9 |
+| Largest single query (live) | 18.2 GB, an unfiltered `JOIN` across two large tables |
+
+What the team reads:
+
+1. **One query is eating the headroom.** Of the 45.8 GB tracked, a single 18.2 GB `JOIN` accounts for ~40% of the live total. The other 8 queries share the rest plus the caches. With only ~6 GB of slack left, the *next* concurrent heavy query will push past 52 GB and get killed at code 241, and on a server-wide breach that kill can land on an innocent query, not the greedy one.
+2. **This is a "before the kill" warning, by design.** The Sensitivity threshold fired at 85% so the team is looking *before* any `MEMORY_LIMIT_EXCEEDED` has happened. The companion card [MEMORY_LIMIT_EXCEEDED (24h)](/nerve-centre/kpi-cards/clickhouse/memory-limit-exceeded-24h) still reads `0`, which is exactly the state you want to act in.
+3. **Caches are part of the number, but not the villain here.** The mark and uncompressed caches count toward `MemoryTracking`, so a chronically high baseline can be cache-driven and harmless. But an 88% reading driven by a single live 18 GB `JOIN` is query-driven and acute, not a cache baseline.
+
+```text
+Headroom maths for this snapshot:
+  - Ceiling (max_server_memory_usage):     52.0 GB
+  - Tracked now (MemoryTracking):          45.8 GB  -> 88%
+  - Free headroom:                          6.2 GB
+  - Largest live query:                    18.2 GB
+  => A second query of similar size cannot fit. The next heavy concurrent
+     query crosses 52 GB and triggers a server-wide MEMORY_LIMIT_EXCEEDED.
+     Action window is NOW, while the card is amber and kills are still 0.
+```
+
+The remediation: kill or let-finish the 18 GB `JOIN` (add a `WHERE` filter or a `LIMIT`, or rewrite it to stream), cap the offending user with `max_memory_usage_for_user`, and if the baseline is persistently high, trim `mark_cache_size` / `uncompressed_cache_size` or scale the box. The gauge falls back into the green band once the heavy query completes and the headroom returns.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards platform teams should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Memory Usage % | What the combination tells you |
+| --- | --- | --- |
+| [MEMORY_LIMIT_EXCEEDED (24h)](/nerve-centre/kpi-cards/clickhouse/memory-limit-exceeded-24h) | The consequence when headroom runs out. | High Memory Usage % with kills still at 0 is your action window; once kills start, you are already over the edge. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/clickhouse/database-disk-usage) | The other capacity wall. | Both high at once means spilling-to-disk is no escape valve; you are squeezed on both axes. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/clickhouse/connection-pool-saturation) | Concurrency drives memory. | More concurrent connections means more concurrent queries means more memory; saturation and memory often climb together. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p99-ms) | Memory pressure inflates tail latency. | p99 spiking with memory near the ceiling means even surviving queries are paying for the pressure. |
+| [Merges In Progress](/nerve-centre/kpi-cards/clickhouse/merges-in-progress) | Background merges consume memory too. | A merge storm plus high memory means background work is competing with queries for RAM. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that weights capacity. | Sustained high memory drags the score down before any user-visible failure. |
+| [UncompressedCache Hit Rate %](/nerve-centre/kpi-cards/clickhouse/uncompressedcache-hit-rate) | The cache is part of the memory total. | A large uncompressed cache lifts both the hit rate and the memory baseline; trimming it frees headroom at the cost of some cache benefit. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse itself:**
+
+> **`SELECT value FROM system.metrics WHERE metric = 'MemoryTracking'`** for the live tracked-bytes numerator (use `formatReadableSize(value)` to make it human-readable).
+> **`SELECT * FROM system.settings WHERE name IN ('max_server_memory_usage','max_server_memory_usage_to_ram_ratio')`** for the ceiling that forms the denominator.
+> **`SELECT query, formatReadableSize(memory_usage) FROM system.processes ORDER BY memory_usage DESC`** to see which live queries are holding the memory right now.
+> **`system.asynchronous_metrics`** (`OSMemoryTotal`, `MemoryResident`) for the OS-level view, to compare ClickHouse's tracked figure against the process RSS.
+> **ClickHouse Cloud:** the service monitoring view exposes memory utilisation against the service tier's allocated ceiling.
+
+**Why our number may legitimately differ from a manual read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Tracked vs RSS** | Either direction | The card uses `MemoryTracking` (ClickHouse's accounting), not OS `RSS`. The two differ because of untracked allocations, allocator overhead, and freed-but-not-returned pages. A glance at `top` will not match exactly. |
+| **Denominator choice** | Different % | If `max_server_memory_usage = 0`, the card uses the derived effective limit (RAM x ratio). A manual division by the literal `0` setting is meaningless; ours uses the real enforced ceiling. |
+| **Sampling instant** | Marginal | Memory moves fast under concurrent load. The card's sample and a hand-run query are taken milliseconds apart and can differ during a spike. |
+| **Per-node vs cluster** | Vortex IQ shows busiest node | The metric is node-local; the card surfaces the highest node so the gauge reflects the most at-risk member, which may be higher than the node you happen to query. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`clickhouse.memory-limit-exceeded-24h`](/nerve-centre/kpi-cards/clickhouse/memory-limit-exceeded-24h) | Sustained high usage precedes memory kills. | Usage near 100% but zero kills means you are right on the edge but nothing has crossed it yet, the ideal moment to act. |
+| [`clickhouse.connection-pool-saturation`](/nerve-centre/kpi-cards/clickhouse/connection-pool-saturation) | More concurrency drives memory up. | High memory with low saturation means a few heavy queries, not many small ones; the fix is the queries, not concurrency limits. |
+
+<details>
+<summary><em>Same-concept peer on other database connectors</em></summary>
+
+The "percentage of the memory budget in use" concept exists on every database connector. These are not a reconciliation against your ClickHouse data; they exist so a mixed-estate platform team can cross-link the same idea across docs.
+
+- PostgreSQL equivalent: shared-buffers + work_mem utilisation against the configured memory budget.
+- MySQL/InnoDB equivalent: buffer-pool utilisation against `innodb_buffer_pool_size`.
+- Redis equivalent: `used_memory` against `maxmemory`.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does the card not match what `top` shows for the clickhouse process?**
+Because the card uses `MemoryTracking`, ClickHouse's own internal accounting of allocated bytes, not the OS resident set size (`RSS`). They are usually close but rarely identical: the allocator can hold freed pages that ClickHouse no longer counts but the OS still attributes to the process, and some allocations are untracked. `MemoryTracking` is the right number for "how close am I to the ceiling ClickHouse will enforce", which is what the gauge is for.
+
+**My baseline sits at 60% even when idle. Is that a problem?**
+Not necessarily. The mark cache, uncompressed cache, and in-memory primary-key indexes all count toward `MemoryTracking` and persist between queries. A high but *stable* idle baseline is usually cache, which is doing its job. The risk is when live query memory stacks on top of that baseline and pushes you toward the ceiling. If the idle baseline is uncomfortably high, trim `mark_cache_size` / `uncompressed_cache_size`, accepting slightly lower cache hit rates in exchange for headroom.
+
+**What is the right action when the card is red?**
+Find the heavy live queries first: `SELECT query, formatReadableSize(memory_usage) FROM system.processes ORDER BY memory_usage DESC`. If one or two queries dominate, the fix is those queries (add filters, a `LIMIT`, or spilling via `max_bytes_before_external_group_by`) or capping the user. If many small queries add up, the issue is concurrency, and limiting concurrent queries or scaling the box is the answer. Acting while the card is red but [MEMORY_LIMIT_EXCEEDED (24h)](/nerve-centre/kpi-cards/clickhouse/memory-limit-exceeded-24h) is still 0 prevents the kills entirely.
+
+**Why is 85% the threshold and not 95%?**
+Because ClickHouse memory can climb fast under concurrent load, and you want to be warned *before* the next heavy query tips the server-wide ceiling, not after. At 85% there is typically enough headroom to investigate and act before a kill. Pushing the threshold to 95% leaves almost no reaction time. This is a Sensitivity card with a per-profile threshold, so teams with very stable, predictable workloads can raise it, but the conservative default is intentional.
+
+**My `max_server_memory_usage` is 0. What is the gauge dividing by?**
+The derived effective ceiling: physical RAM multiplied by `max_server_memory_usage_to_ram_ratio` (default 0.9). A literal `0` means "unbounded by an explicit setting", but ClickHouse still enforces the RAM-ratio limit, so the card uses that real ceiling as the denominator. The percentage therefore stays meaningful even with the explicit setting at 0.
+
+**Does background work (merges, mutations) count toward this number?**
+Yes. Merge and mutation buffers are tracked memory and count against `max_server_memory_usage`. During a merge storm you can see the gauge rise from background work alone. Pair with [Merges In Progress](/nerve-centre/kpi-cards/clickhouse/merges-in-progress): if memory is high and many merges are running, the contention is between background maintenance and live queries, and throttling merge concurrency or pausing heavy ingest can free headroom.
+
+**On a multi-node cluster, whose memory does the headline show?**
+The busiest node. Memory tracking is per node, and a cluster is only as safe as its most-pressured member, so the headline reflects the highest node rather than an average that would hide a single hot node. Drill in to see the per-node breakdown.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Memory Usage %* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

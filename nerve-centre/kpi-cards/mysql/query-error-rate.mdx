@@ -1,0 +1,168 @@
+---
+title: "Query Error Rate %, MySQL"
+sidebarTitle: "Query Error Rate %"
+description: "Query Error Rate % for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Query Error Rate %** is the share of statements the server attempted that ended in an error rather than a clean result, evaluated over a 5-minute window. It is the single most direct "is something broken?" signal for a MySQL instance. A healthy production database sits at or very near zero; even 1% means one statement in a hundred is failing, which at storefront volumes is hundreds of failed operations a minute (a failed checkout, a dropped cart write, a 500 served to a shopper). Because the failure is binary and customer-visible, this is a Hero sensitivity card with a low, deliberate alert threshold.
+
+| | |
+| --- | --- |
+| **What it tracks** | The percentage of attempted statements that returned an error over the selected period. |
+| **Data source** | Error counters from `SHOW GLOBAL STATUS`, principally the aborted/error families, expressed as a ratio against `Questions` (total attempted statements) over the same window. |
+| **Time window** | `5m` (5-minute evaluation window; the rate is computed from counter deltas across the window, not a single instantaneous read). |
+| **Alert trigger** | `> 1%`. Sustained error rate above 1% pages the on-call; for many OLTP workloads even a brief breach above 0.1% is worth a look. |
+| **Aggregation** | Windowed ratio. Numerator is the error-count delta over the window; denominator is the `Questions` delta over the same window. |
+| **Units** | Percentage (0 to 100). The card also exposes the raw error count so you can see absolute volume, not just the ratio. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card computes a windowed ratio of failed statements to attempted statements:
+
+```text
+Query Error Rate % = (error_count delta over 5m / Questions delta over 5m) * 100
+```
+
+Both halves are drawn from cumulative `SHOW GLOBAL STATUS` counters and turned into a rate by taking the delta across the 5-minute window. The denominator is `Questions`, the same attempt-counting basis the [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live) card uses, which keeps the two cards consistent: every attempted statement that the QPS card counts is eligible to appear in this card's denominator.
+
+The numerator aggregates the server's error and abort counters. MySQL does not expose a single "total query errors" status variable, so the rate is built from the relevant error-family counters that the server does expose, including the connection-abort counters (`Aborted_connects`, `Aborted_clients`) and the access-denied and error-handler counters surfaced through `performance_schema` where available. On MySQL 8.0 the richest source is `performance_schema.events_errors_summary_global_by_error`, which records a `SUM_ERROR_RAISED` per error code; the card can roll that up into a total when Performance Schema error instrumentation is enabled.
+
+The 5-minute window matters for two reasons. First, it smooths out single-statement blips (one bad ad-hoc query from an analyst should not page the on-call). Second, it makes the rate meaningful at low volume: on a quiet instance a single error in a 5-second window would read as a huge percentage, whereas across 5 minutes it is correctly diluted by total volume. Sustained breach over the window is the alert condition, not a momentary spike.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MySQL 8.0 primary behind the checkout and order services for a retailer. Baseline error rate is effectively 0.00% (a handful of errors a day from ad-hoc analyst queries). Snapshot taken on 16 Apr 26 from 13:00 BST, shortly after a schema migration was deployed.
+
+| Window (5m) | Questions delta | Error delta | Error Rate % | State |
+| --- | --- | --- | --- | --- |
+| 12:50 to 12:55 | 1,020,000 | 12 | 0.001% | Healthy |
+| 12:55 to 13:00 | 1,015,000 | 30 | 0.003% | Healthy |
+| 13:00 to 13:05 | 998,000 | 18,400 | **1.84%** | **Alert** |
+| 13:05 to 13:10 | 1,002,000 | 19,100 | 1.91% | Alert sustained |
+
+At 13:05 the rate crosses 1% and the card fires. The DBA pulls the error breakdown from Performance Schema:
+
+```sql
+SELECT ERROR_NUMBER, ERROR_NAME, SUM_ERROR_RAISED
+FROM performance_schema.events_errors_summary_global_by_error
+WHERE SUM_ERROR_RAISED > 0
+ORDER BY SUM_ERROR_RAISED DESC
+LIMIT 5;
+```
+
+```text
+ERROR_NUMBER  ERROR_NAME                       SUM_ERROR_RAISED
+1054          ER_BAD_FIELD_ERROR               18,900   <- "Unknown column"
+1146          ER_NO_SUCH_TABLE                 120
+1213          ER_LOCK_DEADLOCK                 80
+```
+
+The dominant error is `1054 ER_BAD_FIELD_ERROR` ("Unknown column"). The 13:00 migration renamed a column the application's order-write path still references by its old name. Every checkout that reaches that write fails. The corrective path:
+
+1. **Confirm customer impact.** Cross-check [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/mysql/slow-queries-during-checkout-window-5m) and the storefront's own 5xx rate. Failed order writes mean lost sales, so this is a revenue incident, not just a database one.
+2. **Roll back the breaking change, not the data.** A column rename can usually be made backward-compatible by adding the old name back as a generated/aliased column, or by rolling the application to the version that uses the new name. Rolling back the schema is safer than rolling back order data.
+3. **Hold the alert open until the rate returns to baseline.** A migration fix can take minutes to deploy; the card should stay red until error rate is back near 0.00% across a full window.
+
+```text
+Cost framing while the error is live:
+  - Checkout write failure rate: ~1.9% of all statements
+  - Of those, the order-insert path is the customer-facing slice
+  - Estimated failed checkouts: ~40/min during the window
+  - At an average order value of 58 GBP: ~2,320 GBP/min exposed
+  - 10-minute incident before rollback: ~23,000 GBP at risk
+```
+
+Three takeaways:
+
+1. **Even 1% is a lot.** At a million statements per 5 minutes, 1% is ~10,000 failures. Error rate is one of the few database metrics where the threshold sits far below "feels broken".
+2. **The error code is the diagnosis.** The percentage tells you something is wrong; `events_errors_summary_global_by_error` tells you what. Always pull the breakdown before guessing.
+3. **A jump right after a deploy is a deploy bug until proven otherwise.** Schema renames, removed columns, and changed grants are the usual culprits. Correlate the spike's start time with your deploy log.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Error Rate % | What the combination tells you |
+| --- | --- | --- |
+| [Query Error Rate Spike (>1% in 5m)](/nerve-centre/kpi-cards/mysql/query-error-rate-spike-1-in-5m) | The alert-list card that fires off this exact metric. | The gauge shows the level; the alert card shows when it breached and for how long. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | The denominator behind the ratio. | A flat error rate with rising QPS means absolute failures are climbing; check the raw count. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mysql/connection-errors-24h) | Connection-level failures vs statement-level failures. | If errors are mostly connection aborts, the cause is networking or auth, not bad SQL. |
+| [Aborted Connects (24h)](/nerve-centre/kpi-cards/mysql/aborted-connects-24h) | A specific error family feeding the rate. | A spike here driving the error rate points at credentials, network, or `max_connect_errors`. |
+| [InnoDB Deadlocks (last 5m)](/nerve-centre/kpi-cards/mysql/innodb-deadlocks-last-5m) | Deadlocks surface as error 1213. | A deadlock storm shows up as both a deadlock count and a contribution to the error rate. |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/mysql/slow-queries-during-checkout-window-5m) | The revenue-path view during an error event. | Errors plus slow checkout queries together size the customer impact. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite that weights error rate heavily. | A sustained error-rate breach is one of the fastest ways to drop the health score. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) | Distinguishes "failing fast" from "failing slow". | Errors with high latency means timeouts; errors with low latency means immediate rejections (bad SQL, denied grants). |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look on the instance:**
+
+> `SELECT * FROM performance_schema.events_errors_summary_global_by_error WHERE SUM_ERROR_RAISED > 0 ORDER BY SUM_ERROR_RAISED DESC;` for the authoritative per-error-code breakdown (MySQL 8.0).
+> `SHOW GLOBAL STATUS LIKE 'Aborted%';` for connection and client abort counters.
+> `SHOW GLOBAL STATUS LIKE 'Questions';` for the denominator.
+> The server error log (`log_error` location) for the actual error text and the statements that triggered it.
+
+To reproduce the card's rate over a window, capture the error and `Questions` counters at the start and end of the period and divide the deltas. Performance Schema error summaries are cumulative since the last `TRUNCATE` of the table or server restart, so use deltas, not absolute totals.
+
+**On a managed service:**
+
+| Service | Where to confirm |
+| --- | --- |
+| Amazon RDS / Aurora | There is no single "error rate" CloudWatch metric; use the `Aborted_clients` and `Aborted_connects` enhanced-monitoring counters, and enable the error log export to CloudWatch Logs to see the actual error codes. Performance Insights does not surface error rate directly. |
+| Google Cloud SQL | Inspect the MySQL error log via Cloud Logging; the `database/mysql/innodb/...` metrics cover deadlocks but not a blanket error rate. |
+| Azure Database for MySQL | The `aborted_connections` metric in Azure Monitor; error codes via the server logs. |
+
+**Why our number may legitimately differ from a native reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Performance Schema error instrumentation disabled** | Card lower | If `performance_schema` error instruments are off, the card falls back to the narrower abort counters and undercounts statement-level errors. |
+| **Counter reset** | Card temporarily off | A server restart or a `TRUNCATE` of the error summary table resets the cumulative base; the first window after that is computed from a low base. |
+| **What counts as an "error"** | Either way | Warnings are not errors. A statement that completes with a warning (truncated value, implicit conversion) does not count here, though some native dashboards lump warnings and errors together. |
+| **Window alignment** | Marginal | The card uses a rolling 5-minute window; a console aggregating per calendar minute will draw period boundaries differently. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My error rate is 0.00% but customers report failed checkouts. How?**
+The failure may not be reaching the database as an error. If the application times out before MySQL responds, or a connection-pool exhaustion event rejects the client before a statement is even sent, the customer sees a failure but the database records no statement error. Check [Connection Pool Saturation %](/nerve-centre/kpi-cards/mysql/connection-pool-saturation) and [Connection Errors (24h)](/nerve-centre/kpi-cards/mysql/connection-errors-24h); a failure that never became a query will not show here.
+
+**Why is the threshold as low as 1%?**
+Because at production volume 1% is enormous. A storefront primary handling a million statements per 5-minute window has ten thousand failures at 1%. Most of those map to customer-facing operations, so the threshold is set where the business impact is already material. For critical OLTP paths, consider tightening the sensitivity below 1% in the Sensitivity tab.
+
+**What error codes are the most common contributors?**
+In practice: `1213 ER_LOCK_DEADLOCK` (contention), `1205 ER_LOCK_WAIT_TIMEOUT` (lock waits), `1054 ER_BAD_FIELD_ERROR` and `1146 ER_NO_SUCH_TABLE` (schema drift after a deploy), `1062 ER_DUP_ENTRY` (unique-key violations), and `1040 ER_CON_COUNT_ERROR` (too many connections). The breakdown query in the reconcile section gives you the exact mix for your incident.
+
+**Do deadlocks count as errors here?**
+Yes. A deadlock returns error 1213 to the loser of the deadlock, so it increments the error count and contributes to this rate. That is why a deadlock storm shows up on both this card and [InnoDB Deadlocks (last 5m)](/nerve-centre/kpi-cards/mysql/innodb-deadlocks-last-5m). The deadlock card isolates that specific cause; this card shows its weight against total volume.
+
+**The rate spiked then returned to zero on its own. Should I still investigate?**
+Usually yes, briefly. A self-resolving spike often means a transient cause (a deploy that auto-rolled back, a lock contention burst that cleared, a single bad batch job that finished). Pull the error breakdown for the spike window to confirm the cause was transient and not the leading edge of a recurring problem. A spike that recurs on a schedule (every hour, every nightly batch) is a structural issue, not a blip.
+
+**Does a warning count as an error?**
+No. MySQL distinguishes errors (the statement failed) from warnings (the statement completed but something was off, such as a truncated value or an implicit type conversion). This card counts only errors. If you want to track warnings, that is a separate signal; a high warning rate often precedes data-quality problems but is not an availability issue.
+
+**My instance has Performance Schema disabled. Does the card still work?**
+Partially. With Performance Schema error instrumentation off, the card cannot read the per-error-code summary and falls back to the abort counters from `SHOW GLOBAL STATUS`, which capture connection and client errors but miss many statement-level errors. The number will be lower and less precise. Enabling `performance_schema` (and the error instruments) gives the card its full fidelity; on managed services it is usually on by default.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Error Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,144 @@
+---
+title: "Galera Flow Control Paused %, MariaDB"
+sidebarTitle: "Galera Flow Control Paused %"
+description: "Galera Flow Control Paused % for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Galera Cluster](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The fraction of the last 5-minute window during which the Galera cluster was throttling writes via flow control, derived from `wsrep_flow_control_paused`. Galera keeps every node in sync, so when one node falls behind applying the write-set queue, it sends flow-control messages that pause writes cluster-wide until it catches up. A high value means a single slow node is acting as a brake on the entire cluster: every other node, however fast, is being held back to the speed of the slowest. For a DBA this is the early-warning signal that a node is struggling before it drops out entirely.
+
+| | |
+| --- | --- |
+| **Status variable** | `wsrep_flow_control_paused` from `SHOW GLOBAL STATUS LIKE 'wsrep_flow_control_paused'`. A float between 0 and 1: the fraction of time replication was paused since the counter was last reset. |
+| **Metric basis** | Time-paused ratio, NOT a count. The card renders it as a percentage of the 5-minute window. It measures cluster-wide write throttling caused by flow control, not query latency. |
+| **Aggregation window** | 5 minutes. The card reads the paused ratio over a rolling 5-minute window so a brief blip does not dominate. |
+| **Healthy value** | At or near 0%. A well-balanced cluster spends essentially no time paused. |
+| **What drives it up** | (1) A node with slow disk I/O applying write-sets too slowly; (2) a node mid-SST/IST as a joiner; (3) a node desynced as a donor; (4) an undersized `gcs.fc_limit` against a heavy write burst; (5) a long-running transaction blocking apply. |
+| **What does NOT drive it** | Read load (reads do not replicate), async-replica lag, or router latency. Flow control is strictly about the synchronous write-set apply queue. |
+| **Time window** | `5m` (rolling 5-minute paused ratio) |
+| **Alert trigger** | `>10%`, when the cluster spends more than a tenth of the window throttled, write throughput is materially degraded. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Galera maintains `wsrep_flow_control_paused` as the cumulative fraction of time replication has been paused since the value was last reset (a reset happens on `FLUSH STATUS` or instance restart). Because the raw variable is cumulative, the card samples it across the 5-minute window and reports the rate of pausing over that window rather than the lifetime average:
+
+```text
+paused_ratio_5m = (paused_seconds in window) / (window length in seconds)
+displayed %     = paused_ratio_5m * 100
+
+state = healthy   if displayed < 1%
+        watch     if 1% <= displayed < 10%
+        alert     if displayed >= 10%
+```
+
+A reading of, say, 18% means that over the last 5 minutes, write replication was paused for roughly 54 of the 300 seconds: almost a minute of the cluster sitting on its hands waiting for the slowest node. The companion variable `wsrep_flow_control_sent` (how many flow-control pause messages this node sent) tells you *which* node is the brake, which is the first thing to check when this card alerts.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 3-node MariaDB Galera cluster. Two nodes sit on NVMe storage; a third, db-galera-03, was recently re-provisioned onto a slower network-attached volume to save cost. On 03 Jun 26 at 19:40 BST a nightly bulk-import job kicks off, generating a heavy write burst.
+
+| Node | Storage | `wsrep_flow_control_sent` (last 5m) | Apply keeping up? |
+| --- | --- | --- | --- |
+| db-galera-01 | NVMe | 0 | Yes |
+| db-galera-02 | NVMe | 0 | Yes |
+| db-galera-03 | network volume | 412 | No, falling behind |
+
+The Vortex IQ headline reads **Flow Control Paused 18%** with a red gauge. The DBA reads three things:
+
+1. **One slow node is throttling the whole cluster.** Only db-galera-03 is sending flow-control messages (412 of them). The two NVMe nodes could apply the import easily, but Galera pauses them so the slow node does not fall out of sync. The cluster is running at the speed of its weakest disk.
+2. **The symptom is cluster-wide, the cause is local.** Write latency is up on *every* node and the application sees slower commits everywhere, but the fix is on db-galera-03 alone: faster storage, a tuned `innodb_flush_log_at_trx_commit`, or a larger apply-thread count (`wsrep_slave_threads`).
+3. **This is a precursor, not yet an outage.** At 18% the cluster is degraded but whole. If db-galera-03 keeps slipping, it can eventually fall so far behind that it leaves the Primary Component, which would show up on [Galera Cluster Size](/nerve-centre/kpi-cards/mariadb/galera-cluster-size). Acting now (at the flow-control stage) avoids the harder node-loss recovery later.
+
+```text
+Triage when this card alerts:
+  1. Find the brake: compare wsrep_flow_control_sent across nodes; highest = culprit.
+  2. Check that node's disk I/O wait and wsrep_local_recv_queue depth.
+  3. Short term: throttle the write burst (batch the import smaller).
+  4. Medium term: fix the slow node's storage or raise wsrep_slave_threads.
+```
+
+The team pauses the bulk import, splits it into smaller batches, and schedules db-galera-03 back onto NVMe. The next morning the card sits at 0.2% even during the import. The lesson the team should carry: in a synchronous cluster you provision every node to the same standard, because the slowest node sets the pace for all of them.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Flow Control Paused % | What the combination tells you |
+| --- | --- | --- |
+| [Galera Cluster Size](/nerve-centre/kpi-cards/mariadb/galera-cluster-size) | Sustained flow control can precede a node dropping out. | Rising pause % then a size drop equals the slow node finally left the cluster. |
+| [Galera Cluster Status](/nerve-centre/kpi-cards/mariadb/galera-cluster-status) | The outcome if a throttled node fully falls behind. | Pause % climbing toward a Non-Primary flip is the danger path. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms) | Flow control shows up as slower commits everywhere. | High pause % plus high write p95 equals the cluster is throttled, not query-bound. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation) | Paused writes hold connections open longer. | Pause % up plus pool saturation up equals throttling is backing up the connection pool. |
+| [InnoDB / XtraDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mariadb/innodb-xtradb-buffer-pool-hit-rate) | A cold or undersized node applies write-sets slowly. | Low hit rate on the slow node explains why it cannot keep up. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite that weights flow control. | Sustained pausing drags the composite down before any outage. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mariadb/slow-query-rate) | Distinguishes throttling from genuinely slow queries. | High pause % with low slow-query rate confirms the cause is replication, not SQL. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> Run `SHOW GLOBAL STATUS LIKE 'wsrep_flow_control_paused';` for the cumulative paused ratio the card derives from.
+> Run `SHOW GLOBAL STATUS LIKE 'wsrep_flow_control_sent';` and `LIKE 'wsrep_flow_control_recv';` per node to find which node is sending the pause messages.
+> Run `SHOW GLOBAL STATUS LIKE 'wsrep_local_recv_queue%';` to see the apply-queue backlog on the slow node.
+> On a managed service, the provider's Galera metrics view exposes the same flow-control series.
+
+**Why our number may legitimately differ from a manual query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Cumulative vs windowed** | Manual read usually lower | The raw variable is the lifetime average since reset; the card reports the 5-minute rate, which spikes higher during a burst than the long-run average. |
+| **Counter reset timing** | Variable | `FLUSH STATUS` or a restart resets the cumulative counter, after which the raw variable starts near 0; the card's windowed value is unaffected by where in the lifetime you read. |
+| **Which node you query** | Can differ | Each node reports its own paused ratio; they are usually close but a donor node mid-SST reads higher. |
+| **Poll timing** | Brief lag | A burst between polls is reflected on the next refresh. |
+
+**Cross-source reconciliation:**
+
+| Source | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| `wsrep_flow_control_sent` per node | The node with the highest sent count is the throttling node. | If every node sends roughly equal amounts, the bottleneck is shared (network or global write load), not a single slow node. |
+| `wsrep_local_recv_queue_avg` | Should be elevated on the throttling node when pause % is high. | A high paused ratio with empty queues everywhere is unusual and worth deeper investigation. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows 0% almost all the time. Is the metric working?**
+Yes, and 0% is the healthy reading. A balanced cluster with adequately-provisioned nodes spends virtually no time in flow control. You should only see meaningful values during write bursts, joiner SST/IST, or when a node is genuinely struggling. A flat 0% means your nodes are keeping up with each other.
+
+**How do I find which node is causing the pause?**
+Compare `wsrep_flow_control_sent` across all nodes. The node sending the most flow-control messages is the brake, it is the one asking the others to slow down because its apply queue is backing up. Then check that node's disk I/O, `wsrep_local_recv_queue`, and `wsrep_slave_threads` to understand why it cannot keep pace.
+
+**Can I just turn flow control off to make the card green?**
+You can relax it by raising `gcs.fc_limit`, but turning it off effectively is dangerous. Flow control is what keeps nodes from diverging; without it a slow node falls arbitrarily far behind and either runs out of memory holding the receive queue or gets evicted from the cluster. The right fix is to make the slow node faster, not to remove the safety mechanism.
+
+**Is flow control the same as replication lag?**
+No, and the distinction matters. Galera is synchronous, so it does not have async-style lag; instead, when a node would lag, flow control pauses everyone so the apply queue drains. So in Galera you see flow control, not lag. Async replicas attached downstream are a different mechanism, tracked by [Async Replication Lag (seconds)](/nerve-centre/kpi-cards/mariadb/async-replication-lag-seconds).
+
+**A joiner node is causing 30% pause during SST. Is that an emergency?**
+It is expected, not an emergency, but it is worth managing. While a node performs a State Snapshot Transfer it cannot apply live write-sets, so flow control can spike. Use a non-blocking SST method (mariabackup) so the donor stays available, and schedule joins outside peak write windows. The pause should fall back to near 0% once the joiner reaches `Synced`.
+
+**Why a 5-minute window rather than real-time?**
+Flow control is bursty: a single large transaction can pause writes for a fraction of a second. A 5-minute window smooths those harmless blips while still catching a node that is *sustainably* slow. The 10% alert threshold is set against this window so it fires on a real, ongoing brake rather than transient noise.
+
+**Does this card exist for standalone MariaDB?**
+No. `wsrep_flow_control_paused` only exists when the Galera (wsrep) provider is loaded. On a standalone server there is no synchronous cluster to throttle, so the card is not applicable.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Galera Flow Control Paused %* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

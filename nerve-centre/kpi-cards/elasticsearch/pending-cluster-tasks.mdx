@@ -1,0 +1,163 @@
+---
+title: "Pending Cluster Tasks, Elasticsearch"
+sidebarTitle: "Pending Cluster Tasks"
+description: "Pending Cluster Tasks for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cluster Health](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of cluster-state change tasks queued on the elected master node, read from `GET /_cluster/pending_tasks`. Every shard allocation, index create or delete, mapping update, and settings change flows through this single ordered queue. A healthy cluster drains it to zero within milliseconds. A persistently non-zero queue means the master is overloaded with cluster-state updates and cannot keep pace, which delays shard recovery, blocks new indices, and can cascade into a yellow or red cluster.
+
+| | |
+| --- | --- |
+| **API endpoint** | Cluster Pending Tasks API, `GET /_cluster/pending_tasks`. Returns each queued task with its `priority`, `source` (what triggered it), `insert_order`, and `time_in_queue_millis`. |
+| **Metric basis** | A point-in-time count of tasks waiting in the master's cluster-state update queue. This is queue depth, not throughput. The companion field `time_in_queue_millis` on the oldest task tells you how long the head of the queue has been stuck. |
+| **Aggregation window** | Real-time (`RT`), polled on the standard cluster-health cadence. The value is instantaneous, so brief spikes during a legitimate operation (a rolling restart, a large reindex) are expected. |
+| **Alert threshold** | `> 10 sustained for 5 minutes`. A momentary spike is normal; a queue that stays above 10 for five minutes means the master cannot drain faster than work arrives. |
+| **Priority awareness** | Tasks carry a `priority` (`IMMEDIATE`, `URGENT`, `HIGH`, `NORMAL`, `LOW`, `LANGUID`). The master processes higher priorities first, so a queue full of `LOW` reindex tasks behind one `URGENT` shard allocation is less alarming than ten `URGENT` tasks stacked up. |
+| **What counts** | Cluster-state mutations only: shard allocation and relocation decisions, index create/delete/open/close, mapping and settings updates, alias changes, ILM and template applications. |
+| **What does NOT count** | Search and indexing traffic (those never touch this queue), per-node tasks visible in `GET /_tasks`, and background segment merges. Confusing `_cluster/pending_tasks` with `_tasks` is a common mistake; they are different queues. |
+| **Time window** | `RT` (real-time, polled on the cluster-health cadence) |
+| **Alert trigger** | `> 10 sustained 5m`, a queue that will not drain points at master-node saturation. |
+| **Roles** | platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card reads the array returned by `GET /_cluster/pending_tasks` and counts its length. In Elasticsearch terms:
+
+```text
+pending_tasks = len(response.tasks)
+oldest_wait_ms = max(task.time_in_queue_millis for task in response.tasks)  # 0 when empty
+```
+
+The headline number is the raw count. The card also surfaces the priority mix and the oldest `time_in_queue_millis` so you can tell a deep-but-fast-draining queue from a shallow-but-stuck one. Cluster-state updates are single-threaded on the elected master by design: this guarantees a consistent, ordered view of the cluster, but it also means the master is the bottleneck. When the count climbs and stays up, the master is either CPU-bound, GC-bound, or generating cluster states so large that publishing each one to the other nodes takes too long. The alert fires on `> 10 sustained 5m` so that genuine bursts (a rolling restart relocates many shards at once) do not page anyone, while a master that has truly fallen behind does.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 6-node Elasticsearch 8.x cluster (3 dedicated master-eligible nodes, 3 data nodes) backing product search and log analytics for a mid-size retailer. At 09:14 on 14 Apr 26 the on-call SRE sees the Pending Cluster Tasks card jump from its usual `0` to `47` and hold there.
+
+Drilling into the raw API response:
+
+| insert_order | priority | source | time_in_queue_millis |
+| --- | --- | --- | --- |
+| 88412 | URGENT | shard-failed | 41,800 |
+| 88413 | URGENT | shard-started | 39,200 |
+| 88414 | HIGH | create-index [logs-2026.04.14] | 12,500 |
+| ... (44 more, mostly NORMAL) | NORMAL | put-mapping / ilm-execute | 1,000 to 30,000 |
+
+The headline reads **47 pending tasks** with the oldest at roughly 42 seconds in queue. Two `URGENT` shard-failed/shard-started pairs sit at the head, so the cluster is trying to recover shards but the master cannot publish the resulting cluster states fast enough.
+
+The SRE checks the master's vitals and finds the symptom: [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) on the elected master is at 91% and [GC Pause Time (5m total ms)](/nerve-centre/kpi-cards/elasticsearch/gc-pause-time-5m-total-ms) shows 3,400ms of stop-the-world pauses in the last five minutes. The master is spending so long in garbage collection that it cannot drain its own task queue.
+
+```text
+Why the queue grew:
+  - A data node dropped briefly (network blip), failing ~40 shards.
+  - The master must process shard-failed then shard-started for each.
+  - Each cluster-state publish is blocked behind multi-second GC pauses.
+  - New ILM and mapping tasks keep arriving and stack up behind the recovery.
+
+Cost of leaving it:
+  - New indices cannot be created (create-index task is stuck at insert_order 88414).
+  - Log ingestion that needs today's daily index begins to back up.
+  - The cluster shows YELLOW until the failed shards re-allocate.
+```
+
+The fix is not to touch the queue (you cannot reorder it) but to relieve the master. The team confirms the master nodes are under-provisioned for heap, raises the dedicated-master heap from 4GB to 8GB during the next maintenance window, and in the immediate term throttles the reindex job that was generating the `NORMAL` put-mapping churn. Within 90 seconds of GC pressure easing, the queue drains to `0` and the cluster returns to green.
+
+Three takeaways:
+
+1. **Pending tasks is a master-health signal, not a traffic signal.** It moves because of cluster-state work, so always read it alongside master-node JVM heap and GC. A spiking queue with a calm master usually self-heals; a spiking queue with a hot master is the real incident.
+2. **Read the priority mix and the oldest wait, not just the count.** Fifty `LOW` reindex tasks draining steadily is fine. Two `URGENT` tasks stuck for 40 seconds is not.
+3. **Dedicated master nodes earn their keep here.** If master duties share a node with data and search load, this queue is the first thing to suffer under traffic.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Pending Cluster Tasks | What the combination tells you |
+| --- | --- | --- |
+| [Cluster Status (green / yellow / red)](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) | The outcome a stuck queue eventually produces. | A growing queue plus a slide to yellow means shard recovery is blocked on the master. |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | The most common root cause: a heap-pressured master. | High master heap plus a high queue equals "the master cannot drain cluster-state work". |
+| [GC Pause Time (5m total ms)](/nerve-centre/kpi-cards/elasticsearch/gc-pause-time-5m-total-ms) | The mechanism that stalls cluster-state publishing. | Long GC pauses on the master directly translate into rising queue depth. |
+| [Initializing / Relocating Shards](/nerve-centre/kpi-cards/elasticsearch/initializing-relocating-shards) | The work that floods the queue during recovery. | Many initializing shards plus a high queue equals a recovery the master cannot keep up with. |
+| [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) | What stays broken while the queue is stuck. | Unassigned shards that will not allocate often trace back to a backed-up pending-tasks queue. |
+| [Active Node Count](/nerve-centre/kpi-cards/elasticsearch/active-node-count) | A node loss is a classic trigger for a queue spike. | A drop in node count followed by a queue spike is the shard-failed/shard-started recovery storm. |
+| [Elasticsearch Health Score](/nerve-centre/kpi-cards/elasticsearch/elasticsearch-health-score) | The composite that folds queue depth into overall health. | A health-score dip with no obvious traffic cause often points back here. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch itself:**
+
+> `GET /_cluster/pending_tasks` is the canonical source; the card reads it verbatim. The human-friendly view is `GET /_cat/pending_tasks?v`, which prints `insertOrder`, `timeInQueue`, `priority`, and `source` as a table.
+> `GET /_cluster/health` shows the downstream effect (status, `unassigned_shards`, `initializing_shards`).
+> `GET /_nodes/stats/jvm` on the elected master shows the heap and GC pressure that usually drives a stuck queue. Identify the master with `GET /_cat/master?v`.
+
+**Why our number may legitimately differ from a manual API call:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Polling instant vs your instant** | Either | The queue can change in milliseconds. The card's last poll and your manual `curl` are rarely the exact same moment, so a draining queue may read `12` for us and `3` for you seconds later. |
+| **Sustained-window smoothing** | Card may not alert when a raw call is high | The alert needs `> 10 sustained 5m`; a single high reading you catch by hand will not trip the card. |
+| **Managed-service proxies** | Either | On Elastic Cloud or AWS OpenSearch/Elasticsearch-compatible offerings, the console may sample at its own cadence; compare like-for-like timestamps. |
+| **`_tasks` confusion** | Large divergence | If you are comparing against `GET /_tasks` (per-node task framework), that is a different queue entirely and will not match. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | A sustained high queue should coincide with master heap pressure. | If heap is calm but the queue is high, suspect oversized cluster states (too many indices/shards) rather than GC. |
+| [Cluster Status](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) | A stuck queue and a non-green status usually move together during recovery. | A green cluster with a high queue is an early warning before any status change. |
+
+<details>
+<summary><em>Same-concept peer on other engines</em></summary>
+
+The "master cannot keep up with control-plane work" pattern exists on every distributed datastore, though the metric name differs. This is **not** a reconciliation against a parallel system; it is a cross-reference for teams documenting multiple engines.
+
+- Cassandra equivalent: pending tasks in the internal stage queues (`nodetool tpstats`), particularly `MigrationStage` and `GossipStage`.
+- Kafka equivalent: controller queue size / active controller count.
+- etcd equivalent: proposal pending and apply-queue depth.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The queue spiked to 60 during a rolling restart but never alerted. Is the card broken?**
+No, that is the design. A rolling restart relocates many shards at once, so a transient spike is expected and healthy. The alert only fires on `> 10 sustained 5m`. If the spike drained within a minute or two, the master kept up and there is nothing to act on. The card is protecting you from paging on normal maintenance.
+
+**What is the difference between `_cluster/pending_tasks` and `_tasks`?**
+`_cluster/pending_tasks` is the single, ordered queue of cluster-state updates on the elected master (shard allocation, index creation, mapping changes). `_tasks` is the per-node task-management framework that tracks in-flight operations like a long-running search or reindex. This card reads the former. A backed-up search will show in `_tasks`, not here.
+
+**The count is high but every task is priority `LOW`. Should I worry?**
+Less so. The master processes by priority, so `URGENT` and `HIGH` tasks (the ones that affect availability) jump the queue. A deep tail of `LOW` reindex or ILM tasks that is draining steadily is usually fine. Watch the oldest `time_in_queue_millis`: if even the `URGENT` tasks are aging, that is the problem, not the raw count.
+
+**My queue is stuck but JVM heap looks fine. What else causes this?**
+Oversized cluster states. If you have tens of thousands of shards or indices, each cluster-state publish is large and slow to serialise and send to every node, independent of heap. Check total shard count (aim for under ~20 shards per GB of heap as a rule of thumb), prune unused indices, and consolidate small indices. Network latency between master-eligible nodes during the two-phase publish can also stall the queue.
+
+**Can I clear or reorder the pending-tasks queue manually?**
+No. There is no API to flush or reprioritise it; the ordering and single-threaded processing are what give Elasticsearch a consistent cluster state. The only levers are relieving the master (heap, GC, CPU), reducing the rate of cluster-state changes (throttle reindex/ILM churn), and shrinking the cluster state (fewer shards/indices).
+
+**Does a high queue mean I am losing data?**
+Not directly. It means cluster-state changes are delayed, which can block new index creation and slow shard recovery, and that recovery delay is what risks availability (yellow/red). Ingestion already in flight to existing indices is largely unaffected unless the delay is severe enough to push the cluster red. Pair this card with [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) to gauge real data-availability risk.
+
+**Why is this single-threaded? Surely parallelising would help.**
+Cluster-state updates must be applied in a strict, total order so every node agrees on the same view of the cluster. Parallel application would break that consistency guarantee. The trade-off is that the master is a serial bottleneck, which is exactly why this card matters and why dedicated, well-provisioned master nodes are recommended for any cluster of meaningful size.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Pending Cluster Tasks* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

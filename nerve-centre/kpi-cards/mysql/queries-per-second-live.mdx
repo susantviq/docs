@@ -1,0 +1,163 @@
+---
+title: "Queries per Second (live), MySQL"
+sidebarTitle: "Queries per Second (live)"
+description: "Queries per Second (live) for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Queries per Second (live)** is the instance's throughput heartbeat: how many statements the server is executing right now, sampled every 5 seconds. It is derived from the `Questions` status counter, exposed by MySQL as `Questions_per_sec`. On its own QPS is not "good" or "bad" (a healthy reporting database might idle at 20 QPS while a busy OLTP primary runs at 40,000), which is why this card carries no alert threshold. Its value is as the denominator and the context line for almost every other card: error rate, slow-query rate, and latency only make sense against the volume that produced them. A flat-line to zero means the instance has stopped serving; a sudden 5x spike with no matching order growth usually means a bot, a runaway retry loop, or a missing cache.
+
+| | |
+| --- | --- |
+| **What it tracks** | Statement execution throughput in queries per second, as a live rate. |
+| **Data source** | `Questions_per_sec`, computed from the `Questions` counter in `SHOW GLOBAL STATUS`, sampled every 5 seconds. The rate is the delta in `Questions` between two samples divided by the elapsed seconds. |
+| **Time window** | `RT` (real-time, 5-second sampling cadence). |
+| **Alert trigger** | None. QPS has no universal "bad" value; it is interpreted relative to your own baseline and paired with the error and latency cards. |
+| **Aggregation** | Instantaneous rate. The headline shows the latest 5-second sample; the sparkline shows the trailing window so you can see the shape (steady, ramping, spiking, or flat-lined). |
+| **Units** | Queries per second (statements/sec). |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card derives a rate from a monotonically increasing counter:
+
+```text
+QPS = (Questions[now] - Questions[5s ago]) / elapsed_seconds
+```
+
+The source counter is `Questions`, read via `SHOW GLOBAL STATUS LIKE 'Questions'`. A note on which counter is used, because it matters:
+
+- **`Questions`** counts statements sent by clients. It excludes statements executed inside stored procedures and excludes most internal server-side commands. This is the counter that reflects application-facing load, which is why the card uses it.
+- **`Queries`** is the broader counter. It includes everything `Questions` does plus statements run inside stored programs and certain internal operations. On a server heavy with stored procedures, `Queries` can be substantially higher than `Questions`.
+
+The card standardises on `Questions` so the number maps to "work the application asked for", which is the most actionable framing for an Executive Overview card. If your environment leans heavily on stored procedures and you want the fuller picture, the `Queries`-based rate is available on hover.
+
+Because the counter is cumulative since the last server start (or last `FLUSH STATUS`), the rate is always computed from two samples; a single read of `Questions` only gives you a total, not a rate. The 5-second cadence is a deliberate balance: fast enough to catch a spike as it forms, slow enough that the polling itself does not add meaningful load to the instance.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MySQL 8.0 primary behind the storefront and order APIs for a UK retailer. The instance's normal weekday-evening baseline is around 3,200 QPS. Snapshot taken on 22 Apr 26 starting at 20:15 BST.
+
+| Sample time | Questions (cumulative) | QPS (5s rate) | Read | Note |
+| --- | --- | --- | --- | --- |
+| 20:15:00 | 4,812,440,000 | 3,180 | Baseline | Normal evening traffic |
+| 20:15:05 | 4,812,455,900 | 3,180 | Baseline | Steady |
+| 20:16:00 | 4,812,940,000 | 9,420 | **3x spike** | Something changed |
+| 20:16:30 | 4,813,225,000 | 9,500 | Sustained | Still elevated |
+
+QPS has tripled to ~9,500 and held there. The card itself does not alert (no threshold), but the shape is the signal. The DBA cross-checks two things immediately:
+
+1. **Did orders spike too?** [MySQL QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mysql/mysql-qps-spike-vs-ecom-order-rate) overlays storefront order rate on the same axis. Orders are flat. A 3x query spike with flat orders is the classic signature of a bot or scraper hammering search and category endpoints, not genuine demand.
+2. **What kind of queries?** `SHOW PROCESSLIST` shows hundreds of near-identical `SELECT ... FROM products WHERE ... LIKE '%...%'` statements from a single subnet, all on the search path.
+
+```text
+Diagnosis at 20:16:30:
+  - QPS: 9,500 (baseline 3,200)
+  - Order rate: 14/min (baseline 13/min) -> NO real demand increase
+  - Slow-query rate climbing: search LIKE scans are not index-friendly
+  - Source: 89% of the excess from one /24 subnet
+Conclusion: scraper, not a sale. Rate-limit the subnet at the edge,
+do not scale the database.
+```
+
+Contrast with a healthy spike: if orders had risen to 40/min alongside the QPS jump, this would be a genuine traffic surge (a marketing email landing, a flash sale) and the correct response is the opposite, ensure read replicas and connection headroom can absorb it.
+
+Three takeaways:
+
+1. **QPS is a context number, not a verdict.** There is no threshold because the same value can be excellent or alarming depending on what produced it. Always read it next to order rate, error rate, and latency.
+2. **The shape matters more than the level.** A flat-line to zero (instance stopped serving) and a vertical spike (bot or retry storm) are both anomalies; a smooth ramp into a known peak is healthy.
+3. **A spike without matching business volume is almost always waste.** Bots, retry loops, a cache that just expired, or a deploy that removed a query cache, all show as QPS up with orders flat. Find the source before you scale.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Queries per Second | What the combination tells you |
+| --- | --- | --- |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mysql/query-error-rate) | QPS is the denominator behind the error rate. | A stable error rate with rising QPS means absolute errors are climbing; watch the raw count. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) | Latency under load is the real test. | QPS up and p95 up together signals the instance is hitting a throughput wall. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mysql/slow-query-rate) | Slow queries as a share of total volume. | A QPS spike that drags slow-query rate up points to un-indexed paths under load. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mysql/connection-pool-saturation) | Throughput vs connection headroom. | High QPS with rising saturation means demand is outpacing connection capacity. |
+| [MySQL QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mysql/mysql-qps-spike-vs-ecom-order-rate) | The business overlay for any QPS move. | Distinguishes a real sale from a bot: query spike with no order spike equals waste. |
+| [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) | Whether throughput is served from memory or disk. | Rising QPS with a falling hit rate means the working set no longer fits in the buffer pool. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite that frames throughput against errors and latency. | Health score holds steady under a QPS spike only if errors and latency stay flat. |
+| [Instance Uptime](/nerve-centre/kpi-cards/mysql/instance-uptime) | Context for the cumulative `Questions` counter. | A QPS read just after a restart is computed from a low base; uptime tells you the counter is warm. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look on the instance:**
+
+> `SHOW GLOBAL STATUS LIKE 'Questions';` read twice, a few seconds apart, to compute the rate by hand.
+> `SHOW GLOBAL STATUS LIKE 'Queries';` for the broader counter that includes stored-program statements.
+> `SHOW STATUS LIKE 'Uptime';` so you can compute the lifetime average QPS as `Questions / Uptime` for a sanity check against the live rate.
+> `SELECT * FROM performance_schema.events_statements_summary_global_by_event_name;` for a breakdown of statement counts by type.
+
+To reproduce a live rate at the prompt, MySQL exposes the per-second derivation directly:
+
+```sql
+SHOW GLOBAL STATUS LIKE 'Questions';
+-- wait ~10 seconds
+SHOW GLOBAL STATUS LIKE 'Questions';
+-- QPS = (second value - first value) / elapsed seconds
+```
+
+**On a managed service:**
+
+| Service | Where to confirm |
+| --- | --- |
+| Amazon RDS / Aurora | The `Queries` CloudWatch metric is published per second already. Performance Insights also shows "Calls/sec" per SQL digest. |
+| Google Cloud SQL | The `database/mysql/queries` metric in Cloud Monitoring, available as a rate. |
+| Azure Database for MySQL | Derive from the `Queries` aggregate metric in Azure Monitor over a 1-minute grain. |
+
+**Why our number may legitimately differ from a native reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **`Questions` vs `Queries`** | Card lower | The card uses `Questions` (application statements); a tool reporting `Queries` will read higher on a stored-procedure-heavy server. |
+| **Averaging window** | Card spikier | The card samples every 5 seconds; CloudWatch and most consoles average over 60 seconds, smoothing out short spikes. |
+| **Counter reset** | Card temporarily low | A `FLUSH STATUS` or a server restart resets `Questions`; the first rate samples after that are computed from a low base. |
+| **Replica vs primary** | Different scope | Read-only replicas show their own QPS, which can exceed the primary's if reads are offloaded. Make sure you are comparing the same instance. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is there no alert threshold on this card?**
+Because there is no universal "bad" QPS. A reporting database might run healthily at 20 QPS; a busy storefront primary at 30,000. A threshold that fits one instance would be meaningless for the next. QPS is best read as context for the cards that do have thresholds (error rate, latency, slow-query rate). If you want alerting on throughput, set it on a deviation from your own baseline rather than an absolute number, and pair it with the order-rate overlay.
+
+**My QPS doubled but nothing feels slower. Is that a problem?**
+Not necessarily, but find the source. If the extra volume corresponds to real business activity (orders, sessions, an email send), it is healthy demand and your job is to confirm there is headroom. If volume rose with no matching business signal, it is usually waste: a bot, a retry storm, a cache that just expired, or a new code path issuing redundant queries. Use [MySQL QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mysql/mysql-qps-spike-vs-ecom-order-rate) to tell the two apart.
+
+**What is the difference between `Questions` and `Queries`?**
+`Questions` counts statements sent directly by clients and excludes statements executed inside stored procedures. `Queries` counts everything, including stored-program internals. This card uses `Questions` because it reflects what the application asked for. On a server with heavy stored-procedure use, `Queries` can be much higher; that gap is normal and not a discrepancy.
+
+**My QPS dropped to near zero. Is the database down?**
+A flat-line to zero is the one QPS reading you should treat as urgent even without an alert. It means clients have stopped sending statements. Causes: the application lost its connection pool, a network partition between app and database, the instance is in recovery, or a `max_connections` saturation event is rejecting every new client. Check [Connection Pool Saturation %](/nerve-centre/kpi-cards/mysql/connection-pool-saturation) and [Connection Errors (24h)](/nerve-centre/kpi-cards/mysql/connection-errors-24h) immediately.
+
+**Does QPS include failed queries?**
+Yes. `Questions` increments for statements the server received and attempted, including those that errored. That is why QPS is the correct denominator for [Query Error Rate %](/nerve-centre/kpi-cards/mysql/query-error-rate): both numerator and denominator are drawn from the same attempt-counting basis.
+
+**Why does the console show a smoother line than the card?**
+The card samples every 5 seconds and reports the instantaneous rate, so it captures short spikes. Most managed-service consoles average over a 60-second window, which flattens those spikes. Neither is wrong; they answer different questions. For incident forensics use the card's fine-grained view; for capacity trend reporting the smoothed console view is fine.
+
+**Should I read primary and replica QPS together?**
+They tell you about read/write split. The primary handles all writes plus any reads not offloaded; replicas handle the reads you have routed to them. A healthy read-heavy workload often shows replica QPS well above primary QPS. If replica QPS is near zero, your read traffic is not actually being offloaded, which puts avoidable load on the primary.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Queries per Second (live)* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

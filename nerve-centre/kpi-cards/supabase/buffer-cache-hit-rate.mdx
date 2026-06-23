@@ -1,0 +1,154 @@
+---
+title: "Buffer Cache Hit Rate %, Supabase"
+sidebarTitle: "Buffer Cache Hit Rate %"
+description: "Buffer Cache Hit Rate % for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of Postgres data-page reads that were served from the shared buffer cache (RAM) rather than fetched from disk. On a Supabase project this is the single best early-warning signal that your instance is running out of memory headroom for its working set. A healthy OLTP database sits at 99% or higher; when the ratio drops below 95% the database has started paging in data from disk on the hot path, which shows up as rising query latency long before anything actually breaks. For a platform team this is "is my database still comfortably holding the data it reads most often in RAM?"
+
+| | |
+| --- | --- |
+| **What it tracks** | Buffer Cache Hit Rate %: the share of buffer reads satisfied from the shared buffer pool versus reads that fell through to the operating-system / disk layer, expressed as a percentage. |
+| **Data source** | `detail`: Buffer Cache Hit Rate % for the selected period. Derived from Postgres `pg_stat_database` (the `blks_hit` and `blks_read` counters) on the Supabase project, sampled by the Vortex IQ Supabase connector. |
+| **Calculation basis** | `blks_hit / (blks_hit + blks_read)` aggregated across the database, then multiplied by 100. This is the canonical Postgres cache-hit formula. |
+| **Time window** | `RT/1h`: a real-time reading plus a 1-hour rolling ratio so a single cold query does not whipsaw the headline. |
+| **Alert trigger** | `< 95%`. Below 95% the working set no longer fits comfortably in `shared_buffers` plus OS page cache and disk reads have entered the hot path. |
+| **Chart type** | Gauge (0 to 100%), green band 99%+, amber 95 to 99%, red below 95%. |
+| **Roles** | owner, engineering, operations (DBA / platform / SRE) |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calc */}
+The card is computed directly from the Postgres counters Supabase exposes on every project. Postgres keeps two cumulative counters per database in `pg_stat_database`:
+
+- `blks_hit`: the number of 8 KB data-page reads that were found already in the shared buffer cache.
+- `blks_read`: the number of reads that had to go to the file system (which may itself be served from the OS page cache, but Postgres counts it as a "read" because it left the shared buffer pool).
+
+The hit rate is:
+
+```text
+buffer_cache_hit_rate = blks_hit / (blks_hit + blks_read) * 100
+```
+
+Because the raw counters are cumulative since the last stats reset, the Vortex IQ connector samples them at the start and end of the rolling window and works on the delta, so the `RT/1h` reading reflects the last hour of activity rather than the lifetime average (which is almost always flatteringly high). A lifetime number near 100% can hide an hour in which the rate collapsed to 90%; the windowed delta is what surfaces that.
+
+The reading is a database-wide blend. A single large analytical scan that streams a cold table from disk will pull the headline down for the duration of that scan even while your transactional queries are still 99%+, which is why the worked example below separates the two.
+{/* /HUMAN_AUTHORED:calc */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Supabase Pro project (a Small compute add-on, 2 GB RAM, roughly 512 MB of `shared_buffers`) backing the storefront API for a mid-sized retailer. The reading is taken on 14 Apr 26 at 09:40 BST during the morning traffic ramp.
+
+| Window | blks_hit (delta) | blks_read (delta) | Hit rate |
+| --- | --- | --- | --- |
+| Overnight (02:00 to 06:00) | 41,800,000 | 38,000 | 99.91% |
+| 08:00 to 09:00 | 96,400,000 | 410,000 | 99.58% |
+| 09:00 to 09:40 (live) | 71,200,000 | 3,950,000 | **94.74%** |
+
+The gauge flips amber-to-red just after 09:20 as the live ratio crosses below 95%. Investigating, the team finds two things happening at once:
+
+1. A scheduled reporting job started at 09:15 and is running a wide `SELECT` over the orders history table, which is far larger than `shared_buffers`. Every page it touches is a cold disk read, dragging the database-wide ratio down.
+2. Independently, organic working-set growth means the hot `products` and `inventory` tables no longer fully fit in 512 MB of buffers, so even transactional reads have started missing occasionally.
+
+The fix splits cleanly:
+
+```text
+Immediate: move the 09:15 reporting job off the primary.
+  - Route it to a read replica, or reschedule to the overnight 02:00 window.
+  - Result: live ratio recovers to ~99.4% within minutes.
+
+Structural: the working set has outgrown the compute tier.
+  - Small (2 GB) buffers are now too small for the hot tables.
+  - Upgrade the compute add-on to Medium (4 GB) so shared_buffers ~1 GB.
+  - Result: steady-state ratio returns to 99.9%+ even under load.
+```
+
+Three takeaways a platform team should remember:
+
+1. **A dip is not automatically a problem; a sustained dip is.** A momentary drop while a one-off analytical query streams a cold table is expected and harmless. The 95% alert is tuned for *sustained* erosion over the 1-hour window, which signals the working set has outgrown RAM.
+2. **The cache ratio leads latency.** It degrades before [Postgres Query Latency p95](/nerve-centre/kpi-cards/supabase/postgres-query-latency-p95-ms) climbs, because disk reads are slower than buffer reads. Watching the ratio buys you lead time to act before users feel it.
+3. **The two cures are different.** "Move the heavy reader off the primary" fixes a transient dip; "size up compute" fixes structural growth. Reading the per-query breakdown (see [Top 10 Slowest Queries](/nerve-centre/kpi-cards/supabase/top-10-slowest-queries)) tells you which one you are looking at.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Buffer Cache Hit Rate | What the combination tells you |
+| --- | --- | --- |
+| [Memory Usage %](/nerve-centre/kpi-cards/supabase/memory-usage) | The other half of the memory story: how full RAM already is. | High memory usage plus falling cache hit rate equals "no headroom left to cache the working set", the textbook size-up signal. |
+| [Postgres Query Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgres-query-latency-p95-ms) | The downstream symptom of cache misses. | Hit rate down and p95 up together confirms the misses are landing on the hot path, not a cold batch job. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate) | Identifies whether specific queries are the cause. | A spike in slow queries co-occurring with a cache dip points at one heavy reader rather than working-set growth. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/supabase/top-10-slowest-queries) | Names the exact statements doing the cold reads. | Lets you decide between rerouting a job and resizing compute. |
+| [Database Queries per Second (live)](/nerve-centre/kpi-cards/supabase/database-queries-per-second-live) | Load context. | A cache dip during a QPS spike is load-driven; a dip at flat QPS is a single expensive query. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The executive roll-up that includes cache pressure. | A red cache ratio is one of the components that pulls the composite score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to confirm this in Supabase's own tooling:**
+
+> **SQL Editor / `psql`** is the ground truth. Run the canonical query against `pg_stat_database`:
+> ```sql
+> SELECT sum(blks_hit) * 100.0 / nullif(sum(blks_hit) + sum(blks_read), 0) AS cache_hit_rate
+> FROM pg_stat_database;
+> ```
+> **Supabase Studio → Reports → Database** surfaces a "Cache hit rate" chart that uses the same counters.
+> **`pg_statio_user_tables`** breaks the ratio down per table if you need to find which relation is missing cache.
+
+**Why our number may legitimately differ from a one-off `psql` reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window vs lifetime** | Vortex IQ usually lower | The bare `pg_stat_database` query returns the cumulative-since-reset ratio, which is dominated by quiet overnight hours. Vortex IQ reports the `RT/1h` delta, which reflects current pressure. |
+| **Stats reset** | Vortex IQ unaffected | If someone runs `pg_stat_reset()`, the lifetime counters zero out; the windowed delta keeps working across the reset. |
+| **OS page cache** | Both overstate true disk I/O | A `blks_read` may still be served from the OS page cache rather than physical disk. Postgres counts it as a miss regardless, so both numbers treat OS-cached reads as misses. |
+| **Per-database scope** | Possible mismatch | A raw query may scope to the current database only; the connector aggregates across the project's user database. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`supabase.memory-usage`](/nerve-centre/kpi-cards/supabase/memory-usage) | Cache hit rate falls as memory usage climbs toward the cap. | If memory is comfortable but the ratio still dips, the cause is a cold batch scan, not capacity. |
+| [`supabase.postgres-query-latency-p95-ms`](/nerve-centre/kpi-cards/supabase/postgres-query-latency-p95-ms) | p95 latency rises within minutes of a sustained cache dip. | Latency flat while cache dips means the misses are on cold, non-hot-path tables. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My lifetime cache hit rate in `psql` says 99.9% but the card shows 94%. Which is right?**
+Both are right; they measure different windows. The lifetime `pg_stat_database` figure is the average since the last stats reset and is dominated by hours of quiet, well-cached activity. The card reports the `RT/1h` delta, which is the truthful picture of the *last hour*. When you are diagnosing a live latency problem, the windowed number is the one that matters.
+
+**Is a cache hit rate below 95% always bad?**
+No. A transient dip while a one-off analytical query streams a large cold table is normal and harmless. What matters is a *sustained* dip over the rolling window, which means your hot working set no longer fits in RAM. The alert is tuned to fire on sustained erosion, not single-query blips.
+
+**Does "read from disk" mean a physical SSD read every time?**
+Not necessarily. `blks_read` counts anything that left the Postgres shared buffer pool, but the read may still be served from the operating-system page cache, which is also RAM. So a 94% Postgres cache hit rate does not mean 6% of reads hit physical disk; the true disk-I/O figure is usually much lower. Postgres simply cannot see the OS cache, so it counts those as misses.
+
+**How do I actually raise the ratio?**
+Three levers, in increasing cost: (1) move heavy analytical readers off the primary, either to a read replica or to an off-peak schedule; (2) add or fix indexes so queries touch fewer pages (a sequential scan of a cold table is the worst case); (3) upgrade the Supabase compute add-on, which increases RAM and therefore `shared_buffers`. Sizing up is the right fix only when the working set has genuinely outgrown the tier.
+
+**Why is the alert at 95% and not, say, 90%?**
+Because a well-run OLTP Postgres database lives at 99%+ effectively all the time, so 95% already represents a meaningful regression with room to act before users notice. Waiting for 90% would mean alerting only once latency is already visibly degraded. Like every threshold in Vortex IQ, the 95% trigger is configurable per profile in the Sensitivity tab if your workload is genuinely analytical and runs hotter on disk by design.
+
+**Can a single bad query tank the whole project's ratio?**
+Yes, temporarily. The headline is a database-wide blend, so one wide sequential scan over a table larger than `shared_buffers` will drag the aggregate down for as long as it runs, even while your transactional queries stay at 99%+. Use [Top 10 Slowest Queries](/nerve-centre/kpi-cards/supabase/top-10-slowest-queries) to confirm whether one statement is responsible before you reach for a compute upgrade.
+
+**Does upgrading compute always fix it?**
+Only if the cause is working-set growth. More RAM gives Postgres a bigger `shared_buffers` and a bigger OS page cache, which fixes structural pressure. It does nothing about a poorly indexed query that scans a cold table on every run; that still misses cache no matter how much RAM you have. Diagnose the cause first.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Buffer Cache Hit Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

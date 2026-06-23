@@ -1,0 +1,161 @@
+---
+title: "Job Success Rate (24h), Databricks"
+sidebarTitle: "Job Success Rate (24h)"
+description: "Job Success Rate (24h) for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Jobs & Workflows](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of Databricks job runs that completed successfully over the last 24 hours, shown as a gauge. This is the Databricks-distinctive defining metric for pipeline health: if scheduled runs are failing, your data pipelines are broken and every downstream table, dashboard, and feature store is at risk of going stale. A single number gives the platform owner an instant read on whether the lakehouse is delivering its contracts. The alert fires below 95%, the floor at which the team should assume something systemic is wrong rather than a one-off flake.
+
+| | |
+| --- | --- |
+| **Data source** | Databricks Jobs API, `GET /api/2.2/jobs/runs/list`. Each completed run carries a terminal `state.result_state`; the card computes the ratio of `SUCCESS` runs to all completed runs in the window. |
+| **Formula** | `SUCCESS runs / (SUCCESS + FAILED + TIMEDOUT runs) × 100`, over the rolling 24-hour window. |
+| **What counts in the denominator** | All runs that reached a terminal state in the window: `SUCCESS`, `FAILED`, and `TIMEDOUT`. These are the runs that had a chance to succeed or fail. |
+| **What is excluded** | `CANCELED` runs (intentional, not a quality signal) and runs still `RUNNING` / `PENDING` (no terminal state yet). Including cancellations would distort the rate with deliberate human actions. |
+| **Aggregation window** | Rolling 24 hours, refreshed each polling cycle. The gauge reflects the live ratio across that window. |
+| **Time window** | `24h` (rolling 24 hours) |
+| **Alert trigger** | `< 95%`. When success rate drops below 95% the card flags it; pair with [Failed Jobs (24h)](/nerve-centre/kpi-cards/databricks/failed-jobs-24h) for the worklist of exactly which runs failed. |
+| **Roles** | owner, platform engineering, data engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The success rate is the share of terminal runs that ended in `SUCCESS`:
+
+```text
+SuccessRate(24h) = SUCCESS
+                   ----------------------------------  × 100
+                   SUCCESS + FAILED + TIMEDOUT
+
+(runs reaching a terminal state in the last 24h; CANCELED excluded)
+Alert fires when SuccessRate < 95%
+```
+
+Three points govern how to read the number:
+
+1. **Cancellations are excluded so the rate measures quality, not activity.** A run that a human or an upstream task cancelled is neither a success nor a failure of the pipeline; it is a deliberate act. Including cancellations would let a busy operations day drag the rate down even when nothing is genuinely broken. The denominator is only runs that actually attempted to complete.
+2. **The rate is run-weighted, not job-weighted.** A job that runs hourly contributes 24 runs to the window; a daily job contributes one. This is intentional: a flaky high-frequency job has more downstream impact (more stale refreshes) and should move the gauge more than a single daily job. To see per-job patterns instead, use [Top 10 Failing Workflows (7d)](/nerve-centre/kpi-cards/databricks/top-10-failing-workflows-7d).
+3. **Small denominators are volatile.** With only 8 runs in the window, one failure is a 12.5-point drop. The gauge shows the absolute rate, but the card annotates the run count so a 87.5% from 7-of-8 is read differently from 87.5% across 400 runs. Low-volume workspaces should weight the failed-run worklist over the headline percentage.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A data platform team runs a busy lakehouse: hourly micro-batches, several nightly ETL jobs, and a feature pipeline. Snapshot taken 18 Apr 26 at 08:00, covering the previous 24 hours.
+
+| Result state | Runs |
+| --- | --- |
+| SUCCESS | 184 |
+| FAILED | 9 |
+| TIMEDOUT | 2 |
+| CANCELED (excluded) | 5 |
+
+The gauge reads **94.4%** (184 of 195 terminal runs), just below the 95% threshold, so the card is flagged amber. The owner reads it like this:
+
+1. **94.4% is below the floor, so this is not a normal day.** In a healthy steady state this workspace sits at 98 to 99%. The drop of four to five points means a cluster of failures, not background flakiness. The first move is to open [Failed Jobs (24h)](/nerve-centre/kpi-cards/databricks/failed-jobs-24h) and see whether the 11 failures share a root cause.
+2. **The worklist shows 7 of the 11 failures are the same hourly job.** `prod_orders_hourly` failed seven times overnight on the same schema-mismatch error. That is one broken pipeline expressing itself as seven failed runs, which is why a single bug dropped the rate so far: the high-frequency job dominates the denominator. Fixing that one job recovers most of the gap. Cross-check [Failed Job Burst (>5 failures in 1h)](/nerve-centre/kpi-cards/databricks/failed-job-burst-5-failures-in-1h) to confirm whether the seven clustered in one hour (a cascade) or spread evenly (a deterministic per-run bug).
+3. **The two timed-out runs are a separate, slower problem.** A nightly feature build hit its timeout twice. That is a duration / data-volume issue, not a code error; it is worth a same-day look via [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) but is not what dragged the gauge down.
+
+```text
+Reading the 94.4%:
+  Dominant cause:  prod_orders_hourly × 7 (schema mismatch)  → fix recovers ~3.6 pts
+  Secondary:       feature_build × 2 timeouts                → duration tuning
+  Residual:        2 unrelated one-off failures              → background flake, ignore
+  -----------------------------------------------------------------
+  After fixing the hourly job, projected rate: ~98.5% (back above floor)
+```
+
+The teaching point: the success rate tells you *that* something is wrong; the failed-jobs worklist tells you *what*. A drop below 95% almost always traces to one or two jobs, not a broad collapse. Find the dominant offender first.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Job Success Rate | What the combination tells you |
+| --- | --- | --- |
+| [Failed Jobs (24h)](/nerve-centre/kpi-cards/databricks/failed-jobs-24h) | The worklist behind the percentage. | The rate says how bad; the worklist says which runs to fix first. |
+| [Failed Job Burst (>5 failures in 1h)](/nerve-centre/kpi-cards/databricks/failed-job-burst-5-failures-in-1h) | Detects whether failures clustered into a cascade. | A burst plus a rate drop signals a dependency chain breaking, not isolated bugs. |
+| [Top 10 Failing Workflows (7d)](/nerve-centre/kpi-cards/databricks/top-10-failing-workflows-7d) | The weekly per-job pattern under the daily rate. | A chronic offender keeps the rate suppressed day after day. |
+| [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) | The leading signal for `TIMEDOUT` runs that hurt the rate. | Catching duration creep early prevents future timeouts. |
+| [Pipeline Lag (since last success)](/nerve-centre/kpi-cards/databricks/pipeline-lag-since-last-success) | The downstream consequence of a low success rate. | A falling rate plus rising lag quantifies data staleness. |
+| [Databricks Health Score](/nerve-centre/kpi-cards/databricks/databricks-health-score) | The composite that weights success rate heavily. | A sub-95% success rate is one of the largest drags on the overall score. |
+| [Pipeline Lag vs Ecom Order Flow](/nerve-centre/kpi-cards/databricks/pipeline-lag-vs-ecom-order-flow) | The cross-channel impact view. | A low success rate while orders keep flowing is the highest-urgency case. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **Workflows → Job runs** with the 24-hour filter shows every run and its result state; counting `Succeeded` against the total of `Succeeded + Failed + Timed out` reproduces the rate.
+> **System tables**: `system.lakeflow.job_run_timeline` holds run-level terminal states for an exact SQL reconcile.
+> **Each job's Runs tab** shows the per-job success history, useful for confirming which job is dragging the rate.
+
+A reconciling query you can run in a Databricks SQL editor:
+
+```sql
+SELECT
+  ROUND(100.0 *
+    SUM(CASE WHEN result_state = 'SUCCEEDED' THEN 1 ELSE 0 END) /
+    SUM(CASE WHEN result_state IN ('SUCCEEDED','FAILED','TIMED_OUT') THEN 1 ELSE 0 END)
+  , 1) AS success_rate_pct
+FROM system.lakeflow.job_run_timeline
+WHERE period_end_time >= now() - INTERVAL 24 HOURS;
+```
+
+**Why our number may legitimately differ from the Workflows UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Cancellation handling** | Vortex IQ may read higher | The card excludes `CANCELED` from the denominator; a UI tally that includes cancellations as non-successes would show a lower rate. |
+| **`TIMEDOUT` in denominator** | Vortex IQ may read lower | The card counts timed-out runs as failures in the denominator; a calculation counting only `FAILED` would read higher. |
+| **Window edge / time zone** | Small drift | Rolling 24h from the current minute vs the UI's calendar-day or last-N-hours buckets, plus workspace vs UTC alignment near midnight. |
+| **Run-weighting** | Perception difference | The card weights by run, so a high-frequency job dominates. A per-job average in the UI will look different even on the same data. |
+| **System-table lag** | Vortex IQ live, table delayed | The live Jobs API updates within seconds; `system.lakeflow.*` can trail by minutes. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Failed Jobs (24h)](/nerve-centre/kpi-cards/databricks/failed-jobs-24h) | Failed-run count and success rate move inversely over the same population. | If they disagree, check cancelled runs or window misalignment. |
+| [Pipeline Lag vs Ecom Order Flow](/nerve-centre/kpi-cards/databricks/pipeline-lag-vs-ecom-order-flow) | A sustained sub-95% rate should show as rising lag against steady order flow. | Lag flat despite a low rate means the failing jobs are non-load-bearing. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is the threshold 95% and not 100%?**
+Because transient failures are a fact of life in distributed compute: a spot-instance reclaim, a brief cloud-API hiccup, a momentary lock contention. A run that fails once and succeeds on retry is normal. The 95% floor allows for that background flake while still catching anything systemic. If your workspace routinely sits at 99%+, you can tighten the sensitivity threshold per profile.
+
+**A high-frequency job failed a few times and tanked the whole rate. Is the metric over-reacting?**
+The metric is run-weighted on purpose. An hourly job that fails repeatedly causes far more downstream staleness than a single daily job failing once, so it should move the gauge more. The headline is doing its job; use [Top 10 Failing Workflows (7d)](/nerve-centre/kpi-cards/databricks/top-10-failing-workflows-7d) to confirm it is one job, not a broad problem, and fix that job.
+
+**Why are cancelled runs excluded?**
+Because a cancellation is a deliberate action, not a quality outcome. A human killed the run, or an upstream task short-circuited the workflow. Counting cancellations as failures would let a busy operations day (lots of intentional cancels) drag the rate down even when every pipeline is healthy. Only runs that genuinely attempted to complete count.
+
+**Our success rate is 100% but a stakeholder says their data is stale. How?**
+A run can succeed and still produce wrong or stale output: it read from an empty upstream source, a conditional branch skipped the real work, or it wrote to the wrong partition. Success means "the run did not error", not "the data is correct". Pair this card with [Pipeline Lag (since last success)](/nerve-centre/kpi-cards/databricks/pipeline-lag-since-last-success), which measures whether fresh data actually landed, and with data-quality expectations inside your pipelines.
+
+**With only a handful of runs a day, the rate swings wildly. What should I watch instead?**
+Low-volume workspaces should weight the [Failed Jobs (24h)](/nerve-centre/kpi-cards/databricks/failed-jobs-24h) worklist over the percentage. With 8 runs a day, one failure is a 12.5-point drop that looks alarming but is just one run. The card annotates the run count so you can judge the rate in context; below roughly 20 runs, trust the worklist.
+
+**Do Delta Live Tables (DLT) pipeline runs count toward this rate?**
+No. This rate is computed from the Jobs / Workflows runs API. DLT pipelines have a separate lifecycle and are tracked on [DLT Pipeline Status Distribution](/nerve-centre/kpi-cards/databricks/dlt-pipeline-status-distribution). If you orchestrate DLT pipelines via a job task, the wrapping job run counts here, but native DLT update health is read separately.
+
+**The rate recovered overnight without anyone fixing anything. Why?**
+The window is a rolling 24 hours, so a batch of failures from yesterday rolls off the back as time passes, lifting the rate even if the root cause is unaddressed. That is why the card pairs with the failed-jobs worklist and pipeline-lag cards, which reflect current state rather than a trailing average. Do not assume a recovered gauge means a fixed pipeline.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Job Success Rate (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

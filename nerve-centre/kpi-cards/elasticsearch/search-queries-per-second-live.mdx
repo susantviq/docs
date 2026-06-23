@@ -1,0 +1,140 @@
+---
+title: "Search Queries per Second (live), Elasticsearch"
+sidebarTitle: "Search Queries per Second (live)"
+description: "Search Queries per Second (live) for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Search Queries per Second (live)** is the rate at which the cluster is serving search queries right now. It is the single best measure of demand on the search path, the denominator behind every latency and error percentage, and the first number to check when anything else moves. A latency card means little without the QPS context: 300ms p95 at 50 QPS is a query-shape problem; the same p95 at 800 QPS is a capacity problem.
+
+| | |
+| --- | --- |
+| **What it tracks** | The current rate of completed search queries across the cluster, expressed in queries per second. |
+| **Data source** | Derived from the `indices.search.query_total` counter in the Elasticsearch node stats API (`GET /_nodes/stats/indices/search`), differenced between consecutive polls and divided by the elapsed time. |
+| **Time window** | `RT` (real-time, refreshed continuously; the live rate, not a period sum). |
+| **Alert trigger** | None. QPS is a demand signal, not a health threshold; it is read for context and capacity, not paged on directly. |
+| **Why it matters** | It is the load denominator. Every other Performance card (latency percentiles, error rate, pool saturation) is only interpretable against the QPS it was measured at. |
+| **What counts** | Query-phase operations on searchable indices in the connector scope, including aggregations and `_msearch` sub-queries. |
+| **What does NOT count** | Indexing operations (see [Indexing Rate (docs/sec)](/nerve-centre/kpi-cards/elasticsearch/indexing-rate-docssec)), management API calls, and `_cat`/`_cluster` administrative requests. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Elasticsearch exposes a monotonic `query_total` counter per node in the search index stats: every completed query-phase operation increments it. The counter is cumulative since node start, so the instantaneous rate is the delta between two consecutive samples divided by the seconds between them:
+
+```text
+QPS = (query_total[now] - query_total[previous]) / seconds_elapsed
+```
+
+Vortex IQ samples the counter on a short poll interval and reports the live rate. Because `query_total` counts shard-level query operations, a single user-facing search that fans out across several shards increments the counter once per shard; the card reports cluster-wide query operations per second, which is the figure that maps to thread-pool load. Where the connector is scoped to a specific index pattern, only that pattern's shards contribute, isolating storefront search demand from background analytics traffic. The value is a rate, not a period total, so it tracks the current pulse of demand rather than a cumulative count.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team watches the QPS card across a normal trading day on the cluster behind their storefront. Readings taken on 14 Apr 26.
+
+| Time (BST) | QPS | What is happening |
+| --- | --- | --- |
+| 04:00 | 22 | Overnight trough; mostly bots and health checks. |
+| 09:30 | 210 | Morning ramp as traffic builds. |
+| 12:45 | 480 | Lunchtime peak; steady. |
+| 19:20 | 905 | Evening peak, plus an email campaign drop at 19:00. |
+| 19:25 | 1,640 | Sudden doubling. |
+
+The 19:25 reading is the interesting one. QPS nearly doubled in five minutes with no matching jump in storefront sessions. The team reads three things:
+
+1. **Demand is the headline, but it needs a partner.** On its own a QPS spike could be good (a successful campaign) or bad (a runaway client or a crawler). The team immediately pairs it with [Search QPS Spike vs Ecom Traffic](/nerve-centre/kpi-cards/elasticsearch/search-qps-spike-vs-ecom-traffic), which shows storefront sessions flat while QPS doubled. That divergence is the signature of a bot crawler hammering search, not real shopper demand.
+2. **It reframes the latency cards.** During the spike, [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) climbed from 150ms to 240ms. Without QPS context that looks like a regression; with it, the cause is plainly load. The fix is to shed the bot traffic, not to retune queries.
+3. **It sets the capacity baseline.** Knowing the cluster comfortably serves ~900 QPS at a healthy p95, but degrades past ~1,500 QPS, gives the team a concrete headroom figure for the next sale event and for replica-count planning.
+
+```text
+Reading QPS as the denominator:
+  - 19:20  905 QPS,  p95 = 150ms  -> healthy demand
+  - 19:25  1,640 QPS, p95 = 240ms -> load-driven latency, sessions flat
+  Diagnosis: bot crawler, not shopper demand.
+  Action: rate-limit the offending source at the edge; p95 returns to baseline.
+```
+
+The takeaway: QPS is rarely the thing you act on directly, but it is the thing that makes every other Performance card legible. Always read latency and error percentages against the QPS they were measured at.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Search Queries per Second | What the combination tells you |
+| --- | --- | --- |
+| [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) | Latency is only interpretable against load. | p95 up with QPS up equals capacity; p95 up with flat QPS equals a query-shape or heap problem. |
+| [Search Latency p99 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p99-ms) | The tail under the current demand. | A p99 spike at flat QPS is a pathological query, not load. |
+| [Search Latency p50 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p50-ms) | The median under load. | A rising p50 as QPS climbs marks the cluster approaching its comfortable ceiling. |
+| [Search Error Rate %](/nerve-centre/kpi-cards/elasticsearch/search-error-rate) | Errors as a share of the QPS denominator. | Error rate climbing as QPS climbs means the search pool is saturating into rejections. |
+| [HTTP Connection Saturation %](/nerve-centre/kpi-cards/elasticsearch/http-connection-saturation) | Connection headroom under demand. | Saturation rising with QPS shows the connection tier nearing its limit before queries even run. |
+| [Indexing Rate (docs/sec)](/nerve-centre/kpi-cards/elasticsearch/indexing-rate-docssec) | The write-side load competing with search. | Heavy indexing alongside high QPS means search and indexing are contending for the same resources. |
+| [Search QPS Spike vs Ecom Traffic](/nerve-centre/kpi-cards/elasticsearch/search-qps-spike-vs-ecom-traffic) | Distinguishes real demand from bot traffic. | QPS up with storefront traffic flat equals a crawler, not shoppers. |
+| [ES Search Pool Saturation vs Ecom Burst](/nerve-centre/kpi-cards/elasticsearch/es-search-pool-saturation-vs-ecom-burst) | Whether the pool can absorb the current QPS. | High QPS plus high pool saturation during a burst signals imminent rejections. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> **`GET /_nodes/stats/indices/search`** for the raw `query_total` counter per node; two samples seconds apart give the live rate.
+> **`GET /<index>/_stats/search`** for the counter scoped to one index pattern.
+> **`GET /_cat/thread_pool/search?v&h=name,active,queue,completed`** to see the search thread pool under the current load.
+> **Kibana Stack Monitoring → Overview → Search** for the search-rate chart over time.
+> On **Elastic Cloud** or **AWS OpenSearch Service**, the search-rate series in the cluster monitoring dashboard.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Shard fan-out** | Our value higher | `query_total` counts shard-level operations; one user search across N shards increments the counter N times. A dashboard reporting request-level QPS will read lower. |
+| **Sample interval** | Either | A live rate over a short poll interval resolves spikes that a 1-minute or 1-hour Kibana bucket averages out. |
+| **Index scope** | Usually lower | A connector scoped to the storefront index excludes background analytics and admin queries. |
+| **`_msearch` expansion** | Our value higher | Multi-search bundles expand into individual query operations on the counter. |
+| **Counter reset** | Brief dip | A node restart resets `query_total`; the first post-restart sample is discarded to avoid a negative delta. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Search QPS Spike vs Ecom Traffic](/nerve-centre/kpi-cards/elasticsearch/search-qps-spike-vs-ecom-traffic) | QPS should track storefront session volume. | QPS rising while sessions stay flat means non-shopper traffic (crawler, runaway client, retries). |
+| [ES Search Pool Saturation vs Ecom Burst](/nerve-centre/kpi-cards/elasticsearch/es-search-pool-saturation-vs-ecom-burst) | Pool saturation should rise and fall with QPS. | Saturation high at modest QPS means slow queries holding threads, not raw demand. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does the QPS look higher than my application's request rate?**
+Elasticsearch counts query operations at the shard level. A single user-facing search that fans out across, say, 5 shards increments `query_total` five times. The card reports cluster query operations per second, which is the figure that maps to thread-pool load, not the request-level rate your application sees. To compare like for like, divide by the number of primary shards the index queries.
+
+**Why is there no alert on this card?**
+QPS is a demand signal, not a health signal. High QPS is usually good news (traffic). The point is to read it as context for the cards that do alert: latency, error rate, pool saturation. A QPS spike that hurts is caught by those cards crossing their own thresholds. If you want an alert on unusual demand, set one on [Search QPS Spike vs Ecom Traffic](/nerve-centre/kpi-cards/elasticsearch/search-qps-spike-vs-ecom-traffic), which compares QPS against storefront traffic.
+
+**QPS dropped to near zero but the site is up. Should I worry?**
+Possibly. A genuine traffic trough is fine, but a sudden drop to near zero during trading hours can mean search requests are failing before they reach Elasticsearch (an application-tier or load-balancer fault), or the connector lost its scope. Cross-check storefront sessions and [Search Error Rate %](/nerve-centre/kpi-cards/elasticsearch/search-error-rate); a real demand trough shows low QPS with no errors, a fault shows low QPS with sessions still arriving.
+
+**Does QPS include indexing?**
+No. This card is search only, derived from `query_total`. The write-side equivalent is [Indexing Rate (docs/sec)](/nerve-centre/kpi-cards/elasticsearch/indexing-rate-docssec). The two together describe total cluster load, since search and indexing compete for heap and I/O.
+
+**How quickly does the live value update?**
+QPS is reported in real time on the standard poll interval. Because it is a rate over a short interval, it responds within seconds to a genuine change in demand, which is what makes it useful as the first card to check when latency or errors move.
+
+**My QPS looks spiky even when traffic is smooth. Why?**
+Short-interval rates are inherently more variable than smoothed dashboard charts, and `_msearch` bundles or scheduled aggregations can arrive in bursts. If you want a smoother view for capacity discussions, read the trend over several intervals rather than the instantaneous value, or compare against the Kibana search-rate chart bucketed over a minute.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Search Queries per Second (live)* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

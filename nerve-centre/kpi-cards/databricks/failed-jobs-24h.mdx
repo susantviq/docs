@@ -1,0 +1,157 @@
+---
+title: "Failed Jobs (24h), Databricks"
+sidebarTitle: "Failed Jobs (24h)"
+description: "Failed Jobs (24h) for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Jobs & Workflows](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The count of Databricks job runs that finished in a failure state over the last 24 hours, surfaced as a triage queue. A "failed job" here means a scheduled or triggered run whose terminal `result_state` is `FAILED` or `TIMEDOUT`. For a data platform team this is the single most operationally urgent number on the Databricks board: every failed run is a table that did not refresh, a feature that did not build, or a report that will show stale data this morning. The card is both the count and the worklist of exactly which runs to investigate first.
+
+| | |
+| --- | --- |
+| **Data source** | Databricks Jobs API, `GET /api/2.2/jobs/runs/list` (and `runs/get` for detail), filtered to runs whose `state.result_state` is `FAILED` or `TIMEDOUT` and whose `end_time` falls in the last 24 hours. |
+| **What counts as failed** | `result_state = FAILED` (the task raised an error or a dependency failed) and `result_state = TIMEDOUT` (the run exceeded its configured timeout and was killed). Both represent a pipeline that did not deliver its output. |
+| **What does NOT count** | `SUCCESS` runs; `CANCELED` runs (a human or upstream cancelled deliberately, not a failure); runs still `RUNNING` or `PENDING`; and `result_state = SKIPPED` tasks within an otherwise-successful multi-task run. |
+| **Triage ordering** | The list is ordered by business criticality where the job carries a `criticality` / `tier` tag, then by most recent `end_time`. Runs on jobs tagged critical are flagged so the on-call sees revenue-feeding pipelines first. |
+| **Aggregation window** | Rolling 24 hours from the current minute, refreshed each polling cycle. |
+| **Time window** | `24h` (rolling 24 hours) |
+| **Alert trigger** | `> 0 critical jobs`. Any run on a job tagged critical that ends in `FAILED` or `TIMEDOUT` pages the on-call immediately; non-critical failures populate the queue without paging. |
+| **Roles** | owner, platform engineering, data engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Vortex IQ polls the Jobs runs list and counts every run that meets all three conditions:
+
+```text
+FailedJobs(24h) = COUNT(run)
+                  WHERE state.result_state IN ('FAILED', 'TIMEDOUT')
+                  AND end_time >= now - 24h
+```
+
+Each surviving run is enriched with the job name, the failing task, the run page deep-link, the duration, and the cluster it ran on, so the card is a clickable worklist rather than a bare number. Three points of nuance:
+
+1. **Runs, not jobs, are counted.** If one nightly job retries and fails three times, that is three failed runs but one broken pipeline. The count reflects runs; the worklist groups by job so a flapping job is visible as one entry with a retry count, not three separate alarms.
+2. **`TIMEDOUT` is treated as a failure on purpose.** A run that hits its timeout produced no usable output and usually signals either a data-volume spike or a stuck stage. Folding it into the same count keeps the triage queue honest: from a downstream consumer's point of view, a timed-out table is just as missing as an errored one.
+3. **`CANCELED` is excluded deliberately.** A cancelled run is an intentional act (a human killed it, or an upstream task short-circuited the workflow). Counting cancellations as failures would inflate the queue with non-incidents and erode trust in the alert.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A data engineering team owns the lakehouse that powers a brand's overnight reporting and its product-recommendation feature store. Snapshot taken 16 Apr 26 at 07:15 (workspace time zone), covering the previous 24 hours.
+
+| Run | Job | Result state | Ended | Duration | Tier |
+| --- | --- | --- | --- | --- | --- |
+| run-88412 | `prod_orders_ingest` | **FAILED** | 02:14 | 9m | **critical** |
+| run-88419 | `prod_orders_ingest` (retry) | **FAILED** | 02:31 | 9m | **critical** |
+| run-88431 | `feature_store_build` | **TIMEDOUT** | 04:02 | 120m | critical |
+| run-88440 | `marketing_attribution` | **FAILED** | 05:48 | 22m | standard |
+| run-88455 | `adhoc_export_csv` | **FAILED** | 06:55 | 3m | low |
+
+The headline reads **5 failed runs across 4 jobs**, with the two critical jobs outlined in red. The on-call engineer reads the queue top-down:
+
+1. **`prod_orders_ingest` failed and its retry failed too (critical).** This is the page-worthy event: the table feeding every downstream report did not refresh, and the automatic retry did not save it, so the failure is deterministic (bad input or a code regression), not transient. The run detail shows a schema-mismatch error: an upstream source added a column. The fix is a quick schema evolution change. While it is broken, [Pipeline Lag (since last success)](/nerve-centre/kpi-cards/databricks/pipeline-lag-since-last-success) on the orders table is climbing and any morning report built on it will be stale.
+2. **`feature_store_build` timed out at the 120-minute limit (critical).** Not a code error but a duration blowout. The likely cause is a data-volume spike or a skewed join. The engineer checks [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) to confirm it was genuinely stuck rather than slow, then either raises the timeout for tonight and investigates skew, or fixes the join before the next scheduled run.
+3. **`marketing_attribution` and `adhoc_export_csv` are standard / low tier.** These did not page anyone and can wait until the two criticals are resolved. The attribution job is worth a same-day fix because a stakeholder relies on it; the ad-hoc export is genuinely low priority.
+
+```text
+Triage decision in plain terms:
+  CRITICAL, fix now:   prod_orders_ingest (schema), feature_store_build (timeout)
+  STANDARD, fix today: marketing_attribution
+  LOW, fix when free:  adhoc_export_csv
+  -----------------------------------------------------------------
+  Blast radius of the criticals: all overnight reporting + the recs feature store
+```
+
+The teaching point: the raw count (5) matters far less than the tier breakdown. Five low-tier failures is a quiet morning; one critical failure with a failed retry is an incident. Always read the queue, not just the number.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Failed Jobs | What the combination tells you |
+| --- | --- | --- |
+| [Job Success Rate (24h)](/nerve-centre/kpi-cards/databricks/job-success-rate-24h) | The percentage view of the same run population. | A low count of failures can still be a poor success rate if total run volume is small. |
+| [Failed Job Burst (>5 failures in 1h)](/nerve-centre/kpi-cards/databricks/failed-job-burst-5-failures-in-1h) | The cascade alert across a tighter window. | Many of these failures clustered in one hour signals a dependency cascade, not isolated bugs. |
+| [Top 10 Failing Workflows (7d)](/nerve-centre/kpi-cards/databricks/top-10-failing-workflows-7d) | The weekly pattern behind today's queue. | A job in both lists is a chronic offender that deserves a permanent fix. |
+| [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) | The pre-failure signal for `TIMEDOUT` runs. | A job that appears here before it times out is a duration problem you can catch early. |
+| [Pipeline Lag (since last success)](/nerve-centre/kpi-cards/databricks/pipeline-lag-since-last-success) | The downstream consequence of a failed ingest. | A failed run plus rising lag quantifies how stale the data has become. |
+| [DLT Pipeline Status Distribution](/nerve-centre/kpi-cards/databricks/dlt-pipeline-status-distribution) | The streaming / DLT equivalent of job failures. | Failures here plus DLT pipelines in `FAILED` state means the breakage spans both job types. |
+| [Pipeline Lag vs Ecom Order Flow](/nerve-centre/kpi-cards/databricks/pipeline-lag-vs-ecom-order-flow) | The cross-channel impact of a stalled pipeline. | A critical failure while orders keep flowing is the highest-urgency combination. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **Workflows → Job runs** lists every run with its result state and a 24-hour filter; set the status filter to "Failed" to match the card's core count (then add timed-out runs).
+> **System tables**: `system.lakeflow.job_run_timeline` (and `system.lakeflow.jobs`) hold run-level history you can query in SQL for an exact reconcile.
+> **Each run page** shows the failing task, the stack trace, the cluster, and the retry chain for root-cause work.
+
+A reconciling query you can run in a Databricks SQL editor:
+
+```sql
+SELECT result_state, COUNT(*) AS runs
+FROM   system.lakeflow.job_run_timeline
+WHERE  period_end_time >= now() - INTERVAL 24 HOURS
+AND    result_state IN ('FAILED', 'TIMED_OUT')
+GROUP  BY result_state;
+```
+
+**Why our number may legitimately differ from the Workflows UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **`TIMEDOUT` inclusion** | Vortex IQ may read higher | The card counts timed-out runs as failures; the Workflows "Failed" filter alone may show only `FAILED`. Add the "Timed out" status in the UI to match. |
+| **Retry counting** | Vortex IQ may read higher | The count is per run, so each retry of the same job is a separate failed run. The worklist groups them, but the headline counts each attempt. |
+| **Time window edge** | Small drift | The card uses a rolling 24h from the current minute; the UI default may snap to calendar-day or last-N-hours buckets. |
+| **Time zone** | Edge-run shift | Runs near midnight can fall on either side of the window depending on workspace vs UTC alignment. |
+| **System-table lag** | Vortex IQ live, table delayed | The live Jobs API reflects a failure within seconds; `system.lakeflow.*` tables can trail by minutes, so a SQL reconcile may briefly read lower. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Pipeline Lag vs Ecom Order Flow](/nerve-centre/kpi-cards/databricks/pipeline-lag-vs-ecom-order-flow) | A critical ingest failure should coincide with rising lag while orders continue. | Lag flat despite a failure means the failed job was non-load-bearing. |
+| [Job Success Rate (24h)](/nerve-centre/kpi-cards/databricks/job-success-rate-24h) | Failed-run count and success rate should move inversely over the same population. | If they disagree, check whether cancelled runs are inflating one view. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why are timed-out runs counted as failures?**
+Because a timed-out run produced no usable output. From the perspective of the report or feature table waiting on it, a run killed at its timeout is exactly as missing as one that errored. Folding `TIMEDOUT` into the count keeps the triage queue honest; pair with [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) to catch the duration problem before it times out.
+
+**A job retried three times and the count shows three. I think of that as one broken job.**
+Both views are valid, which is why the card carries both. The headline counts runs (three attempts), while the worklist groups by job and shows a retry count so you see one entry. Counting runs makes a flapping job's cost visible; grouping in the list keeps the queue readable.
+
+**Why are cancelled runs not counted?**
+A `CANCELED` result is intentional: a human killed the run, or an upstream task short-circuited the workflow on purpose. Counting deliberate cancellations as failures would fill the queue with non-incidents and train the team to ignore the alert. Only `FAILED` and `TIMEDOUT` count.
+
+**The card pages me for a "critical" failure but the job is not actually business-critical.**
+Tier comes from the job's tag (`criticality` / `tier`). If a job is tagged critical but is not, retag it in the job settings and the alert behaviour follows. Conversely, a genuinely critical job with no tag will not page; tagging it is the fix. Get the tags right once and the paging logic does the rest.
+
+**A task inside a multi-task job was skipped. Does that count?**
+No. `SKIPPED` tasks within an otherwise-successful run are excluded; they usually reflect conditional branches that were not meant to execute. Only the run-level terminal state of `FAILED` or `TIMEDOUT` counts. If a skipped task should have run, that is a logic issue to investigate, but it is not a failure for this card.
+
+**Does this include Delta Live Tables (DLT) pipeline failures?**
+No. This card covers the Jobs / Workflows runs API. DLT pipelines have their own lifecycle and are tracked on [DLT Pipeline Status Distribution](/nerve-centre/kpi-cards/databricks/dlt-pipeline-status-distribution). If your breakage spans both, read the two cards together for the full picture.
+
+**Why did the count drop to zero mid-morning when nothing was fixed?**
+Because the window is a rolling 24 hours. Overnight failures roll off the back of the window as time passes, even before anyone resolves them. That is expected: the card answers "what failed in the last 24h", not "what is still broken". For unresolved breakage, follow the lag and DLT status cards, which reflect current state rather than a trailing window.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Failed Jobs (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

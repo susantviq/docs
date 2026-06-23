@@ -1,0 +1,154 @@
+---
+title: "Failed Logins (24h), Snowflake"
+sidebarTitle: "Failed Logins (24h)"
+description: "Failed Logins over the last 24 hours for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The count of failed authentication attempts against your Snowflake account in the last 24 hours, read from `LOGIN_HISTORY`. A healthy account sits at or near zero. A non-zero count is rarely benign: a burst of failures usually means one of three things, and a platform team needs to tell them apart fast. Either a credential went stale (a rotated service-account key still cached in a pipeline, an expired key-pair), or someone is fat-fingering a password, or the account is being probed: credential stuffing, a brute-force attempt, or a leaked username being tested. Snowflake is a data platform holding your entire analytics estate, so the security stakes are high. This card is the early-warning tripwire: the `>10` alert fires before a slow probe becomes a successful breach, and well before the quarterly access review would ever surface it.
+
+| | |
+| --- | --- |
+| **Data source** | `SNOWFLAKE.ACCOUNT_USAGE.LOGIN_HISTORY`, counting rows where `is_success = 'NO'` over the trailing 24 hours. The view also carries the username, client IP, authentication method, reported client, and an `error_code` / `error_message` for each failure. |
+| **Metric basis** | A raw count of failed authentication events, NOT a rate. Each failed attempt is one row; the headline is the sum over 24 hours. The breakdown groups by user and by error reason so a single stale credential is distinguishable from a spray across many users. |
+| **What counts as a failure** | Any authentication attempt Snowflake rejected: wrong password, expired or invalid key-pair, blocked by network policy, MFA failure, locked user, or unknown user. Each lands in `LOGIN_HISTORY` with `is_success = 'NO'` and a reason code. |
+| **What does not count** | Successful logins, session refreshes on an already-authenticated session, and queries that fail for authorisation (not authentication) reasons. A user who logs in fine but lacks a grant on a table is a query error, not a login failure; that lives on [Query Error Rate %](/nerve-centre/kpi-cards/snowflake/query-error-rate). |
+| **Aggregation window** | `24h`, a trailing 24-hour count, long enough to catch a slow overnight probe but short enough that a resolved burst clears the headline within a day. |
+| **Latency** | `LOGIN_HISTORY` in `ACCOUNT_USAGE` can lag up to around 2 hours; for near-real-time investigation use `INFORMATION_SCHEMA.LOGIN_HISTORY`, which has no latency but a 7-day retention limit. |
+| **Time window** | `24h` (trailing 24 hours) |
+| **Alert trigger** | `>10`, more than 10 failed logins in 24 hours raises the sensitivity alert. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card counts rejected authentication events over the window:
+
+```text
+failed_logins_24h =
+  SELECT COUNT(*)
+  FROM SNOWFLAKE.ACCOUNT_USAGE.LOGIN_HISTORY
+  WHERE is_success = 'NO'
+    AND event_timestamp >= now − 24h
+
+breakdown = GROUP BY user_name, error_code, client_ip
+```
+
+What a platform team needs to know about how Snowflake records these:
+
+- **The reason code is the diagnosis.** `LOGIN_HISTORY.error_code` and `error_message` tell you why the attempt failed: an incorrect password reads differently from an expired key-pair, which reads differently from a network-policy block. The error reason is what separates "stale credential" from "attack".
+- **Group by user before you panic.** Ten failures from one service account is almost always a single stale credential retrying on a loop. Ten failures spread across ten different usernames from one IP is credential stuffing. The raw count is identical; the shape is opposite. Always read the breakdown.
+- **Client IP names the source.** A failure burst from a known office or pipeline IP is operational; the same burst from an unfamiliar geography or a cloud-provider IP range is a probe. Snowflake records `client_ip` on every row.
+- **Network-policy blocks count too.** If you run an IP allowlist via a network policy, attempts from outside it land here as failures. A spike of these is usually a misconfigured client or a genuine outside probe, both worth seeing.
+- **Lockout interacts with the count.** Snowflake locks a user for 15 minutes after 5 consecutive failures by default. A determined brute force therefore shows as bursts of ~5 then a pause, a recognisable sawtooth in the breakdown.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Snowflake account for an ecommerce data stack. The card has sat at 0 to 2 for weeks. On 14 Apr 26 it reads **34** and the `>10` alert fires. The breakdown:
+
+| User | Failures (24h) | Error reason | Client IP |
+| --- | --- | --- | --- |
+| `FIVETRAN_SVC` | 28 | `JWT_TOKEN_INVALID` (key-pair) | 35.x.x.x (Fivetran range) |
+| `j.okafor` | 4 | `INCORRECT_USERNAME_PASSWORD` | office VPN |
+| `unknown` | 2 | `USER_DOES_NOT_EXIST` | 185.x.x.x (unfamiliar) |
+
+The count of 34 is one event masquerading as three. Reading the breakdown changes the whole response:
+
+1. **`FIVETRAN_SVC` is the real story (28 of 34), and it is operational, not an attack.** The error is `JWT_TOKEN_INVALID`: the key-pair the Fivetran connector authenticates with has been rotated in Snowflake but the new public key was never (or only partially) registered, or the old key was unset. The service account is retrying its sync every few minutes and failing each time. This is not a breach; it is a broken pipeline. The downstream impact is data: ingest has stalled, so warehouse tables are going stale. Cross-check [Snowflake Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/snowflake/snowflake-event-ingest-vs-ecom-orders), which will show ingest flatlined while orders keep flowing.
+2. **`j.okafor` (4 failures) is a human.** Four `INCORRECT_USERNAME_PASSWORD` from the office VPN is someone mistyping their password after a holiday. Below the lockout threshold, self-resolving, no action beyond a note.
+3. **`unknown` (2 failures) is a probe to watch, not yet to act on.** Two `USER_DOES_NOT_EXIST` from an unfamiliar IP is someone guessing usernames. Two is noise; if it climbs or starts hitting real usernames, it becomes credential stuffing and the response escalates to tightening the network policy.
+
+```text
+Triage by shape, not by count:
+  28 from one service account, one error code  → stale credential, fix the key-pair
+  4  from one human, password error            → benign, self-resolves
+  2  from "unknown" at an odd IP                → probe, monitor; escalate if it grows
+The headline "34" alone would have looked like an attack. The breakdown shows it is mostly a broken sync.
+```
+
+The fix for the dominant cause: register the rotated public key on `FIVETRAN_SVC` with `ALTER USER FIVETRAN_SVC SET RSA_PUBLIC_KEY = '...'`, confirm the connector picks it up, and the 28 failures stop. For the probe, confirm the account has a network policy and MFA enforced; if the `unknown` attempts grow, add the source range to a deny rule.
+
+Three things worth remembering:
+
+1. **The count is meaningless without the breakdown.** "34 failed logins" could be a single stale service account or a coordinated attack. The error code and the per-user grouping are what tell you which, and they demand completely different responses.
+2. **Most failure bursts are operational, not malicious.** Rotated keys, expired passwords, and misconfigured clients dwarf real attacks in frequency. Check for a stale credential first; treat as an attack only once the breakdown shows a spray across users or unfamiliar IPs.
+3. **A service-account failure burst is also a data-freshness incident.** When a pipeline cannot authenticate, ingest stops. The security alert and a stale-data problem are the same event; pair with the ingest cross-channel card.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Failed Logins (24h) | What the combination tells you |
+| --- | --- | --- |
+| [Query Error Rate %](/nerve-centre/kpi-cards/snowflake/query-error-rate) | The authorisation-vs-authentication distinction. | Logins fine but queries failing = a grant problem; logins failing = an auth problem. |
+| [Snowflake Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/snowflake/snowflake-event-ingest-vs-ecom-orders) | A service-account failure stalls ingest. | A login burst on a pipeline user usually coincides with ingest flatlining here. |
+| [Active Sessions](/nerve-centre/kpi-cards/snowflake/active-sessions) | The successful-login counterpart. | Failures up while sessions drop = a credential broke; both up = a busy but healthy account. |
+| [Snowflake Health Score](/nerve-centre/kpi-cards/snowflake/snowflake-health-score) | The account-level composite. | A login burst that breaks a pipeline can show as an error-pillar wobble on the score. |
+| [Query Error Rate Spike (>1% in 1h)](/nerve-centre/kpi-cards/snowflake/query-error-rate-spike-1-in-1h) | The acute error alert. | A broken service account can drive both a login burst and a query-error spike. |
+| [Queries per Hour (live)](/nerve-centre/kpi-cards/snowflake/queries-per-hour-live) | The activity baseline. | A login burst alongside a QPH drop confirms a service account stopped working. |
+| [Credit Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/snowflake/credit-burn-vs-ecom-order-volume) | The downstream cost-and-freshness view. | A stalled ingest from failed logins eventually shows as diverging data volume. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake's own tooling:**
+
+> **Failure count, last 24h:** `SELECT COUNT(*) FROM SNOWFLAKE.ACCOUNT_USAGE.LOGIN_HISTORY WHERE is_success = 'NO' AND event_timestamp >= DATEADD('hour', -24, CURRENT_TIMESTAMP());`
+> **Breakdown by user and reason:** `SELECT user_name, error_message, client_ip, COUNT(*) FROM SNOWFLAKE.ACCOUNT_USAGE.LOGIN_HISTORY WHERE is_success = 'NO' AND event_timestamp >= DATEADD('hour', -24, CURRENT_TIMESTAMP()) GROUP BY 1,2,3 ORDER BY 4 DESC;`
+> **Low-latency check (last 7 days, no lag):** `SELECT * FROM TABLE(INFORMATION_SCHEMA.LOGIN_HISTORY(DATEADD('hour', -24, CURRENT_TIMESTAMP()), CURRENT_TIMESTAMP())) WHERE is_success = 'NO';`
+> **Managed console:** Snowsight under **Admin -> Users & Roles** for user status (locked / disabled), and **Monitoring -> Query History** does not cover logins, so the login view above is the authoritative source. There is no separate console widget for failed logins; the `LOGIN_HISTORY` view is the native equivalent of this card.
+
+**Why our number may legitimately differ from a native query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **`ACCOUNT_USAGE` latency** | Recent value settles up | `LOGIN_HISTORY` in `ACCOUNT_USAGE` can lag up to ~2 hours; a hand-run query against `INFORMATION_SCHEMA` (no lag) may show more recent failures than ours. |
+| **Rolling vs calendar day** | Variable | We count a trailing 24 hours; a native query bucketed by calendar UTC day will split a burst that straddles midnight. Match the window. |
+| **Account scope** | Our count covers the connected account | `LOGIN_HISTORY` is per-account; if you operate multiple Snowflake accounts, each connector reads only its own. |
+| **Failure definition** | Marginal | We count every `is_success = 'NO'` row including network-policy and MFA rejections; a narrower native filter (password failures only) will read lower. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`snow_event_ingest_vs_ecom_orders`](/nerve-centre/kpi-cards/snowflake/snowflake-event-ingest-vs-ecom-orders) | A service-account login burst should coincide with ingest stalling. | Login burst but ingest healthy = the failing user is not on the ingest path (likely a human or a probe). |
+| [`snow_qps`](/nerve-centre/kpi-cards/snowflake/queries-per-hour-live) | A broken automated user dropping out reduces query volume. | Login failures with steady QPH = the failures are from a user that was not contributing queries anyway. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The count spiked but it is all one service account. Is this an attack?**
+Almost certainly not. A burst concentrated on a single service account with one repeating error code (typically `JWT_TOKEN_INVALID` for key-pair auth or `INCORRECT_USERNAME_PASSWORD`) is a stale credential retrying on a loop, not an intrusion. Attacks spray across many usernames or come from unfamiliar IPs. Read the breakdown: one user plus one error code plus a known IP equals a broken pipeline; fix the credential and the count falls to zero. It is also a data-freshness incident, because that pipeline has stopped ingesting.
+
+**How do I tell a stale credential from a brute-force attack?**
+Three signals in the breakdown. (1) Number of distinct usernames: one user equals operational, many users equals attack. (2) Error code: `JWT_TOKEN_INVALID` or a consistent password error equals stale credential; `USER_DOES_NOT_EXIST` across guessed names equals probing. (3) Client IP: a known office or pipeline range equals operational; an unfamiliar geography or a sawtooth of 5-then-pause (hitting Snowflake's 15-minute lockout) equals brute force. The raw count is the same in both cases; the shape is opposite.
+
+**Why is the threshold only 10? Our account has noisy users.**
+Ten is a deliberately sensitive default because a successful breach of a data platform is high-impact, and because most legitimate accounts genuinely sit near zero. If your account has a known-noisy pattern (a flaky client, a service account that occasionally retries), raise the threshold for this profile in the Sensitivity tab rather than ignoring the alert, so a real spike above your true baseline still fires.
+
+**A user is locked out. Does that show here?**
+The failures that caused the lockout show here (Snowflake locks a user for 15 minutes after 5 consecutive failures by default), and you will see the characteristic burst of around 5 then a pause. The lockout state itself is visible under **Admin -> Users & Roles** in Snowsight. If a human keeps getting locked out, it is usually a stale saved password in a client; if a service account does, it is a rotated key.
+
+**Do network-policy and MFA rejections count as failed logins?**
+Yes. Any attempt Snowflake rejected at authentication lands in `LOGIN_HISTORY` with `is_success = 'NO'`, including attempts blocked by an IP allowlist network policy and MFA failures. A spike of network-policy blocks usually means either a client connecting from a new, un-allowlisted IP or a genuine outside probe; both are worth seeing, which is why they are included.
+
+**The most recent failures are not showing yet. Why?**
+Because `ACCOUNT_USAGE.LOGIN_HISTORY` can lag up to around 2 hours. For an active investigation where you need the last few minutes, query the table function `INFORMATION_SCHEMA.LOGIN_HISTORY`, which has no latency (its retention is 7 days). The card uses `ACCOUNT_USAGE` for the stable 24-hour count; use `INFORMATION_SCHEMA` when you are responding to a live event.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Failed Logins (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

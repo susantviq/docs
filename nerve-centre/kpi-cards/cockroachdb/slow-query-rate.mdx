@@ -1,0 +1,132 @@
+---
+title: "Slow-Query Rate %, CockroachDB"
+sidebarTitle: "Slow-Query Rate %"
+description: "Slow-Query Rate % for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Slow-Query Rate %** is the share of SQL statements over the last 15 minutes whose service latency crossed the slow threshold (200ms by default, the same line the p95 card uses). It answers a question a raw latency percentile cannot: "what fraction of my workload is actually slow right now?" A p99 can look ugly while only a sliver of traffic is affected, and a healthy-looking average can hide a steady drip of slow statements. This card collapses that into one number a DBA or on-call SRE can read at a glance. At or under 1% is a comfortable cluster; 1 to 5% is worth watching; above 5% fires an alert because a meaningful slice of your workload is now slow enough for users to feel.
+
+| | |
+| --- | --- |
+| **What it tracks** | Slow-Query Rate % for the selected period: slow statements divided by total statements, expressed as a percentage. |
+| **Data source** | Computed by Vortex IQ from CockroachDB statement statistics: the per-statement latency distribution in `crdb_internal.node_statement_statistics` (and the cluster-wide `crdb_internal.cluster_statement_statistics`), counting statements whose service latency exceeds the slow threshold against the total statement count. The same `sql.service.latency` time-series that backs the latency-percentile cards underpins this rate. On CockroachDB Cloud the equivalent statement-stats and metrics are read via the Cloud metrics API and the SQL Activity page. |
+| **Time window** | `15m` (a rolling 15-minute window, refreshed in near real time). |
+| **Alert trigger** | `> 5%`. When more than one statement in twenty is slow over the 15-minute window, the card turns red. |
+| **Roles** | DBA, platform, SRE, engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The rate is a simple ratio computed over the rolling 15-minute window:
+
+```text
+Slow-Query Rate % = (statements with service latency > slow threshold)
+                    / (total statements executed)
+                    × 100
+```
+
+A few points worth understanding:
+
+- **What "slow" means.** The slow threshold defaults to 200ms of service latency, the time CockroachDB spends planning and executing the statement (it excludes network round-trip to the client). This is the same threshold the [Statement Latency p95 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms) card alerts on, so the two read consistently. The threshold is configurable per profile.
+- **Service latency, not full round-trip.** Because the measure is server-side service latency, a slow client or a saturated network link will not inflate this number. That keeps it a clean signal of database-side slowness.
+- **Count-weighted, not time-weighted.** Every statement counts once regardless of how slow it was. A statement at 205ms and a statement at 9 seconds each add one to the numerator. This is deliberate: the card answers "how much of my workload is slow", and the [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) and latency-percentile cards answer "how slow, and why".
+- **Internal statements excluded.** Background and internal SQL (schema jobs, statistics collection, internal range housekeeping) is filtered out so the rate reflects application traffic, not the cluster talking to itself.
+
+Because it is a ratio, the rate is sensitive to traffic mix. A quiet period with a handful of slow analytical queries can show a high percentage on a small denominator; always read it alongside [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live) to know whether a spike is meaningful or just thin traffic.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 5-node CockroachDB cluster (v23.2) backing the cart, catalogue, and order services for an ecommerce stack. Snapshot taken on 14 Apr 26 at 12:05 BST during the lunchtime peak.
+
+| Window | Total statements (15m) | Slow statements (> 200ms) | Slow-Query Rate % | Reading |
+| --- | --- | --- | --- | --- |
+| 11:30 to 11:45 | 1,420,000 | 8,520 | 0.6% | Healthy baseline. |
+| 11:45 to 12:00 | 1,510,000 | 22,650 | 1.5% | Drifting, worth a glance. |
+| 11:50 to 12:05 | 1,380,000 | 91,080 | 6.6% | Above the 5% trigger, card red. |
+
+At 12:05 the card fires. The team's first move is to check whether the spike is real load or a thin denominator: [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live) shows a healthy ~1,500 statements/second, so this is not a quiet-period artefact, a genuine 6.6% of a busy workload is slow.
+
+Next, the breakdown. The team opens [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) and finds a single `UPDATE inventory SET qty = qty - $1 WHERE sku = $2` pattern accounting for the bulk of the slow events: a flash sale on one hot SKU is serialising writes to the same range, and the contention is dragging the slow rate up. [Statement Latency p99 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p99-ms) confirms the tail has blown out to 1,400ms.
+
+```text
+Diagnosis at 12:05 BST
+  Slow-Query Rate:        6.6%  (alert: > 5%)
+  Statements/sec:         ~1,500  (real load, not thin traffic)
+  Dominant slow pattern:  UPDATE inventory ... WHERE sku = <hot SKU>
+  p99 latency:            1,400ms (vs 200ms threshold)
+  Root cause:             write contention on a single hot range
+```
+
+The fix is not "add nodes": the cluster is not short of capacity, it is short of write parallelism on one range. The team's options are to split the hot range, move the hot SKU's counter to a different schema pattern, or shed the contention by batching the decrements. Within ten minutes of splitting the range the slow rate falls back to 1.1%.
+
+Two takeaways:
+
+1. **The rate tells you how much, not why.** A high Slow-Query Rate is the prompt; the [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) and latency-percentile cards tell you which statements and how slow. Never act on the headline alone.
+2. **Always check the denominator.** On a quiet cluster a tiny number of slow analytical queries can push the percentage high without any user impact. Pair it with statements-per-second so you know whether 6% means "60 slow queries" or "60,000".
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow-Query Rate | What the combination tells you |
+| --- | --- | --- |
+| [Statement Latency p95 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms) | Shares the 200ms slow threshold. | A high slow rate with a p95 above 200ms confirms the slowness is broad, not a tail artefact. |
+| [Statement Latency p99 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p99-ms) | The tail view of the same latency distribution. | High slow rate plus extreme p99 means a subset of statements is very slow, often contention. |
+| [Statement Latency p50 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p50-ms) | The median, your typical statement. | If p50 is also rising, the whole workload is slowing, not just the tail. |
+| [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) | The "why" behind a slow-rate spike. | Contention on one range frequently drives the slow rate up without any capacity shortfall. |
+| [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live) | The denominator sanity check. | A high rate on low throughput is usually a thin-traffic artefact, not an incident. |
+| [Statement Error Rate %](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate) | The error companion to slowness. | Slow plus erroring usually means contention or retries; slow but clean means pure latency. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation) | The capacity angle. | A saturated pool can make statements queue and read as slow even when the cluster is healthy. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The composite that takes latency as an input. | A slow-rate spike is one of the signals that can pull the overall health score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+CockroachDB does not print a single "slow-query rate" figure, so reconcile it from the statement statistics that feed it:
+
+- **DB Console SQL Activity.** The Statements page lets you sort by latency and filter by a latency floor; counting statements above 200ms against the total over a 15-minute window reproduces the rate. The Statements page also exposes the per-statement execution counts and latency percentiles used in the calculation.
+- **`crdb_internal` tables.** `SELECT * FROM crdb_internal.node_statement_statistics` (and the cluster-wide `crdb_internal.cluster_statement_statistics`) expose per-statement counts and latency, so you can compute the ratio directly in SQL.
+- **Slow-query logging.** If you have enabled the SQL slow-query log (the `sql.log.slow_query.latency_threshold` cluster setting), the log captures every statement over the configured threshold; the count of log lines over a window divided by total statements is another way to sanity-check the rate.
+- **Time-series.** The `sql.service.latency` histogram in the DB Console Metrics dashboard underpins the percentile cards and the slow threshold.
+
+On CockroachDB Cloud the same data lives on the SQL Activity page and the Metrics tab. If the Vortex IQ rate looks higher than the console "feels", check the denominator first (a quiet window inflates the ratio) and confirm both views are using the same 200ms threshold and the same 15-minute window.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is the rate high when the cluster feels fine?**
+The most common cause is a thin denominator. During a quiet window a handful of slow analytical or reporting queries can push the percentage up even though almost nothing is affected. Always read the rate alongside [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live): 6% of 50 statements is not an incident, 6% of 1.5 million is.
+
+**Does a single very slow query count more than a barely-slow one?**
+No. The rate is count-weighted, so a statement at 205ms and one at 9 seconds each add one to the numerator. The card measures how much of the workload is slow, not how slow it gets. To see how slow, use the [p99](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p99-ms) and [p95](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms) latency cards.
+
+**What is the slow threshold, and can I change it?**
+It defaults to 200ms of service latency, the same line the p95 card alerts on, so the cards read consistently. Both the threshold and the 5% alert trigger are configurable per profile in the Sensitivity tab. Teams with strict latency SLAs often lower the threshold; analytics-heavy clusters often raise it to avoid flagging expected long-running queries.
+
+**Are long-running analytical queries unfairly inflating this?**
+They can be, if you run reporting workloads on the same cluster. Two options: exclude known analytical statement fingerprints in the profile so they do not count toward the rate, or raise the slow threshold. The card filters internal CockroachDB statements automatically, but it cannot know which of your application queries are "expected to be slow" without configuration.
+
+**The rate spiked but latency percentiles look fine. How?**
+Usually a brief contention burst. The percentile cards smooth over the window, while a sharp spike of slow statements concentrated in a few seconds can move the count-based rate before it visibly moves p95. Check [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) and [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) for a contention hotspot.
+
+**Does this measure server-side latency or what the client experienced?**
+Server-side service latency only: the time CockroachDB spends planning and executing the statement. A slow client, a saturated network, or a backed-up connection pool will not inflate this number. If your application sees slowness that this card does not, look at [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation) and the client-side timing.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow-Query Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

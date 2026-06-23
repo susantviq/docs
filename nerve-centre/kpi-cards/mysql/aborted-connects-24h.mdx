@@ -1,0 +1,147 @@
+---
+title: "Aborted Connects (24h), MySQL"
+sidebarTitle: "Aborted Connects (24h)"
+description: "Aborted Connects (24h) for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of connection attempts that failed to authenticate or complete a handshake in the last 24 hours, read from the `Aborted_connects` global status counter. A handful per day is background noise (a port scanner, a stale credential in a forgotten script). A spike is a signal: wrong credentials being retried in a loop, network packets being dropped mid-handshake, or a client tripping `max_connect_errors` and getting host-blocked. For a DBA this is an early-warning card, the failures it counts often precede a flood of application errors that have not surfaced yet.
+
+| | |
+| --- | --- |
+| **Status source** | `Aborted_connects` from `SHOW GLOBAL STATUS`. This is a monotonic counter since server start; the card derives the 24h delta by differencing successive samples. |
+| **Metric basis** | Connection attempts that failed *before* a client was authenticated and assigned a thread. This is distinct from `Aborted_clients`, which counts already-connected sessions that dropped without a clean `COM_QUIT`. |
+| **Aggregation window** | Rolling 24 hours, computed from counter deltas. The live headline is the trailing-24h sum; the sparkline shows the per-interval rate. |
+| **Alert threshold** | `> 100` aborted connects in the trailing 24h window. Above this, the engine raises the card to amber and surfaces it in the sensitivity feed. |
+| **What counts** | Failed handshakes: bad username or password, denied host, TLS negotiation failure, packet timeout before auth, and hosts blocked after exceeding `max_connect_errors`. |
+| **What does NOT count** | (1) Successful connections that later disconnect uncleanly (those are `Aborted_clients`); (2) Connections refused because `max_connections` is full (those increment `Connection_errors_max_connections`); (3) Queries that error after a session is established. |
+| **Common causes** | Rotated credentials still cached in a deploy artefact; a misconfigured load-balancer health check probing the SQL port; a flapping network path dropping handshake packets; an attacker brute-forcing the account. |
+| **Time zone** | Counter deltas are time-zone independent; chart axes render in the merchant display time zone set in the Vortex IQ profile. |
+| **Time window** | `24h` (rolling, derived from counter deltas). |
+| **Alert trigger** | `> 100` aborted connects in the trailing 24 hours. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine samples `Aborted_connects` on each refresh via `SHOW GLOBAL STATUS LIKE 'Aborted_connects'`. Because the underlying value is a counter that only ever increases until the server restarts, the card never displays the raw counter. Instead it stores the value with a timestamp and reports:
+
+```text
+aborted_connects_24h = value(now) - value(now - 24h)
+```
+
+If an `Uptime` reset is detected between samples (the server restarted, so the counter went backwards), the engine treats the post-restart value as the new baseline rather than reporting a negative delta. The per-interval rate shown on the sparkline is each sample's delta divided by the sampling interval, which is what lets you see *when* in the 24h window the failures clustered, a single 02:00 spike behaves very differently from a steady all-day trickle.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a primary MySQL 8.0 instance behind an application tier of 12 pods plus a handful of batch workers. Snapshot taken on 14 Apr 26 at 09:15.
+
+| Sample time | `Aborted_connects` (raw) | 15-min delta |
+| --- | --- | --- |
+| 08:00 | 41,902 | 2 |
+| 08:15 | 41,905 | 3 |
+| 08:30 | 41,908 | 3 |
+| 08:45 | 42,090 | 182 |
+| 09:00 | 42,377 | 287 |
+| 09:15 | 42,651 | 274 |
+
+The trailing-24h figure reads **812 aborted connects**, well past the `> 100` threshold, and the card is amber. The shape tells the story: a flat baseline of 2 to 3 every 15 minutes (normal background noise), then a step change at 08:45 to ~280 per interval that has not let up.
+
+The DBA's read:
+
+1. **This started at 08:45, not gradually.** A step change at a precise time almost always maps to a deploy or a config push. Checking the change log, the 08:43 release rotated the application database password but one batch-worker manifest still carried the old secret.
+2. **The worker is retrying in a tight loop.** Each failed connect is a bad-password handshake; the worker's connection library retries every 200ms with no backoff, generating ~280 failures per 15-minute window.
+3. **The danger is `max_connect_errors`.** With this volume from a single host, MySQL will block that host once it crosses `max_connect_errors` (default 100), at which point even a *fixed* credential cannot connect until someone runs `FLUSH HOSTS` (or `TRUNCATE performance_schema.host_cache` on 8.0).
+
+```text
+Impact framing:
+  - Baseline aborted/day:        ~250 (noise floor, ignore)
+  - Today's run-rate from 08:45: ~280 per 15 min = ~1,120/hour
+  - Host-block risk:             max_connect_errors=100 -> host blocked within minutes
+  - Fix:                         redeploy worker with rotated secret, then FLUSH HOSTS
+```
+
+Three takeaways:
+
+1. **Read the shape, not just the count.** "812 in 24h" sounds alarming, but a steady trickle and a sharp step have completely different root causes. The step here points straight at the 08:43 deploy.
+2. **Aborted connects are leading, not lagging.** The application error dashboard had not lit up yet because the *worker* was failing, not user-facing traffic. This card caught it before customers did.
+3. **Know the host-block trap.** A credential spike does not just generate noise; once `max_connect_errors` trips, the offending host is locked out until a `FLUSH HOSTS`, turning a 5-minute fix into a 30-minute incident if nobody knows the command.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Aborted Connects | What the combination tells you |
+| --- | --- | --- |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mysql/connection-errors-24h) | The broader `Connection_errors_*` family. | Aborted connects high but connection errors flat equals auth/handshake problem, not capacity. Both high equals the server is also refusing connections. |
+| [Connections In Use](/nerve-centre/kpi-cards/mysql/connections-in-use) | The live count of established threads. | Aborted spiking while in-use is flat confirms the failures never became sessions (pure handshake failure). |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mysql/connection-pool-saturation) | How close `Threads_connected` is to `max_connections`. | If aborts are capacity-driven, saturation will be near 100% too; if it is calm, the cause is credentials or network. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/mysql/connection-pool-at-90-saturation) | The hero alert for exhaustion. | Distinguishes "can't get in because pool is full" from "can't get in because auth failed". |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mysql/query-error-rate) | Post-connection failures. | Aborts plus a quiet error rate means clients never reached the query stage. |
+| [Instance Uptime](/nerve-centre/kpi-cards/mysql/instance-uptime) | Detects counter resets. | A recent restart resets `Aborted_connects` to zero, which can mask or reset this card's baseline. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite that weights connection health. | A sustained abort spike pulls the composite down even when latency looks fine. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL itself:**
+
+> `SHOW GLOBAL STATUS LIKE 'Aborted_connects';` for the raw counter (since server start, not 24h).
+> `SHOW GLOBAL STATUS LIKE 'Aborted_clients';` to separate clean-disconnect drops from handshake failures.
+> `SELECT * FROM performance_schema.host_cache\G` to see which hosts are accumulating errors and whether any are blocked.
+> `SHOW GLOBAL VARIABLES LIKE 'max_connect_errors';` to confirm how close a noisy host is to being locked out.
+
+To see *why* a connect failed, enable the error log with `log_error_verbosity = 3`; aborted handshakes are logged with the offending host and reason (access denied, lost connection, etc.).
+
+**Why our number may legitimately differ from a raw `SHOW STATUS`:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Counter vs delta** | Raw is far higher | `SHOW GLOBAL STATUS` returns the lifetime counter since start; the card reports only the trailing-24h delta. |
+| **Restart reset** | Card lower after restart | A `mysqld` restart zeroes the counter; the card rebaselines, so a value just after restart understates a longer trend. |
+| **Sampling interval** | Marginal | The card differences discrete samples; a burst between two samples is counted in full but attributed to the interval boundary. |
+| **Managed-service proxy** | Card may be lower | RDS Proxy, ProxySQL, or Cloud SQL connectors can absorb some handshake failures before they reach the server counter. |
+
+**Managed-service note:** On Amazon RDS and Aurora the same counter is exposed as the `AbortedConnects` CloudWatch metric (and via `SHOW GLOBAL STATUS` on the instance). On Google Cloud SQL use the `mysql.aborted_connects` metric in Cloud Monitoring. These should track the card closely once you align the window to a rolling 24h.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What is the difference between Aborted_connects and Aborted_clients?**
+`Aborted_connects` counts attempts that never finished the handshake: bad password, denied host, TLS failure, timeout before auth. `Aborted_clients` counts sessions that *did* connect successfully but then dropped without sending `COM_QUIT`, usually an application that crashed, a `wait_timeout` expiry, or a `max_allowed_packet` violation mid-query. This card tracks the former. If your spike is actually `Aborted_clients`, look at idle-timeout settings and application connection handling instead.
+
+**My count is in the thousands but nothing seems broken. Should I worry?**
+Look at the shape and the host. A steady, low-rate trickle from many hosts is usually port scanning or a single forgotten script with a stale credential, annoying but benign. A high rate from one host is the dangerous case because it risks tripping `max_connect_errors` and host-blocking. Check `performance_schema.host_cache` to find the source.
+
+**A host got blocked. How do I unblock it and stop it recurring?**
+Run `FLUSH HOSTS` (or `TRUNCATE performance_schema.host_cache` on MySQL 8.0) to clear the block, then fix the root cause, almost always a stale credential or a health check hitting the SQL port with no valid login. Raising `max_connect_errors` only masks the problem; fix the offending client.
+
+**Could a load-balancer health check be inflating this?**
+Yes, and it is one of the most common false alarms. A TCP-only health check that opens and immediately closes the SQL port without authenticating can register as an aborted connect. Use a proper MySQL-aware health check (a real login plus a trivial query) or point the probe at a dedicated status endpoint.
+
+**Does TLS negotiation failure count here?**
+Yes. If `require_secure_transport` is on and a client connects without TLS, or presents an invalid certificate, the handshake fails before authentication and increments `Aborted_connects`. After enabling enforced TLS, watch this card for clients that have not been updated to connect securely.
+
+**The card reset to a low number after a failover. Is that a problem?**
+No, that is expected. A failover or restart starts `mysqld` fresh, zeroing the counter, so the trailing-24h delta rebaselines. Cross-reference [Instance Uptime](/nerve-centre/kpi-cards/mysql/instance-uptime); if uptime is small, a low abort count simply reflects the short window since restart.
+
+**Can I change the `> 100` threshold?**
+Yes. The threshold is configurable per profile in the Sensitivity tab. A busy multi-tenant instance with thousands of legitimate clients may have a higher noise floor; set the threshold above your normal baseline so the card only fires on genuine spikes.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Aborted Connects (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

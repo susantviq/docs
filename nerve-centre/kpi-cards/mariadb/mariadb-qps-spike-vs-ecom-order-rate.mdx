@@ -1,0 +1,139 @@
+---
+title: "MariaDB QPS Spike vs Ecom Order Rate, MariaDB"
+sidebarTitle: "MariaDB QPS Spike vs Ecom Order Rate"
+description: "MariaDB QPS Spike vs Ecom Order Rate for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A dual-axis view that plots MariaDB queries-per-second against the storefront's order rate on the same timeline. When the two lines move together, your database load is paying for itself: more queries, more orders. When QPS spikes but orders stay flat, the database is working hard for nothing, and the usual culprit is a bot, a scraper, or a runaway integration hammering the catalogue. This card turns a raw database-load signal into a revenue-relevance question: is this traffic worth serving?
+
+| | |
+| --- | --- |
+| **What it tracks** | MariaDB queries per second on one axis, the connected storefront's order rate on the other, over a rolling 15-minute window, so load and value can be read against each other. |
+| **Data source** | The `Questions` (or `Queries`) global status counter on MariaDB, sampled over time for QPS, plotted against order events from the Shopify, BigCommerce or Adobe Commerce connector. |
+| **Time window** | `15m` rolling, refreshed on the live poll. |
+| **Alert trigger** | `qps spike with no order spike (= bot / scraper)`, a QPS surge that is not matched by an order-rate surge. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+QPS is derived from the `Questions` status counter (or `Queries`, depending on whether you want to include stored-procedure internals): Vortex IQ samples the counter, takes the delta between samples, and divides by the elapsed seconds to produce queries per second. The order rate is the count of order events from the linked storefront over the same window, expressed per minute or per second to share the axis. The card plots both on a dual axis so the *correlation* between them is the readable signal, not either line alone. Per the card's alert rule, the trigger condition is a `qps spike with no order spike`: the engine looks for a window where QPS rises sharply above its recent baseline while the order rate stays flat. That divergence is the bot/scraper fingerprint, traffic that costs you database load and infrastructure spend while generating zero revenue. A spike in both lines together is healthy demand and does not alert.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A Shopify store on a self-managed MariaDB backend (custom catalogue service) normally runs ~1,200 QPS at ~3 orders/min during the day. Snapshot taken 14 Apr 26, 13:20 to 13:35 BST, 15-minute window.
+
+| Time | QPS | Orders/min | Reading |
+| --- | --- | --- | --- |
+| 13:20 | 1,180 | 3 | Baseline, healthy ratio |
+| 13:25 | 1,240 | 3 | Baseline |
+| 13:30 | **6,900** | 3 | **QPS spike, order rate flat** |
+| 13:35 | **7,150** | 2 | **Spike sustained, orders if anything down** |
+
+QPS has jumped 5.8x while orders are flat (and dipping). The headline shows the alert fired: **QPS spike with no order spike**. This is not a flash sale; a sale would lift both lines. It is the signature of a catalogue scraper crawling every product and variant page as fast as it can, each page firing a burst of database reads.
+
+The on-call response runs in two tracks:
+
+1. **Protect the database now.** A 6x query load can saturate the connection pool and slow legitimate shoppers. Check [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation) and [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms); if real customers are now seeing slow pages, the scraper is causing collateral damage and needs blocking at the WAF or CDN immediately.
+2. **Confirm it is a scraper, not a bug.** Pull [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mariadb/top-10-slowest-queries-digest) and `SHOW PROCESSLIST`. A scraper shows as a flood of identical catalogue-read digests from a narrow set of source IPs. A runaway integration or an N+1 regression after a deploy shows a different fingerprint (often a single digest exploding in call count). The fix differs: block the IPs for a scraper, roll back or patch for a code regression.
+
+```text
+Cost framing for the spike:
+  Baseline cost: 1,200 QPS serving ~3 orders/min => load is "paid for"
+  During spike: ~7,000 QPS serving ~2-3 orders/min
+  ~5,800 QPS of pure overhead generating zero revenue
+  Risk: pool saturation slows the ~3 orders/min of REAL shoppers
+         => the scraper does not just waste capacity, it threatens conversion
+```
+
+If the scraper tips the pool over, the genuine 3 orders/min (at, say, £64 AOV that is ~£192/min, ~£11,500/hour of real revenue) is what is actually at stake, not the worthless scraper traffic.
+
+Three takeaways:
+
+1. **QPS alone is not a health metric.** High QPS is good if it tracks orders and bad if it does not. This card exists precisely because a raw QPS number cannot tell you which it is; the order-rate overlay can.
+2. **The dangerous case is divergence, not magnitude.** A genuine 5x QPS spike during a flash sale is fine because orders rise with it. The alert fires only when the lines decouple, because that is the only pattern that means "load without value".
+3. **A scraper is also a database-stability risk, not just a cost.** The collateral is the threat: a scraper that saturates the connection pool degrades the experience for paying shoppers. Treat a no-order QPS spike as a potential availability event, not merely a billing annoyance.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with QPS Spike vs Order Rate | What the combination tells you |
+| --- | --- | --- |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mariadb/queries-per-second-live) | The raw QPS line this card gives revenue context to. | The live card shows magnitude; this card shows whether that magnitude is worth serving. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation) | A QPS flood drives connection pressure. | If a no-order spike pushes saturation past 90%, the scraper is now a stability risk. |
+| [Pool Saturation Across Galera Nodes vs Traffic](/nerve-centre/kpi-cards/mariadb/pool-saturation-across-galera-nodes-vs-traffic) | The per-node view of where the QPS flood lands. | A scraper hitting one node via a sticky proxy can saturate it while siblings stay calm. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms) | Measures the collateral damage to real shoppers. | Latency rising during a no-order spike confirms the scraper is degrading genuine traffic. |
+| [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mariadb/top-10-slowest-queries-digest) | Identifies the digest the spike is firing. | A flood of one catalogue-read digest is the scraper's fingerprint. |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/mariadb/slow-queries-during-checkout-window-5m) | Checks whether the spike is hurting checkout specifically. | If checkout queries slow during the spike, the scraper is directly threatening conversion. |
+| [MariaDB Inventory Rows vs Ecom Inventory Count](/nerve-centre/kpi-cards/mariadb/mariadb-inventory-rows-vs-ecom-inventory-count) | The other cross-channel revenue-at-risk card. | A runaway sync job can also spike QPS with no orders; the inventory card helps tell sync from scraper. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The executive roll-up. | A no-order spike may not move the health score until the pool saturates; read both. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> Compute QPS yourself from the counter: sample `SHOW GLOBAL STATUS LIKE 'Questions';` (or `'Queries'`) twice a few seconds apart and divide the delta by elapsed seconds. `SHOW GLOBAL STATUS LIKE 'Uptime';` gives the lifetime average (`Questions / Uptime`).
+> `SHOW PROCESSLIST;` or `SELECT * FROM information_schema.PROCESSLIST` reveals who is running the flood and from which host.
+> `performance_schema.events_statements_summary_by_digest` shows which query shapes are exploding in `COUNT_STAR`.
+> On managed platforms: AWS RDS / Aurora "Queries" CloudWatch metric or Performance Insights, SkySQL monitoring QPS panel.
+
+The order-rate axis is verified against the storefront's own analytics: Shopify Analytics orders-over-time, BigCommerce Analytics, or Adobe Commerce Reports → Orders.
+
+**Why our number may legitimately differ from a manual reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Questions vs Queries** | Our QPS can be higher or lower | `Questions` excludes statements run inside stored procedures; `Queries` includes them. The connector documents which it samples; a manual reading of the other counter will differ. |
+| **Sample interval** | Smoothing | Vortex IQ samples on the live poll; a tighter manual sample can catch a sharper instantaneous peak. |
+| **Order attribution lag** | Orders appear later | Storefront order events can arrive with a short delay, so a real order spike may look momentarily flat before the orders land. |
+| **Replica vs primary QPS** | Per-node variance | QPS is per instance; reads served by replicas are counted on those nodes, not the primary. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) / [`adobe_commerce.total_revenue`](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | A genuine QPS spike that tracks orders should coincide with rising revenue. | A QPS spike with flat revenue confirms the no-order (scraper) pattern. |
+| [`google_analytics.ga_property_health`](/nerve-centre/kpi-cards/google-analytics/ga4-property-health) | Real shopper sessions in GA4 should rise with a genuine demand spike. | A QPS spike with no GA4 session rise points at server-to-server traffic (a scraper or integration), not browsers. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**QPS spiked but it was a real flash sale. Why did the card not alert?**
+Because orders rose with it, that is the design. The alert fires only on divergence: QPS up, orders flat. A flash sale lifts both lines, so the ratio stays healthy and no alert fires. If a genuine sale ever triggers the alert, it usually means orders are *not* landing despite the traffic (a checkout failure), which is itself worth investigating.
+
+**The card alerted but it was a legitimate batch job, not a scraper. How do I stop the noise?**
+Known internal jobs (nightly reindex, analytics export, ETL) produce exactly the no-order spike fingerprint. Exclude them by source IP or user in the Sensitivity tab, or schedule them in a window the card knows to discount. Do not widen the threshold globally, as that would also hide real scrapers.
+
+**Is high QPS bad?**
+Not by itself. High QPS that tracks orders means the store is busy and the database is earning its keep. The card is agnostic about magnitude; it cares only whether the load corresponds to revenue. Use [Queries per Second (live)](/nerve-centre/kpi-cards/mariadb/queries-per-second-live) for the raw number and this card for the "is it worth it?" judgement.
+
+**Should I sample `Questions` or `Queries` for QPS?**
+`Questions` counts statements sent by clients and excludes statements executed inside stored procedures and triggers; `Queries` includes them. For a storefront-facing read of shopper-driven load, `Questions` is usually the more meaningful counter. The connector documents which it uses; match it when reconciling manually.
+
+**A no-order QPS spike is hitting only one Galera node. Why?**
+A scraper coming through a sticky-session proxy or hitting one hard-coded node concentrates its flood there. That node can saturate while siblings stay idle. Cross-reference [Pool Saturation Across Galera Nodes vs Traffic](/nerve-centre/kpi-cards/mariadb/pool-saturation-across-galera-nodes-vs-traffic) to see the per-node picture and rebalance or block at the proxy.
+
+**Does this card work without a storefront connector?**
+No. The order-rate axis comes from the linked Shopify, BigCommerce or Adobe Commerce connector. Without it the card cannot answer the core question (is this load generating orders?) and stays empty. Link the storefront connector to activate the dual-axis view.
+
+**Could a no-order spike be a code regression rather than a scraper?**
+Yes, and the distinction matters. A scraper shows as many catalogue-read queries from a few external IPs; a regression (for example a new N+1 query after a deploy) shows as one digest exploding in call count from your own application servers. Use [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mariadb/top-10-slowest-queries-digest) and `SHOW PROCESSLIST` to tell them apart: block IPs for a scraper, roll back or patch for a regression.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*MariaDB QPS Spike vs Ecom Order Rate* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,154 @@
+---
+title: "Realtime Disconnect Rate (per min), Supabase"
+sidebarTitle: "Realtime Disconnect Rate (per min)"
+description: "Realtime Disconnect Rate (per min) for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Realtime & Auth](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The rate at which Supabase Realtime clients drop their WebSocket connection, measured in disconnects per minute over a rolling one-hour window. A low, steady rate is normal: clients refresh pages, switch networks, and close tabs all day. The signal that matters is a sustained spike above baseline, which is a disconnect storm. When this card spikes, Realtime is unstable and your users are losing live updates: tickets stop appearing, presence indicators go stale, dashboards freeze. Because the disconnect-then-reconnect cycle keeps the connected-client headcount roughly flat, this is often the only card that reveals the instability.
+
+| | |
+| --- | --- |
+| **What it counts** | WebSocket disconnect events on the Supabase Realtime service per minute, charted over the last hour. Every time a client's connection closes (cleanly or not) it is one disconnect. |
+| **Data source** | Supabase Realtime service connection telemetry, the same source as connect events, surfaced in the project dashboard under Reports, then Realtime, and in the Realtime logs. The Realtime service is a standalone Elixir/Phoenix process. |
+| **Metric basis** | A rate (events per unit time), not a level. This is the derivative of the connection churn, distinct from [Realtime Connected Clients](/nerve-centre/kpi-cards/supabase/realtime-connected-clients), which is the standing headcount. |
+| **Chart type** | Line chart over a one-hour window, so you read the shape (a spike, a step, a ramp), not just the latest value. |
+| **What does NOT count** | (1) Clean client-initiated tab closes are still disconnects and do count; (2) failed initial connection attempts (those never connected); (3) PostgREST or Edge Function request failures, which are stateless HTTP, not WebSocket; (4) Postgres connection drops in the Supavisor pool. |
+| **Time window** | `1h` (rolling, charted per minute). |
+| **Alert trigger** | `sustained spike > baseline`. There is no fixed number: the alert is relative to your project's normal churn, so a quiet project and a busy one can both trip it. |
+| **Roles** | engineering, operations. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card plots, per minute, the count of WebSocket disconnect events on the Realtime service, read from the connector's `sb_realtime_disconnect_rate` series. Conceptually:
+
+```text
+disconnect_rate(minute) = count(websocket close events on Realtime
+                                service during that minute)
+```
+
+The detail (`Disconnect storms = Realtime instability; clients lose live updates`) is the whole point of the card, and three properties follow from it:
+
+- **Baseline is project-specific.** A project with thousands of mobile clients on flaky networks has a naturally high, noisy baseline; a project with a few hundred desktop consoles has a low, smooth one. That is why the alert is `sustained spike > baseline` rather than a hard number. Vortex IQ learns the normal band and flags departures from it.
+- **Sustained matters more than peak.** A one-minute blip (a deploy, a brief network wobble) is not a storm. A spike that holds for several minutes is. The line-chart window exists so you can tell a spike from a step from a ramp.
+- **It is blind in the headcount.** Because most disconnects are followed by an immediate reconnect, [Realtime Connected Clients](/nerve-centre/kpi-cards/supabase/realtime-connected-clients) can stay almost flat through a disconnect storm. The churn is invisible there and visible only here, which is exactly why this is a Sensitivity card.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+The same platform team from the connected-clients card runs a live support console on Supabase Realtime. Their normal disconnect baseline is 3 to 6 per minute during a shift. On 22 May 26 they ship a back-end change at 11:02 BST. The line chart over the following hour:
+
+| Time (BST) | Disconnect rate (per min) | Connected clients | Notes |
+| --- | --- | --- | --- |
+| 10:55 | 4 | 310 | Normal baseline. |
+| 11:02 | 5 | 311 | Deploy goes out. |
+| 11:05 | 28 | 305 | Spike begins; clients dipping slightly. |
+| 11:12 | 31 | 308 | Sustained, not a blip. Alert fires. |
+| 11:20 | 30 | 307 | Headcount looks fine; users are complaining. |
+| 11:34 | 6 | 312 | Rollback applied; storm clears. |
+
+The team reads the situation as follows:
+
+1. **The headcount lied; the rate told the truth.** Across the storm, [Realtime Connected Clients](/nerve-centre/kpi-cards/supabase/realtime-connected-clients) barely moved (305 to 312) because every dropped client reconnected within a second or two. A dashboard watching only connected clients would have shown a healthy, full project while agents reported tickets vanishing and reappearing. The disconnect-rate line is the only card that exposed the churn.
+
+2. **Sustained, not spiky, so it is real.** The rate held above 28 for nearly half an hour. That rules out a momentary network wobble and points at something the project is doing to its own clients: in this case, the 11:02 deploy changed a Realtime authorisation policy, causing the service to repeatedly reject and re-establish subscriptions.
+
+3. **Recovery confirms the cause.** Disconnects fell back to baseline within two minutes of the rollback at 11:32. A clean, fast return to baseline after a specific action is strong evidence the action was the cause, which is what the team needs to write up the post-incident note.
+
+```text
+Impact framing for the storm window (11:05 to 11:32, ~27 min):
+  - Baseline disconnects ~5/min; storm ~30/min
+  - Excess churn: ~25/min × 27 min = ~675 extra disconnects
+  - Every excess disconnect = a moment a user lost live updates
+  - User-visible effect: tickets and presence flickering for the
+    whole support floor for ~27 minutes
+```
+
+Three takeaways:
+
+1. **This card is a leading indicator of Realtime instability, and often the only one.** Treat a sustained spike as an incident-grade signal even when connected clients and uptime look fine.
+2. **Tie spikes to deploys.** The most common cause of a sudden disconnect storm is a change to Realtime auth/RLS policy, a channel-naming change, or a client library upgrade. Overlay your deploy timeline on this chart.
+3. **Set the threshold relative to your own baseline.** Because churn is project-specific, tune the Sensitivity threshold to your normal band rather than a generic number, or you will either miss real storms or drown in false alerts.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Realtime Disconnect Rate | What the combination tells you |
+| --- | --- | --- |
+| [Realtime Connected Clients](/nerve-centre/kpi-cards/supabase/realtime-connected-clients) | The headcount that a storm can hide. | Flat clients plus spiking disconnects equals a reconnect storm: instability invisible in the headcount. |
+| [Active Realtime Channels](/nerve-centre/kpi-cards/supabase/active-realtime-channels) | Topology context for the churn. | Channels collapsing alongside the spike equals subscriptions being torn down, not just sockets cycling. |
+| [Project Uptime](/nerve-centre/kpi-cards/supabase/project-uptime) | Distinguishes a service blip from a client-side storm. | Disconnect spike plus uptime dip equals a Realtime service restart; spike without uptime dip equals an app or policy change. |
+| [Auth Sign-in Error Rate](/nerve-centre/kpi-cards/supabase/auth-sign-in-error-rate) | Realtime auth depends on valid tokens. | Disconnects plus auth errors equals expired or rejected tokens forcing re-subscription. |
+| [Memory Usage](/nerve-centre/kpi-cards/supabase/memory-usage) | Resource pressure can cause the service to shed connections. | Disconnect spike plus memory pressure equals the instance dropping sockets under load. |
+| [Connections in Use](/nerve-centre/kpi-cards/supabase/connections-in-use) | Postgres-side pressure from reconnect storms. | Reconnect storms on Postgres Changes workloads churn database connections too. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite that folds Realtime stability in. | A sustained disconnect storm pulls the composite down even when other cards look green. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase's own tooling:**
+
+> **Project dashboard, then Reports, then Realtime** for connection and message charts; compare the disconnect or churn series against the same one-hour window.
+> **Project dashboard, then Logs, then Realtime** to read individual disconnect events with timestamps, client identifiers, and close reasons. This is where you confirm whether disconnects are clean closes or errors.
+> **Your deploy and change log** to overlay platform changes on the spike; the most common storm cause is a recent change.
+
+**Why our number may legitimately differ from the Supabase dashboard:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Bucket granularity** | Smoothing differences | This card charts per-minute; the Supabase report may bucket at a coarser interval, smoothing a sharp spike. |
+| **Clean vs error closes** | Counts may differ by category | The Realtime logs separate clean closes from errors; this card counts all disconnects together. Filter the logs to compare like for like. |
+| **Time zone** | X-axis shifts | The Supabase dashboard renders in account time zone; Vortex IQ aligns to your reporting time zone. |
+| **Sampling window edges** | Edge-minute differences | A rolling one-hour window and a fixed dashboard window can disagree on the first and last minute of the range. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Project Uptime](/nerve-centre/kpi-cards/supabase/project-uptime) | A service-side disconnect storm should coincide with an uptime dip; a client-side storm should not. | Spike with no uptime change isolates the cause to the application or auth policy, not the platform. |
+| [Auth Sign-in Error Rate](/nerve-centre/kpi-cards/supabase/auth-sign-in-error-rate) | Token expiry or auth-policy changes can drive both disconnects and auth errors together. | Disconnects without auth errors rules out token problems and points at channel or network causes. |
+
+No Postgres system table records Realtime disconnects, because the Realtime service runs as a separate Elixir process outside Postgres. `pg_stat_activity` will show Postgres connections opening and closing if your Realtime usage is Postgres-Changes-heavy, which can corroborate a storm, but the authoritative record of WebSocket disconnects is the Supabase Realtime report and logs.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My connected-client count looks healthy but this card is spiking. Which do I trust?**
+Trust this card. Most disconnects are immediately followed by a reconnect, so the connected-client headcount stays roughly flat through a storm. The disconnect rate is the only card that exposes the churn, which is exactly why it is a Sensitivity card. If users are reporting flickering live features while the headcount looks fine, this is the metric confirming the problem.
+
+**Why is there no fixed alert number?**
+Disconnect churn is highly project-specific: a large mobile audience on cellular networks has a naturally high, noisy baseline, while a small desktop audience has a low one. A hard threshold would either miss real storms on busy projects or spam alerts on quiet ones. The alert is `sustained spike > baseline`, and you tune the band in the Sensitivity tab to your normal traffic.
+
+**What usually causes a disconnect storm?**
+In order of frequency: (1) a deploy that changed a Realtime authorisation or RLS policy, causing repeated reject-and-reconnect cycles; (2) a client library upgrade or front-end change to channel naming or subscription logic; (3) expired or rotated auth tokens forcing mass re-subscription; (4) a Realtime service restart during maintenance; (5) genuine network problems affecting a large client cohort. Overlay your deploy timeline on the chart to narrow it down fast.
+
+**Are clean tab closes counted as disconnects?**
+Yes. Any WebSocket close is a disconnect, whether the user intentionally closed the tab or the connection dropped on error. That is why a normal baseline is non-zero. To distinguish clean closes from errors, open the Realtime logs in the Supabase dashboard, which record the close reason per event.
+
+**The spike lasted one minute then vanished. Is that a storm?**
+No. A single-minute blip is usually a deploy, a brief platform hiccup, or a network wobble, and it is not actionable. The alert looks for a sustained spike (several consecutive minutes above baseline). The line-chart window is there precisely so you can tell a one-minute blip from a sustained step.
+
+**Does a disconnect storm cost me database load?**
+Only for Postgres Changes workloads. Each reconnect on a Postgres Changes channel re-establishes a database subscription, so a storm can churn Postgres connections and show up on [Connections in Use](/nerve-centre/kpi-cards/supabase/connections-in-use). Broadcast and Presence channels do not touch Postgres, so a storm on those is purely a Realtime-service event.
+
+**How do I confirm a rollback fixed it?**
+Watch the line return to baseline. A clean, fast drop back to your normal band within a minute or two of a specific action (a rollback, a token rotation, a config change) is strong evidence that action addressed the cause. If the rate stays elevated after the rollback, the cause is elsewhere, often a client-side change that is already deployed to users' browsers and will only clear as sessions cycle.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Realtime Disconnect Rate (per min)* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

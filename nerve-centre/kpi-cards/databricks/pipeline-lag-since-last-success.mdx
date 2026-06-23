@@ -1,0 +1,145 @@
+---
+title: "Pipeline Lag (since last success), Databricks"
+sidebarTitle: "Pipeline Lag (since last success)"
+description: "Pipeline Lag (since last success) for Databricks pipelines. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Pipelines](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Pipeline Lag (since last success)** is the elapsed time since your data pipeline last completed a successful run. It answers the question every data team dreads being asked: "how stale is the data?". If a pipeline that should refresh every 15 minutes last succeeded 90 minutes ago, every dashboard, Delta table, and downstream consumer fed by that pipeline is showing data that is up to 90 minutes old. The card turns red when the lag exceeds the pipeline's own expected interval, so a fast pipeline and a slow daily pipeline are each judged against their own cadence.
+
+| | |
+| --- | --- |
+| **What it tracks** | Seconds elapsed since the most recent successful pipeline run, for the selected period. The card surfaces the worst (most-lagging) pipeline in scope. |
+| **Data source** | Databricks pipeline run history: Delta Live Tables pipeline updates (`/pipelines` and pipeline update events) and/or scheduled Jobs run history (`/jobs/runs/list`), comparing `now` to the last `COMPLETED`/`SUCCESS` finish time. |
+| **Time window** | `RT` (real-time, continuously evaluated) |
+| **Alert trigger** | `> expected_interval`. When lag exceeds the pipeline's configured/expected refresh interval, the on-call data engineer is notified. A 15-minute pipeline alerts at 15 minutes of lag; a daily pipeline alerts at roughly 24 hours. |
+| **Roles** | owner, engineering, operations |
+| **Card class** | Hero and Sensitivity card: it drives the Pipelines health signal and the expected-interval threshold is configurable in the Sensitivity tab. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+For each pipeline in scope, Vortex IQ records the finish time of the most recent run whose result state was successful (`COMPLETED` for a Delta Live Tables update, or `SUCCESS` for a scheduled Job run). The lag is `current_time - last_successful_finish_time`, expressed in seconds and rendered in human-friendly units on the card (minutes/hours).
+
+Crucially, only **successful** runs reset the clock. A pipeline that is currently retrying, failing repeatedly, or stuck mid-update does not reset the lag, so the number keeps climbing even while the pipeline looks "busy". This is deliberate: a pipeline that has been failing for an hour has produced no fresh data for an hour, regardless of how many attempts it made.
+
+The alert compares the live lag against the pipeline's **expected interval**, derived from its schedule (a cron trigger, a continuous-pipeline cadence, or the Sensitivity-tab override). Because the threshold is relative to each pipeline's own cadence, the same card sensibly governs both a 5-minute streaming pipeline and a nightly batch pipeline without false alarms on the slow one.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A homewares retailer runs a Delta Live Tables pipeline, `orders_to_lakehouse`, every 15 minutes. It ingests order events from the storefront, applies dedup and currency normalisation, and writes a `silver.orders` Delta table that feeds the finance dashboard and the inventory-replenishment job. Snapshot taken on 19 May 26 at 11:42 BST.
+
+| Reading | Value |
+| --- | --- |
+| Expected interval | 15 minutes |
+| Last successful run | 10:08 BST |
+| **Pipeline Lag** | **94 minutes** (alert: lag above expected interval) |
+| Last 4 run states | FAILED, FAILED, FAILED, COMPLETED (10:08) |
+
+The card is red because 94 minutes of lag dwarfs the 15-minute expected interval. The run-state history is the key: the pipeline has attempted four times since 10:08 and failed three of them, so the lag clock has not reset.
+
+1. **The data is stale by 94 minutes and getting worse.** Everything downstream of `silver.orders`, the finance dashboard and the replenishment job, is operating on a snapshot from 10:08. The longer the lag, the larger the gap the eventual successful run must backfill.
+2. **The failures explain the lag.** Drilling into the pipeline update events shows the dedup step failing on a schema-evolution error: an upstream change added a `gift_message` column the pipeline's expectations did not allow. Each 15-minute attempt fails the same way, so lag grows by ~15 minutes per cycle.
+3. **There is a real downstream risk.** The replenishment job reads `silver.orders` to decide reorder quantities. Running on 94-minute-old order data, it under-counts recent sales of a flash-sale item and risks ordering too little stock. This is where a pipeline-lag problem becomes a business problem.
+
+```text
+Staleness / impact framing at 11:42:
+  - Expected interval: 15 min  ->  healthy lag would be < 15 min
+  - Actual lag: 94 min  ->  ~6x over threshold
+  - Failed attempts since last success: 3
+  - Downstream affected: finance dashboard (cosmetic) +
+    replenishment job (financial: risk of under-ordering)
+  - Action: fix the schema-evolution expectation, trigger a manual
+    pipeline update to backfill the 94-minute gap, confirm lag resets to ~0.
+```
+
+Three takeaways:
+
+1. **Lag, not failure count, is the metric that matters to the business.** A pipeline can fail ten times and still be fine if a recovery run lands inside the expected interval. What hurts is uninterrupted staleness, which is exactly what this card measures.
+2. **Always pair lag with the run-state history.** A growing lag with recent failures is a broken pipeline (fix the code). A growing lag with no failures is a stuck or unscheduled pipeline (check the trigger / cluster availability).
+3. **The threshold must match the cadence.** If you change a pipeline's schedule, update its expected interval in the Sensitivity tab, otherwise a now-hourly pipeline will keep alerting against an old 15-minute expectation.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Pipeline Lag | What the combination tells you |
+| --- | --- | --- |
+| [DLT Pipeline Status Distribution](/nerve-centre/kpi-cards/databricks/dlt-pipeline-status-distribution) | The live status of every pipeline. | A FAILED pipeline in the donut explains a growing lag; an IDLE one suggests a missing trigger. |
+| [Failed Jobs (24h)](/nerve-centre/kpi-cards/databricks/failed-jobs-24h) | The job-level failures that cause lag. | Repeated job failures map directly to a pipeline whose lag clock is not resetting. |
+| [Job Success Rate (24h)](/nerve-centre/kpi-cards/databricks/job-success-rate-24h) | The success-ratio peer. | A falling success rate is the leading indicator that lag is about to grow. |
+| [Failed Job Burst (>5 failures in 1h)](/nerve-centre/kpi-cards/databricks/failed-job-burst-5-failures-in-1h) | The cascade alert. | A burst of failures across dependent jobs often shows up as lag on the pipeline they feed. |
+| [Top 10 Failing Workflows (7d)](/nerve-centre/kpi-cards/databricks/top-10-failing-workflows-7d) | The chronic-offender view. | A pipeline that lags often will appear here; chronic lag deserves a structural fix. |
+| [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) | The stuck-run view. | Lag with no failures and a job still running equals a stuck/over-running pipeline, not a crash. |
+| [Pipeline Lag vs Ecom Order Flow](/nerve-centre/kpi-cards/databricks/pipeline-lag-vs-ecom-order-flow) | The revenue cross-channel view. | Tells you whether the pipeline stalled while live orders were still flowing, the worst case. |
+| [Databricks Health Score](/nerve-centre/kpi-cards/databricks/databricks-health-score) | The composite. | Sustained pipeline lag pulls the overall health score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **Delta Live Tables** in the workspace: open the pipeline, the "Update history" panel shows the timestamp and result of every update, so you can read the last successful finish directly.
+> **Workflows → Jobs → Runs** for scheduled-job pipelines: the run list shows the last `SUCCESS` finish time used to compute lag.
+> **`system.lakeflow` / pipeline event log** (or the `event_log` for the DLT pipeline) gives the machine-readable update events to reproduce the calculation.
+
+To reproduce lag for a scheduled-job pipeline you can compute it from run history: take `current_timestamp()` minus the latest `end_time` where `result_state = 'SUCCESS'`. For a DLT pipeline, read the most recent update with state `COMPLETED` from the pipeline event log.
+
+**Why our number may legitimately differ from the Databricks UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **"Success" definition** | Vortex IQ may read higher lag | We reset the clock only on a fully successful run; a partially-successful or warning-state update that the UI shows as "completed with issues" may not reset our clock. |
+| **Continuous pipelines** | Different basis | For continuous DLT pipelines there is no discrete "run"; lag is derived from the last successful flow checkpoint, which can differ from the UI's notion of "last updated". |
+| **API/event-log latency** | Brief lag | Pipeline event logs can take a few seconds to record a completion, so a just-finished run may not yet reset the clock. |
+| **Time zone** | Display only | Vortex IQ renders the last-success timestamp in your reporting time zone; the workspace UI uses workspace time. |
+| **Expected-interval source** | Threshold differs | The alert uses the Sensitivity-tab expected interval if set, which may not match the pipeline's literal schedule. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | If a revenue pipeline lags, lakehouse revenue figures fall behind the storefront's own order count. | A gap between storefront orders and lakehouse-reported revenue is the downstream symptom of pipeline lag. |
+| [`google_analytics`](/nerve-centre/kpi-cards/google-analytics/ga4-property-health) | Independent measurement source. | GA4 shows live traffic while the lakehouse table is stale equals confirmation the lag is on the ingestion side. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The pipeline is clearly running right now, so why is lag still high?**
+Because lag only resets on a *successful* completion, not on activity. A pipeline that is busy retrying or stuck mid-update has produced no fresh data, so the lag clock keeps ticking. Check the update/run history: if recent attempts are FAILED or the current update has been running far past its normal duration, the data is still as stale as the last green run.
+
+**How is "expected interval" determined for the alert?**
+It comes from the pipeline's schedule by default: a cron trigger, a continuous-pipeline cadence, or the interval you set in the Sensitivity tab. The alert fires when live lag exceeds that interval, so each pipeline is judged against its own cadence. If you reschedule a pipeline, update the expected interval so the threshold stays correct.
+
+**My pipeline runs hourly but lag alerts only after about an hour. Is that right?**
+Yes. For an hourly pipeline, a healthy lag is anything under roughly one hour (the time until the next scheduled run). Lag naturally grows toward the interval and resets to near zero on each success. The alert is designed to fire only when lag exceeds the interval, meaning a scheduled run was missed or failed.
+
+**Does a continuous (streaming) DLT pipeline have meaningful lag?**
+Yes, but it is computed differently. There is no discrete run, so lag is derived from the most recent successful flow checkpoint or the recency of processed records. For continuous pipelines, set a tight expected interval (for example a few minutes) so a stalled stream is caught quickly. Pair with [DLT Pipeline Status Distribution](/nerve-centre/kpi-cards/databricks/dlt-pipeline-status-distribution) to confirm the pipeline is still in RUNNING state.
+
+**Which pipeline does the headline number represent if I have many?**
+The headline surfaces the worst (most-lagging) pipeline in the connector's scope, so the card always shows your biggest staleness risk. To monitor a specific critical pipeline on its own, stack a panel scoped to that pipeline so it cannot be masked by a less-important laggard.
+
+**Lag suddenly dropped to zero but I did not fix anything. What happened?**
+A scheduled run succeeded on its own, resetting the clock. This is normal for transient failures (a brief upstream outage, a momentary cluster shortage) that clear before the next cycle. If lag oscillates, succeeding then lagging repeatedly, treat it as a chronic reliability problem and investigate via [Top 10 Failing Workflows (7d)](/nerve-centre/kpi-cards/databricks/top-10-failing-workflows-7d) rather than waiting for each self-recovery.
+
+**Can lag be high even though the data looks fine?**
+Yes, if the pipeline is one of several writing the same target table, or if a manual backfill already loaded the data the pipeline would have produced. The card measures pipeline-run recency, not table freshness directly. When in doubt, check the target Delta table's latest commit timestamp in the table history alongside this card.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Pipeline Lag (since last success)* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,152 @@
+---
+title: "Statement Latency p99 (ms), CockroachDB"
+sidebarTitle: "Statement Latency p99 (ms)"
+description: "Statement Latency p99 (ms) for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The 99th-percentile service latency for SQL statements across the cluster, in milliseconds. Ninety-nine of every hundred statements finished faster than this; the slowest one percent took longer. p99 is the extreme-tail gauge: it captures the worst experiences real users hit, the ones that cause timeouts, abandoned requests, and angry support tickets, even when the median and the p95 look fine. For an SRE, p99 is the number that maps most directly to an application's timeout budget. If your service times out at 500ms and p99 is climbing toward it, a measurable fraction of requests is about to fail.
+
+| | |
+| --- | --- |
+| **Data source** | CockroachDB time-series metric `sql.service.latency` at the p99 quantile, exposed via the `_status/vars` Prometheus endpoint and the `crdb_internal.node_statement_statistics` view. Vortex IQ reads the cluster-wide merged quantile. |
+| **What it tracks** | Statement Latency p99 (ms) for the selected period: the service-side time CockroachDB spent planning and executing a statement, from gateway receipt to result ready. Excludes client network round-trip. |
+| **Metric basis** | Service latency: planning plus distributed execution plus KV-layer waits. It reflects the worst-case experience inside the cluster, including the cost of transaction retries and contention waits that disproportionately hit the tail. |
+| **Time window** | `RT/5m` (real-time, computed over a rolling 5-minute window, refreshed continuously). |
+| **Alert trigger** | `> 500ms`. A sustained p99 above 500ms means the worst one percent of statements is slow enough to breach typical application timeouts; the Nerve Centre raises this as a sensitivity event. |
+| **Units** | Milliseconds. The underlying histogram is nanoseconds; Vortex IQ converts to ms. |
+| **Scope** | Cluster-wide aggregate across all live nodes. Per-node and per-statement detail via the siblings below. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Every CockroachDB node keeps an HDR histogram of statement service latency, exported as `sql.service.latency`. The p99 quantile is the value below which 99 percent of statements in the window fell.
+
+Vortex IQ derives the headline as follows:
+
+1. Poll `sql.service.latency-p99` from each live node's `_status/vars` endpoint over the rolling 5-minute window (`RT/5m`).
+2. Compute the cluster-wide quantile from the merged histogram rather than averaging per-node p99 figures. Averaging percentiles badly understates the extreme tail, so Vortex IQ uses the cluster status layer's merged-quantile value to match the DB Console.
+3. Convert nanoseconds to milliseconds and round to one decimal place.
+4. Compare against the `> 500ms` sensitivity threshold; a sustained breach over the configured dwell flips the card to alert and feeds the sensitivity layer.
+
+The p99 is far noisier than p50 or p95 because it is computed from very few samples per window. A single very slow statement, a brief stop-the-world event, or one retry storm can swing it. Treat a single-window spike with care; a sustained climb is the meaningful signal. Like all percentiles it is not additive: you cannot average p99 across windows or nodes.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs an 8-node CockroachDB cluster (v23.2) behind a payments service whose HTTP clients time out at 500ms. Baseline p99 sits near 120ms. Snapshot taken on 22 May 26 at 14:05 BST during an end-of-day settlement batch.
+
+| Window (5m, rolling) | p50 (ms) | p95 (ms) | p99 (ms) | Txn retries/min |
+| --- | --- | --- | --- | --- |
+| 13:45 | 10 | 58 | 132 | 40 |
+| 13:55 | 11 | 71 | 240 | 180 |
+| 14:05 | 12 | 96 | **610** | 770 |
+
+The p99 headline reads **610ms**, above the 500ms threshold, so the card is alerting. Notice the shape: p50 is essentially flat, p95 has roughly doubled, but p99 has nearly quintupled. That progression, "the further into the tail you look, the worse it gets", is the signature of write contention amplified by transaction retries.
+
+The retry column confirms it: retries per minute jumped from 40 to 770 across the same three windows. Under CockroachDB's serialisable isolation, conflicting transactions on a hot row retry, and each retry adds latency that lands squarely in the tail. The settlement batch is updating a small set of summary rows that the live payment path also touches.
+
+```text
+Tail-progression framing for the 14:05 window:
+  - p50:  12ms    (unchanged: most statements are fine)
+  - p95:  96ms    (elevated: tail widening)
+  - p99:  610ms   (alerting: worst 1% breaching the 500ms timeout budget)
+  - Txn retries:  770/min and climbing
+  - Likely cause: the settlement batch and live payments contend on the
+                  same summary rows; serialisable retries inflate the tail
+  - Client impact: HTTP clients timing out at 500ms now see sporadic
+                   failures on the slowest 1% of payment writes
+```
+
+The fix is workload-shaping, not cluster-scaling: the team reschedules the settlement batch to a quiet window, or restructures it to avoid touching the live summary rows (for example, writing to a staging table and merging off-peak). p99 returns to ~120ms and retries fall back to baseline within one window.
+
+Three takeaways:
+
+1. **p99 is the number your timeout budget cares about.** If the service times out at 500ms, a p99 of 610ms means roughly one percent of requests is already failing or about to. p50 and p95 cannot tell you that; only the extreme tail can.
+2. **A widening p50 to p95 to p99 fan is a contention fingerprint.** When each deeper percentile is worse than the last and retries are climbing, suspect write contention on a hot row or range, not raw capacity.
+3. **Single-window p99 spikes are noisy; trends are not.** p99 is computed from few samples and can jump on one slow statement. Act on a sustained climb across windows, as in the table above, not on an isolated blip.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Statement Latency p99 | What the combination tells you |
+| --- | --- | --- |
+| [Statement Latency p95 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms) | The broader tail. | p99 far above p95 means a small, very slow slice; p99 close to p95 means a uniformly wide tail. |
+| [Statement Latency p50 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p50-ms) | The median baseline. | A flat p50 with a soaring p99 is the classic tail-only contention signature. |
+| [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) | Retries land disproportionately in the tail. | Rising retries plus rising p99 confirms write contention as the latency driver. |
+| [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) | Names the contended statements. | The fastest route from "p99 is bad" to "this statement is the cause". |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/cockroachdb/slow-query-rate) | The proportion over your slow threshold. | Rising p99 plus rising slow-rate sizes how many statements are affected, not just how slow the worst is. |
+| [Statement Error Rate %](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate) | Timeouts often surface as errors. | A p99 near the client timeout plus a rising error rate equals requests actively failing. |
+| [Range Lease Balance Skew %](/nerve-centre/kpi-cards/cockroachdb/range-lease-balance-skew) | A hot node inflates the tail. | Lease skew plus a high p99 points at one node carrying the contended range. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The latency-weighted composite. | A sustained p99 breach drags the health score and confirms cluster-level impact. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in CockroachDB's own tooling:**
+
+> **DB Console → Metrics → SQL dashboard → "Service Latency: SQL, 99th percentile"** is the canonical chart. Match its time range to the Vortex IQ window before comparing.
+> **DB Console → SQL Activity → Statements**, sorted by max latency, surfaces the worst statements feeding the tail.
+> **`SELECT * FROM crdb_internal.cluster_statement_statistics`** gives per-statement latency stats cluster-wide from SQL.
+> **`curl http://<node>:8080/_status/vars | grep sql_service_latency`** exposes the raw histogram buckets for hand computation.
+> For **CockroachDB Cloud** (Serverless or Dedicated), the equivalent chart is under **Monitoring → SQL** in the Cloud Console, and the metrics export feeds Prometheus/Datadog with the identical metric name and quantile labels.
+
+**Why our number may legitimately differ from the DB Console:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window length** | Variable | Vortex IQ uses a rolling 5-minute window; a longer DB Console chart range smooths the spiky p99. The shorter the window, the higher and noisier the p99. |
+| **Quantile merge method** | Vortex IQ usually higher | Vortex IQ uses the merged-histogram cluster quantile; a single-node chart reads lower. |
+| **Service vs exec latency** | Vortex IQ slightly higher | This card uses `sql.service.latency` (includes planning); the "SQL exec latency" chart excludes it. |
+| **Sample sparsity** | Both noisy | p99 is computed from few samples; the same window can read differently second to second on both sides. Trends reconcile better than single readings. |
+| **Internal statements** | Vortex IQ lower | Background internal statements are excluded from the application-facing figure where labels permit; the DB Console may include them. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`crdb_xc_slow_query_during_checkout`](/nerve-centre/kpi-cards/cockroachdb/slow-statements-during-checkout-window-5m) | A p99 breach in a checkout window should co-occur with slow checkout statements and a checkout drop. | If p99 spikes but checkout holds, the slow tail is on a non-customer path. |
+| Application APM p99 | App-side p99 should exceed DB p99 by roughly the network round-trip plus app overhead. | A large gap with a calm DB p99 means the slowness is upstream of the database. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is p99 so much noisier than p50 and p95?**
+Because it is computed from very few samples: the slowest one percent of a window's statements. A single very slow statement, a brief GC pause, or one retry storm can move it sharply. That is why a single-window spike deserves caution while a sustained climb across consecutive windows is the real signal. Read it as a trend, not a tick.
+
+**p99 jumped for one window and then recovered. Should I be worried?**
+Usually not, on its own. An isolated p99 spike that clears within a window or two is often a single slow statement, a momentary stop-the-world, or a transient retry. Worry when it stays elevated, when [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) rises alongside it, or when it approaches your application's timeout budget.
+
+**How does p99 relate to my application timeout?**
+Directly. If your service times out at, say, 500ms, then a p99 of 500ms means about one percent of database statements are at or past the point where the client gives up. As p99 approaches the timeout, request failures begin. This is why the default alert sits at 500ms; set it to match your real timeout budget in the Sensitivity tab.
+
+**Can I average p99 across nodes or across time?**
+No. Percentiles are not additive. Averaging per-node or per-window p99 values produces a meaningless number that understates the tail. Vortex IQ computes the cluster p99 from the merged histogram for exactly this reason. For a longer period, read the histogram rather than doing arithmetic on the headline.
+
+**My p99 is high but p50 and p95 are fine. What does that pattern mean?**
+A widening fan (flat p50, mildly raised p95, high p99) is the fingerprint of contention concentrated on a small slice of traffic: a hot row, a contended range, or a retry-heavy transaction. Start with [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) and [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h). The fix is usually workload-shaping (reschedule a batch, restructure a hot write), not adding nodes.
+
+**Does this include client network time?**
+No. `sql.service.latency` is measured inside the gateway node. If your application's p99 is much higher than this card, the extra time is network or application driver overhead, not CockroachDB. Compare against your APM's database-span p99.
+
+**The DB Console p99 is lower than Vortex IQ. Why?**
+The three usual causes: you are reading one node's chart instead of the cluster merge; you are reading "SQL exec latency" rather than "Service latency"; or the chart window is longer and has smoothed the spiky tail. Because p99 is sample-sparse, also expect some genuine second-to-second variance on both sides. Align the window and the metric and the figures converge in trend.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Statement Latency p99 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,170 @@
+---
+title: "Search Error Rate %, Elasticsearch"
+sidebarTitle: "Search Error Rate %"
+description: "Search Error Rate % for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The share of search requests that fail, expressed as a percentage of total search requests over the window. A failed search is one that returns an error (non-2xx) or completes with shard failures rather than a clean result set. This is the most direct measure of "is search working for users right now". Unlike latency, which degrades gracefully, an error rate spike is binary from the user's point of view: their query returned nothing usable. For a storefront, a climbing search error rate maps straight onto shoppers who cannot find products.
+
+| | |
+| --- | --- |
+| **API basis** | Search counters from `GET /_nodes/stats/indices/search` and per-request shard-failure data. Errors are counted from failed search requests plus searches that completed with `_shards.failed > 0` (partial results); total is `search.query_total` delta over the window. |
+| **Metric basis** | A ratio: failed searches divided by total searches in the window, as a percentage. Both hard failures (rejected, timed out, malformed) and partial failures (some shards failed) are counted. |
+| **Aggregation window** | `5m` rolling, so a brief blip self-clears while a sustained problem is caught quickly. |
+| **Alert threshold** | `> 1%`. Above 1% of searches failing, a meaningful slice of users is affected and the gauge trips red. |
+| **Why a gauge** | The value is a bounded percentage with a clear danger band, so it renders as a gauge; the needle crossing into red is the page-worthy signal. |
+| **What counts** | HTTP non-2xx search responses, thread-pool rejections on the search pool, query-phase and fetch-phase failures, timeouts, and searches returning `_shards.failed > 0`. |
+| **What does NOT count** | Indexing/write errors (a separate pipeline, see Bulk Rejections), client-side network failures that never reached the cluster, and zero-result searches (a successful query that simply matched nothing is not an error). |
+| **Time window** | `5m` (rolling) |
+| **Alert trigger** | `> 1%`, more than one search in a hundred failing is user-visible breakage. |
+| **Roles** | platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card computes a delta ratio over the five-minute window:
+
+```text
+failed   = (failed_search_requests + searches_with_shard_failures) over 5m
+total    = search.query_total(now) - search.query_total(5m ago)
+error_rate_pct = (failed / total) * 100      # guard: 0 when total == 0
+```
+
+"Failed" deliberately includes two distinct categories. *Hard failures* are searches that returned an error to the client: a 5xx, a search thread-pool rejection (`es_rejected_execution_exception`), a timeout, or a malformed-query 4xx. *Partial failures* are searches that returned a 200 but with `_shards.failed > 0`, meaning some shards could not respond and the result set is incomplete; from a user's perspective this is silent data loss in the results and is treated as an error here. Counting both is important because partial failures are insidious: the application sees a 200 and renders results, but those results are missing whatever the failed shards held.
+
+The `5m` window balances responsiveness against noise: a single transient failure in a low-traffic minute will not trip the gauge, but a genuine spike that affects a sustained fraction of traffic shows up within minutes. The `> 1%` threshold reflects that search is a primary user journey: even a low single-digit error rate means a noticeable cohort of users got a broken experience.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs an Elasticsearch cluster behind the search bar of a fashion retailer. Baseline search error rate is `~0.02%` (the odd malformed query from a bot). On 09 Apr 26 at 12:50, during the lunchtime traffic peak, the Search Error Rate gauge climbs to **3.7%** and trips red.
+
+Breaking down the failures from `GET /_nodes/stats/indices/search` and the cluster's error logs:
+
+| failure type | share of failures | signature |
+| --- | --- | --- |
+| Search thread-pool rejection | 71% | `es_rejected_execution_exception`, search queue full |
+| Partial shard failure | 24% | 200 responses with `_shards.failed: 1` |
+| Timeout | 5% | queries exceeding the client's 1s timeout |
+
+The dominant cause is search thread-pool rejection: the search queue on the data nodes is full and the cluster is rejecting incoming searches outright to protect itself. The team checks [HTTP Connection Saturation %](/nerve-centre/kpi-cards/elasticsearch/http-connection-saturation) (88%, high but not the cause) and [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) (climbing from 90ms to 640ms) and finds the real trigger.
+
+```text
+Root cause chain:
+  - A marketing email went out at 12:45 driving a 3x traffic spike to the search bar.
+  - A new "search suggestions" feature fires an extra wildcard query per keystroke.
+  - Wildcard queries are expensive; each one holds a search thread far longer than a normal term query.
+  - The search thread pool (fixed size = number of CPUs * 1.5 + 1) filled up.
+  - With the pool full, the queue filled, and new searches were rejected -> the 71% rejections.
+  - Some shards on the busiest node timed out mid-query -> the 24% partial failures.
+```
+
+Immediate mitigation: the team debounces the suggestion feature on the client (fire after 300ms of no typing instead of per-keystroke), instantly cutting query volume. Within five minutes the error rate falls to 0.4%. Structurally, they rewrite the suggestion query from an expensive leading-wildcard to a `search_as_you_type` field (far cheaper), and add an `index.search.idle` and a sensible client-side timeout-and-retry. By 13:10 the error rate is back to baseline.
+
+```text
+What 3.7% cost during the spike:
+  - At the peak ~8,000 searches/min, 3.7% = ~296 failed searches/min.
+  - Each failed search is a shopper who typed a query and saw "no results" or an error.
+  - Pair with the storefront conversion cards: a search error during peak traffic is
+    a direct, measurable drop in the search-to-cart funnel.
+```
+
+Three takeaways:
+
+1. **Most search-error spikes are self-inflicted load, not cluster faults.** A new feature, an expensive query pattern, or a traffic burst fills the fixed-size search thread pool, and the cluster sheds load by rejecting. The fix is usually on the query/client side, not the cluster.
+2. **Partial shard failures are silent and dangerous.** A 200 with `_shards.failed > 0` looks fine to the application but returns incomplete results. Counting these in the error rate surfaces a failure mode that latency and HTTP-status monitoring miss.
+3. **Read it alongside latency and saturation.** Error rate is the outcome; latency and connection saturation are the leading indicators. A rising p95 that crosses into rejections is the typical path to a search-error spike.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Search Error Rate | What the combination tells you |
+| --- | --- | --- |
+| [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) | The leading indicator before errors begin. | Rising p95 that tips into rejections is the standard route to a search-error spike. |
+| [Search Latency p99 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p99-ms) | The tail that times out first. | A p99 blowout often becomes the timeout portion of the error rate. |
+| [Search Queries per Second (live)](/nerve-centre/kpi-cards/elasticsearch/search-queries-per-second-live) | The load that fills the search pool. | An error spike that tracks a QPS spike is load-driven; one that does not is a query or cluster fault. |
+| [HTTP Connection Saturation %](/nerve-centre/kpi-cards/elasticsearch/http-connection-saturation) | The front door that refuses clients when full. | High saturation plus errors means clients are refused before queries even run. |
+| [Circuit Breaker Trips (24h)](/nerve-centre/kpi-cards/elasticsearch/circuit-breaker-trips-24h) | The memory-protection mechanism that rejects queries. | Breaker trips plus search errors means heavy queries are being rejected to avoid OOM. |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | Heap pressure causes rejections and breaker trips. | High heap plus search errors points at memory-bound query failures. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/elasticsearch/slow-query-rate) | Slow queries precede timeouts and rejections. | A rising slow-query rate is the early warning before errors climb. |
+| [Slow Searches During Checkout Window (5m)](/nerve-centre/kpi-cards/elasticsearch/slow-searches-during-checkout-window-5m) | The cross-channel revenue framing of search failure. | Correlates search errors with the checkout funnel to size revenue impact. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch itself:**
+
+> `GET /_nodes/stats/indices/search` gives `query_total` and `query_time_in_millis`; combined with the search thread-pool stats it shows the denominator and the rejection signal.
+> `GET /_cat/thread_pool/search?v&h=node_name,active,queue,rejected` is the fastest way to confirm search thread-pool rejections, the most common error cause; a non-zero and rising `rejected` column is the smoking gun.
+> The cluster logs (or the slow log) capture per-query failures and `_shards.failed` details; the application or proxy access logs hold the authoritative non-2xx HTTP rate as the client experienced it.
+
+**Why our number may legitimately differ from a manual reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Partial-failure counting** | Card higher | We count 200 responses with `_shards.failed > 0` as errors; a pure HTTP-status check at a proxy would not. |
+| **Window boundary** | Either | The card's 5-minute delta and your manual snapshot bracket different intervals. |
+| **Rejection accounting** | Either | Thread-pool `rejected` is a cumulative counter; reading it raw versus as a windowed delta gives different rates. |
+| **Where errors are measured** | Either | The cluster's view (rejections, shard failures) can differ from the client/proxy view (which also sees network failures the cluster never saw). |
+| **Managed service abstraction** | Either | Elastic Cloud and AWS-managed consoles may present an aggregated request-error metric at their own granularity. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) | Errors should follow a latency climb under load. | Errors spiking with calm latency points at malformed queries or shard failures, not load. |
+| [Search Queries per Second (live)](/nerve-centre/kpi-cards/elasticsearch/search-queries-per-second-live) | A load-driven error spike tracks a QPS spike. | Errors rising with flat QPS means a query pattern changed or a node degraded, not volume. |
+
+<details>
+<summary><em>Same-concept peer on other engines</em></summary>
+
+"What fraction of read requests are failing" is a universal reliability metric; only the failure taxonomy differs. This is **not** a reconciliation against a parallel system.
+
+- PostgreSQL equivalent: failed-query rate / error log rate against total queries.
+- Solr equivalent: request error count from the request handler metrics (`errors` / `requests`).
+- Generic HTTP service equivalent: 5xx rate as a percentage of total requests.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Does a zero-result search count as an error?**
+No. A search that runs successfully and simply matches no documents is a valid result, not a failure; it returns a 200 with an empty hits array. This card counts only searches that errored (non-2xx, rejection, timeout) or completed with `_shards.failed > 0`. A high zero-result rate is a relevance/merchandising concern, not a reliability one, and is tracked separately.
+
+**What is a partial shard failure and why does it count as an error?**
+When a search fans out to all shards of an index and one or more shards cannot respond (the node is overloaded, the shard is recovering, a circuit breaker tripped), Elasticsearch can still return a 200 with the partial results it did get, flagged by `_shards.failed > 0` in the response. The application usually renders those incomplete results as if they were complete, so users silently miss whatever the failed shards held. Because that is a broken result from the user's perspective, we count it as an error.
+
+**My error rate spiked but every failure is `es_rejected_execution_exception`. What does that mean?**
+The search thread pool is full and the cluster is shedding load by rejecting new searches to protect itself. The pool is fixed-size (roughly the node's CPU count times 1.5 plus 1) by design, so the fix is to reduce the load reaching it: debounce or cache client queries, replace expensive query patterns (leading wildcards, deep pagination, huge aggregations) with cheaper equivalents, and add client-side timeouts with backoff. Scaling out data nodes adds search threads if the load is genuinely legitimate.
+
+**Errors are climbing but latency looks fine. How is that possible?**
+That pattern usually means the failures are not load-driven. Common causes: a deploy shipped a malformed query that 4xxs, a mapping change broke a query against a now-missing field, a specific shard or node is failing (partial failures) while the rest serve fast, or a circuit breaker is rejecting only the heavy queries. Look at the failure-type breakdown rather than assuming a capacity problem.
+
+**Can I tune the alert threshold?**
+Yes, the sensitivity threshold is configurable per profile. The default `> 1%` suits user-facing storefront search where any meaningful failure cohort matters. A purely internal analytics cluster with retrying batch clients might tolerate a higher threshold. Set it against your own baseline and the user impact of a failed search, not the generic default.
+
+**Why count both HTTP errors and shard failures together instead of separately?**
+Because from the user's standpoint both produce a broken search experience: a hard error returns nothing, and a partial failure returns incomplete results the user cannot tell are incomplete. A single combined rate is the truest "search is broken for users" signal. For root-cause work you still get the breakdown by failure type; the headline gauge intentionally unifies them so nothing user-visible hides behind a clean HTTP-status number.
+
+**A retry on the client masks these errors. Should I still care?**
+Yes. Client retries can paper over a transient spike for the end user, but the cluster is still rejecting and re-serving requests, which amplifies load (each retry is another query against an already-strained pool) and can turn a small spike into a retry storm. The card measures the cluster's true error rate before client retries, which is the honest signal of cluster health; a high rate that users do not feel today is a fragility waiting to tip over under more load.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Search Error Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,145 @@
+---
+title: "Query Error Rate Spike (>1% in 5m), MongoDB"
+sidebarTitle: "Query Error Rate Spike (>1% in 5m)"
+description: "Query Error Rate Spike for MongoDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> An alert card that fires when the share of failing queries crosses 1% over a rolling five-minute window. The error rate is the count of operations that returned an error divided by total operations in the window, derived from the `serverStatus` `opcounters` and the assert/error counters. A healthy MongoDB instance runs well under 0.1% errors. Crossing 1% means roughly one in every hundred queries is failing, which for an application usually translates to visible errors, retries, and degraded user experience. This card surfaces the breach in real time so the on-call DBA sees it before the support queue fills up.
+
+| | |
+| --- | --- |
+| **What it tracks** | Active alerts where the query error rate has crossed 1% over the trailing five minutes. Each firing entry lists the instance, the current error rate, and the dominant error class. |
+| **Data source** | `serverStatus` `opcounters` (total operations) and the error/assert counters; error rate = failing ops / total ops over the window. |
+| **Time window** | `5m` (rolling five-minute window). |
+| **Alert trigger** | `>1% sustained 5m`, error rate above 1% held across the five-minute window. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The error rate is the proportion of operations that failed over the rolling window:
+
+```text
+error_rate = failing_ops / total_ops   (over the trailing 5 minutes)
+```
+
+`total_ops` comes from the delta in `serverStatus.opcounters` (queries, inserts, updates, deletes, getmores, and commands) across the window. `failing_ops` is derived from the operation error and assert counters over the same window: operations that returned an error to the client rather than completing successfully. The card computes the ratio as a percentage and compares it against the 1% threshold.
+
+The five-minute window is the smoothing mechanism. Individual error bursts are common and harmless: a brief network blip, a single timed-out cursor, a one-off duplicate-key insert. Measuring over five minutes means the rate only crosses 1% when failures are sustained or large enough to matter at the aggregate level. This is the same metric exposed continuously by the [Query Error Rate %](/nerve-centre/kpi-cards/mongodb/query-error-rate) gauge; this alert card is the thresholded, paging view of it.
+
+Common error classes that drive the rate up: write conflicts under high write contention, exceeded operation time limits (`maxTimeMS`), connection failures when the pool is exhausted, `NotWritablePrimary` errors during an election, and validation or duplicate-key errors from application bugs. The dominant class in the alert tells you which family to investigate first.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MongoDB replica set behind a high-write inventory service. Snapshot taken on 27 May 26 at 14:18 BST, five minutes after a new application release went out.
+
+| Window metric | Value |
+| --- | --- |
+| Total operations (5m) | 412,000 |
+| Failing operations (5m) | 6,180 |
+| Error rate | **1.5%** |
+| Dominant error class | WriteConflict (TransientTransactionError) |
+
+The card raises one active alert: error rate 1.5%, above the 1% threshold, dominated by `WriteConflict`. The timing lines up exactly with the 14:13 release, which is the first thing the on-call DBA notices.
+
+What the team reads from this:
+
+1. **The errors are write conflicts, not infrastructure failures.** `WriteConflict` under the WiredTiger storage engine means two operations tried to modify the same document concurrently and one was aborted. A spike of these right after a release almost always points to a new code path doing un-batched, high-contention updates to a hot document (for example, decrementing a single shared counter on every order rather than sharding the counter).
+2. **The blast radius is the inventory service, not the whole estate.** Total ops are still flowing at 412k over five minutes, so the database is up and serving; it is one operation pattern that is failing. The fix is in the application's write pattern, not in MongoDB itself.
+3. **The clock matters.** The five-minute window means the team caught this within minutes of the release rather than after a flood of customer complaints. The remediation is a fast rollback of the release, then a redesign of the contended write to use `findAndModify` with retry, or to spread the counter across multiple documents.
+
+```text
+Reading the alert:
+  - error_rate = 6,180 / 412,000 = 1.5%  → above 1% threshold → alert fires
+  - dominant class = WriteConflict → contention, not outage
+  - correlation = started at 14:13, release went out at 14:13
+  - action = roll back release; fix hot-document write pattern; redeploy
+```
+
+Three takeaways for the team:
+
+1. **1% is a meaningful line, not an arbitrary one.** Below it, errors are usually transient noise the drivers retry away. Above it, one in a hundred operations is failing, which is enough to surface as user-visible errors and retry storms.
+2. **The dominant error class is the fastest diagnostic.** WriteConflict means contention; NotWritablePrimary means an election is in progress; connection errors mean the pool is exhausted. Each points at a different sibling card and a different fix.
+3. **Correlate with deploys first.** The most common cause of a sudden error-rate spike is a release that changed a query or write pattern. Before deep-diving the database, check what shipped in the last fifteen minutes.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Error Rate Spike | What the combination tells you |
+| --- | --- | --- |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mongodb/query-error-rate) | The continuous gauge this alert thresholds. | Watch the gauge trend toward 1% before the alert fires; gives early warning. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mongodb/connection-errors-24h) | The connection-failure slice of the error mix. | If the error spike is connection-class, this card confirms the pool is the cause. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/mongodb/connection-pool-at-90-saturation) | The saturation that produces connection-class errors. | Saturation alert plus error spike equals the pool exhausted and started refusing queries. |
+| [Replica Set Member Lag >10s or in RECOVERING State](/nerve-centre/kpi-cards/mongodb/replica-set-member-lag-10s-or-in-recovering-state) | Elections cause NotWritablePrimary errors. | Error spike plus an unhealthy replica set equals failover-driven errors, not a code bug. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p99-ms) | Operations exceeding `maxTimeMS` become errors. | Rising p99 plus error spike equals timeouts tipping over into failures. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | The denominator of the error-rate calculation. | A flat numerator with falling ops can inflate the rate; read both together. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | The composite that weights error rate. | A sustained error spike pulls the overall score below its threshold. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MongoDB's own tooling:**
+
+> Run `db.serverStatus().opcounters` and `db.serverStatus().asserts` in `mongosh` to see the raw operation and error counters; the deltas between two readings give you the rate over the interval.
+> Inspect the `mongod` log (`db.adminCommand({getLog: "global"})` or the on-disk log) and grep for error codes such as `WriteConflict`, `NotWritablePrimary`, `MaxTimeMSExpired`, and `ExceededTimeLimit` to identify the dominant class.
+> On MongoDB Atlas, the Metrics tab exposes operation-error and assert charts, and the **Query Targeting** and **Opcounters** panels help you see the failing operation family.
+
+**Why our number may legitimately differ from a manual reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window boundary** | Either | We measure a rolling five-minute window; a `mongosh` two-reading delta uses whatever interval you sampled. |
+| **Driver-side retries** | Our rate may be higher than app-visible errors | MongoDB retryable writes and the driver retry layer mask some failures from the application; the server counters still record the original error. |
+| **Counter scope** | Either | `asserts` includes warning-class asserts that did not fail an operation; the card filters to operation-failing errors, so a raw assert count can read higher. |
+| **Per-node aggregation** | Either | We evaluate per node; an election can spike errors on one node while others stay clean. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | A sustained error spike during a checkout window often corresponds to failed orders. | Error spike with no revenue dip equals errors on a background path; error spike with a revenue dip equals customer-facing failures. |
+| Application error logs / APM | App-visible error rate should roughly track the database error rate, minus retried failures. | A gap means the driver retry layer is absorbing failures; the database is straining even if the app looks calm. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card says 1.5% but my application is not throwing errors. How?**
+MongoDB drivers retry transient failures automatically (retryable writes and retryable reads), so a `WriteConflict` or a brief `NotWritablePrimary` can be recorded by the server and then retried successfully by the driver without ever reaching your application code. The server-side counters reflect the original failures; your app sees only the ones that exhausted retries. A high server error rate with a calm application is a sign the database is straining under contention even though users are not yet affected.
+
+**What is the most common cause of a sudden spike?**
+A recent deploy. The single most frequent trigger is a release that changed a query shape or write pattern, introducing un-indexed queries, hot-document contention, or operations that exceed `maxTimeMS`. Before investigating the database internals, check what shipped in the last fifteen minutes and consider a rollback.
+
+**My error rate spiked but cleared in two minutes. Did the alert fire?**
+It depends on whether 1% was sustained across the five-minute window. A two-minute burst that pushes the rolling rate over 1% only briefly may not hold the breach long enough. The [Query Error Rate %](/nerve-centre/kpi-cards/mongodb/query-error-rate) gauge will show the transient even when this alert card does not raise.
+
+**How do I tell a code bug from an infrastructure problem?**
+Read the dominant error class. WriteConflict and duplicate-key errors are usually application or schema issues. NotWritablePrimary and connection errors are infrastructure: an election in progress or an exhausted pool. The class points you straight at the right sibling card and the right team.
+
+**Does this count slow queries as errors?**
+Only if they actually fail. A slow query that completes is not an error; it shows up on [Slow Ops (15m, >100ms)](/nerve-centre/kpi-cards/mongodb/slow-ops-15m-100ms) and the latency cards instead. A slow query becomes an error only when it exceeds its `maxTimeMS` deadline or a client timeout and is aborted, at which point it counts toward this rate.
+
+**Can I change the 1% threshold?**
+Yes, sensitivity thresholds are configurable per profile in the Sensitivity tab. A very high-write OLTP workload that runs with constant low-level write conflicts may want a higher line; a read-mostly analytics instance that should almost never error may want a tighter one. Tune it to your normal baseline rather than the generic default.
+
+**An election just happened and the error rate jumped. Is that expected?**
+Yes. During a primary election there is a brief window where writes to the old primary fail with `NotWritablePrimary` until a new primary is elected and the drivers reconnect. A short error spike that coincides with an election on the [Replica Set Member Lag](/nerve-centre/kpi-cards/mongodb/replica-set-member-lag-10s-or-in-recovering-state) card is failover behaviour, not a query bug. If elections are frequent, the real problem is replica-set instability, not the error rate itself.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Error Rate Spike (>1% in 5m)* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

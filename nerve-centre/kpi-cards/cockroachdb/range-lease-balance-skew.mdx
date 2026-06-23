@@ -1,0 +1,127 @@
+---
+title: "Range Lease Balance Skew %, CockroachDB"
+sidebarTitle: "Range Lease Balance Skew %"
+description: "Range Lease Balance Skew % for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ranges & Leases](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Range Lease Balance Skew %** measures how unevenly range leaseholders are distributed across the nodes of your cluster. In CockroachDB every range has one leaseholder, the single replica that serves reads and coordinates writes for that range, so the node holding the most leases does the most work. When leases pile up on one node it becomes a hot node: higher CPU, higher latency, and a single point of contention even though, on paper, the data is replicated everywhere. This metric is CockroachDB-distinctive: it exists because of the leaseholder model, and it is one of the earliest, cheapest warnings that a cluster is becoming lopsided before that imbalance shows up as latency pain.
+
+| | |
+| --- | --- |
+| **What it tracks** | The spread of leaseholders across nodes, as a percentage: `(max leaseholder_count - min leaseholder_count) / total leases`. |
+| **Data source** | Per-node leaseholder counts from the `replicas.leaseholders` time-series metric and `crdb_internal.kv_node_status` / the per-store status views. The DB Console Replication dashboard exposes the same "Leaseholders per Node" series; on CockroachDB Cloud the Metrics tab carries it. |
+| **Time window** | `RT` (real-time, refreshed on each poll). |
+| **Alert trigger** | `> 25% skew across nodes`. Above roughly a quarter the imbalance is large enough that one node is carrying a disproportionate, latency-affecting share of the read/write coordination. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+For each node the cluster reports how many ranges it is the leaseholder for. The skew is computed as the gap between the busiest and least-busy node, normalised by the total number of leases:
+
+```text
+skew % = (max(leaseholder_count) - min(leaseholder_count)) / total_leases * 100
+```
+
+A perfectly balanced cluster has every node holding roughly the same number of leases, so `max - min` is small and the skew is near zero. As leases concentrate on one node, `max` rises and `min` falls, widening the gap and pushing the percentage up. Normalising by the total lease count keeps the metric comparable across clusters of different sizes: a 12-lease gap means very different things on a 100-lease cluster than on a 100,000-lease cluster.
+
+CockroachDB's allocator continuously tries to balance leases, both by count and (in recent versions) by load, so a healthy cluster self-corrects modest skew within minutes. Sustained skew above the 25% trigger means the balancer is either fighting a hot range it cannot split, being overridden by a lease preference or zone constraint, or reacting to a recent topology change (a node restart or decommission) that concentrated leases temporarily. Reading the skew alongside the absolute leaseholder counts tells you whether this is a transient rebalance or a structural hot node.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 5-node CockroachDB cluster (v23.2) behind an ecommerce order and session workload. Snapshot on 14 Apr 26 at 10:00 BST, steady state.
+
+| Node | Leaseholders |
+| --- | --- |
+| n1 | 1,020 |
+| n2 | 1,005 |
+| n3 | 998 |
+| n4 | 1,012 |
+| n5 | 990 |
+
+Total leases: 5,025. Skew = (1,020 - 990) / 5,025 = **0.6%**. The cluster is well balanced and the card is green; no node is doing meaningfully more lease work than any other.
+
+Now a flash sale concentrates traffic on a small set of hot tables (the active-cart and inventory-counter ranges), and a recent zone configuration accidentally set a lease preference pinning those ranges to n1's locality. At 18:30 BST the card reads:
+
+| Node | Leaseholders |
+| --- | --- |
+| n1 | 1,640 |
+| n2 | 905 |
+| n3 | 880 |
+| n4 | 870 |
+| n5 | 360 |
+
+Total leases: 4,655. Skew = (1,640 - 360) / 4,655 = **27.5%**, above the 25% trigger, and the card is red. n1 is now a hot node: it holds far more leaseholders than the others, so it is shouldering a disproportionate share of read serving and write coordination. The symptom downstream is rising tail latency, because requests that route to n1's leases queue behind each other. The SRE confirms this by checking [Statement Latency p99 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p99-ms), which has climbed, while p99 on ranges led by other nodes is fine.
+
+The remediation depends on the cause:
+
+1. **An accidental lease preference or zone constraint.** Correct the zone configuration so the allocator is free to rebalance leases away from n1. Once the constraint is lifted, the balancer redistributes leases within minutes.
+2. **A genuine hot range that cannot be balanced by moving its single lease.** If one range is taking the bulk of traffic, moving its leaseholder just moves the hotspot. The fix is to split the hot range (load-based splitting usually does this automatically, but you can force a split) so the load spreads across multiple leaseholders on multiple nodes.
+3. **A transient post-restart concentration.** If n1 was the last node to restart, leases may have piled onto it as others recovered; this clears on its own and needs no action.
+
+Two takeaways:
+
+1. **Skew is a leading indicator of latency, not a lagging one.** It rises before tail latency does, because a hot node degrades gradually as its lease share grows. Catching skew early lets you rebalance before customers feel it.
+2. **Moving a lease does not fix a hot range.** If a single range is the problem, redistributing its one leaseholder just relocates the hotspot. Splitting the range is the real fix, because it creates more leases to spread across more nodes.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Lease Skew | What the combination tells you |
+| --- | --- | --- |
+| [Replicas per Node](/nerve-centre/kpi-cards/cockroachdb/replicas-per-node) | Replica balance is the structural layer beneath lease balance. | Even replicas but skewed leases means a lease-placement problem, not a data-placement one. |
+| [Statement Latency p99 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p99-ms) | The downstream symptom of a hot node. | Rising skew with rising p99 confirms one node's lease load is hurting tail latency. |
+| [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) | A hot range often coincides with contention on the same keys. | Skew plus contention on one table points to a single hot range needing a split. |
+| [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) | Hot ranges drive retries as transactions conflict. | High retries concentrated on the hot node's ranges reinforce the split diagnosis. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The composite that a hot-node latency dip pulls down. | A health dip explained by skew tells you to rebalance, not to scale. |
+| [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count) | Topology changes are a common cause of transient skew. | A recent node restart or addition explains short-lived skew that self-corrects. |
+| [Decommissioning Nodes](/nerve-centre/kpi-cards/cockroachdb/decommissioning-nodes) | A downsize concentrates leases on fewer nodes. | Rising skew during a decommission is expected and should settle once it completes. |
+| [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live) | Traffic volume is what turns skew into pain. | High skew at low QPS is harmless; high skew at high QPS is urgent. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+The native source is the per-node leaseholder count. Query it directly with `SELECT node_id, range_count, lease_holder_count FROM crdb_internal.kv_node_status ORDER BY lease_holder_count DESC;` (column names vary slightly by version; the `replicas.leaseholders` time-series metric is the canonical series). Compute `(max - min) / total` from those counts to reproduce the skew percentage. In the DB Console, the Replication dashboard's "Leaseholders per Node" graph shows the same distribution over time, and the Hot Ranges page (Advanced Debug) identifies the specific ranges driving load onto a hot node, which is the detail you need to decide between rebalancing and splitting.
+
+On CockroachDB Cloud, the Metrics tab carries the leaseholders-per-node series, and the cluster Overview hints at node imbalance through per-node CPU. If Vortex IQ flags skew but the DB Console graph looks settled, you are probably seeing the tail of a self-correcting rebalance; allow a few minutes and recheck. Persistent skew that does not clear in the native graph is the genuine signal, and the Hot Ranges view is where you confirm whether a lease preference, a zone constraint, or a single hot range is the cause.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What is a leaseholder, and why does its placement matter so much?**
+In CockroachDB each range has multiple replicas for durability, but exactly one of them, the leaseholder, serves reads and coordinates writes for that range. So while data is spread everywhere, the work for any given range lands on one node. If leases concentrate, one node does a disproportionate share of the cluster's read and write coordination, which makes it a hot node even though the data is fully replicated. That is why lease balance, not just replica balance, drives latency.
+
+**The skew spiked right after a node restart, then cleared on its own. Was that a real problem?**
+No. When a node restarts, its leases move to other nodes, and when it comes back the allocator gradually moves leases back, so you see a transient spike that self-corrects within minutes. The allocator continuously rebalances leases. Treat short-lived skew around restarts, additions, or decommissions as expected; the alert is aimed at skew that persists.
+
+**The card is red but moving leases off the hot node does not help. Why?**
+Almost certainly because a single range is hot, not a spread of ranges. Each range has only one lease, so relocating that one lease just moves the hotspot to whichever node receives it. The real fix is to split the hot range into several, which creates multiple leases that the allocator can place on different nodes. CockroachDB's load-based splitting usually does this automatically; if it has not, you can force a manual split.
+
+**Could a lease preference or zone configuration be causing the skew?**
+Yes, and this is a common cause. A lease preference or a restrictive zone constraint can pin leases to a particular node or locality, overriding the allocator's balancing. Check the zone configurations on the busy tables (`SHOW ZONE CONFIGURATION FROM TABLE ...`) for `lease_preferences` or constraints that funnel leases to one place, and relax them if the pinning is unintended.
+
+**Is high skew dangerous even at low traffic?**
+Not really. Skew turns into a problem only when the hot node's extra lease load translates into real work. At low QPS a lopsided distribution causes no measurable latency harm. Read this card alongside [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live): high skew at high QPS is urgent; high skew at trivial QPS can wait for the next maintenance window.
+
+**Why use a skew percentage rather than just the busiest node's count?**
+Because absolute counts are not comparable across clusters. A 30-lease gap is severe on a 200-lease cluster and negligible on a 200,000-lease one. Normalising the max-minus-min gap by the total lease count gives a single percentage that means the same thing regardless of cluster size, which is what makes the 25% trigger meaningful everywhere.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Range Lease Balance Skew %* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

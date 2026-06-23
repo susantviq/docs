@@ -1,0 +1,154 @@
+---
+title: "Unavailable or Under-Replicated Ranges, CockroachDB"
+sidebarTitle: "Unavailable or Under-Replicated Ranges"
+description: "Unavailable or Under-Replicated Ranges alerts for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Alerts for **Unavailable or Under-Replicated Ranges**: the firing list for the two most serious states a CockroachDB range can be in. This card is CockroachDB-distinctive, it watches the replication layer that no single-node database has. An *unavailable* range has lost quorum: some of your data cannot be read or written right now. An *under-replicated* range has fewer healthy replicas than the configured replication factor: it still works, but it is one more failure away from going unavailable. Any unavailable range is a data-availability incident, full stop. Sustained under-replication is the warning that the cluster cannot self-heal fast enough.
+
+| | |
+| --- | --- |
+| **What it tracks** | CockroachDB-distinctive: quorum loss or replication gap. Any unavailable range is a data-loss / data-availability risk. Fires on `unavailable_ranges > 0` OR `under_replicated_ranges > 0` held for 5 minutes. |
+| **Data source** | The `ranges.unavailable` and `ranges.underreplicated` time-series metrics, also surfaced on the DB Console Replication dashboard ("Ranges" and "Under-replicated/Unavailable Ranges" panels) and queryable via `crdb_internal` range views. |
+| **Metric basis** | Range-state counts from the replication layer, independent of SQL-level metrics. A cluster can be answering queries on healthy ranges while a subset of ranges is unavailable. |
+| **Time window** | `RT`, evaluated continuously; the under-replicated arm requires a **sustained 5-minute** breach so that normal, self-healing rebalancing does not fire. Unavailable ranges are treated as urgent the moment they appear. |
+| **Alert trigger** | `unavailable_ranges > 0 OR under_replicated > 0 sustained 5m`. |
+| **What counts as a firing** | (1) Any range reporting unavailable; (2) Under-replicated ranges that persist above zero for 5 continuous minutes. |
+| **What does NOT fire** | (1) Brief under-replication during a rolling restart or planned rebalance that clears within 5 minutes; (2) Replica *moves* (the up-replicate / down-replicate churn of a healthy balancer) that never drop a range below quorum. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+CockroachDB splits all data into ranges, and each range is replicated (by default 3 replicas, sometimes 5 for system or critical ranges). The replicas form a Raft group that needs a majority (quorum) to commit reads and writes. This card watches two range-state counters:
+
+```text
+fires when:  ranges.unavailable > 0
+        OR   ranges.underreplicated > 0   (held continuously for 5 minutes)
+```
+
+**Unavailable** (`ranges.unavailable`) counts ranges that have lost quorum: too many replicas are on dead or partitioned nodes for the Raft group to reach a majority. While a range is unavailable, statements touching its key span block or error. This is the data-availability emergency arm, so it is treated as urgent the instant the counter is non-zero.
+
+**Under-replicated** (`ranges.underreplicated`) counts ranges that currently have fewer live replicas than their configured replication factor (for example 2 live replicas on a range configured for 3). The range still has quorum and works, but it has lost its safety margin: one more replica failure could push it to unavailable. CockroachDB normally self-heals this by up-replicating onto a healthy node within minutes. Because brief under-replication is *expected* during rolling restarts, node decommissioning, and rebalancing, the under-replicated arm requires a sustained 5-minute breach before it fires. A sustained breach means the cluster cannot self-heal, usually because a node is down, the balancer is overloaded, or there is nowhere healthy to place the missing replica.
+
+Each firing carries the unavailable count, the under-replicated count, and the nodes/stores implicated so the on-call engineer can map ranges to failed hardware.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 6-node CockroachDB cluster, replication factor 3, spread across three availability zones (two nodes per zone). Snapshot taken on 18 Apr 26 at 03:20 BST, after a zone-level network incident took two nodes offline at 03:08.
+
+| Time (BST) | Live nodes | Under-replicated | Unavailable | State |
+| --- | --- | --- | --- | --- |
+| 03:05 | 6 | 0 | 0 | healthy |
+| 03:08 | 4 | 0 | 0 | two nodes drop (zone B) |
+| 03:09 | 4 | 1,240 | 0 | ranges lose a replica each |
+| 03:14 | 4 | 1,180 | 0 | self-heal stalling |
+| 03:20 | 4 | 1,160 | **38** | **alert fires (unavailable + sustained under-replication)** |
+
+When zone B's two nodes dropped at 03:08, every range that had a replica on those nodes immediately went under-replicated (2 live replicas instead of 3). The cluster began up-replicating onto the four remaining nodes. But 38 ranges had two of their three replicas in zone B, so losing both at once cost those ranges their quorum: they went **unavailable**. The under-replicated count also stayed high past the 5-minute window because four nodes could not absorb the rebalancing fast enough. The card fired at 03:20 on both arms.
+
+What the on-call SRE does with this:
+
+1. **Treat unavailable as the priority.** 38 unavailable ranges means a slice of the keyspace is unreadable and unwritable. Cross-read [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges) for the live count and which tables those ranges back. The fastest recovery is to bring the two zone-B nodes back: restoring even one of them can hand quorum back to those 38 ranges instantly.
+2. **Confirm the node loss.** Check [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count) and [Active Nodes (status=live)](/nerve-centre/kpi-cards/cockroachdb/active-nodes-statuslive). Both should read 4, confirming the two-node loss is the root cause rather than a metrics artefact.
+3. **Decide on the under-replication path.** If the zone-B nodes are coming back within minutes, do nothing further: the under-replicated ranges will re-replicate onto the returning nodes and the unavailable ranges recover. If the nodes are gone for good, the cluster will eventually re-replicate the survivors onto the four healthy nodes, but only the unavailable ranges that still have at least one surviving replica can recover. Ranges that lost all replicas in zone B require restore from backup, which is why [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/cockroachdb/last-successful-backup-hours-ago) matters at exactly this moment.
+
+```text
+Why the topology caused this:
+  - RF=3 survives the loss of 1 replica per range (quorum = 2 of 3).
+  - Losing 2 zones-worth of nodes at once cost some ranges 2 of their 3 replicas.
+  - Those ranges dropped from quorum (2/3 live) to no quorum (1/3 live) = unavailable.
+  - Lesson: with RF=3 across 3 zones, survive 1 zone loss, NOT 2 nodes in the same zone
+    that happened to co-locate replicas. Constraints (per-zone replica placement) prevent this.
+```
+
+Three takeaways for the team:
+
+1. **Unavailable and under-replicated are not the same severity.** Under-replicated is a warning (safety margin lost, usually self-heals). Unavailable is an active outage (data cannot be served). The card fires on either, but you triage unavailable first, always.
+2. **Sustained under-replication means self-healing failed.** A brief blip during a restart is normal and will not fire. A 5-minute-plus breach means the cluster cannot place the missing replicas: a node is down, disks are full, or placement constraints leave nowhere legal to put them.
+3. **Backups are the floor under this card.** If a range loses every replica, no amount of cluster recovery brings it back; only a restore does. The freshness of your backup is the difference between minutes of recovery and permanent data loss.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Unavailable or Under-Replicated Ranges | What the combination tells you |
+| --- | --- | --- |
+| [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges) | The live count for the urgent arm of this alert. | Confirms how much of the keyspace is currently unserveable. |
+| [Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/under-replicated-ranges) | The live count for the warning arm. | A non-zero sustained value means the balancer cannot keep up. |
+| [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count) | The usual root cause: a lost node. | A drop in node count immediately before the firing pinpoints the failed node. |
+| [Active Nodes (status=live)](/nerve-centre/kpi-cards/cockroachdb/active-nodes-statuslive) | The live-node headcount feeding quorum. | If live nodes fell, the replication gap is a direct consequence. |
+| [Raft Quiescent Lag (seconds)](/nerve-centre/kpi-cards/cockroachdb/raft-quiescent-lag-seconds) | Replication-health peer. | High Raft lag alongside under-replication means replicas are struggling to catch up. |
+| [Decommissioning Nodes](/nerve-centre/kpi-cards/cockroachdb/decommissioning-nodes) | A stuck decommission is a common cause of sustained under-replication. | A long-running decommission with persistent under-replication means draining is blocked. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/cockroachdb/last-successful-backup-hours-ago) | The recovery floor when ranges lose all replicas. | A stale backup at the moment of an unavailable firing is the worst case: no clean restore point. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The executive composite this alert dominates. | Any unavailable range should push the health score well below the alert line. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look natively:**
+
+> **DB Console Replication dashboard** for the "Under-replicated Ranges" and "Unavailable Ranges" panels (the canonical live view).
+> **DB Console Problem Ranges report** (Advanced Debug page) to list the specific ranges, their replicas, and which nodes hold them.
+> **`SELECT range_id, unavailable, under_replicated FROM crdb_internal.ranges WHERE unavailable OR under_replicated;`** to enumerate the affected ranges and trace them to tables.
+> **`cockroach node status --ranges`** for the per-node replica and range health view.
+> **CockroachDB Cloud Metrics tab** plots the same `ranges.unavailable` and `ranges.underreplicated` series; the cluster page flags replication health.
+
+**Why our number may legitimately differ from the native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sustain filter (under-replicated)** | Vortex IQ fires less often | The DB Console graph shows every momentary under-replication during a rebalance; this card only fires when under-replication persists for 5 minutes. |
+| **Unavailable urgency** | Same | Both surface unavailable ranges immediately; there is no sustain delay on that arm. |
+| **Aggregation timing** | Brief lag | Range counts are gossiped and polled; a count can settle a poll later than the live DB Console graph. |
+| **Counting scope** | Either way | This card counts cluster-wide range states; the Problem Ranges report can additionally show ranges with other issues (no leaseholder, raft leader/leaseholder split) that are not part of this card's two counters. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count) | A node-count drop should precede most firings. | A firing with no node loss points to disk-full stores or placement-constraint deadlock rather than a dead node. |
+| [CRDB Inventory Rows vs Ecom Inventory](/nerve-centre/kpi-cards/cockroachdb/crdb-inventory-rows-vs-ecom-inventory) | Unavailable ranges backing inventory tables can stall stock sync. | Inventory drift appearing during an unavailable firing confirms the outage is hitting customer-facing data. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What is the difference between unavailable and under-replicated?**
+An *under-replicated* range has fewer live replicas than its configured replication factor but still has quorum, so it keeps serving reads and writes; it has merely lost its safety margin and CockroachDB will normally re-replicate it within minutes. An *unavailable* range has lost quorum (a majority of its replicas are on dead or partitioned nodes), so statements touching it block or error. Under-replicated is a warning; unavailable is an active outage. This card fires on either, but you triage unavailable first.
+
+**Under-replicated ranges appear during every rolling restart. Will that fire the alert?**
+Not usually. Brief under-replication during a planned rolling restart, decommission, or rebalance is expected, and the under-replicated arm requires the breach to persist for 5 continuous minutes before firing. A restart that completes and re-replicates within that window will not trip the alert. If it does fire during a restart, the cluster is not self-healing fast enough, which is itself worth investigating.
+
+**The card fired on unavailable ranges. What is the single fastest recovery?**
+Restore the lost replicas' nodes. An unavailable range lost quorum because too many of its replicas are on down or partitioned nodes; bringing even one of those nodes back can immediately restore the majority and recover the range. Check [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count) to identify the missing node and prioritise getting it back over any rebalancing change.
+
+**A range lost all of its replicas. Can the cluster recover it on its own?**
+No. CockroachDB can re-replicate from any *surviving* replica, but a range with zero live replicas has no source to copy from. That data is recoverable only from a backup, which is why [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/cockroachdb/last-successful-backup-hours-ago) is the critical sibling at the moment of an unavailable firing. Total-replica-loss is the scenario your replication factor and zone placement exist to prevent.
+
+**Sustained under-replication is firing but all nodes are live. Why won't it heal?**
+Common causes: (1) the target stores are out of disk, so there is nowhere to place the missing replica; (2) placement constraints (per-zone or per-region replica rules) leave no *legal* node for the replica; (3) a stuck decommission is blocking draining (see [Decommissioning Nodes](/nerve-centre/kpi-cards/cockroachdb/decommissioning-nodes)); (4) the rebalancer is throttled or overloaded. Check store disk usage and your zone/replication constraints first.
+
+**Does my replication factor change how this card behaves?**
+The counters are the same, but your survivability is not. At RF=3 a range survives 1 replica loss (quorum 2 of 3); at RF=5 it survives 2 (quorum 3 of 5). Critical system ranges often run at RF=5. The card fires on the same thresholds regardless, but a higher RF buys more headroom before under-replicated becomes unavailable. Spreading replicas across zones with constraints is what prevents a single zone failure from costing a range its quorum.
+
+**On CockroachDB Cloud the platform manages nodes. Do I still need this card?**
+Yes. The managed service handles node provisioning and many recovery actions, but range availability is still observable and still matters: a zone incident, a regional event, or a placement issue can still produce under-replicated or unavailable ranges. The card gives you an independent, real-time view of replication health rather than waiting for a managed-service status update.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Unavailable or Under-Replicated Ranges* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

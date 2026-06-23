@@ -1,0 +1,157 @@
+---
+title: "PostgREST API Latency p95 (ms), Supabase"
+sidebarTitle: "PostgREST API Latency p95 (ms)"
+description: "PostgREST API Latency p95 for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [PostgREST API](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This card reports the 95th-percentile response time of requests served by PostgREST, the auto-generated REST layer that fronts your Supabase database. It is Supabase-distinctive: PostgREST is what your application code actually calls, so its p95 is the closest server-side proxy you have for how fast your API feels to real clients. The p95 means 95% of requests completed at or below this number in the window, and 5% were slower. It catches the slow tail that an average hides, while staying robust against the handful of pathological outliers that distort p99. For a platform or SRE team this is the headline latency gauge: when it bends upward, the application gets slower for a meaningful slice of users before anything has actually broken.
+
+| | |
+| --- | --- |
+| **What it tracks** | The 95th-percentile end-to-end latency of HTTP requests served by PostgREST (Supabase's auto-generated REST API over Postgres), measured in milliseconds for the window. |
+| **Data source** | Supabase request logs and edge/PostgREST metrics, exposed through the project's Logs & Analytics layer (`api_logs` / Logflare-backed request logs) and the project metrics endpoint. The card reads the per-request duration distribution and computes the p95. |
+| **Time window** | `RT/5m` (a live reading plus a five-minute rolling percentile to smooth single-request spikes). |
+| **Alert trigger** | `>200ms`. A sustained p95 above 200ms on an OLTP-style API workload is the point where the slow tail starts to be felt by users; tune per project for heavier read-aggregation endpoints. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card collects the duration of every PostgREST request in the rolling window, sorts them, and reports the value at the 95th percentile:
+
+```text
+p95 = the latency value at the 95th percentile of all PostgREST
+      request durations in the window
+fire when: p95 > 200ms (sustained, OLTP API profile)
+```
+
+Each request duration is the full server-side time PostgREST spends on the request: parsing the URL into a query, opening or borrowing a pooled connection, executing the SQL against Postgres, serialising the result to JSON, and writing the response. It does not include the network time between the client and Supabase's edge, so the number a browser sees is always this value plus round-trip network latency. That distinction matters when you reconcile against client-side timing.
+
+Two computation details shape how to read the number:
+
+1. **Percentile, not average.** A mean is dragged down by the many fast cache-hit reads and hides a slow minority. The p95 deliberately surfaces the slow tail: it is the experience of the unluckiest 1 in 20 requests. A p95 of 180ms with a mean of 35ms is normal; it means most calls are quick and a tail of heavier queries sits behind them.
+2. **PostgREST latency is mostly Postgres latency plus pool wait.** PostgREST itself is thin. When this card rises, the cause is almost always downstream: a slow query, a missing index, lock contention, or, very commonly on Supabase tiers, time spent waiting for a free connection in the Supavisor pool. The pooler wait is invisible in the SQL plan but very visible here.
+
+The natural drill-downs are [Postgres Query Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgres-query-latency-p95-ms) (does the slowness live in the database itself?) and [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) (is the request waiting for a connection before it even runs?).
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Supabase Pro project backing a customer-facing web app. The PostgREST p95 normally sits around 70ms. Snapshot taken on 28 Apr 26 at 09:40 BST, shortly after a marketing email drove a traffic surge.
+
+| Window | Requests | p50 | **p95** | State |
+| --- | --- | --- | --- | --- |
+| 08:30 to 09:00 (baseline) | 142k | 24ms | 68ms | healthy |
+| 09:35 to 09:40 (surge) | 51k | 31ms | **246ms** | **BREACH** |
+
+The card fires. The headline reads **PostgREST API Latency p95 246ms (BREACH)**. The team reads:
+
+1. **The median barely moved, the tail blew out.** p50 went 24ms to 31ms (a normal load nudge) while p95 jumped from 68ms to 246ms. That shape (stable median, exploding tail) is the signature of contention, not of every query getting uniformly slower. Something is making a minority of requests wait.
+2. **Check the pooler before blaming the queries.** Cross-reference [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation); it has climbed to 96%. The surge opened more concurrent requests than the tier's pool can serve at once, so a slice of requests now queue for a connection. The added latency is pool wait, not slow SQL.
+3. **The database itself is fine.** [Postgres Query Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgres-query-latency-p95-ms) is steady at 19ms. This confirms the queries are fast once they run; the lost time is in front of them, queueing for a connection.
+
+```text
+Triage path for a tail-only p95 breach:
+  1. Pool wait (most common on Free/Pro under burst):
+     - Supavisor Pool Saturation high -> requests queue for a connection.
+     - Fix: move clients to the transaction-mode pooler (port 6543),
+       reduce per-request connection lifetime, or raise the tier's pool size.
+  2. Slow query (if Postgres p95 also rose):
+     - Find it in pg_stat_statements ORDER BY mean_exec_time DESC.
+     - EXPLAIN (ANALYZE, BUFFERS) the offender; add the missing index.
+  3. Lock contention (if Deadlocks or lock waits also rose):
+     - Check pg_stat_activity for wait_event_type = 'Lock'.
+```
+
+```text
+Confirm pool-wait hypothesis:
+  SELECT count(*) AS waiting
+  FROM pg_stat_activity
+  WHERE wait_event_type = 'Client' OR state = 'idle in transaction';
+  -- plus the Supavisor saturation card trending alongside the p95 spike.
+```
+
+The fix here is the pooler, not the queries: the team switched the app's connection string to the transaction-mode pooler endpoint and the p95 settled back under 80ms within a few minutes. Adding indexes would have done nothing, the queries were never the bottleneck.
+
+Three takeaways:
+
+1. **Read the shape, not just the number.** A tail-only spike (stable median, exploding p95) means contention or queueing; a whole-distribution shift (median and p95 rise together) means the queries themselves got slower. They have different fixes.
+2. **On Supabase, pool wait is the usual hidden cost.** Tier-bound Supavisor caps mean a traffic burst exhausts connections fast, and the wait shows up here, not in the SQL plan. Always check pool saturation before re-indexing.
+3. **200ms is an OLTP API threshold, not a universal law.** Endpoints that aggregate or paginate large result sets will legitimately run slower. Set the threshold per workload in the Sensitivity tab rather than chasing one global number.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with PostgREST API Latency p95 | What the combination tells you |
+| --- | --- | --- |
+| [PostgREST API Latency p99 (ms)](/nerve-centre/kpi-cards/supabase/postgrest-api-latency-p99-ms) | The far tail of the same distribution. | p95 steady but p99 spiking equals a few very slow requests; both rising equals broad degradation. |
+| [PostgREST Request Rate (req/sec)](/nerve-centre/kpi-cards/supabase/postgrest-request-rate-reqsec) | Separates a load surge from a query regression. | Latency up with flat request rate equals a regression, not more traffic. |
+| [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) | Latency often precedes errors as load climbs. | Rising p95 then rising 5xx equals saturation tipping into failure. |
+| [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) | The most common hidden cause of PostgREST tail latency. | High saturation alongside a p95 spike equals pool wait, not slow SQL. |
+| [Postgres Query Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgres-query-latency-p95-ms) | Isolates database time from API overhead. | Postgres p95 flat while PostgREST p95 rises equals the time is in front of the query (pool or serialisation). |
+| [Buffer Cache Hit Rate %](/nerve-centre/kpi-cards/supabase/buffer-cache-hit-rate) | Cache misses turn fast queries slow. | A hit-rate dip preceding a latency rise equals disk reads dragging the tail. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate) | Catches the specific query behind a database-side spike. | New slow queries plus rising p95 equals a missing index or plan regression. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite that reflects API latency. | A sustained p95 breach nudges the composite before downstream cards fire. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase's own tooling:**
+
+> In the Supabase dashboard, open **Reports → API** (and the **Logs → API / Edge** explorer) for the request-duration distribution PostgREST records per route. The dashboard charts and this card draw from the same request-log stream.
+> Query the logs directly with the project's log explorer: the `api_logs` / edge request logs expose per-request `execution_time` / response duration, which you can percentile yourself over a matching window.
+> To separate API overhead from database time, compare against `pg_stat_statements` (`mean_exec_time`, `max_exec_time`) for the underlying queries. If Postgres is fast but PostgREST is slow, the gap is pool wait or serialisation, not the SQL.
+> The managed-service console exposes the same metric under the project's observability charts; confirm the chart's percentile and window match the card before assuming a divergence.
+
+**Why our number may legitimately differ from Supabase's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window boundary** | Variable | The card uses a five-minute rolling percentile; a dashboard chart bucketed to 1m or 1h will sit higher or lower depending on where the spike falls. |
+| **Server vs client timing** | Card lower than browser | This card measures PostgREST server-side duration only; a client-side measurement adds network round-trip and edge time on top. |
+| **Percentile method** | Marginal | Percentiles computed over slightly different sample sets (sampled logs vs full stream) can differ by a few ms at the tail. |
+| **Route scope** | Variable | The card aggregates across PostgREST routes; a dashboard view filtered to one endpoint can read very differently from the blended p95. |
+| **Time zone** | Axis shift only | Supabase charts render in the project's configured zone; Vortex IQ renders in your profile zone, which shifts the x-axis but not the value. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My p95 is fine but users say the app feels slow. Why?**
+This card measures PostgREST's server-side time only, not the network leg between the client and Supabase's edge. If the server p95 is healthy but users complain, the latency is likely in the round trip (distant region, mobile networks), in the client rendering, or in a non-PostgREST call such as an Edge Function or Realtime subscription. Check [Edge Function Error Rate %](/nerve-centre/kpi-cards/supabase/edge-function-error-rate) and your client-side timing, and consider whether a read replica closer to your users would cut the round trip.
+
+**The p95 spiked but every query in pg_stat_statements is fast. What am I missing?**
+Almost certainly pool wait. PostgREST cannot run a query until it has a connection, and on tier-capped Supavisor pools a burst makes requests queue for one. That wait is real latency the client feels but is invisible in the SQL plan. Check [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation); if it is high during the spike, move clients to the transaction-mode pooler (port 6543) or raise the tier's pool size.
+
+**Should I alert on p95 or p99?**
+Both, for different reasons. p95 is your headline "is the API healthy" gauge because it reflects a meaningful slice of users (1 in 20) while staying stable. p99 catches the rare, severe outliers that p95 smooths over. A common pattern is a tight p95 alert at 200ms for routine health plus a looser p99 alert at 500ms to catch pathological tails. See [PostgREST API Latency p99 (ms)](/nerve-centre/kpi-cards/supabase/postgrest-api-latency-p99-ms).
+
+**Is 200ms the right threshold for my project?**
+It is an OLTP-API default. Endpoints that aggregate, join across many tables, or return large paginated payloads will legitimately run slower, and forcing them under 200ms is the wrong goal. Set the threshold per project in the Sensitivity tab to match the kind of work your busiest routes do, so you alert on regressions rather than on the nature of the endpoint.
+
+**Does Row Level Security affect this latency?**
+It can. RLS policies are evaluated as additional predicates on every query PostgREST runs, so a complex policy (especially one that itself queries another table) adds work to each request. If a p95 rise coincides with a policy change, profile the affected route with `EXPLAIN (ANALYZE, BUFFERS)` including the RLS predicates; an unindexed column referenced in a policy is a common, easily missed cause.
+
+**Why does the card show a higher p95 than my Supabase dashboard chart?**
+Usually window granularity. The card uses a five-minute rolling percentile, which surfaces a short burst sharply; a dashboard chart bucketed to an hour averages that burst into a calmer number. Match the windows before assuming a real discrepancy, and remember the card and the dashboard read from the same underlying request-log stream.
+
+**Free-tier projects pause when idle. Does that distort the p95?**
+Yes, at the edges. A Free-tier project that has been paused shows a cold-start penalty on its first requests after waking, which can inflate the p95 briefly. That is expected behaviour, not a fault. On a paused-prone Free project, read the p95 over a warm window, or move to a tier that does not pause if cold starts are unacceptable for your workload.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*PostgREST API Latency p95 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

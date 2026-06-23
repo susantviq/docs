@@ -1,0 +1,142 @@
+---
+title: "Storage Used (TB), Snowflake"
+sidebarTitle: "Storage Used (TB)"
+description: "Storage Used (TB) for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Storage Used (TB)** is the total billable storage in your Snowflake account, in terabytes: active table data plus Time Travel and Fail-safe retention plus internal stages. Compute (credits) gets the headlines, but storage is the quiet, compounding line on the bill, and unlike compute it does not auto-suspend. Because storage is cost-anchored, growth in this number is growth in your monthly spend. For a platform team, a sudden month-on-month jump is usually one of three things: an un-dropped clone, a retention setting left too high, or a table that is being rewritten in full every night and dragging its Time Travel history along with it.
+
+| | |
+| --- | --- |
+| **What it tracks** | Total billable account storage in TB: active bytes plus Time Travel plus Fail-safe plus stage bytes, as Snowflake bills it. |
+| **Data source** | `detail`: From `STORAGE_USAGE` table (1.5hr latency). Storage is cost-anchored, growth equals bill growth. Read from `SNOWFLAKE.ACCOUNT_USAGE.STORAGE_USAGE` (and `TABLE_STORAGE_METRICS` / `STAGE_STORAGE_USAGE_HISTORY` for breakdowns). |
+| **Time window** | `RT` (latest available daily storage reading; the source view carries roughly 1.5 hours of latency). |
+| **Alert trigger** | `+25% MoM`. A month-on-month increase above 25% pages the platform owner: that pace of growth materially changes the bill. |
+| **Why it matters** | Storage is a direct, recurring cost that compounds. It also reflects data hygiene: runaway Time Travel, orphaned clones, and bloated stages all surface here before they surface on the invoice. |
+| **Roles** | owner, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card reads the latest daily storage figure Snowflake records for the account and converts to terabytes:
+
+```text
+storage_used_tb = ( storage_bytes + stage_bytes + failsafe_bytes ) / 1024^4
+
+month_on_month_pct = ( storage_now - storage_30d_ago ) / storage_30d_ago * 100
+```
+
+The `ACCOUNT_USAGE.STORAGE_USAGE` view exposes a once-per-day reading per account: `STORAGE_BYTES` (active table data plus Time Travel), `STAGE_BYTES` (internal stage files), and `FAILSAFE_BYTES` (the non-configurable 7-day Fail-safe retention). The card sums all three because all three are billable, then divides by 1024^4 to get TB. This is the number that maps to your storage line item, billed on average daily TB across the month.
+
+Two points matter for reading it correctly. First, "active" storage is not the same as the logical size of your tables: Snowflake stores compressed micro-partitions, so the billed figure is usually well below the uncompressed row count would suggest, and a table that looks large logically may bill modestly. Second, and more importantly for the alert, Time Travel and Fail-safe mean that deleting data does not immediately reduce storage. When you drop or overwrite a large table, its prior version is retained for the Time Travel window (1 to 90 days, depending on edition and the `DATA_RETENTION_TIME_IN_DAYS` setting) plus 7 days of Fail-safe, so the bytes linger and keep billing until both windows expire. A nightly full-rewrite of a big table is the classic trap: each rewrite leaves a full prior copy in Time Travel, so a 2TB table on a 30-day retention can quietly bill closer to 60TB of accumulated history.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a single production Snowflake account that normally holds about 8.0TB. Storage is billed at roughly $23 per TB per month (on-demand, illustrative). They alert at `+25% MoM`. Snapshot taken on 01 May 26.
+
+| Reading date | Storage (TB) | MoM change | State |
+| --- | --- | --- | --- |
+| 01 Mar 26 | 7.8 | +1.3% | healthy |
+| 01 Apr 26 | 8.1 | +3.8% | healthy |
+| 01 May 26 | 11.4 | **+40.7%** | alert |
+
+The 40.7% jump pages the platform owner. At $23/TB/month, the extra 3.3TB is about $76/month of new, recurring spend, and if the cause is structural it will keep climbing.
+
+```text
+Diagnosis trail:
+  - TABLE_STORAGE_METRICS ordered by (ACTIVE_BYTES + TIME_TRAVEL_BYTES) desc:
+      EVENTS_RAW shows ACTIVE_BYTES = 1.9TB but TIME_TRAVEL_BYTES = 2.8TB.
+  - Root cause #1: EVENTS_RAW is rebuilt nightly with CREATE OR REPLACE,
+      and DATA_RETENTION_TIME_IN_DAYS was set to 30. Every nightly rebuild
+      leaves a full prior copy in Time Travel; 30 days of copies pile up.
+  - STORAGE_USAGE breakdown also shows STAGE_BYTES up 0.4TB:
+      a failed bulk load left ~0.4TB of orphaned files in an internal stage.
+
+Cost framing:
+  - EVENTS_RAW Time Travel bloat: ~2.8TB ~= $64/month, recurring.
+  - Orphaned stage files: ~0.4TB ~= $9/month until cleaned.
+```
+
+The team takes two actions. They switch `EVENTS_RAW` from `CREATE OR REPLACE` to an incremental `MERGE` (so each night writes a delta, not a full copy) and lower `DATA_RETENTION_TIME_IN_DAYS` on that table to 1, which is appropriate for a reproducible raw-event table. They also `REMOVE` the orphaned stage files. Storage settles back toward 8.3TB over the following week as the old Time Travel versions age out. Note the lag: lowering retention does not reclaim the bytes instantly; the already-retained versions still bill until their original window expires.
+
+Three takeaways for the team:
+
+1. **Storage growth equals bill growth, and it compounds.** Compute spikes and falls; storage accumulates. A 25% MoM jump that is structural becomes next month's new baseline plus its own growth on top.
+2. **Deleting data does not free storage immediately.** Time Travel plus Fail-safe keep prior versions billable for days to weeks. Plan reclamation with that lag in mind, and do not panic when a drop fails to move the number the same day.
+3. **Full rewrites are the silent storage killer.** `CREATE OR REPLACE` or full `INSERT OVERWRITE` on a large table multiplies its Time Travel footprint. Prefer incremental `MERGE` and set retention to match how recoverable the table needs to be.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Storage Used (TB) | What the combination tells you |
+| --- | --- | --- |
+| [Largest Table (GB)](/nerve-centre/kpi-cards/snowflake/largest-table-gb) | Names the table driving total storage. | A storage jump is usually one or two tables; this card finds them. |
+| [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) | The compute half of the bill. | Storage plus credits is your full Snowflake spend picture. |
+| [Snowflake Health Score](/nerve-centre/kpi-cards/snowflake/snowflake-health-score) | The composite that folds cost posture into health. | Runaway storage drags the health gauge. |
+| [Last Snapshot Age (hours)](/nerve-centre/kpi-cards/snowflake/last-snapshot-age-hours) | Time Travel retention is both recovery and storage cost. | Longer retention improves recovery but inflates storage here. |
+| [Cross-Account Replication Lag (s)](/nerve-centre/kpi-cards/snowflake/cross-account-replication-lag-s) | Replicated databases duplicate storage on the secondary. | A new replication target raises storage without raising local data. |
+| [Avg Cost per Query ($)](/nerve-centre/kpi-cards/snowflake/avg-cost-per-query) | Cost-efficiency peer on the compute side. | Read both to see whether spend growth is storage-led or compute-led. |
+| [Credit Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/snowflake/credit-burn-vs-ecom-order-volume) | The cross-channel cost-efficiency view. | Confirms whether spend growth tracks business volume or is pure waste. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake's own tooling:**
+
+> Query `SNOWFLAKE.ACCOUNT_USAGE.STORAGE_USAGE` for the daily account total (`STORAGE_BYTES`, `STAGE_BYTES`, `FAILSAFE_BYTES`).
+> Query `SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS` for per-table `ACTIVE_BYTES`, `TIME_TRAVEL_BYTES`, `FAILSAFE_BYTES`, and clone-shared bytes.
+> In Snowsight, open **Admin to Cost Management** (Storage view) and the **Usage** dashboards for the billed daily-average TB; this is the figure that ties to your invoice.
+
+**Why our number may legitimately differ from Snowflake's view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Source latency** | Vortex IQ may trail | `STORAGE_USAGE` updates roughly daily with ~1.5 hours of latency; the card shows the latest available reading, which can be hours behind a just-completed load. |
+| **Daily-average billing** | Differs from a point reading | Snowflake bills the average daily TB across the month; the card's latest-reading value is a snapshot, not the month-to-date average, so it will not equal the invoice mid-month. |
+| **Clone accounting** | Variable | Zero-copy clones share micro-partitions until modified; the card follows Snowflake's billed attribution, which may differ from a naive sum of table sizes. |
+| **Fail-safe inclusion** | Vortex IQ may be higher | The card includes the 7-day Fail-safe bytes (billable); a query that sums only active bytes will read lower. |
+| **TB definition** | Marginal | The card uses binary TB (1024^4 bytes). A tool using decimal TB (1000^4) will show a slightly larger number for the same bytes. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**I dropped a huge table but storage barely moved. Why?**
+Time Travel and Fail-safe. When you drop or overwrite data, Snowflake retains the prior version for the table's Time Travel window (1 to 90 days depending on edition and `DATA_RETENTION_TIME_IN_DAYS`) plus a non-configurable 7-day Fail-safe period. Those retained bytes keep billing until both windows expire, so a drop frees space gradually, not instantly.
+
+**Does this number match my Snowflake invoice exactly?**
+Not at any single instant. Snowflake bills storage as the average daily TB over the month; this card shows the latest daily reading. They converge at month end but will differ mid-month, and the source view itself carries about 1.5 hours of latency. For billing reconciliation, use the Cost Management view in Snowsight.
+
+**My storage jumped but I did not load any new data. What happened?**
+Three usual suspects: (1) a table being fully rewritten nightly, so Time Travel accumulates a full prior copy each run; (2) an un-dropped zero-copy clone that has diverged from its source and now stores its own modified micro-partitions; (3) orphaned files in an internal stage from a failed or abandoned load. Check `TABLE_STORAGE_METRICS` for Time Travel bytes and `STAGE_STORAGE_USAGE_HISTORY` for stage growth.
+
+**How do I reduce storage safely?**
+Lower `DATA_RETENTION_TIME_IN_DAYS` on tables that do not need long Time Travel (raw, reproducible, or staging tables can often go to 1 day or 0), switch large nightly full-rewrites to incremental `MERGE`, drop unused clones, and `REMOVE` orphaned stage files. Remember the lag: changes reduce future accumulation immediately but already-retained versions still bill until their original window expires.
+
+**Why is the billed storage smaller than my tables' logical size?**
+Snowflake stores data as compressed, columnar micro-partitions. The billed figure reflects compressed bytes on disk, which is typically a fraction of the uncompressed logical size. A table that is "100TB of rows" logically may bill a few TB compressed. This card reports the billed (compressed) figure because that is what costs money.
+
+**Does Fail-safe count, and can I turn it off?**
+Yes, Fail-safe bytes are billable and the card includes them. No, you cannot disable Fail-safe; it is a fixed 7-day disaster-recovery retention that Snowflake applies after Time Travel expires. The only lever you control is Time Travel retention; shorter Time Travel means data reaches the end of its life sooner, but the 7-day Fail-safe tail always applies before bytes are finally released.
+
+**We added a disaster-recovery replica and storage doubled. Is that expected?**
+Yes. Replicated databases store a full copy of the data on the secondary account, which bills storage there too. The local Storage Used number may look unchanged while total cross-account storage rose; check the secondary account's own reading and pair with [Cross-Account Replication Lag (s)](/nerve-centre/kpi-cards/snowflake/cross-account-replication-lag-s) to see the replication footprint.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Storage Used (TB)* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

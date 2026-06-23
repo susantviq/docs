@@ -1,0 +1,158 @@
+---
+title: "Query Latency p99 (ms), MySQL"
+sidebarTitle: "Query Latency p99 (ms)"
+description: "Query Latency p99 (ms) for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Query Latency p99 (ms)** is the statement execution time at the 99th percentile: 99% of queries in the window finished faster than this number, and the slowest 1% finished slower. It is the tail-latency card, and the tail is where users feel pain. A healthy p50 with an ugly p99 means most requests are fine but a meaningful slice of sessions stall, which is exactly the experience that drives cart abandonment and timeout retries. p99 is the number an SRE watches when "the database feels slow" but the averages look clean.
+
+| | |
+| --- | --- |
+| **What it tracks** | The 99th-percentile statement latency across all executed statements in the sampling window, in milliseconds. Read from the Performance Schema (`events_statements_summary_by_digest` and the per-statement event tables) rather than from a simple average. |
+| **Data source** | Performance Schema statement events on the MySQL instance. The engine reads percentile buckets where available, or computes the percentile from the `SUM_TIMER_WAIT` / `COUNT_STAR` distribution across digests. Times are converted from picoseconds (Performance Schema's native unit) to milliseconds. |
+| **Time window** | `RT/5m` (real-time headline, rolled over a trailing 5-minute window so a single slow burst does not dominate). |
+| **Alert trigger** | `> 500ms`. When the trailing p99 crosses 500ms the card turns red and a Nerve Centre alert is raised. |
+| **Why it matters** | The tail drives perceived latency. Application connection pools and HTTP front ends commonly time out between 1 and 10 seconds; a p99 that climbs toward those limits turns into errors, retries, and pool exhaustion before the average ever moves. |
+| **Reading the value** | Read p99 next to [p50](/nerve-centre/kpi-cards/mysql/query-latency-p50-ms) and [p95](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms). A wide p50-to-p99 gap signals a tail problem (a few pathological queries, lock waits, or a cold buffer pool), not a broad slowdown. |
+| **Sentiment key** | `mysql_query_latency_p99` |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Conceptually, p99 is the value at the 99th position when every statement's execution time in the window is sorted ascending. In practice the engine does not sort millions of rows; it derives the percentile from the Performance Schema digest distribution.
+
+```text
+For each statement digest in events_statements_summary_by_digest:
+  count  = COUNT_STAR
+  total  = SUM_TIMER_WAIT      (picoseconds)
+  max    = MAX_TIMER_WAIT      (picoseconds)
+
+p99 is interpolated across the digest buckets so that 99% of
+COUNT_STAR-weighted executions fall at or below the returned latency.
+
+Convert the result: picoseconds / 1_000_000_000 = milliseconds.
+```
+
+Two points matter for accuracy. First, Performance Schema records timer waits in picoseconds, so a 12ms query is stored as 12,000,000,000; the engine handles the conversion. Second, the digest tables are cumulative since the last `TRUNCATE` or server restart, so the engine takes deltas between samples to keep the p99 anchored to the trailing 5-minute window rather than to all-time history.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MySQL 8.0 primary behind a product-catalogue and checkout API. Snapshot taken on 14 Apr 26 at 13:05 BST during a flash-sale ramp.
+
+| Percentile card | Value | Reading |
+| --- | --- | --- |
+| [p50](/nerve-centre/kpi-cards/mysql/query-latency-p50-ms) | 4 ms | Typical query is fast; the bulk of traffic is healthy. |
+| [p95](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) | 180 ms | Just under the 200ms alert line; the upper band is starting to stretch. |
+| **p99** | **610 ms** | **Over the 500ms line. Red.** The slowest 1% of queries are now blocking for more than half a second. |
+
+The headline shows **p99 = 610ms** with a red border, and a Nerve Centre alert fires. The team reads the spread:
+
+1. **p50 is 4ms but p99 is 610ms, a 150x gap.** This is a classic tail problem, not a broad regression. If the whole instance were overloaded, p50 would have moved too. Because it has not, the cause is concentrated in a handful of statements.
+2. **They open [Top 10 Slowest Queries](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest).** The top digest is an unindexed `WHERE status = ? AND created_at > ?` filter doing a full scan on the `orders` table, which only hurts under flash-sale write volume because the buffer pool keeps evicting the hot pages.
+3. **They check [InnoDB Buffer Pool Hit Rate](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate),** which has slipped from 99.6% to 97.1%. The cold reads from the full scan are evicting hot pages, so even well-indexed queries occasionally pay a disk read, which fattens the tail further.
+
+```text
+Cost framing for the tail during the sale:
+  - Requests in window (5m): ~180,000
+  - Tail slice (1%):          ~1,800 requests slower than 610ms
+  - App-side HTTP timeout:    2,000ms
+  - Of the tail, ~120 requests exceeded 2,000ms and returned a 504 to the shopper
+  - Each 504 during checkout = one likely abandoned order
+```
+
+The fix is an index on `orders (status, created_at)` plus a temporary bump to `innodb_buffer_pool_size`. After the index ships, p99 settles back to 70ms and the card clears.
+
+Three takeaways:
+
+1. **Watch the gap, not just the number.** A p99 of 610ms with a p50 of 4ms is a different problem from a p99 of 610ms with a p50 of 300ms. The first is a few bad queries; the second is a saturated instance.
+2. **p99 leads errors.** Tail latency climbing toward your application timeout is the early warning before 504s appear in the app logs. Acting on a red p99 is cheaper than acting on a customer-facing outage.
+3. **Tail problems are usually fixable without scaling.** An index, a query rewrite, or a buffer-pool nudge resolves most p99 spikes. Reach for a bigger instance only after [Top 10 Slowest Queries](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest) shows the tail is spread across many digests, not concentrated in one.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Latency p99 | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p50 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p50-ms) | The median, the "typical query" baseline. | A wide p50-to-p99 gap equals a tail problem; both rising together equals a broad slowdown. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) | The upper-band sibling, alert at 200ms. | p95 over the line plus p99 over the line equals the slowdown is spreading down into more of the traffic. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mysql/slow-query-rate) | The proportion of statements over `long_query_time`. | A red p99 with a rising slow-query rate confirms the tail is real, not a single outlier. |
+| [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest) | The named culprits behind the tail. | Tells you which digest to index or rewrite. |
+| [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) | The cache that keeps reads off disk. | A falling hit rate fattens the tail because cold reads hit disk. |
+| [InnoDB Deadlocks (last 5m)](/nerve-centre/kpi-cards/mysql/innodb-deadlocks-last-5m) | Lock contention shows up as latency spikes. | Deadlocks plus a fat tail equals contention, not a missing index. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mysql/connection-pool-saturation) | Slow tails hold connections longer. | A high p99 driving pool saturation is the path to total stall. |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/mysql/slow-queries-during-checkout-window-5m) | The revenue-path framing of the tail. | Confirms whether the slow 1% is hitting the checkout path specifically. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL's own tooling:**
+
+> **Performance Schema digest table** for the per-statement distribution this card is built from:
+> ```sql
+> SELECT DIGEST_TEXT, COUNT_STAR,
+>        ROUND(AVG_TIMER_WAIT/1e9, 2)  AS avg_ms,
+>        ROUND(MAX_TIMER_WAIT/1e9, 2)  AS max_ms
+> FROM performance_schema.events_statements_summary_by_digest
+> ORDER BY MAX_TIMER_WAIT DESC
+> LIMIT 20;
+> ```
+> **The `sys` schema** for a friendlier rollup: `SELECT * FROM sys.statements_with_runtimes_in_95th_percentile;`
+> **The slow query log** (with `long_query_time` set low) for the raw statements that make up the tail.
+> **Managed-service consoles:** Amazon RDS / Aurora **Performance Insights** exposes a database-load-by-wait breakdown and per-statement latency that should track this card.
+
+**Why our number may legitimately differ from a manual query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window boundary** | Variable | The card uses a trailing 5-minute delta; the digest table is cumulative since last truncate, so an ad-hoc `SELECT` over the raw table reports all-time, not the last 5 minutes. |
+| **Percentile method** | Marginal | We interpolate across digest buckets; `MAX_TIMER_WAIT` is a true max, not a p99, so it will read higher. |
+| **Performance Schema sampling** | Slightly low | If `performance_schema` instruments are partially disabled or the digest table has been truncated, some statements are not counted. |
+| **Picosecond conversion** | None if done | Raw timer columns are picoseconds; comparing them as milliseconds without dividing by 1e9 produces a nonsense number. |
+| **Replica vs source** | Variable | p99 on a read replica reflects replica workload, which differs from the source. Confirm you are reading the same node. |
+
+**Cross-connector reconciliation:** pair with your APM connector (for example Datadog [p99 Latency](/nerve-centre/kpi-cards/datadog/p99-latency)). The APM number measures end-to-end request latency including network and application time, so it will be higher than the database-only p99 here. A divergence where the database p99 is flat but the APM p99 spikes points to an application or network problem, not the database.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My average query time looks fine but p99 is red. Which do I trust?**
+Trust p99. Averages hide the tail by design: one million 2ms queries plus a thousand 5-second queries still averages out to a few milliseconds. Your users do not experience the average; the unlucky 1% experience the tail, and during a sale that 1% can be hundreds of abandoned checkouts. The average is the number that makes a slow database look healthy.
+
+**Why is the window 5 minutes and not real-time per query?**
+A pure real-time p99 would swing wildly on a single slow statement. The 5-minute trailing window smooths transient spikes while still reacting fast enough to catch a real regression within one refresh. It is the standard tail-latency window for OLTP alerting.
+
+**The card reads zero or "no data". Why?**
+Almost always because Performance Schema is disabled or the statement instruments are off. Check `SELECT @@performance_schema;` (must be 1) and confirm `events_statements_summary_by_digest` is being collected. On some managed tiers Performance Schema is off by default and must be enabled in the parameter group, after which it needs a restart.
+
+**Does this include queries on read replicas?**
+The card measures the node the connector is pointed at. If you connect to the source, you see source-side latency; if you point at a replica, you see replica latency. Replicas often have a different p99 because their workload is read-heavy and they replay the binlog in the background. Connect a separate Vortex IQ source per node if you want both.
+
+**Can I change the 500ms alert threshold?**
+Yes. The threshold is configurable per profile in the Sensitivity tab. A reporting database can tolerate a higher p99; a real-time checkout database may want it tighter, for example 250ms. Set it to a value just above your normal busy-hour p99 so the card only fires on genuine regressions.
+
+**p99 spiked but Top 10 Slowest Queries looks normal. What happened?**
+Two common causes. First, a lock wait or a deadlock: the query itself is cheap but it blocked behind a lock, so the latency is real but the digest looks innocent. Check [InnoDB Deadlocks](/nerve-centre/kpi-cards/mysql/innodb-deadlocks-last-5m). Second, a buffer-pool eviction storm: a normally cached query paid a disk read. Check [InnoDB Buffer Pool Hit Rate](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate).
+
+**Should I alert on p95, p99, or both?**
+Both, at different thresholds. p95 (200ms here) catches a slowdown spreading into a meaningful slice of traffic; p99 (500ms) catches the tail before it turns into timeouts. p95 red on its own is a "look soon" signal; p99 red is an "act now" signal because it sits closest to your application timeout.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Latency p99 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

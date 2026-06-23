@@ -1,0 +1,142 @@
+---
+title: "Inserts per Second (live), ClickHouse"
+sidebarTitle: "Inserts per Second (live)"
+description: "Inserts per Second (live) for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ingest & Merges](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Inserts per Second (live)** is the live row-ingest rate into ClickHouse: how many rows are landing per second right now, measured as the delta of the `InsertedRows` event between two poll samples. ClickHouse is built for high-throughput ingest, so this is the pulse of your write pipeline. For a DBA, it answers "is data still flowing, and how fast?" A healthy stream is steady or follows a predictable daily shape; a sudden drop to zero while you expect traffic means the pipeline upstream has stalled, and a sudden spike often precedes a parts/merge backlog if the inserts are small and frequent.
+
+| | |
+| --- | --- |
+| **What it tracks** | The live insert throughput in rows per second, computed from the `InsertedRows` counter delta in `system.events`. ClickHouse-distinctive: it measures rows ingested, not insert statements. |
+| **Data source** | `system.events`, the cumulative `InsertedRows` counter, sampled on each live poll and differenced over the elapsed interval to produce a per-second rate. |
+| **Time window** | `RT`: real-time, a rate derived from consecutive live poll samples. |
+| **Alert trigger** | None on this card directly. It is a throughput gauge, not a threshold alarm; a stall is judged in context (see the cross-channel [ClickHouse Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/clickhouse/clickhouse-event-ingest-vs-ecom-orders) card, which alerts when ingest stalls while orders flow). |
+| **Roles** | engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+ClickHouse exposes cumulative profile counters in `system.events`. `InsertedRows` is monotonically increasing since server start: the total rows ever inserted. A single reading is meaningless as a rate, so the card differences two consecutive samples:
+
+```text
+inserts_per_sec = (InsertedRows_now - InsertedRows_prev) / (t_now - t_prev)
+```
+
+where the two readings come from successive live polls. This is why it is a "live" metric: it needs two points in time to produce a rate. Note that this counts *rows*, not insert *statements*. A single `INSERT ... VALUES` of 50,000 rows in one batch adds 50,000 to the counter, the same as 50,000 single-row inserts, but the two have wildly different cost profiles on the merge side (the batched insert creates one part; the 50,000 single inserts create up to 50,000 tiny parts and a merge storm). The companion [Inserts per Second](/nerve-centre/kpi-cards/clickhouse/inserts-per-second-live) reading is therefore best read alongside the parts cards.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A clickstream platform ingests page-view events into ClickHouse via a Kafka consumer. The live insert rate normally tracks site traffic: roughly 12,000 rows/sec at the daytime peak, dropping to about 1,500 rows/sec overnight. On 03 Jun 26 at 13:15 the on-call SRE notices the card reading **0 rows/sec** during what should be the lunchtime peak.
+
+```text
+Insert rate timeline (rows/sec, from InsertedRows delta):
+  12:45   11,800   normal peak
+  13:00   11,200   normal
+  13:05      640   sharp drop
+  13:10        0   stalled
+  13:15        0   still stalled  <-- on-call notices
+```
+
+The rate did not taper; it fell off a cliff, which rules out a normal traffic dip and points at the pipeline. The SRE checks two things in parallel:
+
+1. **Is ClickHouse accepting writes?** A test `INSERT` succeeds, so the server is healthy. The problem is upstream.
+2. **Is the Kafka consumer alive?** The consumer group's lag is climbing fast, confirming the consumer has stopped committing. The events are still arriving at Kafka; they are just not being drained into ClickHouse.
+
+The root cause turns out to be a deploy at 13:04 that crashed the consumer pods. ClickHouse never had a problem; the insert rate hit zero because nothing was being sent to it. The fix is to roll back the consumer deploy. Within two poll cycles of recovery the rate jumps to ~13,500 rows/sec (peak plus the backlog draining) and then settles back to the normal peak shape.
+
+Crucially, the SRE also watches [Active Parts (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) during the catch-up: a backlog drain can dump a burst of inserts that spawns many parts. If the consumer flushes in tiny batches during recovery, the parts count can spike and risk a Too Many Parts halt. It did not here (the consumer batches in 30-second windows), but it is the failure mode to watch when ingest resumes after a stall.
+
+Three takeaways:
+
+1. **Zero is the loudest reading on this card.** A steady or shaped non-zero rate is healthy. Zero (during expected traffic) almost always means the problem is upstream of ClickHouse, not in it. Test a manual insert first to split server from pipeline.
+2. **Rows/sec is not statements/sec.** The same throughput can come from a few big batches (cheap, one part) or many tiny inserts (expensive, a merge storm). When the rate is high, glance at the parts cards to see which pattern you have.
+3. **The dangerous moment is the recovery, not the stall.** When a stalled pipeline restarts, the backlog drains in a burst. If that burst arrives as many small inserts, the parts backlog can spike and trigger a Too Many Parts error. Watch the parts cards while ingest catches up.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Inserts per Second (live) | What the combination tells you |
+| --- | --- | --- |
+| [Active Parts (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) | High insert rate from small batches creates parts fast. | Rate high plus parts climbing equals small-batch inserts risking a merge backlog. |
+| [Merges In Progress](/nerve-centre/kpi-cards/clickhouse/merges-in-progress) | Merges must keep pace with insert-driven part creation. | Inserts high but merges flat equals ingest outpacing merge throughput. |
+| [Too Many Parts Errors (24h)](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h) | The failure mode an unbatched insert surge can trigger. | Rate spiking then parts errors appearing equals the parts cap was hit. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/clickhouse/database-disk-usage) | Sustained high ingest fills the disk. | Rate high plus disk climbing equals a backfill eating the volume. |
+| [ClickHouse Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/clickhouse/clickhouse-event-ingest-vs-ecom-orders) | The cross-channel sanity check on whether ingest matches business activity. | Ingest at zero while orders flow equals the pipeline is broken. |
+| [Replication Lag (absolute_delay)](/nerve-centre/kpi-cards/clickhouse/replication-lag-absolute-delay) | Heavy ingest on the leader increases replication work. | Inserts high plus lag rising equals followers struggling to keep up. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/clickhouse/queries-per-second-live) | The read-side counterpart to this write-side pulse. | Together they show the full live load shape on the cluster. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Confirm the cumulative counter** the rate is derived from:
+
+```sql
+SELECT event, value
+FROM system.events
+WHERE event = 'InsertedRows';
+```
+
+Run it twice a few seconds apart and divide the difference by the elapsed seconds to reproduce the card's per-second rate. To see it as a continuous series rather than a manual delta, query the historical metric log:
+
+```sql
+SELECT event_time, ProfileEvent_InsertedRows
+FROM system.metric_log
+WHERE event_time > now() - INTERVAL 10 MINUTE
+ORDER BY event_time;
+```
+
+(`system.metric_log` must be enabled; it is on by default in most builds.) For a near-real-time view, `system.asynchronous_metrics` and the `SELECT * FROM system.events WHERE event LIKE '%Insert%'` family also help.
+
+**On ClickHouse Cloud**, the service Monitoring tab plots inserted rows over time; reconcile its insert-rate chart against the `system.events` delta above.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| Counter resets on restart | Our number spikes/dips around restart | `InsertedRows` is cumulative since server start; a restart resets it to zero, so the first delta after a restart is meaningless and is suppressed. |
+| Per-node counter | Variable | `system.events` is local to each node; on a cluster the card reflects the connected node, not the cluster total, unless configured otherwise. |
+| Poll interval granularity | Marginal | A short burst between two polls is averaged across the interval; very spiky ingest reads smoother than it is. |
+| Rows vs statements | By design | The counter measures rows; a Cloud chart that plots insert statements will not match a rows-per-second figure. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The rate just jumped to a huge number for one poll. Is that real?**
+Check whether the server restarted. `InsertedRows` is cumulative since start and resets to zero on restart; the first delta after a restart can look like a spike or a negative and is suppressed by the engine. If there was no restart, a genuine one-poll spike usually means a large batch insert (a backfill or a bulk load) landed in that interval.
+
+**The rate is zero but I am sure data is being sent. What is wrong?**
+Split the problem in two. First, confirm ClickHouse accepts writes with a manual test insert; if it succeeds, the server is fine and the issue is upstream (a stalled Kafka consumer, a paused ETL job, a network break between producer and ClickHouse). If the manual insert fails, the server is rejecting writes, check disk usage and the parts cards for a Too Many Parts halt. Zero almost always points upstream.
+
+**Does this count rows or insert statements?**
+Rows. A single batch of 100,000 rows and 100,000 single-row inserts both add 100,000 to `InsertedRows`, so they show the same rate, but they have very different merge cost. When the rate is high, glance at [Active Parts (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) to tell a cheap batched pattern from an expensive small-insert pattern.
+
+**Why is there no alert threshold on this card?**
+Because the healthy value depends entirely on your workload: 50 rows/sec is fine for a reference dataset and alarming for a clickstream. A fixed threshold would be wrong for everyone. The meaningful alert is contextual: ingest stalling while business activity continues, which the cross-channel [ClickHouse Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/clickhouse/clickhouse-event-ingest-vs-ecom-orders) card owns.
+
+**On a multi-node cluster, is this the whole cluster or one node?**
+By default it is the connected node, because `system.events` is per-node. Inserts that route to other nodes are not in the connected node's counter. For a cluster-wide rate, the engine can be configured to sum `InsertedRows` across `clusterAllReplicas`.
+
+**The rate looks smoother than my ingest actually is. Why?**
+The card is a delta over the poll interval, so any burst shorter than the interval is averaged out. If you need sub-poll resolution, query `system.metric_log` directly, which records `ProfileEvent_InsertedRows` at a finer cadence.
+
+**Insert rate is healthy but my data looks stale in queries. How?**
+A high insert rate means rows are landing on disk as parts, but readers may not see them until parts are visible and, on followers, until replication catches up. If inserts are healthy on the leader but reads on a replica are stale, the problem is replication, not ingest, check [Replication Lag (absolute_delay)](/nerve-centre/kpi-cards/clickhouse/replication-lag-absolute-delay).
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Inserts per Second (live)* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

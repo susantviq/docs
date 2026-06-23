@@ -1,0 +1,180 @@
+---
+title: "MEMORY_LIMIT_EXCEEDED (24h), ClickHouse"
+sidebarTitle: "MEMORY_LIMIT_EXCEEDED (24h)"
+description: "MEMORY_LIMIT_EXCEEDED (24h) for ClickHouse deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The count of queries killed in the last 24 hours because they tried to use more memory than their limit allowed. ClickHouse aborts a query the instant its tracked memory crosses `max_memory_usage` (per-query) or `max_server_memory_usage` (whole-server), raising error code 241, `MEMORY_LIMIT_EXCEEDED`. A non-zero reading is rarely "we are short on RAM"; it is almost always one heavy, unbounded query (a `GROUP BY` over high-cardinality keys, an under-filtered `JOIN`, or a `DISTINCT` on a huge column) trying to swallow the instance. The card is your early-warning that a single bad query is putting the whole server at risk.
+
+| | |
+| --- | --- |
+| **Data source** | `system.query_log` over the last 24 hours, counting rows where the query terminated with exception code 241 (`MEMORY_LIMIT_EXCEEDED`). The card reads the failed-query exception code, not a server gauge. |
+| **Metric basis** | Count of *distinct query executions* killed by a memory limit, not a count of bytes. One offending query run five times counts as five. |
+| **What triggers it** | A query whose tracked memory crosses its effective ceiling: the per-query `max_memory_usage`, the per-user `max_memory_usage_for_user`, or the server-wide `max_server_memory_usage`. Whichever ceiling is hit first names the abort. |
+| **Aggregation window** | Rolling 24 hours, recomputed on each refresh. |
+| **Alert threshold** | `> 0`. Any memory-limit kill in 24 hours is worth a look, because it usually means a query pattern exists that can recur and that, if the server-wide ceiling is involved, can destabilise unrelated queries too. |
+| **What does NOT count** | (1) Queries that succeeded but ran close to the limit (use [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) for headroom); (2) queries killed for other reasons (timeout, `TOO_MANY_PARTS`, user cancel); (3) memory pressure handled gracefully by spilling to disk (`max_bytes_before_external_group_by` / `_external_sort`); (4) OOM-killer kills at the OS level (those crash the process, not a single query, and show up as a restart). |
+| **Sensitivity note** | This is a Sensitivity card: the `> 0` default is intentionally strict so the first occurrence surfaces. Teams with known-heavy ad-hoc workloads may raise the threshold per profile. |
+| **Time window** | `24h` (rolling) |
+| **Alert trigger** | `> 0` memory-limit kills in the last 24 hours. |
+| **Roles** | owner, platform, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine counts terminal query-log rows that carry the memory-limit exception code:
+
+```sql
+SELECT count() AS memory_limit_kills_24h
+FROM system.query_log
+WHERE type = 'ExceptionWhileProcessing'
+  AND exception_code = 241          -- MEMORY_LIMIT_EXCEEDED
+  AND event_time >= now() - INTERVAL 24 HOUR;
+```
+
+`type = 'ExceptionWhileProcessing'` selects executions that started and then threw, which is where a memory kill lands (the query had begun consuming memory before it was aborted). `exception_code = 241` is the stable numeric code for `MEMORY_LIMIT_EXCEEDED`; matching on the code rather than the exception text is robust across locales and version wording.
+
+To investigate the *which query* behind a non-zero count, the engine can surface the offending statements by peak memory:
+
+```sql
+SELECT
+    event_time,
+    user,
+    query_duration_ms,
+    formatReadableSize(memory_usage) AS peak_mem,
+    substring(query, 1, 200) AS query_head
+FROM system.query_log
+WHERE exception_code = 241
+  AND event_time >= now() - INTERVAL 24 HOUR
+ORDER BY memory_usage DESC
+LIMIT 10;
+```
+
+On a cluster, the card sums the per-node counts so a kill on any node contributes to the headline. The 24h window is rolling, so a spike ages out exactly 24 hours after it occurred rather than resetting at midnight.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs ClickHouse as the backing store for an internal analytics product. The server has 64 GB RAM, `max_server_memory_usage` set to ~52 GB (0.8 ratio), and `max_memory_usage` left at the 10 GB per-query default. Snapshot taken on 22 May 26 at 16:40 UTC.
+
+The card jumps from `0` to `14` over an hour. The team drills in:
+
+| event_time (UTC) | user | duration | peak_mem | query head |
+| --- | --- | --- | --- | --- |
+| 16:02 | bi_dashboard | 9.8s | 10.0 GB | `SELECT user_id, groupArray(event_name) FROM events GROUP BY user_id` |
+| 16:09 | bi_dashboard | 9.7s | 10.0 GB | `SELECT user_id, groupArray(event_name) FROM events GROUP BY user_id` |
+| ... (12 more, same statement, all peaking at 10.0 GB) | | | | |
+
+The pattern is unmistakable: one statement, the same `GROUP BY user_id` with a `groupArray` over a high-cardinality key, run 14 times by a refreshing dashboard. Each run climbs straight to the 10 GB per-query ceiling and is killed at code 241.
+
+What the team reads:
+
+1. **This is one bad query, not a capacity problem.** Server memory was never the constraint; the per-query `max_memory_usage` was. The 14 kills are 14 reruns of the same dashboard tile auto-refreshing every ~7 minutes. Throwing more RAM at the server would not help; the per-query ceiling would still bite.
+2. **The fix is the query, not the limit.** `groupArray(event_name)` over every distinct `user_id` materialises an unbounded array per user. The correct fix is to bound it (`groupArrayLast(50)(...)`, a `LIMIT`, or a pre-aggregated materialised view), or to enable spilling with `max_bytes_before_external_group_by` so the aggregation goes to disk instead of dying.
+3. **Sensitivity caught it at the first occurrence.** Because the threshold is `> 0`, the card went red at 16:02 on the very first kill, before the dashboard refreshed 13 more times. The team could have killed the saved tile or capped the user before the pattern repeated.
+
+```text
+Why "one heavy query" not "low on RAM":
+  - Server RAM ceiling (max_server_memory_usage): ~52 GB, never breached
+  - Per-query ceiling (max_memory_usage):          10 GB, hit on every run
+  - Other queries during the window:               unaffected, completing normally
+  => The kills are isolated to one statement hitting the per-query ceiling.
+     Raising the server ceiling fixes nothing; raising the per-query ceiling
+     just lets one tile starve everyone else. Fix the query.
+```
+
+The remediation: ship a bounded version of the aggregation (or a materialised view), and as a stopgap set `max_bytes_before_external_group_by` for that user so the `GROUP BY` spills to disk rather than being killed. The card returns to `0` once the offending statement stops hitting its ceiling.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards platform teams should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with MEMORY_LIMIT_EXCEEDED | What the combination tells you |
+| --- | --- | --- |
+| [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) | The live headroom gauge that precedes a kill. | High usage % plus rising memory-limit kills equals genuine server-wide pressure; low usage % plus kills equals a single query hitting the per-query ceiling. |
+| [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h) | The superset: all query failures, not just memory kills. | If memory kills are most of your failed-query count, memory is your dominant failure mode. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/clickhouse/query-error-rate) | The rate view across all error types. | A spike in error rate that lines up with memory kills points the investigation straight at heavy queries. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/clickhouse/top-10-slowest-queries) | Heavy queries are usually slow too. | The query killed for memory often appears here just before it dies; same root cause. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p99-ms) | Memory pressure inflates tail latency. | p99 rising alongside memory kills means even surviving queries are paying the price. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that weights error signals. | Repeated memory kills drag the health score down even when ingest and replication are clean. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/clickhouse/slow-query-rate) | The proportion of queries breaching 1s. | Heavy aggregations that die for memory are usually the same ones inflating the slow-query rate. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse itself:**
+
+> **`system.query_log`** for the authoritative per-execution record: filter `exception_code = 241` over your window and read `query`, `user`, `memory_usage`, and `exception` for the full failure text and the offending SQL.
+> **`system.metrics`** (`MemoryTracking`) and **`system.asynchronous_metrics`** for the live server-memory picture at the time of the kills, to distinguish per-query from server-wide pressure.
+> **`SELECT * FROM system.settings WHERE name LIKE '%max_memory%'`** to read the effective per-query, per-user, and server ceilings that the killed queries were measured against.
+> **ClickHouse Cloud:** the service's query insights / monitoring view exposes the same memory-limit errors against the managed memory ceiling for the service tier.
+
+**Why our number may legitimately differ from a manual `query_log` read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window edges** | Slightly different count | The card uses a rolling 24h ending at refresh time; a manual `WHERE event_time >= today()` uses a calendar boundary, so counts at the edges differ. |
+| **Time zone** | Apparent shift | `event_time` is in the server time zone; the card displays the window in your profile time zone. |
+| **`query_log` flush latency** | Vortex IQ may lag seconds | `query_log` is buffered and flushed periodically (default ~7.5s). A kill in the last few seconds may not yet be in the table for either reader. |
+| **Multi-node summing** | Vortex IQ higher | The card sums kills across cluster nodes; a single-node query sees only one node. |
+| **`query_log` retention/TTL** | Both lose old rows | If `query_log` has a short TTL, very old kills are gone, but the 24h window is well inside any sane retention. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`clickhouse.memory-usage`](/nerve-centre/kpi-cards/clickhouse/memory-usage) | Server-wide kills should coincide with a high Memory Usage %. | Kills with low Memory Usage % mean a per-query (not server-wide) ceiling is the cause, the most common and least alarming case. |
+| [`clickhouse.failed-queries-24h`](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h) | Memory kills are a subset of failed queries. | If the two move together, memory is your dominant failure cause; if failed queries rise without memory kills, look elsewhere (parts, timeouts). |
+
+<details>
+<summary><em>Same-concept peer on other database connectors</em></summary>
+
+The "query killed for exceeding a memory budget" concept exists across database engines, though the mechanism differs. These are not a reconciliation against your ClickHouse data; they exist so a mixed-estate platform team can cross-link the same idea across docs.
+
+- PostgreSQL equivalent: queries failing with "out of memory" / `work_mem` exhaustion (PostgreSQL more often spills to temp files than aborts).
+- MySQL equivalent: queries failing with "Out of sort memory" or temp-table size limits.
+- BigQuery equivalent: "Resources exceeded during query execution" memory errors.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows kills but my server has plenty of free RAM. How?**
+Because the limit that was hit is almost certainly the *per-query* `max_memory_usage` (default 10 GB) or the *per-user* `max_memory_usage_for_user`, not the server-wide ceiling. A single query is allowed only its own budget, no matter how much total RAM is free. Confirm by reading `memory_usage` on the killed rows in `system.query_log`: if they all peak at the same round number (10 GB), that is the per-query ceiling, and the fix is the query or a higher per-query limit, not more server RAM.
+
+**Should I just raise `max_memory_usage` to make the kills stop?**
+Usually not as the first move. Raising the per-query ceiling lets one heavy query consume more of the shared server budget, which can starve or kill *other* queries (turning a localised per-query problem into a server-wide one). Prefer to bound the query, add a materialised view, or enable spilling to disk via `max_bytes_before_external_group_by` / `max_bytes_before_external_sort`. Raise the ceiling only when you have confirmed the query is legitimately large and the server has headroom to spare.
+
+**What is the difference between this and an OS OOM-killer event?**
+`MEMORY_LIMIT_EXCEEDED` (code 241) is ClickHouse politely aborting one query when *its tracked memory* crosses a configured ceiling; the server stays up and other queries continue. An OS OOM-kill is the Linux kernel terminating the whole `clickhouse-server` process when the box runs out of physical memory; that looks like a crash and a restart, not a single failed query. This card counts the former. If you see restarts instead of code-241 errors, your `max_server_memory_usage` is set too high relative to physical RAM.
+
+**Can memory kills affect queries other than the one that was killed?**
+If the *server-wide* ceiling (`max_server_memory_usage`) is the one being hit, yes: ClickHouse will start aborting whichever queries push total memory over the limit, which can include innocent bystanders. That is the dangerous case and why the threshold is `> 0`. If only the per-query ceiling is hit, the blast radius is limited to the offending query. Use [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) to tell the two apart.
+
+**Why does the same query count multiple times?**
+The card counts executions, not distinct statements. A dashboard tile or scheduled job that reruns the same offending query every few minutes generates one kill per run, which is exactly the signal you want: a recurring auto-refreshing query is far more urgent than a one-off ad-hoc mistake, because it will keep happening until someone stops it.
+
+**We deliberately run huge ad-hoc analytics that sometimes get killed. Can we stop the alerts?**
+Yes. This is a Sensitivity card with a per-profile threshold. If a known-heavy ad-hoc workload makes occasional kills normal for you, raise the threshold above your typical daily count, or scope a separate user with its own `max_memory_usage_for_user` and exclude it. Be cautious: a higher threshold also hides a genuinely new offending query, so prefer fixing or bounding the heavy queries over muting the card.
+
+**Does spilling to disk count as a kill?**
+No. When `max_bytes_before_external_group_by` or `max_bytes_before_external_sort` is set, ClickHouse spills the intermediate state to disk and the query *succeeds*, slower but alive. Those queries never reach code 241 and never appear on this card. Enabling spilling is one of the cleanest ways to convert a recurring memory kill into a (slower) successful query.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*MEMORY_LIMIT_EXCEEDED (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

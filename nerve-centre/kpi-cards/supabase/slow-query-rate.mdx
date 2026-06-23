@@ -1,0 +1,151 @@
+---
+title: "Slow-Query Rate %, Supabase"
+sidebarTitle: "Slow-Query Rate %"
+description: "Slow-Query Rate % for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of database queries in the window that exceeded the slow-query threshold. This is the single best early-warning signal that the database is starting to struggle: it rises before latency averages move and well before users complain. A handful of slow queries is normal under any real workload; a rising slow-query rate means an index is missing, a plan has regressed, a table has bloated, or load has outgrown the instance. For an ops team, this card answers "what share of my queries are too slow right now, and is that share growing?"
+
+| | |
+| --- | --- |
+| **What it tracks** | Slow-Query Rate % for the selected period: the proportion of executed queries whose duration crossed the configured slow threshold, expressed as a percentage of total query executions in the window. |
+| **Data source** | Derived from Postgres query statistics, primarily the `pg_stat_statements` extension (which Supabase enables by default) plus the database log stream where `log_min_duration_statement` captures individual slow statements. A query is "slow" if its execution time exceeds the threshold (default 1000ms, configurable per project). |
+| **Time window** | `15m` (rolling 15-minute window). Short enough to catch a regression as it starts, long enough to smooth out single-query noise. |
+| **Alert trigger** | `> 5%`. When more than 5% of queries in the 15-minute window are slow, the card flags. Healthy projects sit well under 1%. |
+| **Why it matters** | Slow queries are the upstream cause of almost every database performance problem: they hold connections open longer (feeding pool saturation), consume CPU and I/O, and inflate latency for everyone. The rate rising is the leading indicator; latency rising is the lagging symptom. |
+| **What counts** | Every completed query execution against the project's Postgres database, including queries arriving via PostgREST, the connection pooler, Edge Functions, and direct connections. |
+| **What does NOT count** | Queries still in flight (only completed executions are rated); the slow-threshold value itself (configurable); idle-in-transaction time (that is a connection problem, not a query-duration problem). |
+| **Roles** | platform, dba, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The rate is a ratio of slow executions to total executions over the rolling window:
+
+```text
+slow_query_rate_% = (slow_executions / total_executions) x 100
+```
+
+where a "slow execution" is any query whose runtime exceeded the slow threshold (default 1000ms).
+
+The numerator and denominator come from `pg_stat_statements`, the Postgres extension that aggregates execution statistics per normalised query (queries are normalised so that `WHERE id = 1` and `WHERE id = 2` collapse into one entry with `id = $1`). For each statement entry, `pg_stat_statements` tracks `calls` (total executions) and timing fields (`total_exec_time`, `mean_exec_time`, `max_exec_time`). The engine takes deltas between successive snapshots so the rate reflects only activity within the 15-minute window rather than lifetime totals.
+
+Because `pg_stat_statements` records mean and max but not a full duration histogram per statement, the engine combines two signals for accuracy:
+
+1. **Statement-level estimate** from `pg_stat_statements`: statements whose mean exceeds the threshold contribute their full call count to the slow bucket.
+2. **Log-derived count** from the database log, where `log_min_duration_statement` writes one line per individual statement that crossed the threshold. This captures the case of an otherwise-fast statement that was slow on a specific execution (a cold cache, a lock wait, a bad parameter value hitting a skewed index).
+
+The two are reconciled so the rate reflects actual slow executions, not just statements with a slow average. The 5% alert threshold is the point at which slow queries stop being background noise and start materially degrading the experience for normal traffic: at 5%, one in twenty queries is dragging, which is already visible in p95 latency and connection-hold time.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A B2B platform team runs a Supabase project backing a customer-facing dashboard. Normal slow-query rate sits at 0.3%. On 22 May 26, a product release added a new "activity feed" panel that queries an `events` table. Snapshot taken at 16:20 BST, 40 minutes after the release.
+
+| Metric | Before release (15:00) | After release (16:20) |
+| --- | --- | --- |
+| Slow-Query Rate % | 0.3% | 7.8% |
+| Total executions (15m) | ~210,000 | ~205,000 |
+| Slow executions (15m) | ~630 | ~16,000 |
+| p95 query latency | 38ms | 290ms |
+
+The Nerve Centre headline shows **7.8%** on the gauge, in the red zone, alert tripped (threshold 5%).
+
+Reading the situation:
+
+1. **The rate jumped 26x with no change in total volume.** Traffic is flat (~205k executions), so this is not a load spike. Something is now structurally slow. The release is the obvious suspect.
+2. **The new activity-feed query is unindexed.** Drilling into [Top 10 Slowest Queries](/nerve-centre/kpi-cards/supabase/top-10-slowest-queries) shows a single statement, `SELECT * FROM events WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`, accounting for nearly all the slow executions. It is doing a sequential scan of a 12-million-row table on every dashboard load because there is no index on `user_id`.
+
+```text
+Cost framing:
+  - Slow executions added: ~15,400 in 15 minutes = ~1,030/min
+  - Each holds a pooled connection ~600ms instead of ~30ms
+  - Connection-seconds consumed: ~1,030 x 0.6 = ~618 conn-sec/min vs ~31 before
+  - Knock-on: pool saturation climbing, p95 up 7x, dashboard feels sluggish to every user
+```
+
+What the team should do:
+
+1. **Add the missing index.** `CREATE INDEX CONCURRENTLY idx_events_user_created ON events (user_id, created_at DESC);` turns the sequential scan into an index scan. The slow-query rate should drop back toward baseline within one 15-minute window once the index is built.
+2. **Confirm the fix with the rate, not a spot check.** Re-running one query by hand may hit a warm cache and look fine. The rate over the next window is the honest signal that the problem is gone for all traffic.
+3. **Check the knock-on metrics drain too.** [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) and [Postgres Query Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgres-query-latency-p95-ms) should both recover as connections stop being held open by the slow scan.
+
+The lesson: slow-query rate is the leading indicator. It moved the moment the bad query shipped, before users filed tickets and before the average latency looked alarming. Watching this card after every release catches index regressions in minutes rather than days.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow-Query Rate | What the combination tells you |
+| --- | --- | --- |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/supabase/top-10-slowest-queries) | The "which queries" drill-down. | Slow-Query Rate tells you the share is high; this names the specific statements responsible. |
+| [Postgres Query Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgres-query-latency-p95-ms) | The lagging latency symptom. | Rate rises first, p95 follows; if rate is high but p95 is flat, the slow queries are a minority of low-traffic statements. |
+| [Database Query Error Rate %](/nerve-centre/kpi-cards/supabase/database-query-error-rate) | Errors vs slowness. | Slow plus erroring often means timeouts (statements aborting after the timeout, counted as both). |
+| [Buffer Cache Hit Rate %](/nerve-centre/kpi-cards/supabase/buffer-cache-hit-rate) | Cache pressure that makes queries slow. | A falling cache hit rate is a common cause of a rising slow-query rate (more disk reads). |
+| [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) | The downstream connection-hold effect. | Slow queries hold connections; high slow rate feeds pool saturation. |
+| [Deadlocks (last 5m)](/nerve-centre/kpi-cards/supabase/deadlocks-last-5m) | Contention that slows queries. | Lock waits inflate query duration without any plan change. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite this feeds. | A rising slow-query rate is one of the strongest drags on the health score. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase and Postgres:**
+
+> **Supabase project Query Performance / Reports section** for the built-in slow-query view, which surfaces `pg_stat_statements` ranked by total and mean time.
+> **`SELECT query, calls, mean_exec_time, max_exec_time FROM pg_stat_statements WHERE mean_exec_time > 1000 ORDER BY total_exec_time DESC;`** for the authoritative server-side list of slow statements.
+> **`SELECT calls, total_exec_time FROM pg_stat_statements;`** aggregated for the denominator (total executions).
+> **The database log** (filtered on `log_min_duration_statement`) for individual slow-execution lines, which catch one-off slow runs that the mean hides.
+
+**Why our number may legitimately differ from a hand-run query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window vs lifetime** | Either | `pg_stat_statements` accumulates lifetime totals since the last reset; this card takes deltas over a 15-minute window. A lifetime view averages in quiet history and reads lower; the windowed view reflects "right now". |
+| **Threshold value** | Either | The default slow threshold is 1000ms. If your project sets `log_min_duration_statement` to a different value, hand-run filters using a different cut-off will not match. |
+| **Mean vs per-execution** | Vortex IQ higher | A statement with a fast mean but occasional slow runs contributes nothing to a mean-based filter, but its log-derived slow runs do count here. |
+| **Stats reset** | Vortex IQ unaffected | If someone runs `pg_stat_statements_reset()`, lifetime totals zero out; the windowed delta is unaffected after the next snapshot. |
+| **Statement tracking limit** | Slight undercount | `pg_stat_statements.max` caps the number of distinct statements tracked; very high-cardinality query shapes can evict entries. Affects both this card and the Supabase view equally. |
+
+The cleanest reconciliation is to take two `pg_stat_statements` snapshots 15 minutes apart, diff the `calls` and slow-bucket counts, and compute the ratio yourself. That delta-based number should track this card closely.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What counts as "slow"? Can I change the threshold?**
+The default is 1000ms (one second). Supabase exposes `log_min_duration_statement` and related settings per project; lowering it (say to 500ms) makes the card stricter and surfaces moderately slow queries earlier. Raising it hides them. Pick a threshold that matches your latency budget: a real-time dashboard might set 200ms, a reporting workload might tolerate 5000ms. The 5% alert applies to whatever threshold you configure.
+
+**My rate is 0% but the dashboard feels slow.**
+Two possibilities. First, your slow threshold may be set higher than the latency users actually notice: if it is 1000ms but users feel pain at 300ms, queries in the 300 to 1000ms band are "fast" by the card's definition but slow to humans. Lower the threshold. Second, the bottleneck may not be query duration at all: connection-pool waits, network latency to the client, or front-end rendering can make a fast database feel slow. Check [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation).
+
+**Why does the rate move before average latency does?**
+Because it is a ratio of count, not a duration average. A burst of slow queries immediately shifts the slow/total ratio, whereas an average is diluted by all the fast queries around it. One bad query shape can push the rate from 0.3% to 8% while only nudging the mean by a few milliseconds. That sensitivity is exactly why this is the leading indicator.
+
+**Does a stats reset break the card?**
+No. Running `pg_stat_statements_reset()` zeroes the lifetime counters, but this card works from deltas between successive snapshots, so after the next snapshot it resumes correctly. The only effect is that the very next reading after a reset may be based on a short partial window.
+
+**Do timeouts count as slow queries?**
+A statement that runs up to the `statement_timeout` and is then aborted has, by definition, exceeded almost any slow threshold, so it counts in the slow bucket and may also count in [Database Query Error Rate %](/nerve-centre/kpi-cards/supabase/database-query-error-rate) as an error. Seeing both rates rise together is the classic timeout signature.
+
+**The rate is high but Top 10 Slowest Queries looks normal.**
+The Top 10 table ranks by total or mean time over its own window (24h). A short, sharp burst of slowness inside the last 15 minutes can spike the rate without yet dominating the 24-hour Top 10. Trust the rate for "is it happening now" and the Top 10 for "what has been costing the most over the day". If the rate stays high, the offending query will climb the Top 10 within a few hours.
+
+**Does PgBouncer / Supavisor pooling affect the count?**
+No. The rate is measured at the Postgres layer from `pg_stat_statements`, which records every executed statement regardless of how it arrived (through the transaction pooler, the session pooler, a direct connection, or PostgREST). Pooling changes how connections are reused, not which queries execute.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow-Query Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

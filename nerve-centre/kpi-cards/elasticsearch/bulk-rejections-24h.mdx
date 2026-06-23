@@ -1,0 +1,141 @@
+---
+title: "Bulk Rejections (24h), Elasticsearch"
+sidebarTitle: "Bulk Rejections (24h)"
+description: "Bulk Rejections (24h) for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Indexing](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The count of write (bulk indexing) operations rejected by the cluster over the last 24 hours. When Elasticsearch cannot keep up with the rate of incoming writes, the write thread pool's queue fills and further requests are rejected with a 429 rather than queued indefinitely. Each rejection means a batch of documents did not get indexed on that attempt. If the client retries, you get latency and load; if it does not, you get silent data loss in the index. This is the canonical indexing-backpressure signal, which is why any value above zero is worth attention.
+
+| | |
+| --- | --- |
+| **What it tracks** | The number of bulk/write operations rejected by the write thread pool across all nodes in the trailing 24-hour window. |
+| **Data source** | `thread_pool.write.rejected` (the `rejected` counter on the `write` thread pool) from `GET /_nodes/stats/thread_pool`. Detail: "thread_pool.write.rejected. Indexing backpressure = client retry / data loss risk." |
+| **Time window** | `24h`. The card reports the delta of the rejected counter over the trailing 24 hours. |
+| **Alert trigger** | `> 0`. Any rejection in the window is flagged, because a healthy write pipeline should never reject. |
+| **Why >0 is the line** | Unlike search, where occasional rejections under a burst are tolerable, a rejected write means documents were not indexed. The default is to surface every rejection so the team decides whether the client retried or whether data was lost. |
+| **What does NOT count** | Successful writes that were merely slow, search-pool rejections (those belong to the search error card), and indexing failures caused by mapping conflicts or version conflicts (those are document-level errors, not pool rejections). |
+| **Roles** | platform, SRE, DBA, data-pipeline owners |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card reads `thread_pool.write.rejected` from `GET /_nodes/stats/thread_pool` for every node and sums them. This counter is monotonic (it only ever increases for the life of the node), so the card reports the delta over the trailing 24-hour window rather than the raw lifetime value.
+
+The mechanics behind a rejection: every node has a `write` thread pool with a fixed number of threads (by default, the number of allocated processors) and a bounded queue (default 10,000). When a bulk request arrives, it is dispatched to a write thread. If all threads are busy, the request waits in the queue. When the queue is also full, Elasticsearch rejects the request immediately with an `EsRejectedExecutionException`, surfaced to the client as HTTP 429. This is deliberate backpressure: rather than accept work it cannot complete and risk running out of memory, the cluster says "no, retry later".
+
+```text
+bulk_rejections_24h = sum over nodes of
+                      ( thread_pool.write.rejected[now] - thread_pool.write.rejected[24h ago] )
+```
+
+A single rejected bulk request can contain many documents, so one rejection is not one lost document, it is one lost batch on that attempt. Whether those documents end up in the index depends entirely on the client: a well-behaved bulk indexer retries the rejected items with backoff, a naive one drops them. The card cannot see the client's retry behaviour, so it surfaces every rejection and leaves the "was this retried or lost?" judgement to the operator.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A data-pipeline team runs a nightly job that re-indexes the full product catalogue (about 280,000 SKUs) into Elasticsearch via the bulk API, plus a continuous stream of inventory updates during the day. Snapshot taken on 16 Apr 26 at 09:00 BST, the morning after a re-index.
+
+The re-index job was changed to use larger batches (10,000 docs per bulk request) and higher parallelism (12 concurrent workers) to finish faster. Overnight the write pool could not keep up. The 24h reading:
+
+| Node | write.rejected delta (24h) | write queue peak | write threads |
+| --- | --- | --- | --- |
+| es-data-01 | 1,840 | 10,000 (full) | 8 |
+| es-data-02 | 1,610 | 10,000 (full) | 8 |
+| es-data-03 | 0 | 2,300 | 8 |
+| **Total** | **3,450** | | |
+
+The Nerve Centre headline reads **3,450 bulk rejections in 24h** against an alert line of >0, flagged amber/red, and the data-pipeline owner is notified. The diagnosis:
+
+1. **3,450 bulk requests were rejected during the re-index.** Each rejected request was a batch of up to 10,000 documents. The question that decides severity: did the indexer retry them? Checking the job logs shows the client used a fixed retry of 3 attempts with no backoff, so most batches eventually landed, but 22 batches exhausted their retries and were dropped. That is real, silent data loss: those SKUs are missing from the index until the next full re-index.
+2. **The cause is the batch-size and parallelism change, not the cluster.** [Indexing Rate (docs/sec)](/nerve-centre/kpi-cards/elasticsearch/indexing-rate-docssec) spiked far above the sustainable rate, the queue hit its 10,000 cap on two of three nodes, and rejections followed. The cluster was green throughout; this is a write-throughput problem, not a health problem.
+3. **The skew across nodes is a clue.** es-data-03 had zero rejections because its shards took less of the write load. Pair with [Shard Size Skew %](/nerve-centre/kpi-cards/elasticsearch/shard-size-skew): if the product index's primaries are concentrated on the two hot nodes, those nodes absorb the writes while the third sits idle.
+
+```text
+Fixing the backpressure (in order of preference):
+  1. Add backoff to the bulk client (exponential, retry only the rejected items)
+     -> turns silent loss into eventual success.
+  2. Reduce batch size (5-15 MB per bulk request is the usual sweet spot,
+     NOT 10,000 docs regardless of size).
+  3. Reduce parallelism so concurrent workers <= write threads available.
+  4. Rebalance shards so writes spread across all nodes, not two of three.
+  5. Only then consider adding write capacity.
+```
+
+The actionable lesson: bulk rejections are the cluster telling you the write pipeline is pushing harder than it can absorb. The number above zero is the symptom; the real risk is whichever rejected batches the client failed to retry, because those are documents missing from search until someone notices.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Bulk Rejections | What the combination tells you |
+| --- | --- | --- |
+| [Indexing Rate (docs/sec)](/nerve-centre/kpi-cards/elasticsearch/indexing-rate-docssec) | Rejections are the consequence of pushing indexing past capacity. | A rejection spike that tracks an indexing-rate spike confirms the write rate is the cause. |
+| [Avg Index Refresh Time (ms)](/nerve-centre/kpi-cards/elasticsearch/avg-index-refresh-time-ms) | Slow refresh means segments stack up under write load. | Climbing refresh time alongside rejections means the write path is genuinely saturated. |
+| [Circuit Breaker Trips (24h)](/nerve-centre/kpi-cards/elasticsearch/circuit-breaker-trips-24h) | Heavy bulk loads can also trip memory breakers. | Rejections plus breaker trips means the write pressure is also stressing heap. |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | Indexing consumes heap for the indexing buffer. | Sustained high heap during a re-index makes rejections more likely. |
+| [Shard Size Skew %](/nerve-centre/kpi-cards/elasticsearch/shard-size-skew) | A hot shard concentrates writes on one node. | High skew plus rejections on the same node means an unbalanced shard layout. |
+| [ES Product Index Doc Count vs Ecom Catalog](/nerve-centre/kpi-cards/elasticsearch/es-product-index-doc-count-vs-ecom-catalog) | Rejected (and dropped) batches show up as missing docs. | Doc drift after a rejection event quantifies the actual data loss in the search index. |
+| [Elasticsearch Health Score](/nerve-centre/kpi-cards/elasticsearch/elasticsearch-health-score) | The composite reflects write-pipeline strain. | Sustained rejections pull the composite down even while the cluster stays green. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> `GET /_nodes/stats/thread_pool` returns the `write` pool's `rejected`, `queue`, `active`, and `completed` counters per node, the exact source for this card.
+> `GET /_cat/thread_pool/write?v&h=node_name,active,queue,rejected` gives a quick human-readable table of write-pool pressure per node.
+> `GET /_nodes/stats/indices/indexing` returns `index_total` and `index_failed` so you can correlate rejections with overall indexing volume.
+> Bulk API responses carry per-item `status` and `error` fields; a 429 on an item is the client-visible form of a pool rejection, and the node logs record `EsRejectedExecutionException` entries.
+
+On a managed service, AWS OpenSearch Service / managed offerings expose `ThreadpoolWriteRejected` (or the legacy `ThreadpoolBulkRejected`) in CloudWatch, which maps directly to this card; Elastic Cloud surfaces write-pool rejections in the deployment monitoring view.
+
+**Why our number may legitimately differ from a manual stats call:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Counter vs window** | Card shows the delta | `thread_pool.write.rejected` is a lifetime cumulative counter per node; the card reports the increase over the trailing 24 hours, so a bare counter read shows a much larger absolute number. |
+| **Node restarts** | Card may read lower | The counter resets to zero when a node restarts; if a node bounced inside the window, its pre-restart rejections are not in the delta. |
+| **Per-node vs cluster sum** | Card shows the total | A single `_cat/thread_pool` row is one node; the card sums every node, so the card's number is larger than any single row. |
+| **Naming on managed services** | Possible confusion | Older managed clusters name the metric `ThreadpoolBulkRejected`; newer ones use `ThreadpoolWriteRejected`. They measure the same pool under its old and new name. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Does one rejection mean one lost document?**
+No. A rejection is one rejected bulk request, and a single bulk request can carry hundreds or thousands of documents. So one rejection can mean many documents did not index on that attempt. Whether they end up indexed at all depends on the client: a bulk indexer with retry-and-backoff will resubmit the rejected items and they eventually land, while a client that ignores the 429 silently drops the whole batch. The card counts requests rejected, not documents lost, because it cannot see the client's retry behaviour.
+
+**The cluster is green and search is fine, but I have bulk rejections. Is that a problem?**
+Potentially yes. Bulk rejections are about the write path, which is independent of the read path and of cluster health. You can have a perfectly green, fast-searching cluster that is quietly failing to index part of its incoming writes. The risk is that the search index drifts out of sync with the source of truth: SKUs that were updated do not reflect in search, or new products are missing. Confirm with [ES Product Index Doc Count vs Ecom Catalog](/nerve-centre/kpi-cards/elasticsearch/es-product-index-doc-count-vs-ecom-catalog).
+
+**Should I raise the write queue size to stop the rejections?**
+Rarely a good idea. A bigger queue (`thread_pool.write.queue_size`) hides the backpressure rather than fixing it: requests sit longer in memory, heap pressure rises, and you risk turning controlled rejections into an OOM crash. The queue exists to absorb short bursts, not to mask a sustained mismatch between write rate and capacity. Fix the client (backoff, smaller batches, less parallelism) or add write capacity instead.
+
+**What is the ideal bulk batch size?**
+Size by bytes, not document count. A common sweet spot is 5 to 15 MB of data per bulk request, tuned by experiment for your document size and cluster. Sizing by a fixed document count (for example "always 10,000 docs") is the classic cause of rejections, because 10,000 large documents is a very different load from 10,000 tiny ones. Start small, increase batch size until you stop seeing throughput gains, then back off slightly.
+
+**My client retries everything, so no data is lost. Can I ignore this card?**
+You can downgrade its urgency, but not ignore it. Even with perfect retries, rejections mean the cluster is at its write ceiling: each retry adds latency to your indexing pipeline and load to the cluster, so re-index jobs take longer and inventory updates lag. Pair with [Indexing Rate (docs/sec)](/nerve-centre/kpi-cards/elasticsearch/indexing-rate-docssec) to see how much the rejections are slowing your effective throughput. Persistent rejections are a capacity-planning signal even when data integrity is safe.
+
+**Why does only one node reject while the others do not?**
+That points to an unbalanced shard layout. Writes for an index are routed to its primary shards; if those primaries are concentrated on one or two nodes, those nodes shoulder the write load while the rest sit idle. Check [Shard Size Skew %](/nerve-centre/kpi-cards/elasticsearch/shard-size-skew) and the shard allocation for your write-heavy index. Spreading the primaries across more nodes usually clears single-node rejections without adding capacity.
+
+**Does this include rejections from the search thread pool?**
+No. This card reads only the `write` thread pool. Search-pool rejections (a read-path capacity problem with very different consequences) are surfaced through the search error cards, including [Search Error Rate %](/nerve-centre/kpi-cards/elasticsearch/search-error-rate) and the [Search Error Rate Spike (>1% in 5m)](/nerve-centre/kpi-cards/elasticsearch/search-error-rate-spike-1-in-5m) alert. Keeping write and search rejections on separate cards stops a re-index from looking like a storefront-search outage.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Bulk Rejections (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,139 @@
+---
+title: "Connection Errors (24h), MongoDB"
+sidebarTitle: "Connection Errors (24h)"
+description: "Connection Errors (24h) for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Connection Errors (24h)** counts the number of failed or refused client connection attempts against your MongoDB deployment in the trailing 24 hours. A healthy deployment under steady load sits near zero. A non-zero, climbing count means clients (your application servers, workers, or analytics jobs) are being turned away at the door: they cannot open a socket, cannot authenticate, or are hitting the server's connection ceiling. For a DBA this is an early-warning signal that sits upstream of latency and error-rate symptoms, because a query that never gets a connection never shows up in your slow-query logs.
+
+| | |
+| --- | --- |
+| **What it tracks** | Failed and rejected client connection attempts over the trailing 24 hours. Sourced from `connections.totalCreated` deltas cross-checked against rejected/refused counters, plus driver-side connection failures surfaced through the deployment's logs. |
+| **Data source** | `serverStatus().connections` (notably `totalCreated`, `current`, `available`, and `rejected` where exposed) sampled on each poll, with the 24h figure computed as the sum of error increments across the window. On Atlas, corroborated by the `CONNECTIONS` and `Connection Errors` metrics in the cluster Metrics tab. |
+| **Time window** | `24h` rolling. Each poll appends to the window; the headline is the 24-hour running total. |
+| **Alert trigger** | `> 100` connection errors in the trailing 24 hours. Sustained breaches escalate to the Nerve Centre alert feed and notify the on-call DBA. |
+| **Why it matters** | Connection refusals are silent revenue and reliability risk. The query never runs, so it never appears as a slow op or a query error; the application sees a timeout or a 5xx and the shopper sees a spinner. |
+| **Reading the value** | Near-zero is healthy. A steady low trickle (single digits per day) is usually transient network blips. A sharp step-change or a sustained climb past the alert line means a pool, auth, or capacity problem that needs action. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card aggregates connection failures from two complementary sources and sums them across the trailing 24 hours.
+
+1. **Server-side refusals.** On each poll the engine reads `serverStatus().connections`. The key fields are `current` (open connections right now), `available` (remaining headroom before the `maxIncomingConnections` ceiling), and `totalCreated` (a monotonic counter of every connection ever opened since the process started). When `available` reaches zero, the server begins refusing new connections; those refusals are counted. Where the build exposes a `rejected` counter, that delta is read directly.
+2. **Driver-side and auth failures.** Connection attempts that fail before a session is established (TLS handshake failures, authentication failures, DNS or socket timeouts) are surfaced through the deployment log stream and the driver's connection-pool events. These are de-duplicated against the server-side count so a single failed attempt is not double-counted.
+
+The 24-hour headline is the sum of error increments observed across the window. Because counters reset when a `mongod` process restarts, the engine detects counter resets (a `totalCreated` value lower than the previous sample) and stitches the window so a restart does not register as a spurious negative or a false spike.
+
+The alert fires when the trailing-24h total exceeds **100**. That threshold is deliberately forgiving: a busy cluster legitimately churns thousands of short-lived connections per day, and the occasional refused attempt during a deploy or a network blip is noise. One hundred genuine refusals in a day is not noise; it is a pattern.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 3-node replica set (`rs0`) backing an order-management service. `maxIncomingConnections` is left at the driver-managed default and the application uses a connection pool sized at 200 per app server, with 6 app servers behind the load balancer. Snapshot taken on 14 Apr 26 at 16:20 BST.
+
+The Connection Errors (24h) card reads **312**, well past the `> 100` alert line, and the trend sparkline shows the count was flat near zero until 13:00, then stepped up sharply.
+
+The DBA pulls the supporting numbers:
+
+| Signal | Value at 16:20 | Baseline |
+| --- | --- | --- |
+| `connections.current` | 1,180 | ~640 |
+| `connections.available` | 12 | ~560 |
+| `connections.totalCreated` (24h delta) | 41,900 | ~9,000 |
+| Connection errors (24h) | 312 | 0 to 4 |
+
+The story is in `available`: it has collapsed to 12, meaning the server is one breath away from refusing every new connection. Cross-referencing the deploy log, a release at 13:05 changed the worker tier to open a fresh connection per job instead of borrowing from the shared pool, so `totalCreated` exploded and the pool ceiling was reached.
+
+```text
+Reading the numbers:
+  - 6 app servers x 200 pool size            = 1,200 potential connections
+  - server maxIncomingConnections (effective) ~ 1,200
+  - worker tier now opens ad-hoc connections  -> ceiling breached
+  - available drops to 12 -> new clients refused
+  - 312 refusals in 24h, all after 13:05
+```
+
+The action is twofold. Short term: roll back the worker change so jobs borrow from the pool again, which immediately restores headroom. Medium term: either raise `maxIncomingConnections` to give margin, or right-size the per-server pool so the aggregate cannot exceed the server ceiling. The DBA also pins [Connection Pool Saturation %](/nerve-centre/kpi-cards/mongodb/connection-pool-saturation) next to this card, because saturation crossing 90% is the leading indicator that predicts these refusals a few minutes before they start.
+
+Two takeaways worth remembering:
+
+1. **Connection errors are upstream of every latency metric.** A refused connection produces no slow op and no query error, so a DBA watching only [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) or [Query Error Rate %](/nerve-centre/kpi-cards/mongodb/query-error-rate) can miss an outage entirely. This card is the canary.
+2. **The shape matters more than the absolute number.** A flat trickle of 30 errors per day from a flaky network path is benign. A step-change from 0 to 300 after a deploy is a regression with a clear cause and a clear owner.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Connection Errors (24h) | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mongodb/connection-pool-saturation) | The leading indicator. Saturation crosses 90% before refusals begin. | Rising saturation then climbing errors equals a capacity wall, not a network blip. |
+| [Connections In Use](/nerve-centre/kpi-cards/mongodb/connections-in-use) | The raw count of open connections right now. | Errors with high `current` equals ceiling reached; errors with low `current` equals auth or network failure. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/mongodb/connection-pool-at-90-saturation) | The real-time alert that fires before this 24h total climbs. | The alert is the warning; this card is the accumulated damage report. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mongodb/query-error-rate) | The symptom that surfaces once refused clients retry and fail. | Connection errors leading query errors equals capacity cascade. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | Traffic context. Did errors rise because load rose? | Errors flat with rising ops equals healthy scaling; errors rising with flat ops equals a leak or misconfiguration. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | The composite that weights connection health. | A spike here drags the health score down before any latency card moves. |
+| [Instance Uptime](/nerve-centre/kpi-cards/mongodb/instance-uptime) | Detects whether a restart reset the counters. | A recent restart explains a sudden window discontinuity. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MongoDB's own tooling:**
+
+> **`db.serverStatus().connections`** is the canonical source. Run it in `mongosh` against the node you are investigating and read `current`, `available`, `totalCreated`, and `rejected` (where present). `available` near zero is the smoking gun for refusals.
+> **`db.currentOp()`** shows what the open connections are actually doing, useful for confirming whether the pool is full of legitimate work or stuck operations.
+> **Atlas Metrics tab** exposes `Connections` and `Connection Errors` charts per node; set the window to 24 hours to compare directly against this card.
+> **mongod log** (or the Atlas log download) records connection-accepted and connection-refused lines, plus authentication failures, which is where driver-side errors that never reach `serverStatus` are visible.
+
+**Why our number may legitimately differ from MongoDB's native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Counter reset on restart** | Vortex IQ may show a stitched window | `totalCreated` resets to zero when `mongod` restarts; the engine detects this and stitches, whereas a raw counter read shows a discontinuity. |
+| **Per-node vs cluster** | Vortex IQ aggregates the set | `serverStatus` is per-node; this card sums refusals across replica-set members unless scoped to one node. |
+| **Driver-side inclusion** | Vortex IQ count higher | We fold in TLS/auth/socket failures from logs that never increment a `serverStatus` counter. |
+| **Time zone** | Window edges shift | Native tooling renders in the node's local time; Vortex IQ aligns the 24h window to your reporting time zone. |
+| **Sampling interval** | Marginal undercount | Refusals between polls are inferred from counter deltas, not captured event-by-event; very brief bursts can be smoothed. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows errors but `db.serverStatus().connections.available` looks healthy right now. Why?**
+The card is a 24-hour rolling total; `serverStatus` is an instantaneous snapshot. The errors likely happened during an earlier burst (a deploy, a traffic spike, a network partition) that has since recovered. Check the trend sparkline for when the increments landed, then correlate with your deploy and incident timeline. The pool can be perfectly healthy now and still carry 200 refusals from three hours ago.
+
+**Does this card count normal connection churn?**
+No. Short-lived connections opening and closing are tracked by `totalCreated` but are not errors. This card counts only failed or refused attempts: pool-ceiling refusals, authentication failures, and handshake or socket failures. A cluster churning 40,000 healthy connections a day can still read zero here.
+
+**A `mongod` restart happened in the window. Is the count reliable?**
+Yes, with a caveat. The engine detects the counter reset (when `totalCreated` drops below the prior sample) and stitches the window so the restart does not create a false spike or a negative. However, a restart itself can cause a brief flurry of genuine refusals as clients reconnect; those are real and counted. If the only errors cluster around a known restart time, treat them as expected reconnection noise rather than a standing problem.
+
+**Why is the alert threshold 100 and not zero?**
+Because zero is unrealistic for a busy cluster. Transient network blips, the occasional client timing out during a deploy, and reconnection storms after a routine failover all produce small numbers of legitimate refusals. Setting the line at 100 keeps the alert meaningful: 100 genuine refusals in a day is a pattern, not noise. You can tighten the threshold per profile in the Sensitivity tab if your deployment is normally pristine.
+
+**Connection errors are high but query latency and error rate look fine. How is that possible?**
+That is exactly why this card exists. A refused connection never establishes a session, so the query it would have carried never runs: no slow op, no query error, nothing in the profiler. The application sees a timeout and the shopper sees a spinner, but your latency and error-rate cards stay green. Connection Errors is the upstream signal that those cards cannot show.
+
+**We run a sharded cluster. Which connections does this count?**
+By default the card scopes to the deployment the connector is configured against. For a sharded cluster pointed at the `mongos` routers, it counts client-to-`mongos` refusals. Internal `mongos`-to-shard connections are a separate concern; if you need shard-level connection health, scope the connector to the shard members directly or pair with [Replica Set Members (state)](/nerve-centre/kpi-cards/mongodb/replica-set-members-state).
+
+**Can a single misbehaving client cause this on its own?**
+Yes, and it is common. A client that opens connections without closing them (a leaked pool, a retry loop with no backoff, an analytics job that forgets to dispose its connection) can exhaust `available` single-handedly. Use `db.currentOp()` and the connection metadata in the mongod log to identify the source `appName` or host, then fix the client. Raising the server ceiling only buys time against a leak.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connection Errors (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

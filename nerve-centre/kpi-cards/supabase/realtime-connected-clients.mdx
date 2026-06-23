@@ -1,0 +1,150 @@
+---
+title: "Realtime Connected Clients, Supabase"
+sidebarTitle: "Realtime Connected Clients"
+description: "Realtime Connected Clients for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Realtime & Auth](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The count of WebSocket clients currently subscribed to your Supabase Realtime service. This is a Supabase-distinctive signal: every connected client holds an open WebSocket and consumes a slot against your project's concurrent-connection ceiling. It answers "how many live, persistent sessions is my project carrying right now?" Connected clients drive Realtime billing, shape the writer's broadcast workload, and are the first thing to inspect when live features feel laggy or when you approach a plan limit. Unlike a request-rate metric, each client here is a standing cost, not a momentary one.
+
+| | |
+| --- | --- |
+| **What it counts** | Distinct WebSocket clients currently connected to the Supabase Realtime service. One browser tab or mobile app session with an open Realtime connection equals one client, regardless of how many channels that client is subscribed to. |
+| **Data source** | Supabase Realtime service connection telemetry, surfaced in the project dashboard under Reports, then Realtime. The Realtime service is a standalone Elixir/Phoenix process, so this count comes from the service, not from a Postgres system table. |
+| **Metric basis** | Concurrent connection count, sampled live. This is a gauge (a point-in-time level), not a counter (a running total). It rises and falls with active sessions. |
+| **What does NOT count** | (1) HTTP requests to PostgREST or Edge Functions, which are stateless and not WebSocket-based; (2) idle browser tabs whose WebSocket has been closed by the client or timed out; (3) the channel count itself, which is tracked separately by [Active Realtime Channels](/nerve-centre/kpi-cards/supabase/active-realtime-channels); (4) database connections in the Supavisor pool. |
+| **Time window** | `RT` (real-time, sampled live). |
+| **Alert trigger** | `-` (no fixed threshold). Connected clients are a capacity signal; the meaningful threshold is your plan's concurrent-connection ceiling, which differs per project. |
+| **Roles** | engineering, operations. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The value is a live gauge of WebSocket clients holding an open connection to the Realtime service, taken from the connector's `sb_realtime_connected_clients` reading. Conceptually:
+
+```text
+connected_clients = count(distinct websocket sessions currently open
+                          to the Realtime endpoint)
+```
+
+A few properties follow from the detail (`Supabase-distinctive: WebSocket subscribers on Realtime channels`):
+
+- **One session, one client.** A client that subscribes to ten channels over a single WebSocket counts once here. That is why this card and [Active Realtime Channels](/nerve-centre/kpi-cards/supabase/active-realtime-channels) can move independently: a code change that splits one channel into ten multiplies channels but not clients.
+- **It is a level, not a flow.** The number does not accumulate over the period. At any instant it is the headcount of open sockets. A busy hour with high churn (clients joining and leaving) can show a stable connected-client count even while [Realtime Disconnect Rate (per min)](/nerve-centre/kpi-cards/supabase/realtime-disconnect-rate-per-min) is elevated.
+- **It maps directly to your concurrency ceiling.** Supabase enforces a maximum concurrent Realtime connection limit per plan. This card is the live reading against that ceiling, which is why it is a Hero card: hitting the ceiling silently rejects new subscribers, and live features simply stop working for the users who could not connect.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Supabase project backing a live customer-support console: agents see new tickets appear in real time, and a presence indicator shows which agent is viewing which ticket. The project is on a plan with a 500 concurrent Realtime connection ceiling. Snapshot taken on 14 Apr 26 at 09:45 BST, just after the support shift starts.
+
+| Reading | Value | Notes |
+| --- | --- | --- |
+| Realtime Connected Clients | 312 | Each agent console tab holds one WebSocket. |
+| [Active Realtime Channels](/nerve-centre/kpi-cards/supabase/active-realtime-channels) | 1,240 | Per-ticket channels plus a global presence channel. |
+| [Realtime Disconnect Rate (per min)](/nerve-centre/kpi-cards/supabase/realtime-disconnect-rate-per-min) | 4/min | Normal shift-start churn. |
+| Concurrency ceiling (plan) | 500 | Headroom: 188 clients (38%). |
+
+The team reads three things at a glance:
+
+1. **Headroom is comfortable but shrinking.** 312 of 500 is 62% utilisation. The morning shift is fully logged in; the afternoon overlap shift adds roughly 120 more consoles at 14:00, which would push the project to 432 (86%). That is close enough to warrant either a plan upgrade before a seasonal spike or a review of whether idle tabs are holding sockets unnecessarily.
+
+2. **Channels far outnumber clients, which is expected here.** 1,240 channels across 312 clients is roughly four channels per client (their open tickets plus presence). If this ratio suddenly jumped to forty channels per client, that would point to a subscription leak in the front-end (channels not being cleaned up on ticket close), which inflates the writer's broadcast fan-out without adding users.
+
+3. **The disconnect rate is benign.** Four disconnects per minute at shift start is normal: agents refreshing, switching networks, reconnecting. The card to watch is the disconnect-rate sibling; a sustained spike there would mean clients are being dropped involuntarily, which connected-client count alone would not reveal because reconnects keep the headcount roughly flat.
+
+```text
+Capacity framing:
+  - Current: 312 / 500 = 62% of concurrent ceiling
+  - Projected at 14:00 overlap: ~432 / 500 = 86%
+  - Action trigger: sustained >85% means provision headroom now,
+    because new subscribers above the ceiling are rejected silently.
+```
+
+Three takeaways:
+
+1. **Connected clients is a standing cost, not a momentary one.** Unlike a query that finishes, each client occupies a slot for as long as the session is open. Capacity planning here is about peak concurrency, not throughput.
+2. **The ceiling is the real threshold.** There is no fixed alert value because the meaningful limit is your plan's concurrent-connection ceiling. Set your own sensitivity threshold in Vortex IQ at roughly 85% of that ceiling.
+3. **Read it with channels and disconnects, never alone.** Connected-client count is stable under churn and blind to subscription leaks. The three Realtime cards together tell you whether the service is healthy, leaking, or unstable.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Realtime Connected Clients | What the combination tells you |
+| --- | --- | --- |
+| [Active Realtime Channels](/nerve-centre/kpi-cards/supabase/active-realtime-channels) | The topic-level companion: channels per client. | A jump in channels without a jump in clients equals a front-end subscription leak inflating broadcast fan-out. |
+| [Realtime Disconnect Rate (per min)](/nerve-centre/kpi-cards/supabase/realtime-disconnect-rate-per-min) | Stability layer: are clients being dropped involuntarily? | Flat client count plus high disconnect rate equals a reconnect storm masking real instability. |
+| [Connections in Use](/nerve-centre/kpi-cards/supabase/connections-in-use) | Postgres-side connection load. | Realtime subscribes to Postgres changes; high client count can drive replication and connection pressure on the primary. |
+| [Memory Usage](/nerve-centre/kpi-cards/supabase/memory-usage) | The Realtime service holds state per connection. | Rising clients plus rising memory equals connection-driven memory growth on the instance. |
+| [Auth Active Users (24h)](/nerve-centre/kpi-cards/supabase/auth-active-users-24h) | User-side context: how many real people are online. | Connected clients far exceeding active users equals multiple tabs or zombie sockets per user. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite that folds Realtime health into one number. | Approaching the concurrency ceiling pulls the composite down before any single card alerts. |
+| [Project Uptime](/nerve-centre/kpi-cards/supabase/project-uptime) | Availability context for the Realtime service. | A dip in connected clients with an uptime blip equals a service restart that dropped every socket. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase's own tooling:**
+
+> **Project dashboard, then Reports, then Realtime** for concurrent-connection and message charts over time. This is the authoritative managed-service view.
+> **Project dashboard, then Logs, then Realtime** to inspect individual connect and disconnect events with client identifiers.
+> **Project Settings, then Billing, or your plan page** to confirm the concurrent Realtime connection ceiling for your tier.
+
+**Why our number may legitimately differ from the Supabase dashboard:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sampling instant** | Small differences | This card is a live gauge; the dashboard chart is bucketed (for example per-minute peak or average). A spike that lands between buckets can read differently. |
+| **Average vs peak** | Dashboard may read higher or lower | Supabase's Realtime report can show per-bucket peak; a live gauge shows the instantaneous value, which is usually below the bucket peak. |
+| **Time zone** | Chart x-axis shifts | The Supabase dashboard renders in account time zone; Vortex IQ aligns to your reporting time zone. |
+| **Service restart** | Brief drop to near zero | A Realtime service restart drops all sockets at once; the dashboard and this card both show the dip, but the recovery curve can differ by a few seconds of sampling. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Auth Active Users (24h)](/nerve-centre/kpi-cards/supabase/auth-active-users-24h) | Connected clients should be in the same order of magnitude as active users, often a small multiple (tabs, devices). | Clients far exceeding users equals multi-tab usage or zombie sockets that have not timed out. |
+| [Connections in Use](/nerve-centre/kpi-cards/supabase/connections-in-use) | Realtime Postgres Changes subscriptions consume database connections; the two tend to move together under Postgres Changes workloads. | Broadcast-only and Presence-only workloads add clients without adding Postgres connections, so the link weakens. |
+
+There is no single Postgres system table that returns Realtime client count, because the Realtime service is a separate Elixir process. `pg_stat_activity` shows database connections (including those the Realtime service opens for Postgres Changes), but it does not enumerate WebSocket subscribers. Treat the Supabase Realtime report as the source of truth for this card.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is my connected-client count higher than my number of logged-in users?**
+Each browser tab or app instance with an open Realtime connection counts as a separate client. A user with three tabs open is three clients. Add background reconnects and mobile apps that hold a socket while backgrounded, and the client count routinely exceeds the human headcount. Compare with [Auth Active Users (24h)](/nerve-centre/kpi-cards/supabase/auth-active-users-24h); a large gap is usually multi-tab behaviour, not a bug.
+
+**Does subscribing to more channels increase this number?**
+No. A single client can subscribe to many channels over one WebSocket and still counts as one connected client. Channel count is tracked separately by [Active Realtime Channels](/nerve-centre/kpi-cards/supabase/active-realtime-channels). If channels climb while clients stay flat, look for a subscription leak in your front-end.
+
+**What happens when I hit my plan's concurrent-connection ceiling?**
+New connection attempts above the ceiling are rejected. The users already connected stay connected, but anyone new fails to subscribe and their live features go quiet, often without an obvious error. Because this happens silently for the affected users, set a Vortex IQ sensitivity threshold at roughly 85% of your ceiling so you provision headroom before the wall.
+
+**Why does this card have no alert threshold?**
+The meaningful limit is your plan's concurrent Realtime connection ceiling, which varies per project and tier. A hard-coded number would be wrong for most projects. The card ships with no threshold (`-`) so you set one in the Sensitivity tab relative to your own ceiling.
+
+**The count dropped to near zero for a few seconds, then recovered. Was that an outage?**
+Most likely a Realtime service restart (during a deploy or platform maintenance), which drops all WebSockets simultaneously; clients then reconnect within seconds. Confirm with [Project Uptime](/nerve-centre/kpi-cards/supabase/project-uptime) and the Realtime logs. A genuine outage would keep the count suppressed and would coincide with elevated [Realtime Disconnect Rate (per min)](/nerve-centre/kpi-cards/supabase/realtime-disconnect-rate-per-min).
+
+**Do Edge Functions or PostgREST requests show up here?**
+No. Those are stateless HTTP requests and do not hold a WebSocket. Only persistent Realtime connections are counted. PostgREST throughput is covered by [PostgREST Request Rate (req/sec)](/nerve-centre/kpi-cards/supabase/postgrest-request-rate-reqsec).
+
+**Does a high connected-client count slow down my database?**
+Indirectly, and only for Postgres Changes workloads. Postgres Changes subscriptions consume database connections and replication-decoding work on the primary. Broadcast and Presence do not touch Postgres at all. If you see connected clients and [Connections in Use](/nerve-centre/kpi-cards/supabase/connections-in-use) rising together, your Realtime usage is Postgres-Changes-heavy and you may want to move high-fan-out events to Broadcast.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Realtime Connected Clients* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

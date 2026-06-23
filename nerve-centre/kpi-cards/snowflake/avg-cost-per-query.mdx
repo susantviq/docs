@@ -1,0 +1,166 @@
+---
+title: "Avg Cost per Query ($), Snowflake"
+sidebarTitle: "Avg Cost per Query ($)"
+description: "Avg Cost per Query for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Credit Burn](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The blended dollar cost of running a single query on your Snowflake account, computed as `(credits consumed x $/credit) / query_count` over a rolling 7-day window compared against the prior 7 days. It is the unit-economics view of your warehouse spend: not "how much did we burn" but "how much did each unit of work cost". When this number rises it means one of two things, and both matter to a platform team: queries are getting less efficient (more bytes scanned, more spilling to remote storage, more time spent queued on an undersized warehouse) or each query is doing more work (wider scans, larger result sets). A stable account holds this number flat even as query volume grows; a drifting number is the earliest signal that compute is being wasted before the monthly bill confirms it.
+
+| | |
+| --- | --- |
+| **Data source** | Derived from `SNOWFLAKE.ACCOUNT_USAGE.METERING_HISTORY` (credits) and `SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY` (query count). Credits are converted to dollars using the account's contracted `$/credit` rate set in the connector. |
+| **Metric basis** | A ratio, not a raw count: `(sum(credits_used) x dollar_per_credit) / count(query_id)`. Both numerator and denominator are taken over the same warehouse scope and time window so the ratio is internally consistent. |
+| **What pushes it up** | (1) Inefficient queries: full table scans where a pruned scan would do, missing clustering, joins that spill to local then remote storage; (2) larger results returned per query; (3) warehouses left oversized for the workload; (4) queueing that holds a warehouse running while queries wait. |
+| **What pushes it down** | Result caching, pruning via clustering keys, right-sizing warehouses, and batching small queries so per-query overhead amortises. |
+| **Aggregation window** | `7d vsP`, a rolling 7-day mean compared against the prior 7-day mean so week-over-week drift is visible without daily noise. |
+| **Latency** | `METERING_HISTORY` is near real-time (within minutes); `QUERY_HISTORY` in `ACCOUNT_USAGE` can lag up to 45 minutes, so the most recent hour may settle upward as late queries land. |
+| **Time window** | `7d vsP` (rolling 7 days, compared to the prior 7 days) |
+| **Alert trigger** | `+25% WoW`, a 25% or greater week-over-week rise raises the sensitivity alert. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card divides total dollar spend by total query count over the window:
+
+```text
+dollars  = sum(credits_used over window) × dollar_per_credit
+queries  = count(distinct query_id over window, excluding cached/metadata-only)
+cost_per_query = dollars / queries
+delta_wow = (cost_per_query_this_7d − cost_per_query_prior_7d)
+            / cost_per_query_prior_7d
+```
+
+Notes that matter for a Snowflake account:
+
+- **Credits, not seconds.** Snowflake bills compute in credits, accrued per second a warehouse runs (with a 60-second minimum on resume). The numerator reads `METERING_HISTORY`, which attributes credits per warehouse per hour, so the dollar figure already includes idle-but-running time, not just active execution.
+- **Query count excludes free reads.** Queries served entirely from the result cache or that touch only metadata (for example `SHOW`, `DESCRIBE`) consume no compute credits. Counting them in the denominator would artificially deflate cost per query, so they are excluded; only queries that ran on a warehouse are counted.
+- **Scope follows the connector.** If the connector is scoped to specific warehouses, both numerator and denominator are restricted to those warehouses, so the ratio reflects the workload you care about rather than the whole account.
+- **The `$/credit` rate is contractual.** Snowflake list pricing varies by edition (Standard, Enterprise, Business Critical) and region. The card uses the rate you set in the connector, so the dollar figure matches your invoice rather than a list assumption.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs Snowflake for an ecommerce analytics stack: a `LOAD_WH` (Small) for Fivetran ingest, a `BI_WH` (Medium) serving a Looker instance, and an `AD_HOC_WH` (Large) for the data team. Their contracted rate is $3.00 per credit (Enterprise edition). Two readings, taken on 14 Apr 26.
+
+**This week (07 to 14 Apr 26):**
+
+| Input | Value |
+| --- | --- |
+| Credits consumed (7d) | 1,820 |
+| Dollar spend (1,820 x $3.00) | $5,460 |
+| Query count (7d) | 42,000 |
+| **Cost per query** | **$0.130** |
+
+**Prior week (31 Mar to 07 Apr 26):**
+
+| Input | Value |
+| --- | --- |
+| Credits consumed (7d) | 1,410 |
+| Dollar spend (1,410 x $3.00) | $4,230 |
+| Query count (7d) | 41,200 |
+| **Cost per query** | **$0.103** |
+
+Week-over-week delta: ($0.130 - $0.103) / $0.103 = **+26%**. The `+25% WoW` alert fires.
+
+The signal is sharp: query volume barely moved (42,000 vs 41,200, up under 2%) but credits jumped 29%. That divergence is the whole story. Volume is flat, so this is not "the business is busier"; it is "the same work now costs more". The team's investigation, in order of leverage:
+
+1. **Find which warehouse moved.** Open [Credits by Warehouse (7d)](/nerve-centre/kpi-cards/snowflake/credits-by-warehouse-7d). The breakdown shows `AD_HOC_WH` credits doubled from 410 to 820 while `BI_WH` and `LOAD_WH` held flat. The cost rise is concentrated, not systemic.
+2. **Ask whether the warehouse was working or idling.** Check [Idle Warehouse Credits Wasted (24h)](/nerve-centre/kpi-cards/snowflake/idle-warehouse-credits-wasted-24h). It shows `AD_HOC_WH` accrued 180 idle credits this week against near-zero last week: someone changed `AUTO_SUSPEND` from 60 seconds to 600 seconds, so the Large warehouse now sits running for ten minutes after each ad-hoc query. At Large size that is 8 credits/hour wasted.
+3. **Check for query inefficiency on top.** Open [Top 10 Slowest Queries](/nerve-centre/kpi-cards/snowflake/top-10-slowest-queries). Two new exploratory queries are scanning an unclustered 4 TB events table with no partition pruning, spilling to remote storage. These are doing genuine extra work, not just idling.
+
+```text
+Decomposing the +26%:
+  Idle (auto-suspend regression):  ~180 credits × $3 = $540 of pure waste
+  Inefficient new ad-hoc queries:  ~230 extra credits × $3 = $690 of real-but-avoidable work
+  Together: ~$1,230 of the $1,230 increase, fully explained.
+```
+
+The fix is two-part and cheap: reset `AUTO_SUSPEND` on `AD_HOC_WH` back to 60 seconds (reclaims the idle $540 immediately) and add a clustering key or a date filter to the two exploratory queries (reclaims most of the $690). Cost per query returns to baseline within a day, with zero change to what the data team can actually do.
+
+Three things worth remembering:
+
+1. **Read this card against volume, always.** Cost per query rising while volume rises proportionally can be benign growth. Cost per query rising while volume is flat is pure inefficiency and is the case that costs money. Pair with [Queries per Hour (live)](/nerve-centre/kpi-cards/snowflake/queries-per-hour-live).
+2. **A flat numerator can still hide a problem.** If credits hold steady but query count falls (a broken ingest pipeline running fewer queries), cost per query rises even though nothing got less efficient. Confirm the denominator before chasing the numerator.
+3. **The biggest single lever is auto-suspend.** Idle-but-running warehouses are the most common cause of a sudden cost-per-query jump, and the cheapest to fix. Check idle credits before assuming the queries themselves got worse.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Avg Cost per Query | What the combination tells you |
+| --- | --- | --- |
+| [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) | The raw dollar numerator. | Cost per query up with credits up = more spend; cost per query up with credits flat = fewer but pricier queries. |
+| [Credits by Warehouse (7d)](/nerve-centre/kpi-cards/snowflake/credits-by-warehouse-7d) | Localises the rise to a single warehouse. | Tells you whether the cost drift is account-wide or one runaway warehouse. |
+| [Idle Warehouse Credits Wasted (24h)](/nerve-centre/kpi-cards/snowflake/idle-warehouse-credits-wasted-24h) | The most common cause of a sudden jump. | A spike here usually explains most of a cost-per-query rise; check it first. |
+| [Queries per Hour (live)](/nerve-centre/kpi-cards/snowflake/queries-per-hour-live) | The denominator's live rate. | Lets you distinguish benign volume growth from genuine inefficiency. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/snowflake/top-10-slowest-queries) | Names the queries doing extra work. | The specific statements driving up the numerator through scans and spilling. |
+| [Credit Burn +50% Week-over-Week](/nerve-centre/kpi-cards/snowflake/credit-burn-50-week-over-week) | The acute alert version of cost drift. | A fired credit-burn alert almost always coincides with a cost-per-query rise. |
+| [Credit Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/snowflake/credit-burn-vs-ecom-order-volume) | The cross-channel sanity check. | Cost per query up while order volume is flat is the clearest waste signal a business can read. |
+| [Snowflake Health Score](/nerve-centre/kpi-cards/snowflake/snowflake-health-score) | The composite this feeds into. | A cost-driven amber score points back to this card as the cause. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake's own tooling:**
+
+> There is no single native command that prints cost per query; reconstruct it from the same two views:
+> **Credits (numerator):** `SELECT SUM(credits_used) FROM SNOWFLAKE.ACCOUNT_USAGE.METERING_HISTORY WHERE start_time >= DATEADD('day', -7, CURRENT_TIMESTAMP());`
+> **Query count (denominator):** `SELECT COUNT(*) FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY WHERE start_time >= DATEADD('day', -7, CURRENT_TIMESTAMP()) AND warehouse_size IS NOT NULL;` (the `warehouse_size IS NOT NULL` filter drops cache-only and metadata queries).
+> **Per-query credits:** `WAREHOUSE_METERING_HISTORY` joined to `QUERY_HISTORY` on warehouse and time gives a finer attribution if you need to localise the rise.
+> **Managed console:** Snowsight under **Admin -> Cost Management** shows credit consumption and a usage breakdown; multiply credits by your contracted rate to match the dollar figure. The Cost Management view is the closest native equivalent to this card's numerator.
+
+**Why our number may legitimately differ from a manual reconstruction:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **`ACCOUNT_USAGE` latency** | Recent value settles up | `QUERY_HISTORY` in `ACCOUNT_USAGE` lags up to 45 minutes; a hand-run query minutes apart from ours can see a different denominator. Use `INFORMATION_SCHEMA.QUERY_HISTORY` for the last few hours if you need lower latency. |
+| **Cache / metadata exclusion** | Our cost per query higher | If your manual count includes cache-served and metadata-only queries, your denominator is larger and your per-query figure lower. We exclude them so the ratio reflects real compute. |
+| **Warehouse scope** | Variable | If the connector is scoped to specific warehouses, our figure covers only those; an account-wide native query will differ. |
+| **`$/credit` rate** | Variable | We use your contracted rate; Snowsight shows credits, and list-price assumptions will not match your invoice. Confirm the rate in the connector. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`snow_credits_burned_24h`](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) | The numerator over a shorter window; should move in the same direction as this card's spend. | Credits flat but cost per query rising = the denominator (query count) fell. |
+| [Ecom order volume](/nerve-centre/kpi-cards/snowflake/credit-burn-vs-ecom-order-volume) | In a healthy account, cost per query is roughly flat as order-driven data volume grows. | Cost per query rising while orders are flat = query inefficiency, not business growth. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Cost per query jumped but our total credits barely moved. How is that possible?**
+The metric is a ratio, so the denominator matters as much as the numerator. If query count fell (a scheduled job that normally fires thousands of small queries broke, or a dashboard stopped refreshing) while credits held roughly steady, cost per query rises mechanically even though no individual query got more expensive. Always read this card next to [Queries per Hour (live)](/nerve-centre/kpi-cards/snowflake/queries-per-hour-live) so you can tell a numerator problem from a denominator problem.
+
+**Does result caching affect this number?**
+Yes, and in your favour. Queries served entirely from Snowflake's result cache consume no credits and are excluded from the denominator, so a high cache-hit workload shows a lower cost per query because only the genuinely-executed queries count. If you suddenly see cost per query rise after a schema or warehouse change, check whether you accidentally invalidated the result cache (for example by toggling a session parameter that disables it).
+
+**Why dollars and not credits?**
+Credits are Snowflake's internal unit, but they are not comparable across editions or regions and they do not appear on a budget. Converting to dollars with your contracted rate makes the number something a finance or platform owner can act on directly and reconcile against the invoice. The credit figure is still available on [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) if you prefer the native unit.
+
+**Our auto-suspend is set high on purpose to avoid cold-start latency. Will this card always flag us?**
+A high `AUTO_SUSPEND` is a legitimate trade-off (keeping a warehouse warm to avoid resume latency on bursty interactive workloads), but it does inflate cost per query because idle-but-running credits land in the numerator with no query in the denominator. The card is doing its job by surfacing the cost of that choice. If the trade-off is deliberate, raise the sensitivity threshold for this profile rather than chasing the alert; if it is accidental, [Idle Warehouse Credits Wasted (24h)](/nerve-centre/kpi-cards/snowflake/idle-warehouse-credits-wasted-24h) will quantify exactly what it is costing.
+
+**Can I see cost per query for a single warehouse rather than the whole account?**
+Yes, scope the connector to the warehouses you care about and both numerator and denominator restrict to that scope. This is the recommended setup for multi-team accounts: a shared `AD_HOC_WH` will have a very different cost profile from a tightly-controlled `BI_WH`, and a blended account-wide figure can hide a runaway warehouse behind a well-behaved one.
+
+**Why does the most recent reading sometimes drift upward after I look?**
+Because `ACCOUNT_USAGE.QUERY_HISTORY` can lag up to 45 minutes. Queries that ran in the last hour may not yet be counted, so the denominator is temporarily low and the ratio temporarily high; it settles as the late queries land. For a real-time check on the last few hours, query `INFORMATION_SCHEMA.QUERY_HISTORY` instead, which has no latency but a shorter retention window.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Avg Cost per Query ($)* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

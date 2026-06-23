@@ -1,0 +1,160 @@
+---
+title: "UncompressedCache Hit Rate %, ClickHouse"
+sidebarTitle: "UncompressedCache Hit Rate %"
+description: "UncompressedCache Hit Rate % for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The share of uncompressed-cache lookups that are served from memory rather than re-read and re-decompressed from disk. ClickHouse can keep already-decompressed blocks in an in-memory uncompressed cache so that repeated reads of the same data skip the decompression step entirely. A high hit rate means hot data is staying resident and repeat queries are cheap; a falling hit rate means the cache is too small for the working set, was recently flushed (for example by a restart), or the query mix has shifted to scanning cold data. Below 80% the card flags amber: repeat reads are paying the decompression cost again and CPU and latency rise. Note that the uncompressed cache is only consulted when `use_uncompressed_cache=1` is set, so on instances that leave it off this card reads near zero by design.
+
+| | |
+| --- | --- |
+| **Data source** | `UncompressedCacheHits` and `UncompressedCacheMisses` from `system.events`. The card computes `UncompressedCacheHits / (UncompressedCacheHits + UncompressedCacheMisses)` as a percentage. |
+| **What it tracks** | Cache effectiveness for the uncompressed block cache: of all lookups against it, what fraction avoided a disk read plus decompression. |
+| **Metric basis** | Event counters from `system.events`, which are cumulative since process start. The card takes the delta over the window so the rate reflects recent behaviour, not lifetime average. |
+| **Why it matters** | A high hit rate keeps repeat-query CPU and latency low. A drop signals the working set has outgrown the cache, the cache was cleared (restart), or queries have moved to cold partitions. It is a capacity and tuning signal, not a fault. |
+| **Time window** | `RT/1h` (real-time gauge backed by a 1-hour rolling delta of the event counters). |
+| **Alert trigger** | `<80%`. A sustained hit rate below 80% flags the card amber for the DBA to review cache sizing or the query mix. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine reads two cumulative counters from `system.events` and divides them:
+
+```sql
+SELECT
+    (h.value - m_prev_h) AS hits_window,
+    (m.value - m_prev_m) AS misses_window,
+    round(100 * hits_window / nullIf(hits_window + misses_window, 0), 1) AS hit_rate_pct
+FROM
+    (SELECT value FROM system.events WHERE event = 'UncompressedCacheHits')   AS h,
+    (SELECT value FROM system.events WHERE event = 'UncompressedCacheMisses') AS m
+```
+
+The values in `system.events` are monotonic counters accumulated since the server started, so a naive lifetime ratio would be dominated by ancient history and would barely move. The card instead snapshots the two counters and computes the delta over the rolling hour, so the percentage reflects how the cache is performing right now. The `nullIf(..., 0)` guard handles a freshly started instance (or one with `use_uncompressed_cache=0`) where both counters are zero and the ratio would otherwise be undefined.
+
+The 80% threshold is a practical floor for a workload that is meant to be cache-friendly. ClickHouse's uncompressed cache pays off most for dashboards and repeated point or small-range reads over the same hot data. When such a workload drops below 80%, the usual causes are a working set larger than `uncompressed_cache_size`, a recent cache flush, or a shift to wide scans that pollute the cache with single-use blocks.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a self-managed ClickHouse instance behind a set of operational dashboards that re-query the same recent partitions of an `order_events` table all day. `use_uncompressed_cache=1` is set on the dashboard profile. Snapshot taken on 14 Apr 26 at 10:15 BST.
+
+| Reading | Value |
+| --- | --- |
+| `UncompressedCacheHits` (delta, last 1h) | 412,800 |
+| `UncompressedCacheMisses` (delta, last 1h) | 132,200 |
+| Hit rate | **75.7%** |
+| `uncompressed_cache_size` configured | 8 GiB |
+| Hot working set (recent partitions, decompressed) | ~11 GiB |
+
+The Nerve Centre gauge reads **75.7%**, amber because it is below the 80% threshold. The DBA reads three things:
+
+1. **The working set no longer fits.** At ~11 GiB of hot decompressed blocks against an 8 GiB cache, the cache is thrashing: every new range read evicts blocks that a slightly later query then needs again, so misses climb and the rate falls.
+2. **It tracks with a cost rise.** Misses re-read and re-decompress from disk, which shows up as higher CPU and a small bump in [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) on the dashboard queries.
+3. **It is a sizing decision, not an incident.** Nothing is broken; the cache is simply undersized for what changed (the dashboards added a wider date range last week).
+
+```text
+Why the hit rate fell:
+  - Hot decompressed working set: ~11 GiB
+  - uncompressed_cache_size: 8 GiB  -> cannot hold the full set
+  - Result: ~24% of lookups miss and pay re-decompression
+  - Mitigation options, in order:
+      1. Raise uncompressed_cache_size to ~12-16 GiB (if RAM headroom allows)
+      2. Narrow the dashboard date range so the hot set shrinks back under 8 GiB
+      3. Confirm use_uncompressed_cache is only on for cache-friendly profiles,
+         not for wide ad-hoc scans that pollute the cache with single-use blocks
+```
+
+The right fix depends on RAM headroom. If memory is available (check [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) first), raising `uncompressed_cache_size` to comfortably exceed the hot set restores the hit rate. If memory is tight, narrowing the working set or restricting `use_uncompressed_cache` to the queries that truly benefit is the better lever, because over-growing the cache competes with the memory queries themselves need.
+
+Three takeaways:
+
+1. **A low hit rate is a sizing signal, not a failure.** The instance is healthy; the cache is just smaller than the working set. Read it as a tuning prompt.
+2. **Always size the cache against memory headroom.** Growing the uncompressed cache to chase hit rate while [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) is already high trades one problem for a worse one.
+3. **A sudden drop to near zero usually means a restart or the cache is off.** Check [Instance Uptime](/nerve-centre/kpi-cards/clickhouse/instance-uptime); a recent reset clears the cache and the rate recovers as it warms.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with UncompressedCache Hit Rate | What the combination tells you |
+| --- | --- | --- |
+| [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) | The cache lives in RAM and competes with query memory. | Low hit rate plus low memory usage equals safe to grow the cache; low hit rate plus high memory usage equals shrink the working set instead. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) | The latency that a falling hit rate inflates. | Hit rate dropping while p95 climbs confirms cache misses are the cost driver. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p99-ms) | The tail that cold reads stretch. | A widening p99 with a falling hit rate points at re-decompression on cold blocks. |
+| [Instance Uptime](/nerve-centre/kpi-cards/clickhouse/instance-uptime) | A restart flushes the cache to empty. | Hit rate near zero plus a fresh uptime equals a cold cache that will warm, not a sizing problem. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/clickhouse/slow-query-rate) | Cache misses push more queries over the slow threshold. | Rising slow-query rate alongside a falling hit rate ties the slowdown to cache pressure. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that weights cache effectiveness. | A sustained sub-80% hit rate nudges the composite down. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/clickhouse/database-disk-usage) | More misses mean more disk reads. | Falling hit rate plus rising read I/O confirms the working set is being re-read from disk. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> Read the raw counters in `clickhouse-client`:
+> ```sql
+> SELECT event, value FROM system.events
+> WHERE event IN ('UncompressedCacheHits', 'UncompressedCacheMisses')
+> ```
+> To compute a current-window rate yourself, snapshot the two values, wait, snapshot again, and divide the deltas, which is exactly what the card does.
+> Confirm the cache is actually in use with `SELECT name, value FROM system.settings WHERE name = 'use_uncompressed_cache'` and check its size with `SELECT value FROM system.server_settings WHERE name = 'uncompressed_cache_size'`.
+> On **ClickHouse Cloud**, the same `system.events` query runs in the SQL console, and the managed monitoring view surfaces cache effectiveness alongside memory.
+
+**Why our number may legitimately differ from a manual query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Lifetime vs window** | Manual lifetime ratio looks higher and flatter | A raw ratio of the two counters covers the whole process lifetime; the card uses a 1-hour delta, so it reacts to recent behaviour the lifetime ratio masks. |
+| **Snapshot timing** | Slightly higher or lower | Counters move continuously; two reads seconds apart differ. The card's window smooths this; a single manual snapshot does not. |
+| **Cache disabled** | Card near zero by design | If `use_uncompressed_cache=0` for the running queries, the cache is never consulted and both counters barely move; the card correctly shows near zero rather than a misleading 100%. |
+| **Per-node scope** | Card matches its configured node | On a cluster, counters are per node; a manual query on a different replica reflects that replica's cache, not the one the card reads. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ClickHouse QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/clickhouse/clickhouse-qps-spike-vs-ecom-order-rate) | A genuine dashboard spike should keep the hit rate high (same hot data re-read); a bot or dashboard storm pollutes the cache and drops it. | Hit rate falling during a QPS spike with no matching order spike points at a query-storm scanning cold data, not legitimate traffic. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My hit rate is near zero. Is the cache broken?**
+Almost always the cache is simply not in use. The uncompressed cache is only consulted when `use_uncompressed_cache=1` for the running queries, and many instances leave it off because the mark cache plus OS page cache already cover most workloads. Check `SELECT value FROM system.settings WHERE name = 'use_uncompressed_cache'`. If it is `0`, the near-zero reading is expected and not a fault.
+
+**Should I always aim for 100%?**
+No. The uncompressed cache helps cache-friendly workloads (dashboards, repeated small-range reads over hot data). For workloads dominated by one-off wide scans, a high hit rate is neither achievable nor desirable, because caching single-use blocks just evicts data a repeat query needed. Aim for a high rate only on the profiles where repeat reads dominate.
+
+**The rate dropped to almost nothing for a few minutes, then recovered. What happened?**
+The most common cause is a server restart or a `SYSTEM DROP UNCOMPRESSED CACHE`, both of which empty the cache. The first reads afterwards all miss while the cache refills, so the rate dips and then climbs back as hot data is re-cached. Check [Instance Uptime](/nerve-centre/kpi-cards/clickhouse/instance-uptime); a fresh uptime explains a cold-cache dip.
+
+**Is a low hit rate costing me money?**
+Indirectly. Misses re-read and re-decompress data from disk, which costs CPU and adds latency to repeat queries. On a busy dashboard fleet that translates into slower reports and higher CPU headroom needed. It is rarely an emergency, but a sustained sub-80% rate on a cache-friendly workload is worth a sizing review.
+
+**Should I just keep growing `uncompressed_cache_size` until the rate hits 80%?**
+Only if you have RAM headroom. The cache competes for the same memory queries use; growing it while [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) is already high risks `MEMORY_LIMIT_EXCEEDED` on heavy queries. Size the cache to comfortably exceed the hot working set, then stop; chasing the last few percent rarely pays off.
+
+**Does this differ between the uncompressed cache and the mark cache?**
+Yes, they are separate. The uncompressed cache stores decompressed data blocks; the mark cache stores the index marks used to locate them. This card tracks only the uncompressed cache. A workload can have an excellent mark-cache picture and still show a low uncompressed-cache hit rate if the data blocks themselves do not fit.
+
+**On ClickHouse Cloud, do I tune this the same way?**
+The physics are identical, but on Cloud you generally lean on the managed cache and memory configuration rather than hand-setting `uncompressed_cache_size`. The same `system.events` counters are visible in the SQL console, so the card reads the same way; if the rate is low, the lever on Cloud is usually narrowing the working set or scaling the instance rather than manually resizing the cache.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*UncompressedCache Hit Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

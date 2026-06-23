@@ -1,0 +1,136 @@
+---
+title: "Connection Pool at >90% Saturation, MariaDB"
+sidebarTitle: "Connection Pool at >90% Saturation"
+description: "Connection Pool at >90% Saturation alerts for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A real-time alert that fires when the live connection count climbs above 90% of `max_connections` and stays there for at least one minute. This is the early-warning band before total exhaustion. At 90% you still have headroom, but you are close enough that one traffic burst, one slow query holding threads, or one runaway batch job can push you to the wall, at which point MariaDB returns `ERROR 1040: Too many connections` and refuses new clients outright. For a DBA this is the "act now, do not wait" signal: you have minutes, not hours, to shed load or add capacity before connections start being rejected.
+
+| | |
+| --- | --- |
+| **What it tracks** | An alert list of moments when `Threads_connected / max_connections` exceeded 90% sustained for one minute. Each entry records the timestamp, the peak ratio, and the duration above threshold. |
+| **Data source** | `Threads_connected` from `SHOW GLOBAL STATUS` divided by the `max_connections` system variable (`SHOW VARIABLES LIKE 'max_connections'`), sampled in real time. |
+| **Time window** | `RT` (real-time). The card evaluates every sample and raises an alert entry when the sustained condition is met. |
+| **Alert trigger** | `> 90% sustained 1m`. Saturation must hold above 90% for a full minute to fire, which suppresses transient single-sample spikes. |
+| **Severity** | High. This is a Hero card because exhaustion directly causes connection refusals, which break the application tier and, downstream, the storefront. |
+| **Roles** | DBA, platform, SRE, on-call |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card computes a live saturation ratio on every sample:
+
+```text
+saturation = Threads_connected / max_connections
+alert fires when saturation > 0.90 continuously for >= 60 seconds
+```
+
+`Threads_connected` is the number of currently open connections (both running queries and idle-but-open sessions), read from `SHOW GLOBAL STATUS LIKE 'Threads_connected'`. `max_connections` is the hard ceiling configured for the server. The "sustained 1m" requirement means a single sample above 90% does not raise an alert; the ratio must remain above 90% across consecutive samples spanning at least a minute. This deliberately ignores brief, self-correcting spikes (a deploy, a cache flush, a momentary thundering herd) and only escalates genuine pressure.
+
+Note that MariaDB silently reserves one extra connection above `max_connections` for a user with the `SUPER`/`CONNECTION ADMIN` privilege, so an administrator can always log in to remediate even when ordinary clients are being refused. The card measures against the ordinary ceiling, which is what application traffic competes for.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A retail platform runs MariaDB 10.11 with `max_connections = 500` behind an application tier that auto-scales during promotions. Snapshot taken on 22 Apr 26 during a flash-sale window.
+
+| Time (BST) | `Threads_connected` | Saturation | Sustained? | Alert |
+| --- | --- | --- | --- | --- |
+| 19:58 | 410 | 82% | no | clear |
+| 20:00 | 458 | 91.6% | started | watching |
+| 20:01 | 471 | 94.2% | 1m elapsed | **FIRED** |
+| 20:03 | 489 | 97.8% | yes | escalating |
+| 20:05 | 312 | 62.4% | no | cleared |
+
+At 20:01 the alert fired: saturation had held above 90% for a full minute. The on-call DBA had roughly three minutes of headroom before 100%. Two parallel actions:
+
+```sql
+-- 1. Find who is holding connections and for how long
+SELECT COUNT(*) AS conns, USER, HOST, COMMAND, STATE
+FROM information_schema.PROCESSLIST
+GROUP BY USER, HOST, COMMAND, STATE
+ORDER BY conns DESC;
+```
+
+The processlist showed 140 connections in `Sleep` state from the reporting application (idle pool connections holding slots) and a cluster of long-running `Sending data` threads from an unindexed analytics query launched at 19:55. The DBA killed the analytics query (`KILL <id>`), which freed threads as the pool recycled, and the ratio fell back below 90% by 20:05.
+
+Three takeaways:
+
+1. **Idle connections count too.** `Threads_connected` includes sessions in `Sleep` state. A leaky or oversized application pool can hold MariaDB near the ceiling even when almost nothing is actually executing. Pair with [Connections In Use](/nerve-centre/kpi-cards/mariadb/connections-in-use) to separate active from idle.
+2. **Slow queries pull saturation up indirectly.** A handful of long-running queries hold their threads, so new requests stack up behind them. Always check [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms) and the processlist together; the fix is often killing one query, not adding capacity.
+3. **Raising `max_connections` is the last resort, not the first.** Each connection costs memory (thread stack plus per-connection buffers). Bumping the ceiling without checking RAM can trade connection refusals for an OOM kill. Confirm [Memory Usage %](/nerve-centre/kpi-cards/mariadb/memory-usage) headroom before increasing the limit.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this alert | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation) | The continuous gauge behind this alert. | This alert is the threshold event; the gauge shows the trend leading up to it and how fast it is climbing. |
+| [Connections In Use](/nerve-centre/kpi-cards/mariadb/connections-in-use) | The raw live thread count. | Separates active connections from idle pool slots holding the ceiling near full. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mariadb/connection-errors-24h) | Counts refusals once the ceiling is hit. | If this alert fired and connection errors then rose, clients were actually turned away. |
+| [Aborted Connects (24h)](/nerve-centre/kpi-cards/mariadb/aborted-connects-24h) | Pre-auth failures during pressure. | High aborts during saturation means the server is too busy to complete handshakes. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms) | Slow queries that hold threads. | Rising p95 alongside saturation points at long queries as the root cause, not raw traffic. |
+| [Memory Usage %](/nerve-centre/kpi-cards/mariadb/memory-usage) | The constraint on raising the ceiling. | Tells you whether you can safely increase `max_connections` or must shed load instead. |
+| [Pool Saturation Across Galera Nodes vs Traffic](/nerve-centre/kpi-cards/mariadb/pool-saturation-across-galera-nodes-vs-traffic) | The cluster-wide and revenue view. | Shows whether saturation is one hot node or the whole cluster, and what it costs the storefront. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite health roll-up. | A sustained saturation alert drives the composite down hard. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> `SHOW GLOBAL STATUS LIKE 'Threads_connected';` for the live connection count.
+> `SHOW VARIABLES LIKE 'max_connections';` for the configured ceiling (compute the ratio yourself).
+> `SHOW GLOBAL STATUS LIKE 'Max_used_connections';` for the high-water mark since startup, and `Max_used_connections_time` for when it occurred.
+> `SELECT * FROM information_schema.PROCESSLIST;` (or `SHOW FULL PROCESSLIST`) for who is holding each connection right now.
+
+**Why our number may legitimately differ from a raw `SHOW STATUS`:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Real-time vs point-in-time** | Marginal | `SHOW STATUS` is an instant; our card evaluates a sustained one-minute condition, so a single high sample you catch by hand may not have fired an alert. |
+| **`max_connections` changed at runtime** | Ratio shifts | If `max_connections` was raised with `SET GLOBAL`, the denominator changed; our card uses the value live at each sample. |
+| **Reserved SUPER connection** | +1 vs ceiling | MariaDB allows one extra connection for an admin above `max_connections`; we measure against the ordinary ceiling. |
+| **Per-user connection limits** | Lower effective ceiling | `max_user_connections` or account-level `MAX_CONNECTIONS` can cap a user below the global ceiling; the global ratio will not reflect that. |
+
+**On managed services:** Amazon RDS / Aurora for MariaDB sets `max_connections` from a formula based on instance memory (`DBInstanceClassMemory`), so confirm the effective value before reasoning about the ratio; CloudWatch exposes `DatabaseConnections` for the live count. SkySQL and Azure Database for MariaDB surface connection metrics in their own consoles. Once you align on the same `max_connections` value, the ratio should match.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Q: The alert fired but I could still connect fine. Was it a false alarm?**
+No. 90% is the warning band, not the failure point. You hit refusals at 100%. The alert exists precisely so you act *before* clients are turned away. You could connect because you used a `SUPER`-privileged account, which gets the one reserved connection above the ceiling, or because saturation dipped between the alert and your test. Treat a fired alert as a near-miss to investigate, not a non-event.
+
+**Q: Most of my connections are in Sleep state. Should I still worry?**
+Yes, idle connections still occupy slots and count toward `Threads_connected`. An oversized or leaky application pool can pin the server near the ceiling with almost no real work happening. Tune the pool's `maxPoolSize` and idle-timeout so it returns connections, and consider a connection proxy (MaxScale, ProxySQL) to multiplex. Pair with [Connections In Use](/nerve-centre/kpi-cards/mariadb/connections-in-use) to see the active-versus-idle split.
+
+**Q: Should I just raise max_connections to make the alert stop?**
+Only after checking memory. Every connection consumes a thread stack plus per-connection buffers (`sort_buffer_size`, `join_buffer_size`, `read_buffer_size`, and so on), so raising the ceiling raises peak memory. If you bump it past what RAM allows, you trade `Too many connections` for an OOM kill, which is far worse. Check [Memory Usage %](/nerve-centre/kpi-cards/mariadb/memory-usage) first, and prefer fixing the source of the connections (pool sizing, slow queries) over raising the limit.
+
+**Q: Why the one-minute sustained requirement? I want to know about every spike.**
+Brief spikes above 90% are common and self-correcting: a deploy reconnecting pools, a cache stampede, a momentary burst. Alerting on every single sample would bury you in noise. The one-minute hold ensures the alert reflects genuine, persistent pressure. If you genuinely want a tighter trigger, the [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation) gauge shows every sample without the sustain filter.
+
+**Q: On a Galera cluster, does this measure one node or the whole cluster?**
+This card measures the selected MariaDB instance. In a Galera cluster each node has its own `max_connections` and its own `Threads_connected`, and traffic is rarely balanced perfectly, so one node can saturate while others have headroom. For the cluster-wide picture use [Pool Saturation Across Galera Nodes vs Traffic](/nerve-centre/kpi-cards/mariadb/pool-saturation-across-galera-nodes-vs-traffic), which compares saturation across all nodes against incoming traffic.
+
+**Q: What happens at exactly 100%?**
+New non-SUPER connections are refused with `ERROR 1040: Too many connections`, and `Connection_errors_max_connections` increments. Existing connections keep working. The application sees connection failures and, if it does not degrade gracefully, user-facing errors. This is why the 90% alert matters: it gives you the lead time to avoid 100% entirely.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connection Pool at >90% Saturation* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

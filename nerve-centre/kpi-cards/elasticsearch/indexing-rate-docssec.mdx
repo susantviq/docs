@@ -1,0 +1,141 @@
+---
+title: "Indexing Rate (docs/sec), Elasticsearch"
+sidebarTitle: "Indexing Rate (docs/sec)"
+description: "Indexing Rate (docs/sec) for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Indexing](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The sustained rate at which your Elasticsearch cluster is writing new (or updated) documents, expressed in documents per second. This is the throughput pulse of your ingest pipeline. For a DBA or platform team, it answers one question at a glance: "is data flowing into the cluster at the rate I expect?" A flat-line to zero during a window when upstream producers are still sending means the write path has stalled, which is the leading signal for sync-lag investigations. A sudden spike well above baseline means a bulk reindex, a backfill, or a runaway producer.
+
+| | |
+| --- | --- |
+| **Metric basis** | Computed as the delta of `indices.indexing.index_total` (cluster-wide primary-shard index operations) divided by the elapsed seconds between two samples. Read from `GET /_nodes/stats/indices/indexing` and `GET /_stats/indexing`, summed across data nodes. |
+| **What it counts** | Successful index, create, and update operations on primary shards. A single bulk request of 500 documents counts as 500 operations. Replica writes are not double-counted; the metric is primary-shard throughput. |
+| **What it excludes** | Delete operations (tracked separately under `indices.indexing.delete_total`), search/read traffic, and rejected writes (those surface on [Bulk Rejections (24h)](/nerve-centre/kpi-cards/elasticsearch/bulk-rejections-24h)). |
+| **Aggregation window** | `RT/5m`: a live reading refreshed in real time, charted as a rolling 5-minute rate so a single slow sample does not whipsaw the line. |
+| **Distinctiveness** | Elasticsearch-distinctive. Unlike a relational write count, this is the rate at which documents become part of the Lucene index pipeline, which is why it pairs so tightly with refresh time and merge pressure. |
+| **Time zone** | Cluster/node clock for sampling; rendered in the team's Vortex IQ display time zone on chart axes. |
+| **Time window** | `RT/5m` (real-time value, 5-minute rolling rate for the chart) |
+| **Alert trigger** | None by default. This is a throughput trend card, not a threshold alarm. Use [Bulk Rejections (24h)](/nerve-centre/kpi-cards/elasticsearch/bulk-rejections-24h) and the cross-channel drift card for the alerting layer. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card samples the monotonically increasing counter `indices.indexing.index_total` from node stats at two points in time and divides the difference by the elapsed wall-clock seconds:
+
+```text
+indexing_rate = (index_total[t2] - index_total[t1]) / (t2 - t1 in seconds)
+```
+
+Because `index_total` is a counter that only ever increases until a node restarts, the engine handles counter resets: if `index_total[t2] < index_total[t1]` (a node restarted and reset its counter), that sample is discarded rather than producing a large negative spike. The cluster-wide figure is the sum of per-node deltas across all data nodes, so adding a data node does not artificially inflate the rate.
+
+The 5-minute rolling window smooths the line: the headline real-time number is the most recent inter-sample rate, while the chart plots the rate averaged over the trailing 5 minutes. This matters because Elasticsearch ingest is bursty by nature (bulk requests arrive in clumps), and a raw per-second reading would look jagged even on a perfectly healthy cluster.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 6-node Elasticsearch cluster (3 data, 3 master-eligible) behind a product-catalogue search service. A nightly catalogue sync job pushes inventory and price changes via the `_bulk` API. Snapshot taken on 14 Apr 26 at 02:15 BST, mid-sync.
+
+| Node | `index_total` at 02:14:00 | `index_total` at 02:15:00 | Delta (60s) | Per-node docs/sec |
+| --- | --- | --- | --- | --- |
+| es-data-1 | 48,210,500 | 48,318,200 | 107,700 | 1,795 |
+| es-data-2 | 47,990,140 | 48,096,020 | 105,880 | 1,765 |
+| es-data-3 | 48,400,770 | 48,505,910 | 105,140 | 1,752 |
+| **Cluster** | | | **318,720** | **5,312 docs/sec** |
+
+The Nerve Centre headline reads **5,312 docs/sec**, well within the team's known nightly baseline of 4,800 to 6,000 docs/sec. The chart shows a clean plateau, which is exactly what a healthy bulk sync looks like.
+
+Now consider the failure mode this card is built to catch. The next night, 15 Apr 26 at 02:15 BST, the headline reads **0 docs/sec** and has been flat for 11 minutes:
+
+```text
+Diagnosis path when indexing rate flat-lines during an expected sync window:
+  1. Indexing rate = 0, but the sync job's own logs say it is "sending batches" -> the write path is stalled, not the producer.
+  2. Check Bulk Rejections (24h): if climbing, the write thread pool queue is full and ES is rejecting -> backpressure.
+  3. Check JVM Heap Used % and Circuit Breaker Trips: if heap > 85%, the parent circuit breaker may be rejecting bulk requests.
+  4. Check Cluster Status: if YELLOW/RED, a primary shard for the target index may be unallocated, so writes have nowhere to land.
+  5. Check the cross-channel drift card: if product index doc count has stopped tracking the ecom catalogue, the storefront is now serving a stale catalogue.
+```
+
+In this incident the team found `index_total` was not advancing because the parent circuit breaker had tripped under heap pressure, rejecting every bulk request with a `429`. The producer was retrying silently. The fix was to raise heap headroom and reduce bulk batch size; indexing rate recovered to 5,000+ docs/sec within two minutes.
+
+Three takeaways for an ops team:
+
+1. **Zero during an expected window is the alarm, not low.** A low-but-nonzero rate is usually just a quiet producer. A hard zero while producers are active means the write path is broken, and every minute of zero is a minute the search index drifts further from source-of-truth.
+2. **A spike is not always good news.** An indexing rate 5x above baseline often means an unplanned full reindex or a producer stuck in a retry storm replaying the same documents. Correlate with [Avg Index Refresh Time (ms)](/nerve-centre/kpi-cards/elasticsearch/avg-index-refresh-time-ms): a spike that drags refresh time up is starving search of resources.
+3. **Indexing rate is a leading indicator of search staleness.** It tells you documents are arriving, but not that they are searchable yet. Pair it with refresh time and the product-index drift card to know when writes have actually become visible to queries.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Indexing Rate | What the combination tells you |
+| --- | --- | --- |
+| [Bulk Rejections (24h)](/nerve-centre/kpi-cards/elasticsearch/bulk-rejections-24h) | The backpressure counterpart. | Indexing rate dropping while rejections climb equals the write thread pool is saturated and clients are being told to back off. |
+| [Avg Index Refresh Time (ms)](/nerve-centre/kpi-cards/elasticsearch/avg-index-refresh-time-ms) | The "is it searchable yet?" view. | High indexing rate plus climbing refresh time equals segments stacking faster than they can be made visible. |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | The resource ceiling for ingest. | A flat-lined indexing rate with heap above 85% points to circuit-breaker rejection of bulk writes. |
+| [Cluster Status (green / yellow / red)](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) | The "can writes land?" gate. | Zero indexing with a RED status means a target primary shard is unallocated; writes have nowhere to go. |
+| [ES Product Index Doc Count vs Ecom Catalog](/nerve-centre/kpi-cards/elasticsearch/es-product-index-doc-count-vs-ecom-catalog) | The downstream drift consequence. | Sustained zero indexing rate is the upstream cause of doc-count drift against the storefront catalogue. |
+| [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) | The resource competitor. | A heavy indexing spike can steal CPU and IO from search, pushing p95 up. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> **`GET /_stats/indexing`** returns `indexing.index_total` and `index_current` for the whole cluster, indexed per index.
+> **`GET /_nodes/stats/indices/indexing`** breaks the same counters down per node, which is how you confirm one hot node is carrying the write load.
+> **`GET /_cat/thread_pool/write?v&h=node_name,active,queue,rejected`** shows the live write thread pool: a non-zero `queue` with rising `rejected` explains a falling rate.
+> On Elastic Cloud, the **Stack Monitoring** view (Kibana) plots "Indexing Rate" on the cluster and index overview pages; on AWS OpenSearch the equivalent CloudWatch metric is `IndexingRate`.
+
+**Why our number may legitimately differ from a raw `_stats` read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sampling interval** | Marginal | A manual `_stats` call computes its own instantaneous delta; our card uses a fixed inter-sample interval, so a one-off bulk burst can read slightly higher or lower depending on where it falls. |
+| **Primary vs total** | Vortex IQ may read lower | We count primary-shard operations only; some native dashboards (and CloudWatch on multi-replica clusters) report total including replica writes, which inflates the figure by the replica count. |
+| **Counter reset handling** | Brief gap | After a node restart, the counter resets; we discard that sample to avoid a negative spike, so the chart shows a one-interval gap where a raw read would show a large dip. |
+| **Index filter scope** | Variable | If the connector is scoped to specific indices, system indices (`.kibana`, `.monitoring-*`) are excluded; an unfiltered `_stats` call includes them. |
+
+**Cross-connector reconciliation:** when indexing rate is healthy but the storefront is missing SKUs, the break is downstream of ingest. Compare with [ES Product Index Doc Count vs Ecom Catalog](/nerve-centre/kpi-cards/elasticsearch/es-product-index-doc-count-vs-ecom-catalog) and the originating commerce connector's product count to locate the drift.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows a healthy indexing rate but my search results are stale. Why?**
+Indexing rate measures documents entering the write pipeline, not documents that have become searchable. A document is searchable only after the next refresh (default once per second, but tunable and often longer on write-heavy indices). If indexing rate is healthy but searches are stale, check [Avg Index Refresh Time (ms)](/nerve-centre/kpi-cards/elasticsearch/avg-index-refresh-time-ms): a refresh interval stretched out for ingest performance is the usual cause.
+
+**Why is the rate zero when my producer logs say it is sending data?**
+A hard zero while producers are active means the write path is rejecting or dropping. Check write thread pool rejections (`GET /_cat/thread_pool/write?v`), JVM heap (circuit breakers reject bulk requests when heap is high), and cluster status (an unallocated primary has nowhere to accept writes). See [Bulk Rejections (24h)](/nerve-centre/kpi-cards/elasticsearch/bulk-rejections-24h).
+
+**Does a single large bulk request count as one operation or many?**
+Many. `index_total` increments once per document in the bulk payload, so a `_bulk` call with 1,000 documents adds 1,000 to the counter. This is intentional: the card measures document throughput, not request throughput.
+
+**Why does the rate look spiky even though the cluster is fine?**
+Elasticsearch ingest is bursty; bulk requests arrive in clumps. The card already smooths the chart over a 5-minute rolling window for this reason, but the real-time headline can still jump between samples. Read the trend line, not the single headline tick, for capacity decisions.
+
+**A node restarted and the chart shows a gap instead of a dip. Is that a bug?**
+No. Counters reset to zero on node restart. Rather than render a large negative or zero rate, the engine discards the sample that spans the reset, leaving a one-interval gap. The rate resumes correctly on the next clean sample.
+
+**Can I alert on a low indexing rate?**
+Not directly from this card, which is a trend card with no default threshold. The pattern teams use is to alert on the consequence: doc-count drift via [ES Product Index Doc Count vs Ecom Catalog](/nerve-centre/kpi-cards/elasticsearch/es-product-index-doc-count-vs-ecom-catalog), or write rejections via [Bulk Rejections (24h)](/nerve-centre/kpi-cards/elasticsearch/bulk-rejections-24h). Both fire when a stalled write path actually matters.
+
+**Does this include data streams and ILM rollover writes?**
+Yes. Writes to a backing index of a data stream increment the same `index_total` counter, so rollover and ILM-managed ingest are included in the cluster figure as long as those indices are within the connector's scope.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Indexing Rate (docs/sec)* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,155 @@
+---
+title: "Replication Lag (Seconds_Behind_Source), MySQL"
+sidebarTitle: "Replication Lag (Seconds_Behind_Source)"
+description: "Replication Lag (Seconds_Behind_Source) for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Replication Lag (Seconds_Behind_Source)** is how far, in seconds, a replica is behind the source it copies from. Zero means the replica is caught up; a rising number means writes on the source are not yet visible on the replica. Lag is the number that decides whether your read replicas are safe to read from and whether a failover would lose data. A replica 30 seconds behind serves stale catalogue, stale inventory, and stale order state, which is how customers see "out of stock" on something they just bought, or an order that "does not exist yet".
+
+| | |
+| --- | --- |
+| **What it tracks** | The `Seconds_Behind_Source` value reported by the replica (the field was `Seconds_Behind_Master` before MySQL 8.0.22). It estimates the delay between an event being written on the source and applied on this replica. |
+| **Data source** | `SHOW REPLICA STATUS` on each replica, or the equivalent `performance_schema.replication_applier_status_by_worker` and `replication_connection_status` tables. The engine reads the worst (highest) lag across all attached replicas for the headline. |
+| **Time window** | `RT` (real-time, sampled every refresh). |
+| **Alert trigger** | `> 10s`. When any replica's `Seconds_Behind_Source` exceeds 10 seconds the card turns red and a Nerve Centre alert is raised. |
+| **Why it matters** | Stale reads cause user-visible wrong data; deep lag means a failover would promote a replica that is missing the most recent transactions, which is data loss. Lag is both a correctness and a durability signal. |
+| **Reading the value** | Read lag next to [Replication Thread Health](/nerve-centre/kpi-cards/mysql/replication-thread-health-iosql). Lag that is high but stable is a throughput problem; lag that is `NULL` means a thread has stopped, which is worse than any number. |
+| **Sentiment key** | `mysql_replication_lag_seconds` |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card surfaces `Seconds_Behind_Source` directly from each replica's status, then reports the maximum across the topology so a single lagging node cannot hide behind healthy ones.
+
+```text
+For each replica:
+  status = SHOW REPLICA STATUS
+  lag    = status.Seconds_Behind_Source
+
+headline = MAX(lag across all replicas)
+```
+
+It is important to understand what `Seconds_Behind_Source` actually measures. It is the difference between the timestamp of the event the SQL (applier) thread is currently executing and the replica's clock. This has two well-known quirks the engine accounts for:
+
+1. **It only reflects the applier thread.** If the IO (receiver) thread has stopped but the applier is still chewing through its relay log, the replica can briefly report a small, falling number while in reality it has stopped receiving new data. That is why this card is always read with [Replication Thread Health](/nerve-centre/kpi-cards/mysql/replication-thread-health-iosql).
+2. **`NULL` is not zero.** When a replication thread is stopped, `Seconds_Behind_Source` reports `NULL`, not a large number. The engine treats `NULL` as "lag unknown / threads not running" and escalates rather than rendering it as caught up.
+
+For multi-threaded replicas the engine prefers the Performance Schema applier tables, which give a more accurate per-worker view than the single legacy field.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs one MySQL 8.0 source and two read replicas: `replica-a` serves the catalogue API, `replica-b` serves analytics. Snapshot taken on 22 Apr 26 at 09:40 BST after a bulk price-update job.
+
+| Node | Seconds_Behind_Source | IO thread | SQL thread | Reading |
+| --- | --- | --- | --- | --- |
+| replica-a | 47 s | Yes | Yes | Lagging badly; serving stale catalogue. |
+| replica-b | 2 s | Yes | Yes | Healthy. |
+
+The headline reports **47s** (the worst replica) with a red border, and a Nerve Centre alert fires. The team works the problem:
+
+1. **Both threads are running, so this is throughput, not breakage.** [Replication Thread Health](/nerve-centre/kpi-cards/mysql/replication-thread-health-iosql) is green. The replica is receiving and applying, just not fast enough to keep up with the source's write rate.
+2. **The trigger is the bulk price-update job.** A single large transaction updating 400,000 catalogue rows landed on the source in seconds, but `replica-a` applies it serially and is now behind. `replica-b` lags less because it is on faster storage.
+3. **The customer-visible risk is the catalogue.** Because `replica-a` backs the catalogue API, shoppers may see the pre-update prices for up to 47 seconds. The team temporarily routes catalogue reads to the source until lag clears, then routes them back.
+
+```text
+Stale-read framing while replica-a is 47s behind:
+  - Price-update committed on source at 09:39:50
+  - replica-a will not reflect it until ~09:40:37
+  - Catalogue API reads served from replica-a in that window: ~3,100
+  - Each one shows the old price; on a discount launch this is the wrong direction
+```
+
+The lag drains as the applier catches up, and by 09:41 the card reads 1s and clears. The follow-up action is to enable multi-threaded replication (`replica_parallel_workers`) so future bulk jobs apply in parallel rather than serially.
+
+Three takeaways:
+
+1. **Lag is a data-correctness signal, not just a performance one.** A lagging replica serves stale rows. If you read inventory or pricing from replicas, lag directly causes wrong answers to customers.
+2. **A stable high number and a `NULL` are different emergencies.** Stable high lag is a throughput shortfall you can engineer around (parallel workers, faster storage, smaller transactions). `NULL` means a thread stopped, which is the [Replication Thread Health](/nerve-centre/kpi-cards/mysql/replication-thread-health-iosql) emergency.
+3. **Big transactions are the usual cause.** A single huge `UPDATE` or `DELETE` serialises on the replica even when the source applied it quickly. Batch large DML into smaller chunks to keep lag flat.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Replication Lag | What the combination tells you |
+| --- | --- | --- |
+| [Replication Thread Health (IO/SQL)](/nerve-centre/kpi-cards/mysql/replication-thread-health-iosql) | The thread-state check behind the lag number. | Lag `NULL` plus a stopped thread equals replication broken, not just slow. |
+| [Active Replicas](/nerve-centre/kpi-cards/mysql/active-replicas) | The count of attached replicas. | A drop in replica count plus rising lag equals a replica that disconnected mid-stream. |
+| [Binlog Backlog (MB) on Primary](/nerve-centre/kpi-cards/mysql/binlog-backlog-mb-on-primary) | The source-side view of unconsumed binlog. | A growing backlog confirms the replica is falling behind from the source's perspective. |
+| [Replication Threads Stopped or Lag Exceeds Threshold](/nerve-centre/kpi-cards/mysql/replication-threads-stopped-or-lag-exceeds-threshold) | The Nerve Centre alert that fires on this condition. | The alert feed entry that pages on-call when lag breaches 10s. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p99-ms) | Replica apply competes with read queries. | A busy replica with a fat tail applies the relay log slower, deepening lag. |
+| [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) | Apply speed depends on cache warmth on the replica. | A cold replica buffer pool slows apply and grows lag. |
+| [MySQL Inventory Rows vs Ecom Inventory Count](/nerve-centre/kpi-cards/mysql/mysql-inventory-rows-vs-ecom-inventory-count) | The downstream drift caused by stale replica reads. | Lag plus inventory drift equals the storefront reading a stale replica. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite that weights replication health. | Sustained lag pulls the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL's own tooling:**
+
+> **`SHOW REPLICA STATUS`** on each replica is the canonical source. Read these fields together:
+> ```text
+> Seconds_Behind_Source: 47
+> Replica_IO_Running:     Yes
+> Replica_SQL_Running:    Yes
+> Retrieved_Gtid_Set / Executed_Gtid_Set   (the GTID gap is the true backlog)
+> ```
+> **Performance Schema** for multi-threaded detail: `performance_schema.replication_applier_status_by_worker` and `replication_connection_status`.
+> **GTID delta** for a clock-independent measure: compare `Retrieved_Gtid_Set` (received) against `Executed_Gtid_Set` (applied); the gap is transactions still to apply, immune to clock skew.
+> **Managed-service consoles:** Amazon RDS exposes `ReplicaLag` in CloudWatch; Aurora exposes `AuroraReplicaLag` in milliseconds; both should track this card closely.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Clock skew** | Variable | `Seconds_Behind_Source` is timestamp-based; if source and replica clocks drift, the reported lag is off by the skew. Use the GTID gap for a clock-independent check. |
+| **Idle source** | Reads 0 falsely | When the source receives no writes, `Seconds_Behind_Source` can read 0 even if the IO thread is stuck, because there is no new event to time. The engine cross-checks thread state. |
+| **Multi-threaded apply** | Engine more accurate | The legacy single field can understate lag with parallel workers; the engine prefers the per-worker Performance Schema tables. |
+| **NULL handling** | Engine escalates | A stopped thread reports `NULL`; raw tooling shows `NULL`, the card shows an alert rather than treating it as caught up. |
+| **Managed-service units** | Marginal | Aurora reports lag in milliseconds, RDS in seconds; convert before comparing. |
+
+**Cross-connector reconciliation:** pair with the ecommerce inventory cards. If [MySQL Inventory Rows vs Ecom Inventory Count](/nerve-centre/kpi-cards/mysql/mysql-inventory-rows-vs-ecom-inventory-count) shows drift exactly while lag is high, your storefront is reading a stale replica, which is a routing problem you can fix by pinning inventory reads to the source.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card reads zero but I am sure the replica is behind. Why?**
+The most common trap: the source is idle. `Seconds_Behind_Source` is computed from the timestamp of the event currently being applied, so when no new writes arrive there is nothing to time and it reports 0 even if the IO thread is wedged. Always read this card with [Replication Thread Health](/nerve-centre/kpi-cards/mysql/replication-thread-health-iosql); if a thread is not running, the 0 is a lie.
+
+**The card shows an alert but no number. What is happening?**
+That is `NULL`, which means a replication thread is stopped. `NULL` is worse than a large number: a lagging replica is still catching up, but a stopped one will never catch up until you restart the thread. Jump to thread health and the [replication-broken alert](/nerve-centre/kpi-cards/mysql/replication-threads-stopped-or-lag-exceeds-threshold) immediately.
+
+**Why does the headline show the worst replica instead of an average?**
+Because an average hides the failure. If one replica is caught up and one is 200 seconds behind, the average (100s) describes neither. The replica you happen to route a read to is what the customer experiences, so the safe headline is the worst case.
+
+**My lag is high but stable, not growing. Is that an emergency?**
+Less urgent than growing lag, but still a correctness problem. Stable lag means the replica is keeping pace with new writes but never closing the existing gap, usually because it started behind after a restore or a big transaction. It will not self-heal during steady load; you need a quiet window, smaller transactions, or parallel apply to drain it.
+
+**Can I change the 10-second alert threshold?**
+Yes, per profile in the Sensitivity tab. An analytics replica can tolerate minutes of lag; a replica serving live inventory or session state should be tighter, for example 2 to 3 seconds. Set it to just above your normal busy-hour lag.
+
+**Why does a single big UPDATE cause a lag spike?**
+A large transaction commits atomically on the source in one go, but the replica applies it as one unit too, and (without parallel workers) serially behind everything else in the relay log. A 400,000-row update that took 3 seconds on the source can take far longer to clear on a replica, spiking lag. Chunk large DML into smaller batches and enable `replica_parallel_workers` to mitigate.
+
+**Does GTID replication change how I read this card?**
+The card still surfaces `Seconds_Behind_Source`, but with GTIDs you have a better backup measure: the gap between `Retrieved_Gtid_Set` and `Executed_Gtid_Set` counts transactions, not seconds, and is immune to clock skew. When in doubt about the seconds figure, the GTID gap is the ground truth for "how many transactions behind".
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Replication Lag (Seconds_Behind_Source)* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

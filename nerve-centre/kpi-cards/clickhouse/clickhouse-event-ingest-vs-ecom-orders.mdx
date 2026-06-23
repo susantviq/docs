@@ -1,0 +1,165 @@
+---
+title: "ClickHouse Event Ingest vs Ecom Orders, ClickHouse"
+sidebarTitle: "ClickHouse Event Ingest vs Ecom Orders"
+description: "ClickHouse Event Ingest vs Ecom Orders for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Cross-Channel](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A dual-axis view that plots ClickHouse event-ingest rate against storefront order (and click) rate over the same period. In a healthy analytics pipeline the two move together: when orders and clicks rise, the events describing them flow into ClickHouse at a matching rate. The diagnostic power is in the divergence. If orders keep flowing on the storefront but ingest into ClickHouse flattens or stalls, the pipeline between the storefront and the database has broken: a producer crashed, a Kafka or queue consumer is stuck, or inserts are being rejected. That gap is invisible if you watch ingest alone (it just looks quiet) and invisible if you watch orders alone (they look fine). Seen together, a stalled-ingest-while-orders-flowing pattern is an unmistakable "pipeline broken" signal, and because the lost events are analytics data, the damage compounds silently until someone reconnects the feed.
+
+| | |
+| --- | --- |
+| **Data source** | ClickHouse event-ingest rate (`InsertedRows` event delta from `system.events`) plotted against the storefront order and click rate from the correlated ecommerce connector, on a shared time axis. |
+| **What it tracks** | Whether ingest into ClickHouse keeps pace with the business activity it is supposed to record. The two series should rise and fall together. |
+| **Metric basis** | Insert-rate delta from `system.events` (`InsertedRows`) for the ClickHouse side; order and click rate from the storefront connector for the commercial side. This is a correlation card, not a single counter. |
+| **Why it matters** | A divergence means analytics data is being lost in real time. Dashboards, attribution, and reporting silently go stale, and the longer the stall runs the larger the unrecoverable gap. |
+| **Time window** | `RT/24h` (a real-time view with a 24-hour trailing context so a slow stall and a sudden stall are both visible). |
+| **Alert trigger** | `ingest stalled while orders flowing`. When the ingest series flattens to near zero while the order series is still active, the card flags amber and pages the on-call DBA. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The ClickHouse side derives an inserts-per-second rate from the cumulative `InsertedRows` counter:
+
+```sql
+-- Ingest rate from the InsertedRows event counter delta
+SELECT
+    toStartOfInterval(event_time, INTERVAL 1 MINUTE) AS bucket,
+    max(ProfileEvent_InsertedRows) - min(ProfileEvent_InsertedRows) AS rows_ingested,
+    rows_ingested / 60 AS rows_per_sec
+FROM system.metric_log
+WHERE event_time > now() - INTERVAL 24 HOUR
+GROUP BY bucket
+ORDER BY bucket
+```
+
+`InsertedRows` in `system.events` is a monotonic counter, so the card takes its delta over each bucket to produce a rate rather than a lifetime total. The storefront order and click rate comes from the correlated ecommerce connector on the same buckets, and the two series are drawn on a dual axis so their *shapes* can be compared even though their units differ (rows per second vs orders per minute).
+
+The alert is shape-based, not threshold-based. It does not fire on low ingest by itself, because quiet ingest at a quiet hour is normal. It fires on *divergence*: the order series shows continuing activity while the ingest series drops to near zero. That conjunction is what distinguishes a genuine pipeline break from an ordinary lull. A quiet night with both series low is healthy; a busy afternoon with orders flowing and ingest flat is a broken feed. Because the card holds a 24-hour trailing context alongside the real-time read, it catches both the sudden cliff (a producer crash) and the slow droop (a consumer falling progressively behind).
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a self-managed ClickHouse instance that ingests clickstream and order events from a Shopify storefront through a Kafka topic and a consumer that batches inserts. Snapshot taken on 14 Apr 26 from 13:30 to 14:00 BST.
+
+| Bucket (BST) | Ingest (rows/sec) | Orders/min | Reading |
+| --- | --- | --- | --- |
+| 13:30 | 48,200 | 31 | healthy, series tracking |
+| 13:40 | 51,900 | 34 | healthy |
+| 13:45 | 12,400 | 33 | ingest dropping, orders steady |
+| 13:50 | **180** | 35 | ingest stalled, orders flowing |
+| 13:55 | 90 | 36 | still stalled |
+
+The Nerve Centre card flags amber at 13:50: **ingest stalled while orders flowing**. The DBA reads three things:
+
+1. **Orders are healthy, so the storefront is fine.** The order series is steady at 31 to 36 per minute throughout. The business is operating normally; shoppers are buying.
+2. **Ingest has collapsed independently.** Rows per second fell from ~52,000 to under 200, a near-total stall, with no corresponding drop in orders. The two series have decoupled, which is the signature of a broken pipeline rather than a quiet period.
+3. **Data is being lost right now.** Every order and click happening since 13:45 should have produced events that are not arriving. Dashboards, attribution, and any storefront feature reading ClickHouse are silently going stale, and the gap grows every minute the feed stays down.
+
+```text
+Why ingest stalled while orders kept flowing:
+  - Orders/min: steady ~33 (storefront healthy)
+  - Ingest: 52k rows/sec -> <200 rows/sec (near-total stall)
+  - Decoupling started 13:45, total by 13:50
+  - Likely causes, in order of probability:
+      1. Kafka consumer stuck / crashed (lag climbing, no commits)
+      2. Inserts rejected at ClickHouse (e.g. TOO_MANY_PARTS code 252 on the target table)
+      3. Producer healthy, consumer healthy, but a schema / auth change is bouncing inserts
+  - First checks:
+      1. Consumer lag on the topic + consumer process health
+      2. Too Many Parts Errors (24h) and Failed Queries (24h) on the target table
+      3. ClickHouse error log for rejected INSERTs
+```
+
+The first move is to confirm where the break is. Because orders are flowing, the storefront and its event emission are fine, so the break is downstream: the queue consumer or the insert path into ClickHouse. The fastest discriminator is to check whether ClickHouse is *rejecting* inserts (look at [Too Many Parts Errors (24h)](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h) and [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h)) versus *not receiving* them (a stuck consumer, where ClickHouse sees nothing at all). If errors are climbing, the database is pushing back and the fix is on the ClickHouse side; if errors are flat at zero while ingest is flat at zero, the events are not even reaching ClickHouse and the fix is in the consumer or queue.
+
+Three takeaways:
+
+1. **The divergence is the signal, not either series alone.** Quiet ingest looks fine in isolation and steady orders look fine in isolation; only the two together expose a broken feed.
+2. **Lost analytics data is unrecoverable in real time.** Unlike a slow query you can re-run, events not ingested during a stall are gone unless the queue retains and replays them. Every minute of stall is permanent data loss to your reporting, so this pages.
+3. **The error counters tell you which side broke.** Errors climbing means ClickHouse is rejecting inserts (fix the database); errors flat at zero with ingest at zero means events are not arriving (fix the consumer or queue).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Event Ingest vs Ecom Orders | What the combination tells you |
+| --- | --- | --- |
+| [Inserts per Second (live)](/nerve-centre/kpi-cards/clickhouse/inserts-per-second-live) | The raw ingest rate that forms this card's ClickHouse axis. | A flat inserts/sec confirms the ingest side of the divergence is the broken half. |
+| [Too Many Parts Errors (24h)](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h) | The classic reason ClickHouse rejects inserts mid-stream. | Ingest stalled plus parts errors climbing equals the database is pushing back, not the consumer. |
+| [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h) | Catches rejected inserts that throw other exceptions. | Stall plus rising failed queries points the fix at the ClickHouse insert path. |
+| [Active Parts (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) | The part backlog that precedes a TOO_MANY_PARTS rejection. | Backlog amber just before an ingest stall explains why inserts started bouncing. |
+| [Merges In Progress](/nerve-centre/kpi-cards/clickhouse/merges-in-progress) | The merge throughput that gates how fast inserts can land. | Stalled merges plus stalled ingest means the merge scheduler is the upstream cause. |
+| [ClickHouse QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/clickhouse/clickhouse-qps-spike-vs-ecom-order-rate) | The query-side sibling cross-channel card. | Read together for the full read-and-write picture against order rate. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that reflects a broken ingest path. | A sustained ingest stall pulls the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> Read the ingest counter in `clickhouse-client`:
+> ```sql
+> SELECT value FROM system.events WHERE event = 'InsertedRows'
+> ```
+> Snapshot it, wait, snapshot again, and divide the delta by the elapsed seconds to get the live rate the card plots.
+> Confirm inserts are actually landing (not being rejected) with `SELECT count(), max(event_time) FROM system.query_log WHERE type = 'QueryFinish' AND query_kind = 'Insert' AND event_time > now() - INTERVAL 15 MINUTE`, and check for rejected inserts with `... WHERE type = 'ExceptionWhileProcessing'`.
+> On **ClickHouse Cloud**, the same `system.events` and `system.query_log` reads run in the SQL console; the order and click side of this card comes from your storefront connector, so reconcile that half against the storefront's own order reporting, not against ClickHouse.
+
+**Why our number may legitimately differ from a manual query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Lifetime vs rate** | Manual counter looks huge and static | `InsertedRows` is cumulative since process start; the card plots its delta as a rate, so a raw counter read will not match the per-second figure. |
+| **Snapshot timing** | Slightly higher or lower | Ingest fluctuates bucket to bucket; a single manual delta over a few seconds can differ from the card's bucketed rate. |
+| **Rows vs events** | Card and source can differ | `InsertedRows` counts rows written; one source "event" may expand to several rows, so the ingest curve reflects rows, not raw upstream event count. |
+| **Order-side alignment** | Divergence timing may shift | The order series arrives via the storefront connector with its own cadence and time zone; small offsets between the two axes are expected. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | Order and click activity on the storefront should be mirrored by a matching ingest rate into ClickHouse. | Storefront orders flowing while ClickHouse ingest is flat is the exact "pipeline broken" pattern this card exists to catch. |
+| [ClickHouse QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/clickhouse/clickhouse-qps-spike-vs-ecom-order-rate) | Writes (ingest) and reads (queries) both relate to order rate; a healthy pipeline keeps all three coherent. | Ingest stalled while queries and orders continue means the storefront and read side are fine and only the write feed is broken. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Ingest dropped to near zero but the card did not page. Why?**
+Low ingest alone does not page; the alert is divergence-based. If ingest is quiet because orders and clicks are also quiet (overnight, a public holiday), both series are low together and that is healthy. The card pages only when the order series shows continuing activity while the ingest series stalls. If you want to be alerted on ingest rate regardless of order context, watch [Inserts per Second (live)](/nerve-centre/kpi-cards/clickhouse/inserts-per-second-live) instead.
+
+**How do I tell whether the consumer broke or ClickHouse rejected the inserts?**
+Check the error counters. If [Too Many Parts Errors (24h)](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h) or [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h) is climbing during the stall, ClickHouse is receiving inserts and rejecting them, so the fix is on the database side. If both counters are flat at zero while ingest is flat at zero, the events are not reaching ClickHouse at all, so the fix is upstream in the queue consumer or producer.
+
+**Is the lost data recoverable?**
+It depends on your pipeline. If a durable queue (Kafka, Kinesis, a message broker with retention) sits between the storefront and ClickHouse, the consumer can replay from its last committed offset once it recovers, and little or nothing is lost. If events are pushed directly with no buffer, the data generated during the stall is gone for analytics purposes. This is why a durable, replayable queue is strongly recommended for any ingest feeding a Hero analytics surface.
+
+**The two lines never line up exactly even when healthy. Is that a problem?**
+No. The axes measure different things (rows per second of ingest vs orders or clicks per minute) and arrive through different systems with different refresh cadences and time zones. What matters is that they move *together*: rising together, falling together. A small steady offset is normal; a sudden decoupling is the signal.
+
+**Could a spike in ingest with flat orders also be a problem?**
+Potentially, but that is a different pattern handled elsewhere. Ingest spiking far above what order and click activity would explain can indicate a retry storm (the consumer re-inserting the same batches) or a misconfigured producer duplicating events. This card's alert targets the stall direction; for the read-side equivalent of "activity with no matching orders", see [ClickHouse QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/clickhouse/clickhouse-qps-spike-vs-ecom-order-rate).
+
+**Does the card count rows or upstream events?**
+It plots `InsertedRows`, which counts rows written into ClickHouse. If one upstream event expands into several rows (for example an order event that writes one row per line item), the ingest curve will be higher than the raw event count. This does not affect the divergence detection (the shape is what matters) but it does mean you cannot read the absolute ingest number as a one-to-one event count.
+
+**On ClickHouse Cloud, does this card still work?**
+Yes. `InsertedRows` is available in `system.events` on Cloud and reads through the SQL console identically, so the ingest axis is unchanged. The order and click axis comes from your storefront connector regardless of where ClickHouse runs. The only Cloud nuance is that a managed instance waking from idle can briefly show low ingest as it spins up, which is a wake event rather than a pipeline break; check [Instance Uptime](/nerve-centre/kpi-cards/clickhouse/instance-uptime) to distinguish the two.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*ClickHouse Event Ingest vs Ecom Orders* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

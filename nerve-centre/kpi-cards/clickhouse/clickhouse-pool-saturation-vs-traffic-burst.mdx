@@ -1,0 +1,163 @@
+---
+title: "ClickHouse Pool Saturation vs Traffic Burst, ClickHouse"
+sidebarTitle: "ClickHouse Pool Saturation vs Traffic Burst"
+description: "ClickHouse Pool Saturation vs Traffic Burst for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Cross-Channel](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This card lines ClickHouse connection-pool saturation up against the storefront traffic burst that is driving it, row by row, so you can see when the database is about to become the bottleneck during exactly the windows that matter for revenue. Pool saturation alone tells you the database is busy; the traffic context tells you whether that busy-ness coincides with a sales-critical moment (a campaign send, a flash sale, a homepage feature). When saturation crosses 90% while traffic is bursting, queued connections start to wait, dashboards and analytics-backed storefront features stall, and the slowdown lands at the worst possible time. This is the join between an infrastructure metric and a commercial one.
+
+| | |
+| --- | --- |
+| **Data source** | ClickHouse connection-pool saturation (active connections against the configured pool limit, from `system.metrics`) joined against storefront traffic burst signal over the same window, presented broken down by row. |
+| **What it tracks** | Pool saturation percentage per interval set side by side with the concurrent traffic level, so a DBA sees both the cause (traffic) and the effect (saturation) in one table. |
+| **Metric basis** | Real-time connection counts from `system.metrics` (active vs configured maximum) correlated with the traffic-burst signal; this is a correlation card, not a single counter. |
+| **Why it matters** | Saturation at a quiet hour is a tuning note; saturation during a traffic burst is revenue at risk, because the queries powering live storefront and analytics features queue precisely when shoppers are most active. |
+| **Time window** | `15m` (a short rolling window so a burst and its saturation are caught while they are still actionable). |
+| **Alert trigger** | `>90% during traffic burst`. Saturation above 90% that co-occurs with a traffic burst flags the card amber and pages the on-call DBA. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine computes pool saturation as active connections over the configured pool ceiling and aligns it to the storefront traffic signal on the same time buckets:
+
+```sql
+-- Pool saturation side of the join
+SELECT
+    toStartOfInterval(event_time, INTERVAL 1 MINUTE) AS bucket,
+    max(CurrentMetric_TCPConnection + CurrentMetric_HTTPConnection) AS active_conns,
+    round(100 * active_conns / {max_connections}, 1)               AS saturation_pct
+FROM system.metric_log
+WHERE event_time > now() - INTERVAL 15 MINUTE
+GROUP BY bucket
+ORDER BY bucket
+```
+
+`saturation_pct` is the active connection count (TCP plus HTTP) as a percentage of the instance's configured `max_connections`. The traffic-burst side comes from the correlated storefront connector (the same time buckets), and the card places the two next to each other per row. The alert does not fire on saturation alone: it fires only when saturation exceeds 90% *and* the traffic signal is in a burst state for the same bucket. That conjunction is the point. A pool at 95% at 03:00 with no traffic is a config note (perhaps a runaway batch job). A pool at 95% during a campaign-driven surge is a live commercial risk, because connection waits delay the queries behind storefront and analytics features while the most shoppers are present.
+
+The 15-minute window is deliberately short. Bursts are transient, and a saturation spike that has already passed is a post-mortem, not an alert. Holding the window tight keeps the card focused on the saturation that is happening now, against the traffic that is happening now.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a self-managed ClickHouse instance that powers live merchandising and analytics widgets for a Shopify storefront. A scheduled email campaign goes out at 11:00. Snapshot taken on 14 Apr 26 between 10:55 and 11:10 BST, `max_connections` configured at 200.
+
+| Bucket (BST) | Active connections | Saturation | Traffic state | Note |
+| --- | --- | --- | --- | --- |
+| 10:55 | 96 | 48% | normal | baseline |
+| 11:00 | 142 | 71% | burst start | campaign send lands |
+| 11:03 | 178 | 89% | burst | climbing fast |
+| 11:05 | 194 | **97%** | burst | over threshold |
+| 11:08 | 188 | 94% | burst | still saturated |
+
+The Nerve Centre card flags amber at 11:05: **97% saturation during a traffic burst**. The DBA reads three things:
+
+1. **The cause is the campaign, not a leak.** Saturation tracks the traffic curve exactly, rising from 48% to 97% as the campaign-driven session surge hits the storefront and every session fans out into analytics-widget queries against ClickHouse.
+2. **The pool is the bottleneck, not the queries.** Individual query latency is still acceptable; the problem is that there are not enough connection slots, so new requests queue. This shows up as a small rise in [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) from queue wait, not from heavy queries.
+3. **This is the revenue-critical window.** The campaign exists to drive sales; if the storefront widgets stall now, the campaign's own traffic is degraded. That is why this conjunction pages, where a quiet-hour 97% would not.
+
+```text
+Why saturation hit 97% during the burst:
+  - Baseline: ~96 active connections (48% of 200)
+  - Campaign send at 11:00 -> session surge -> +1 ClickHouse query per widget per session
+  - Peak: 194 / 200 connections in use, ~6 slots free
+  - Effect: new requests queue for a slot -> p95 creeps up from queue wait
+  - Mitigation options, in order of speed:
+      1. Raise max_connections headroom for predictable campaign windows
+      2. Cache the widget queries at the edge so each session does not re-hit ClickHouse
+      3. Pre-warm / pre-scale ahead of the scheduled 11:00 send next time
+```
+
+The durable fix is to decouple storefront widgets from per-session live queries during known burst windows: cache the widget responses so a campaign surge does not translate one-to-one into ClickHouse connections. Raising `max_connections` buys immediate headroom but a large enough burst will still find the ceiling. The most useful operational change is to pre-scale or pre-warm ahead of scheduled campaign sends, because the timing is known in advance.
+
+Three takeaways:
+
+1. **Saturation is only a crisis in context.** 97% at a quiet hour is a tuning note; 97% during a campaign burst is revenue at risk. This card supplies the context that turns a number into a decision.
+2. **Pool exhaustion delays queries even when the queries are fine.** The fix is connection headroom or fewer connections, not query tuning, when latency rises from queue wait rather than heavy work.
+3. **Known bursts should be pre-empted.** Scheduled campaigns are predictable; pre-scaling or caching ahead of the send turns a recurring amber into a non-event.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Pool Saturation vs Traffic Burst | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/clickhouse/connection-pool-saturation) | The standalone saturation gauge without the traffic context. | This card adds the "is it a burst?" question; the gauge is the raw number. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/clickhouse/connection-pool-at-90-saturation) | The Nerve Centre alert that pages on sustained saturation. | The alert is the paging surface; this card explains whether the cause is commercial traffic. |
+| [Connections In Use](/nerve-centre/kpi-cards/clickhouse/connections-in-use) | The absolute connection count behind the percentage. | Rising connections in use plus a burst confirms traffic, not a leak, is driving saturation. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) | The latency that queue wait inflates during saturation. | p95 rising from queue wait (not heavy queries) confirms the pool, not the workload, is the limit. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/clickhouse/queries-per-second-live) | The query inflow a burst produces. | QPS spiking in step with saturation ties the pool pressure to query volume. |
+| [ClickHouse QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/clickhouse/clickhouse-qps-spike-vs-ecom-order-rate) | The sibling cross-channel card that separates real traffic from bot storms. | A QPS spike with no order spike means the saturation is bot-driven, not revenue-critical. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that weights pool pressure. | Sustained burst-time saturation pulls the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> Read the live connection counts in `clickhouse-client`:
+> ```sql
+> SELECT metric, value FROM system.metrics
+> WHERE metric IN ('TCPConnection', 'HTTPConnection', 'MySQLConnection', 'PostgreSQLConnection')
+> ```
+> Compare against the configured ceiling with `SELECT name, value FROM system.server_settings WHERE name = 'max_connections'`.
+> For the time-bucketed view the card uses, query `system.metric_log` for `CurrentMetric_TCPConnection` and `CurrentMetric_HTTPConnection` over the window.
+> On **ClickHouse Cloud**, the same metrics are visible in the SQL console, and the managed monitoring view surfaces connection utilisation; the traffic-burst side of this card comes from your storefront connector, not from ClickHouse, so reconcile that half against the storefront analytics.
+
+**Why our number may legitimately differ from a manual query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Snapshot timing** | Slightly higher or lower | Connection counts move continuously during a burst; a single manual read can land between the peaks the card's bucketed max captures. |
+| **Which connection types counted** | Card may be higher | The card sums TCP and HTTP (and native protocol) connections; a manual query that reads only `TCPConnection` undercounts an HTTP-heavy workload. |
+| **Per-node scope** | Card matches its configured node | On a cluster, connections are per node; a manual query on a different replica reflects that replica only. |
+| **Traffic-side alignment** | Conjunction may differ | The "burst" flag depends on the storefront connector's window; if its time zone or window differs from your manual check, the co-occurrence can look offset. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | A genuine traffic burst that saturates the pool should coincide with rising sessions and orders on the storefront. | Saturation bursting with no matching storefront traffic means the load is internal (a batch job or dashboard storm), not shopper-driven; treat it as a tuning issue, not revenue risk. |
+| [ClickHouse QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/clickhouse/clickhouse-qps-spike-vs-ecom-order-rate) | Saturation during a real burst pairs with both a QPS spike and an order spike. | A QPS spike and saturation with flat orders points at bot traffic or a runaway dashboard, which changes the response from "add capacity" to "block the source". |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does this card not page when saturation hits 95% overnight?**
+By design. The alert fires on saturation above 90% *only when it co-occurs with a traffic burst*. A 95% reading at 03:00 with no storefront traffic is almost always an internal cause (a heavy batch job, a stuck dashboard tab) and is not a revenue risk, so it is surfaced as context rather than a page. If you also want to be paged on saturation regardless of traffic, use [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/clickhouse/connection-pool-at-90-saturation).
+
+**Is high saturation the same as the database being slow?**
+Not directly. Saturation measures how full the connection pool is. The queries themselves may still run quickly; the symptom of a full pool is that new requests *queue* for a connection slot, which adds wait time before the query even starts. That is why a saturation amber can coincide with a modest p95 rise from queue wait rather than from heavy query work.
+
+**The traffic side looks delayed compared to the saturation side. Why?**
+The two halves come from different systems. ClickHouse connection metrics are real time; the storefront traffic signal arrives through the storefront connector, which may have its own refresh cadence and time-zone alignment. Small offsets between the two curves are normal. The card aligns them on shared buckets, but a difference in window boundaries can make one side appear to lead the other.
+
+**My pool is saturated but `max_connections` looks high. What is happening?**
+Either the burst is genuinely large enough to fill even a high ceiling, or connections are not being returned to the pool promptly (long-running queries or a client that holds connections open). Check [Top 10 Slowest Queries](/nerve-centre/kpi-cards/clickhouse/top-10-slowest-queries): a few very long queries each hold a slot for their full duration and can saturate a large pool with surprisingly little concurrency.
+
+**Should I just keep raising `max_connections`?**
+Headroom helps, but a large enough burst will always find the ceiling, and every connection still consumes server resources. The more durable fix for storefront-driven bursts is to stop each shopper session from translating directly into a ClickHouse connection: cache the widget queries so a surge in sessions does not become a surge in connections. Raise the ceiling for known campaign windows, but pair it with caching.
+
+**Does this work on ClickHouse Cloud where I do not manage connections directly?**
+Yes. Cloud still exposes connection metrics in `system.metrics` and the monitoring view, so the saturation side reads the same way. The difference is the lever: on Cloud you scale the instance or rely on managed autoscaling rather than hand-editing `max_connections`. The traffic-burst correlation is identical because it comes from your storefront connector.
+
+**What counts as a "traffic burst"?**
+The traffic-burst signal comes from the correlated storefront connector and represents a short-window surge above the recent baseline (for example a campaign send, a flash sale, or a homepage feature driving a session spike). It is the same burst concept used by the other cross-channel ClickHouse cards, which is what lets you read pool pressure, QPS, and order rate against a single shared notion of "is this a busy moment for the business?".
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*ClickHouse Pool Saturation vs Traffic Burst* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

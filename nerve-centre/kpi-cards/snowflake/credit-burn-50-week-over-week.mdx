@@ -1,0 +1,157 @@
+---
+title: "Credit Burn +50% Week-over-Week, Snowflake"
+sidebarTitle: "Credit Burn +50% Week-over-Week"
+description: "Credit Burn +50% Week-over-Week for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> An alert that fires when this week's Snowflake credit consumption is at least 50% higher than the prior week, **without** a matching rise in query volume. This is the Snowflake-distinctive cost-surprise detector: a runaway query, a misconfigured warehouse, or a scheduled job that overran is the number one source of unexpected Snowflake bills. The whole point of the "without proportional query growth" clause is to separate "we are simply doing more work" (fine, expected) from "we are paying a lot more for the same work" (a problem worth a page).
+
+| | |
+| --- | --- |
+| **What it tracks** | Week-over-week change in credits consumed, cross-referenced against week-over-week change in query count. The alert is the divergence between the two, not raw credit growth. |
+| **Data source** | `detail`: Snowflake-distinctive, runaway query / scheduled job overrun is the #1 cost surprise. Credits read from `SNOWFLAKE.ACCOUNT_USAGE.METERING_HISTORY`; query counts from `QUERY_HISTORY`. |
+| **Time window** | `7d` (current 7-day window compared against the immediately prior 7-day window). |
+| **Alert trigger** | `+50% credits WoW without proportional query growth`. Credits up at least 50% week-over-week while query volume is flat or up far less. |
+| **Roles** | owner, platform, SRE, finance/FinOps |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calc */}
+Two seven-day windows are compared. The current window is the trailing 7 days; the comparison window is the 7 days immediately before it. For each window the engine sums credits from `METERING_HISTORY` (the authoritative billing source: it records credits per warehouse per hour, including compute, cloud-services, and serverless lines) and counts completed statements from `QUERY_HISTORY`.
+
+The alert evaluates two ratios:
+
+```text
+credit_growth = (credits_this_week - credits_last_week) / credits_last_week
+query_growth  = (queries_this_week - queries_last_week) / queries_last_week
+
+FIRE when credit_growth >= 0.50 AND credit_growth is materially larger than query_growth
+```
+
+The "without proportional query growth" guard is what makes this card useful. If you onboarded a new analytics team and query volume doubled, credits doubling too is expected and the alert stays quiet. It fires only when credits outpace the work being done, which points at inefficiency rather than legitimate scale: an under-tuned warehouse left at a larger size, a query rewritten to spill to disk, a job that started full-table-scanning, or a warehouse that stopped auto-suspending. Because `METERING_HISTORY` carries a latency of up to roughly 3 hours, the card evaluates on completed hourly buckets, so the most recent partial hour is excluded to avoid a false "drop".
+{/* /HUMAN_AUTHORED:calc */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Snowflake account that powers ecommerce analytics: dbt models overnight, BI dashboards through the day, and a reverse-ETL job pushing segments back to the marketing stack. Snapshot taken on 12 Mar 26.
+
+| Metric | Prior 7 days (29 Feb to 06 Mar 26) | Current 7 days (07 to 12 Mar 26) | Change |
+| --- | --- | --- | --- |
+| Credits consumed | 1,420 | 2,280 | **+61%** |
+| Query count | 184,000 | 191,000 | +3.8% |
+| Avg cost per query | $0.077 | $0.119 | +55% |
+
+Credits jumped 61% while query volume barely moved. The alert fires. The dashboard surfaces the per-warehouse split so the on-call engineer does not have to go hunting:
+
+```text
+Credit delta by warehouse (current vs prior 7d):
+  TRANSFORM_WH   +610 credits  (was XL, now showing sustained XL with low utilisation)
+  BI_WH          +180 credits  (dashboard refresh frequency unchanged)
+  REVERSE_ETL_WH +70  credits  (one job re-ran 4x after transient failures)
+```
+
+The story: `TRANSFORM_WH` was resized to XL during a one-off backfill three weeks ago and never resized back. With auto-suspend at 600 seconds it stays warm between dbt batches, and at XL each warm minute costs four times what it did at L. Query count is flat because the same models run; the credits are flat-out wasted on oversized, under-utilised compute.
+
+What the team does, in order:
+
+1. **Confirm it is not legitimate growth.** Query count is flat and avg cost per query is up 55%, so this is inefficiency, not scale. Confirmed.
+2. **Right-size the offender.** Resize `TRANSFORM_WH` back to L and shorten auto-suspend to 60 seconds for a batch workload that does not benefit from staying warm. Estimated saving: roughly 580 credits/week.
+3. **Quarantine the noisy job.** `REVERSE_ETL_WH` re-ran four times on transient errors. That is a reliability issue, not a sizing one; route it to the [Query Error Rate Spike](/nerve-centre/kpi-cards/snowflake/query-error-rate-spike-1-in-1h) owner.
+4. **Set a budget guardrail.** Add a resource monitor on the account so a future overrun trips a suspend before it costs a full week of credits.
+
+```text
+Cost framing:
+  At ~$3.00/credit (representative Enterprise rate), the +860 credit overrun = ~$2,580 in one week.
+  Left unfixed, that is ~$11,000/month of avoidable spend from a single un-resized warehouse.
+```
+
+The lesson: in Snowflake, cost surprises almost never come from doing more, they come from doing the same work on oversized or never-suspended compute. This card exists to catch exactly that gap.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Credit Burn +50% WoW | What the combination tells you |
+| --- | --- | --- |
+| [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) | The raw daily spend that rolls up into the weekly comparison. | A single-day spike inside the week localises which day the overrun started. |
+| [Credits by Warehouse (7d)](/nerve-centre/kpi-cards/snowflake/credits-by-warehouse-7d) | The per-warehouse split for the same window. | Identifies which warehouse is responsible for the divergence. |
+| [Avg Cost per Query ($)](/nerve-centre/kpi-cards/snowflake/avg-cost-per-query) | The efficiency ratio that rises when credits outpace queries. | If cost/query is up and query count flat, the burn is inefficiency, not scale. |
+| [Idle Warehouse Credits Wasted (24h)](/nerve-centre/kpi-cards/snowflake/idle-warehouse-credits-wasted-24h) | The auto-suspend tuning candidate. | A high idle figure explains a chunk of the unexplained burn. |
+| [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) | Utilisation of the running warehouses. | Low saturation plus high credits equals oversized compute. |
+| [Credit Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/snowflake/credit-burn-vs-ecom-order-volume) | The cross-channel reframing of the same divergence. | Credits up while orders flat confirms inefficiency over genuine demand. |
+| [Snowflake Health Score](/nerve-centre/kpi-cards/snowflake/snowflake-health-score) | The composite that takes cost anomalies as a component. | A firing credit-burn alert pulls the headline score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake:**
+
+> **`SNOWFLAKE.ACCOUNT_USAGE.METERING_HISTORY`** is the authoritative credit ledger. Sum `CREDITS_USED` grouped by `START_TIME` truncated to the day or week to reproduce the comparison.
+> **`SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY`** for the per-warehouse breakdown that drives the credit-delta table.
+> **`SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY`** for the query-count side of the ratio.
+> **Snowsight, Admin to Cost Management** for the managed-service console view of credits, broken down by warehouse, service type, and day.
+
+A representative reconciliation query:
+
+```sql
+SELECT DATE_TRUNC('week', START_TIME) AS wk,
+       SUM(CREDITS_USED) AS credits
+FROM SNOWFLAKE.ACCOUNT_USAGE.METERING_HISTORY
+WHERE START_TIME >= DATEADD('day', -14, CURRENT_TIMESTAMP())
+GROUP BY 1 ORDER BY 1;
+```
+
+**Why our number may legitimately differ from Snowflake's console:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **ACCOUNT_USAGE latency** | Brief lag | `METERING_HISTORY` can lag up to ~3 hours; Vortex IQ evaluates on completed hourly buckets, so a very recent hour may not yet appear in either view. |
+| **Time zone** | Window edges shift | Snowsight Cost Management groups in the account time zone; Vortex IQ aligns to your reporting time zone, so daily and weekly boundaries can differ. |
+| **Service-type scope** | Variable | The card sums compute, cloud-services, and serverless credit lines together; a console view filtered to compute-only will read lower. |
+| **Partial-week comparison** | Variable | If you read mid-week, the current 7-day rolling window is not a calendar week; match the rolling window before assuming divergence. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | Credit burn should loosely track ecom data volume, which tracks revenue activity. | Credits up 50% with revenue and order volume flat is the cleanest signal that the burn is inefficiency, not demand. |
+| [Credit Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/snowflake/credit-burn-vs-ecom-order-volume) | Direct cross-channel peer for this alert. | If both fire, the divergence is confirmed from two independent angles. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The alert fired but our spend genuinely went up because we onboarded a new team. Is it a false positive?**
+Partly. The guard clause checks credit growth against query growth, so onboarding that lifts both should stay quiet. It can still fire if the new team's queries are far more expensive per statement than your existing baseline (large scans, heavy joins, low warehouse utilisation). In that case the alert is correctly flagging that the new workload is inefficient, even though the headcount growth is legitimate. Use [Avg Cost per Query](/nerve-centre/kpi-cards/snowflake/avg-cost-per-query) to confirm.
+
+**Why measure week-over-week instead of day-over-day?**
+Snowflake workloads are strongly weekly: weekday dbt and BI load, quieter weekends, month-end reporting spikes. A day-over-day comparison would fire every Monday. The 7-day window smooths the weekly cycle so the alert reflects a real shift in the cost-per-work ratio rather than the normal weekday rhythm.
+
+**METERING_HISTORY lags by a few hours. Can the alert be late?**
+Yes, by up to roughly 3 hours. The card evaluates on completed hourly credit buckets, so a runaway that started in the last hour will show up once that hour's metering record lands. For sub-hour cost runaways, lean on [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) and [Active Warehouses](/nerve-centre/kpi-cards/snowflake/active-warehouses), which read live state.
+
+**Does this include storage cost growth, or only compute credits?**
+Only credits from `METERING_HISTORY`, which is compute, cloud-services, and serverless. Storage is billed separately in terabytes, not credits, and is tracked by [Storage Used (TB)](/nerve-centre/kpi-cards/snowflake/storage-used-tb). A storage spike will not trip this card.
+
+**What counts as "proportional" query growth?**
+The engine treats credit growth as anomalous when it materially exceeds query growth, not when the two are penny-perfect. A 50% credit rise on 45% query growth is proportional and stays quiet; a 50% credit rise on 4% query growth fires. The exact tolerance is tuned per profile in the Sensitivity tab so you can match your own baseline volatility.
+
+**A scheduled job re-ran several times and tripled its warehouse's credits. Will that fire this card?**
+Often yes, and that is intended. Re-runs add queries, but transient-failure retries on a warm oversized warehouse can lift credits far more than the extra query count, producing exactly the credit-over-query divergence this card detects. Treat it as a joint cost-and-reliability issue and cross-check [Query Error Rate Spike](/nerve-centre/kpi-cards/snowflake/query-error-rate-spike-1-in-1h).
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Credit Burn +50% Week-over-Week* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,185 @@
+---
+title: "Shard Size Skew %, Elasticsearch"
+sidebarTitle: "Shard Size Skew %"
+description: "Shard Size Skew % for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication & Shards](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Shard Size Skew measures how unevenly your data is spread across the shards of an index. It is computed as `(largest shard size - smallest shard size) / average shard size`, expressed as a percentage. A perfectly balanced index reads near 0%. When this climbs above 25% you have a **hot shard**: one shard holding disproportionately more data (and usually more query and indexing load) than its siblings. Because every search that touches that index waits on its slowest shard, a single oversized shard caps the latency of the whole index. This is an Elasticsearch-distinctive failure mode that traditional databases do not surface, and it is one of the most common silent causes of "search got slow but the cluster looks green".
+
+| | |
+| --- | --- |
+| **API endpoint** | Elasticsearch `GET /_cat/shards?bytes=b&h=index,shard,prirep,store` for per-shard store sizes, rolled up per index. The skew is computed by Vortex IQ from the primary-shard store sizes the cluster reports. |
+| **Metric basis** | Distribution statistic across shards, not a single counter. Formula: `(max_shard_bytes - min_shard_bytes) / avg_shard_bytes`. Computed per index, then the headline shows the worst (highest-skew) index. |
+| **Aggregation window** | `RT` (real-time, polled every 60 seconds). The value is a point-in-time snapshot of current shard sizes, not an average over time. |
+| **Why it matters** | Search latency on an index is bounded by its slowest shard. A hot shard means uneven CPU, heap and disk pressure on whichever node holds it, and that node becomes the bottleneck for the whole index. |
+| **What turns it high** | Poor shard routing (a custom `_routing` key with skewed cardinality), time-based data where one shard catches a burst, too few shards for the data volume, or documents of wildly varying size landing on one shard. |
+| **What does NOT change it** | Replica count (skew is measured on primaries), query volume, or JVM heap. Skew is purely about data distribution across shards. |
+| **Managed-service note** | Elastic Cloud, AWS OpenSearch/Elasticsearch Service and Bonsai all expose per-shard sizes via the same `_cat/shards` API; the skew you see here is reproducible against their consoles. |
+| **Time window** | `RT` (real-time, polled every 60 seconds) |
+| **Alert trigger** | `> 25%`. A sustained skew above 25% raises the card as a hot-shard warning. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The skew is a normalised spread of primary-shard store sizes within an index, grounded directly in the per-shard byte sizes Elasticsearch reports:
+
+```text
+for each index:
+  sizes = [store size in bytes of each PRIMARY shard]
+  avg   = mean(sizes)
+  skew% = (max(sizes) - min(sizes)) / avg * 100
+
+cluster headline = max(skew%) across all indexes
+```
+
+A worked feel for the numbers: an index with three primary shards of 40 GB, 41 GB and 39 GB has an average of 40 GB and a spread of 2 GB, so skew = `2 / 40 = 5%`, healthy. The same index with shards of 70 GB, 25 GB and 25 GB averages 40 GB with a spread of 45 GB, so skew = `45 / 40 = 112.5%`, a severe hot shard.
+
+Vortex IQ measures skew on **primary** shards only, because replicas mirror their primaries exactly and would not change the distribution. The engine maps the result to a sentiment: under 25% is healthy, 25% to 50% is a warning, and above 50% is critical because at that point a single shard is more than 1.5x the size of its smallest sibling and is almost certainly bottlenecking the index.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 4-node Elasticsearch 8.x cluster backing storefront and order-history search for a multi-brand retailer. The `orders` index uses a custom routing key (`_routing=customer_id`) so all of a customer's orders land on the same shard, which makes order-history lookups single-shard and fast. The index has 4 primary shards. Snapshot taken on 19 May 26 at 14:20 BST.
+
+Search latency on `orders` has crept from a p95 of 180 ms to 540 ms over three weeks with no change in query volume. The cluster is green, heap is fine, so the on-call checks shard skew and finds the cause:
+
+```text
+GET /_cat/shards/orders?bytes=b&h=shard,prirep,store&v
+shard prirep store
+0     p       18039143628   # 18.0 GB
+1     p       17884219442   # 17.9 GB
+2     p       61203847291   # 61.2 GB   <- hot shard
+3     p       18112004337   # 18.1 GB
+
+avg = (18.0 + 17.9 + 61.2 + 18.1) / 4 = 28.8 GB
+skew% = (61.2 - 17.9) / 28.8 = 150%
+```
+
+The card reads **150%**, deep into the critical band. The root cause: a handful of very high-volume B2B accounts share the same hashed routing bucket, so shard 2 carries one giant customer plus normal traffic. Every search that hits `orders` (and every account that routes to shard 2) waits on the node holding 61 GB of data while three other shards sit idle.
+
+The on-call's decision tree:
+
+1. **Is it a routing-key problem or a sizing problem?** Routing. The skew is concentrated on one shard tied to a routing bucket, not a smooth gradient. A sizing problem (too few shards for steady growth) shows a gentler, more even spread.
+2. **Can it be fixed without a reindex?** Not for routing skew. The routing key is baked into how documents were written, so the data must be reindexed with either more shards (to spread the hash buckets) or a better routing strategy for the whale accounts.
+3. **What is the interim mitigation?** Move the hot shard onto the least-loaded node and ensure that node has heap and disk headroom, so at least the bottleneck shard runs on dedicated capacity while the reindex is planned.
+
+The team reindexes `orders` from 4 to 12 primary shards over the maintenance window. After the reindex:
+
+```text
+12 shards, sizes ranging 8.9 GB to 11.4 GB
+avg = 9.6 GB, skew% = (11.4 - 8.9) / 9.6 = 26%
+```
+
+Still just over the 25% line (the whale accounts are still slightly lumpy) but search p95 drops back to 210 ms because no single shard dominates.
+
+```text
+Why this matters in numbers:
+  - Before: 1 shard at 61 GB capped index p95 at 540 ms
+  - After:  worst shard 11.4 GB, p95 back to 210 ms (61% faster)
+  - The cluster was GREEN the whole time: skew is invisible to
+    cluster status. Only this card surfaced the imbalance.
+```
+
+Three takeaways:
+
+1. **A green cluster can still have a hot shard.** Cluster status reflects allocation, not balance. Skew is the card that catches "all shards are healthy but one is doing all the work".
+2. **Skew driven by a routing key needs a reindex, not a rebalance.** Elasticsearch's shard balancer balances shard *count* per node, not data *size* within an index. It cannot fix a routing-key skew; only changing shard count or routing (via reindex) will.
+3. **Right-size shards before they grow.** The healthy target is shards of 10 to 50 GB each. Plan shard count for projected data volume up front; oversharding hurts overhead, undersharding causes skew as data grows unevenly.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards platform teams should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Shard Size Skew | What the combination tells you |
+| --- | --- | --- |
+| [Total Shards (primary + replica)](/nerve-centre/kpi-cards/elasticsearch/total-shards-primary-replica) | The total shard count is the lever you change to fix skew. | High skew plus a low shard count for the data volume equals "undersharded, reindex with more shards". |
+| [Replica Sync Lag](/nerve-centre/kpi-cards/elasticsearch/replica-sync-lag) | A hot shard takes longer to replicate. | High skew plus rising replica lag equals "the oversized shard is slowing replication on its node". |
+| [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) | The symptom a hot shard produces. | Skew above 25% with p95 climbing and stable query volume strongly implicates a hot shard. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/elasticsearch/slow-query-rate) | The slowlog confirmation of the latency cap. | Rising slow-query rate isolated to one index points straight at that index's skew. |
+| [Storage Usage %](/nerve-centre/kpi-cards/elasticsearch/storage-usage) | The node holding the hot shard fills faster. | Skew plus uneven per-node disk usage equals "one node is filling because it holds the giant shard". |
+| [Elasticsearch Health Score](/nerve-centre/kpi-cards/elasticsearch/elasticsearch-health-score) | The composite that weights distribution health. | Sustained high skew pulls the composite down even while cluster status stays green. |
+| [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) | A giant shard may fail to allocate after a node loss. | Skew plus unassigned shards equals "the hot shard could not find a node with room to take it". |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> **`GET /_cat/shards?bytes=b&h=index,shard,prirep,store&s=store:desc`** for the per-shard store sizes, sorted largest first. This is the raw data Vortex IQ computes skew from.
+> **`GET /_cat/indices?v&h=index,pri,docs.count,store.size`** for per-index totals to sanity-check the rollup.
+> **`GET /<index>/_stats/store?level=shards`** for the authoritative per-shard byte counts including primaries and replicas.
+> **`GET /_cluster/allocation/explain`** if a large shard is failing to allocate after a rebalance.
+
+In managed services the same per-shard sizes appear via the API and on the console shard-allocation views: Elastic Cloud's index management, AWS OpenSearch/Elasticsearch Service's shard distribution view, and Bonsai's index overview.
+
+**Why our value may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Poll timing** | Brief lag | The card polls every 60 seconds; during an active reindex or force-merge shard sizes change continuously, so a manual call seconds later can differ. |
+| **Primaries only** | Our value may look different | Vortex IQ measures skew on primaries; if you compute skew including replicas you get the same numerator but a different shard set. |
+| **Merge in flight** | Temporary spike | A segment merge transiently inflates a shard's on-disk size until the merge completes and old segments are deleted; both the card and a manual check see this. |
+| **Time zone** | Timestamp display only | The skew value is timezone-independent; only the chart axis renders in your Vortex IQ display timezone. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ES Search Pool Saturation vs Ecom Burst](/nerve-centre/kpi-cards/elasticsearch/es-search-pool-saturation-vs-ecom-burst) | A hot shard saturates the search pool on one node first. | High skew during an ecommerce traffic burst concentrates pool pressure on the hot-shard node, tripping pool saturation earlier than even data would. |
+| [Slow Searches During Checkout Window (5m)](/nerve-centre/kpi-cards/elasticsearch/slow-searches-during-checkout-window-5m) | Hot-shard latency surfaces as slow checkout-window searches. | Skew-driven slow searches cluster on the index and node holding the oversized shard. |
+
+<details>
+<summary><em>Documentation cross-reference (same-concept peer)</em></summary>
+
+Shard size skew is specific to sharded search engines. It is **not** a reconciliation against a parallel system; these references exist only so a team running both engines can map the same concept across docs.
+
+- OpenSearch equivalent: identical computation from `GET /_cat/shards?bytes=b`; OpenSearch inherited the same shard model.
+- Generic equivalent on sharded SQL databases: closest analogue is partition skew (one partition far larger than others), but there is no single rolled-up percentage.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My skew is high but search feels fine. Do I still need to act?**
+Not urgently. Skew is a leading indicator: it tells you an index is at risk of becoming latency-bound by one shard before users feel it. If p95 latency and slow-query rate are still healthy, log it and plan a reindex at the next maintenance window rather than firefighting. Skew becomes a real problem when it pairs with rising [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms).
+
+**Why does Elasticsearch's own rebalancer not just fix the skew automatically?**
+Because the balancer balances shard *count* per node, not data *size* within an index. It will happily place a 60 GB shard and a 6 GB shard on different nodes and call it balanced, since each node has the same number of shards. Fixing intra-index size skew requires changing the shard count or routing, which means a reindex. The balancer cannot do that for you.
+
+**My index has just one primary shard. What does skew read?**
+Zero. With a single shard there is no spread to measure (`max == min`), so skew is 0% by definition. A single-shard index cannot be skewed, but it also cannot parallelise search; if that one shard grows past 50 GB, reindex to more shards before it becomes a different kind of bottleneck.
+
+**The card spiked during a force-merge then came back down. Is that real skew?**
+It is real on-disk size, but transient. A force-merge or large segment merge temporarily holds both old and new segments on disk, inflating a shard's reported store size until the merge finishes and old segments are purged. The skew settles once the merge completes. Do not reindex in response to a merge-time spike; wait for it to settle.
+
+**I use time-based indices (daily rollover). Should I worry about skew across days?**
+This card measures skew *within* an index, not across an index series. Across daily indices, uneven daily volume is expected (weekends differ from weekdays) and is not what this card flags. What matters is whether a single day's index has one shard much larger than its siblings, which usually means too few shards for a high-traffic day. Size your rollover shard count for your peak day.
+
+**Can a routing key cause skew even with the right shard count?**
+Yes, and it is the most common cause. A custom `_routing` value concentrates all documents with the same routing key onto one shard. If that key has skewed cardinality (a few values dominate, such as a handful of whale B2B accounts), one shard balloons regardless of how many shards you have. The fix is either more shards (to spread the hash buckets) or a routing strategy that distributes the heavy keys, both of which require a reindex.
+
+**Does replica count affect the skew reading?**
+No. Vortex IQ measures skew on primary shards only. Replicas are byte-for-byte copies of their primaries, so including them would not change the distribution, only the shard count. Changing `number_of_replicas` will not move this card.
+
+**My skew sits at 26%, just over the line. Is that worth a reindex?**
+Usually not on its own. A skew in the high-20s to low-30s with healthy latency is a mild lumpiness, often from naturally uneven data, and rarely justifies the cost of a reindex. Reserve reindexing for skew that is both high (above 50%) and pairing with measurable latency or slow-query symptoms. Use the [Elasticsearch Health Score](/nerve-centre/kpi-cards/elasticsearch/elasticsearch-health-score) trend to decide whether the imbalance is stable or worsening.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Shard Size Skew %* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

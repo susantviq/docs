@@ -1,0 +1,122 @@
+---
+title: "Connected Clients Saturation vs Traffic Burst, Redis"
+sidebarTitle: "Connected Clients Saturation vs Traffic Burst"
+description: "Connected Clients Saturation vs Traffic Burst for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This card lines up Redis connection-pool saturation (`connected_clients` against the configured `maxclients`) against the storefront traffic burst happening at the same moment. When a flash sale, an email send, or a paid-media spike drives a surge of web and app requests, each new application worker opens Redis connections. If saturation crosses 90% of `maxclients` during that burst, Redis starts refusing new connections, which silently drops downstream services: sessions fail to load, carts cannot be read, and checkout stalls. The card exists to catch that moment while it is happening, not after the revenue has already leaked.
+
+| | |
+| --- | --- |
+| **What it tracks** | A side-by-side table of Redis connection saturation (`connected_clients / maxclients` as a percentage) and the concurrent storefront traffic burst, sampled per row across the window so you can see whether the two curves rise together. |
+| **Data source** | Redis side: `connected_clients` and `maxclients` from `INFO clients` and `CONFIG GET maxclients`. Traffic side: the linked ecommerce connector's live sessions / request rate (Shopify, BigCommerce or Adobe Commerce), windowed to the same minutes. |
+| **Time window** | `15m` rolling, sampled per row. |
+| **Alert trigger** | `>90% maxclients during traffic burst`. Saturation alone is noise; saturation co-occurring with a traffic burst is the revenue-at-risk signal. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+For each sampled row in the 15-minute window the card computes Redis saturation as `connected_clients / maxclients * 100`, where `connected_clients` comes from `INFO clients` and `maxclients` from `CONFIG GET maxclients` (the effective cap, which on managed services is set below the OS file-descriptor limit). Alongside it the card pulls the storefront traffic level for the same minute from the linked ecommerce connector and flags whether that minute is a "burst" (traffic materially above the trailing baseline). The alert fires only when a row shows saturation above 90% AND the same row is inside a traffic burst. That join is the whole point: it separates a benign idle-pool reading from a genuine "we are about to refuse connections while shoppers are queuing" event.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A DTC apparel brand on Shopify runs a single ElastiCache for Redis primary with `maxclients` set to 10,000. Their checkout, session store, and rate-limiter all share this instance. On 14 Apr 26 they send a 09:00 launch email to 240,000 subscribers. The platform team is watching the Nerve Centre.
+
+| Minute (BST) | connected_clients | maxclients | Saturation | Storefront sessions/min | Burst? |
+| --- | --- | --- | --- | --- | --- |
+| 08:58 | 3,120 | 10,000 | 31% | 1,400 | no |
+| 09:00 | 6,800 | 10,000 | 68% | 9,200 | yes |
+| 09:01 | 8,950 | 10,000 | 90% | 14,600 | yes |
+| 09:02 | 9,910 | 10,000 | **99%** | 18,300 | yes |
+| 09:03 | 9,990 | 10,000 | **100%** | 19,100 | yes |
+
+At 09:01 the card crosses the alert line: saturation hits 90% during a confirmed traffic burst. By 09:02 the pool is effectively full and `rejected_connections` begins to climb (visible on the sibling [Rejected Connections (24h)](/nerve-centre/kpi-cards/redis/rejected-connections-24h) card). New application workers cannot get a Redis connection, so session reads start to fail and a fraction of shoppers see a blank cart or a checkout error.
+
+```text
+Why saturation outran traffic:
+  - Each web worker holds a small connection pool (say 8 connections).
+  - Autoscaling spun up 3x the workers to absorb the burst.
+  - 3x workers x 8 connections = connection demand grew faster than request volume.
+  - maxclients is per-instance, not per-worker, so the shared cap was hit first.
+
+Mitigations, in order of speed:
+  1. Raise maxclients (CONFIG SET maxclients, or scale the node tier on a managed service) to buy headroom now.
+  2. Enable / tune client-side connection pooling so each worker reuses fewer connections.
+  3. Move sessions or the rate-limiter to a separate Redis to stop checkout sharing the cap.
+```
+
+The takeaway for the owner is commercial, not technical: for roughly 90 seconds during the single highest-intent traffic moment of the week, a slice of shoppers could not complete checkout. The card turns an obscure infra metric into "we nearly lost the first two minutes of the launch", which is the framing that justifies raising `maxclients` or splitting the instance before the next send.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this card | What the combination tells you |
+| --- | --- | --- |
+| [Clients vs maxclients %](/nerve-centre/kpi-cards/redis/clients-vs-maxclients) | The pure Redis-side saturation gauge without the traffic join. | Confirms whether saturation is chronic (always high) or burst-driven (spikes with traffic). |
+| [Rejected Connections (24h)](/nerve-centre/kpi-cards/redis/rejected-connections-24h) | The downstream consequence: connections actually refused. | Any non-zero value here during a saturation event proves shoppers were affected, not just at risk. |
+| [Connections Rejected Due to maxclients](/nerve-centre/kpi-cards/redis/connections-rejected-due-to-maxclients) | The live alert list for refusal events. | Pairs the rate-of-change view with the at-the-moment join in this card. |
+| [Connected Clients](/nerve-centre/kpi-cards/redis/connected-clients) | The raw client count feeding the saturation maths. | Lets you see absolute pool growth before it becomes a percentage problem. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live) | Throughput alongside connection count. | High clients but flat ops equals idle / leaked connections, not real load. |
+| [Redis OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/redis/redis-ops-spike-vs-ecom-order-rate) | The sibling cross-channel join on command volume. | Together they show whether a burst is genuine shopper demand or a stampede. |
+| [Redis Session Keys vs Active Ecom Users](/nerve-centre/kpi-cards/redis/redis-session-keys-vs-active-ecom-users) | The session-layer cross-channel join. | Confirms whether dropped connections actually cost you live sessions. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look natively:**
+
+> `redis-cli INFO clients` for the live `connected_clients`, `blocked_clients`, and `cluster_connections` fields.
+> `redis-cli CONFIG GET maxclients` for the effective connection cap (this can be lower than the OS limit, especially on managed tiers).
+> `redis-cli CLIENT LIST` to enumerate every open connection with its source address, age, and last command, useful for spotting a single misbehaving service holding hundreds of connections.
+> `redis-cli INFO stats` for `rejected_connections`, the cumulative count of refusals.
+
+**On Amazon ElastiCache:** the `CurrConnections` and `NewConnections` CloudWatch metrics mirror `connected_clients`, and the node's documented connection limit stands in for `maxclients`.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| Sampling cadence | Brief peaks missed | `INFO` is polled, so a sub-second saturation spike between samples may not appear; native `CLIENT LIST` taken at the exact instant can read higher. |
+| maxclients source | Variable | Some managed services reserve a handful of connections for internal use, so the effective cap is a few below the configured `maxclients`. |
+| Cluster aggregation | Our number higher or lower | On Redis Cluster, saturation is read per node; a single hot shard can be saturated while the cluster average looks fine. |
+| Traffic-window alignment | Marginal | The storefront burst is windowed to the connector's reporting time zone; confirm both sides use the same zone before treating a small offset as real. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Saturation is high but there is no traffic burst. Does the alert fire?**
+No, and that is deliberate. High `connected_clients` with no storefront burst usually means leaked or idle connections (a service that opens connections but never closes them, or a missing connection pool). That is a real problem worth fixing, but it is not revenue-at-risk in the way a saturation-during-burst event is. Use the plain [Clients vs maxclients %](/nerve-centre/kpi-cards/redis/clients-vs-maxclients) card to chase idle-connection leaks.
+
+**Why measure against maxclients rather than the OS file-descriptor limit?**
+`maxclients` is the cap Redis actually enforces; once `connected_clients` reaches it, Redis returns an error to the next client regardless of how many file descriptors the OS could theoretically provide. On managed services the OS limit is invisible to you anyway, so `maxclients` is the meaningful ceiling.
+
+**Our workers use connection pooling. Why did we still saturate?**
+Connection pooling caps connections per worker, not across the fleet. When autoscaling triples the worker count during a burst, total demand is workers multiplied by pool size, and that can outrun a fixed `maxclients` even though each individual worker is well-behaved. The fix is either more headroom on `maxclients` or a smaller per-worker pool.
+
+**We are on Redis Cluster. How is saturation read?**
+Per node. Each shard has its own `maxclients`, so the card reads the most saturated node rather than an average. A single hot slot range can saturate one shard while the rest sit idle, which is exactly the situation an average would hide.
+
+**The burst is from bots, not shoppers. Is that still revenue at risk?**
+The connection pressure is real either way: bots opening connections can still starve legitimate shoppers of capacity. But if the burst is bot-driven the right fix is rate-limiting or blocking at the edge, not raising `maxclients`. Pair this with [Redis OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/redis/redis-ops-spike-vs-ecom-order-rate): a command spike with no matching order spike is the bot / stampede signature.
+
+**Can I change the 90% threshold?**
+Yes. The saturation threshold is configurable per profile in the Sensitivity tab. Instances that run hot by design may prefer 95%, while a tightly provisioned shared instance may want 80% to leave a wider safety margin before refusals begin.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connected Clients Saturation vs Traffic Burst* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,156 @@
+---
+title: "Evicted Keys / minute, Redis"
+sidebarTitle: "Evicted Keys / minute"
+description: "Evicted Keys / minute for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cache](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Evicted Keys / minute** is the rate at which Redis is throwing keys away because it has hit `maxmemory` and has to make room for new writes. It is the per-minute delta of the cumulative `evicted_keys` counter from `INFO stats`. Eviction is not the same as expiry: an expired key reached its TTL and was meant to die; an evicted key was alive, still wanted, and got deleted under memory pressure per the configured `maxmemory-policy`. A steady non-zero eviction rate is the single clearest sign that a Redis instance is undersized for its working set.
+
+| | |
+| --- | --- |
+| **Data source** | `evicted_keys delta` from `INFO stats`. `evicted_keys` is a monotonic counter since last restart; the card computes the per-minute rate by differencing consecutive polls. Redis at `maxmemory` is dropping keys per `maxmemory-policy`, which indicates memory pressure. |
+| **Metric basis** | Rate (keys per minute), derived from a cumulative counter. NOT an instantaneous gauge. |
+| **Aggregation window** | `1h`: a rolling one-hour line so you can see whether eviction is a sustained floor or a momentary spike. |
+| **Eviction policies** | The behaviour depends on `maxmemory-policy`: `allkeys-lru`/`allkeys-lfu`/`allkeys-random` evict any key; `volatile-lru`/`volatile-lfu`/`volatile-ttl`/`volatile-random` evict only keys with a TTL; `noeviction` evicts nothing and instead returns write errors. |
+| **What counts** | Any key removed by the eviction subsystem to satisfy a write under `maxmemory`. |
+| **What does NOT count** | (1) Keys removed by TTL expiry, those are `expired_keys`; (2) Keys deleted by the application via `DEL`/`UNLINK`; (3) Keys lost on a flush or restart. Eviction and expiry are reported separately and mean different things. |
+| **Counter reset** | `evicted_keys` resets to 0 on instance restart. The card handles the reset by detecting a counter decrease and resuming from the new baseline. |
+| **Time window** | `1h` (rolling per-minute rate over the last hour) |
+| **Alert trigger** | `sustained >100/min`. A brief blip is tolerable; a sustained floor above 100 keys per minute means the working set no longer fits and useful data is being lost continuously. |
+| **Roles** | owner, platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:worked_example */}
+The card differences the cumulative `evicted_keys` counter between two polls and normalises to a per-minute rate:
+
+```text
+evicted_keys_per_min = (evicted_keys[t]  -  evicted_keys[t-1])
+                       / minutes_between_polls
+
+# Counter-reset guard: if evicted_keys[t] < evicted_keys[t-1]
+# the instance restarted; rebaseline and report 0 for that interval.
+```
+
+The raw inputs come from a single `INFO stats` field:
+
+```text
+# Server
+uptime_in_seconds:412233
+# Stats
+evicted_keys:184529          <- cumulative since restart
+expired_keys:9920481         <- separate counter, NOT eviction
+keyspace_hits:88210334
+keyspace_misses:1944120
+```
+
+Because the rate is derived from a monotonic counter, accuracy depends on poll regularity. If polls are 60 seconds apart, a one-minute resolution is exact; if a poll is missed, the next interval averages the rate across the longer gap, which can mask a short, sharp eviction burst inside it.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+An SRE team runs Redis 7.2 as the catalogue cache for a storefront. `maxmemory` is 8 GB, `maxmemory-policy` is `allkeys-lru`. Normal eviction is zero because the working set (about 5.8 GB) fits comfortably. Snapshot over one hour on 22 May 26.
+
+| Time (BST) | evicted_keys (cumulative) | Delta / min | Note |
+| --- | --- | --- | --- |
+| 12:00 | 184,529 | 0 | Steady state, working set fits |
+| 12:30 | 184,529 | 0 | Still calm |
+| 13:02 | 187,140 | ~85/min | A bulk import wrote 2 GB of new keys |
+| 13:05 | 190,980 | ~1,280/min | Eviction storm: writes outpace headroom |
+| 13:20 | 214,300 | ~1,550/min | Sustained, hit rate now falling |
+| 13:45 | 220,110 | ~230/min | Import finished, settling |
+| 14:00 | 220,540 | ~17/min | Back toward calm |
+
+The card alerts at 13:03 when the rate crosses 100/min and stays there. The SRE reads the line alongside [Keyspace Hit Rate %](/nerve-centre/kpi-cards/redis/keyspace-hit-rate) and [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory):
+
+```text
+At 13:20 peak:
+  - evicted_keys/min : ~1,550
+  - memory used      : 7.95 GB / 8 GB  (99%)
+  - hit rate         : fell from 96% to 81%
+
+Diagnosis: a bulk import pushed the live working set past maxmemory.
+LRU is now evicting hot catalogue keys to make room for import keys.
+Each evicted hot key becomes a future cache miss -> database load rises.
+```
+
+The fix is one of: (1) raise `maxmemory` if the node has RAM headroom; (2) move the bulk import to a separate database/instance so it does not contend with the live cache; (3) shorten TTLs on the import keys so they self-expire; (4) if this is the new normal, scale the node. Three things this shows:
+
+1. **Eviction is a leading indicator of cache misses, not a lagging one.** Every hot key evicted now is a miss later. By the time hit rate drops, the damage is already done. Watch eviction rate to catch the problem before users feel the latency.
+2. **A spike is fine; a floor is not.** The 85/min blip at 13:02 was harmless. The alert is tuned to "sustained >100/min" precisely so that one bulk write does not page anyone, but a continuous eviction floor does.
+3. **Pair eviction with the eviction policy.** With `noeviction`, this card would read 0 forever, but writes would be failing with OOM errors instead. Zero evictions is only good if your policy is actually evicting; check [Rejected Connections (24h)](/nerve-centre/kpi-cards/redis/rejected-connections-24h) and your application's write-error logs when on `noeviction`.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Evicted Keys / minute | What the combination tells you |
+| --- | --- | --- |
+| [Expired Keys / minute](/nerve-centre/kpi-cards/redis/expired-keys-minute) | The other way keys leave the keyspace, but intentionally. | High expiry is healthy TTL churn; high eviction is memory pressure. Tell them apart before acting. |
+| [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) | The cause of eviction. | Eviction starts when used memory reaches `maxmemory`; this card shows the headroom. |
+| [Keyspace Hit Rate %](/nerve-centre/kpi-cards/redis/keyspace-hit-rate) | The downstream effect of evicting hot keys. | Eviction up plus hit rate down equals LRU dropping data that is still wanted. |
+| [Eviction Storm (>1k evicted_keys/min sustained)](/nerve-centre/kpi-cards/redis/eviction-storm-1k-evicted-keysmin-sustained) | The alert escalation for severe, sustained eviction. | Crosses from "watch" to "page" when the rate exceeds 1,000/min. |
+| [Total Keys (db0)](/nerve-centre/kpi-cards/redis/total-keys-db0) | The keyspace size context. | Eviction holding key count flat at the ceiling equals a saturated cache. |
+| [Memory Fragmentation Ratio](/nerve-centre/kpi-cards/redis/memory-fragmentation-ratio) | Fragmentation reduces usable memory and brings eviction forward. | High fragmentation plus eviction equals less real headroom than `maxmemory` implies. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The composite that weights eviction at 15%. | Sustained eviction is one of the fastest ways to push the composite under 70. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live) | The write-pressure context. | Eviction rising with write ops rising equals genuine load; eviction with flat ops equals a working-set/TTL problem. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis:**
+
+> `INFO stats` and read `evicted_keys`. Difference two readings 60 seconds apart to get the per-minute rate the card reports: `redis-cli INFO stats | grep -E 'evicted_keys|expired_keys'`.
+> `CONFIG GET maxmemory-policy` to confirm which policy is doing the evicting (or `noeviction`, in which case the card should read 0 and writes are erroring instead).
+> `CONFIG GET maxmemory` and `INFO memory` (`used_memory`, `maxmemory`) to see the headroom that eviction is defending.
+> `INFO keyspace` for per-database key counts to see whether the keyspace is pinned at the ceiling.
+
+For ElastiCache or MemoryDB, the same `evicted_keys` field is available via `INFO`; the CloudWatch metric `Evictions` is the managed-service equivalent and should track the card closely (CloudWatch publishes at one-minute granularity by default).
+
+**Why our number may legitimately differ from a manual reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Poll spacing.** The card differences consecutive polls. | Either | A burst inside a single poll interval is averaged across it; a manual two-point sample at a different cadence will give a different per-minute figure. |
+| **Counter reset.** A restart zeroes `evicted_keys`. | Card lower for one interval | The card rebaselines and reports 0 for the interval spanning the restart; a naive manual delta would read a large negative. |
+| **CloudWatch latency (managed).** ElastiCache `Evictions` lags by up to a minute. | CloudWatch later | The native `INFO` counter is real-time; CloudWatch is a published aggregate. |
+| **Time zone.** Chart axes render in your reporting time zone. | Marginal | The rate is unaffected; only the timestamp on the spike shifts. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What is the difference between evicted and expired keys?**
+An *expired* key reached its TTL and Redis removed it as designed; that is healthy churn and shows up in [Expired Keys / minute](/nerve-centre/kpi-cards/redis/expired-keys-minute). An *evicted* key was still alive and wanted but got deleted because Redis hit `maxmemory` and needed room for a new write. Expiry is intentional; eviction is a symptom of being undersized. They use separate `INFO stats` counters (`expired_keys` vs `evicted_keys`) and mean opposite things.
+
+**My eviction rate is zero. Is that always good?**
+Only if your `maxmemory-policy` is actually an evicting policy. With `noeviction`, the rate is permanently zero because Redis refuses to evict, instead it returns OOM write errors to the application. So zero evictions plus `noeviction` plus failing writes is a bad state masquerading as a good metric. Check `CONFIG GET maxmemory-policy` and your application's write-error logs.
+
+**Eviction spiked for two minutes then went to zero. Do I care?**
+Probably not. A short spike from a bulk write or a cache warm-up is normal and self-corrects. The alert is deliberately set to "sustained >100/min" so that transient bursts do not page anyone. What matters is a non-zero floor that persists, that means the working set no longer fits.
+
+**Eviction is high but memory is well below `maxmemory`. How?**
+Two common causes. First, memory fragmentation: `used_memory` can be below `maxmemory` while `used_memory_rss` (what the OS actually holds) is near the limit, so check [Memory Fragmentation Ratio](/nerve-centre/kpi-cards/redis/memory-fragmentation-ratio). Second, a `volatile-*` policy with few TTL-bearing keys: Redis can only evict keys that have a TTL, so if most keys are persistent it may struggle to free memory and evict the few volatile keys aggressively.
+
+**Will raising `maxmemory` always stop eviction?**
+Only if the node has spare RAM. Raising `maxmemory` beyond available physical memory pushes Redis into swap, which is far worse than eviction: latency collapses and the fragmentation ratio drops below 1. If the working set genuinely exceeds the node's RAM, the answer is a bigger node, sharding, or shorter TTLs, not a higher `maxmemory` on the same box.
+
+**Does this count evictions across all databases or just db0?**
+The `evicted_keys` counter in `INFO stats` is instance-wide; it covers every logical database on the instance, not just db0. If you need per-database visibility you have to track key counts per database via `INFO keyspace`, the eviction counter itself is not broken down by database.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Evicted Keys / minute* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

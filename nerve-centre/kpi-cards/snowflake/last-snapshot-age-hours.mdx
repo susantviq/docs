@@ -1,0 +1,141 @@
+---
+title: "Last Snapshot Age (hours), Snowflake"
+sidebarTitle: "Last Snapshot Age (hours)"
+description: "Last Snapshot Age (hours) for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Backup](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How far back in time you can still recover your data, expressed as the age in hours of your oldest recoverable point. Snowflake does not take backups the way a traditional database does: it continuously protects data through Time Travel (a configurable `DATA_RETENTION_TIME_IN_DAYS` window) followed by a 7-day Fail-safe period. This card reflects the Time Travel retention floor, the practical answer to "if someone dropped or corrupted a table right now, how old is the furthest-back state I could restore it to?" A low number means a short safety net. The default Time Travel window is 1 day (24h); Enterprise edition allows up to 90 days. The card flags when the recoverable floor drops dangerously short.
+
+| | |
+| --- | --- |
+| **What it tracks** | The age, in hours, of the oldest point you can still restore to via Time Travel, that is, the effective `DATA_RETENTION_TIME_IN_DAYS` expressed in hours. It is a measure of recovery depth, not the time since a backup job ran. |
+| **Data source** | Snowflake auto-snapshots via Time Travel (default 1 day, up to 90 days on Enterprise). Resolved from object `DATA_RETENTION_TIME_IN_DAYS` (via `SHOW PARAMETERS`/`ACCOUNT_USAGE`) and validated against actual recoverability. This reflects the Time Travel retention floor. |
+| **Time window** | `RT`. The card reports the current recoverable depth, refreshed on the standard cadence. |
+| **Alert trigger** | `> 72h`. If the recoverable floor is reported as older than 72 hours when policy expects continuous protection, or conversely if retention has collapsed, the card flags. Read with the worked example: the trigger guards against retention drifting outside the recovery objective. |
+| **Units** | Hours. A default 1-day retention reads as 24; a 90-day Enterprise window reads as 2,160. |
+| **Edition dependency** | Time Travel beyond 1 day requires Enterprise edition or above. Standard edition caps `DATA_RETENTION_TIME_IN_DAYS` at 1. |
+| **Roles** | owner, platform, dba, compliance |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Snowflake has no nightly "backup job", so there is no last-run timestamp to read. Recovery is governed by Time Travel retention. The card computes the recoverable depth from the effective retention setting:
+
+```text
+For each protected object (database / schema / table):
+  retention_days = DATA_RETENTION_TIME_IN_DAYS (effective, after inheritance)
+  recoverable_floor_hours = retention_days * 24
+
+account_floor = min(recoverable_floor_hours) across critical objects
+last_snapshot_age = account_floor   # the practical recovery depth
+```
+
+Two nuances matter. First, retention is inherited: a table inherits its schema's setting, which inherits the database's, which inherits the account default, unless overridden at a lower level. A single table set to `DATA_RETENTION_TIME_IN_DAYS = 0` punches a hole in an otherwise well-protected account, and the card surfaces the weakest link. Second, after Time Travel expires, a further 7-day Fail-safe period exists, but Fail-safe is recoverable only by Snowflake Support, not self-service, so this card deliberately reports the Time Travel floor, the depth you can actually reach yourself. The `> 72h` trigger fires when the self-service recovery floor falls short of the recovery point objective the team has set.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs Snowflake (Enterprise edition) as the warehouse behind a Shopify Plus store's analytics. Their stated recovery point objective is "we must be able to self-restore any production table to at least 3 days ago." Snapshot taken 02 Jun 26, 14:00 UTC.
+
+| Object | `DATA_RETENTION_TIME_IN_DAYS` | Recoverable floor (h) | Note |
+| --- | --- | --- | --- |
+| `PROD` database (account inherit) | 7 | 168 | Healthy, well above RPO. |
+| `PROD.ANALYTICS` schema | 7 (inherited) | 168 | Healthy. |
+| `PROD.STAGING` schema | 1 | 24 | Transient, acceptable by design. |
+| `PROD.ANALYTICS.ORDERS_FACT` | **0** | **0** | Override set during a migration and never reverted. |
+
+The account default looks great at 168h, but the card headline reads **0 hours** because it reports the weakest critical object, and `ORDERS_FACT` has retention turned off entirely. This is the exact failure mode the card exists to catch: a team feels safe because the account default is 7 days, while their single most important fact table has no Time Travel at all.
+
+What happened: during a schema migration eight weeks ago an engineer set `DATA_RETENTION_TIME_IN_DAYS = 0` on `ORDERS_FACT` to avoid Time Travel storage during a heavy rebuild, then forgot to restore it. If a bad `MERGE` corrupted that table today, there would be no self-service `UNDROP`/`AT(OFFSET => ...)` path, only a Fail-safe ticket to Snowflake Support with a multi-hour turnaround.
+
+```text
+Recovery exposure on ORDERS_FACT:
+  Self-service Time Travel window:  0 hours  (alert: floor below 72h RPO)
+  Fail-safe window:                 7 days, support-only, no self-restore
+  Action: ALTER TABLE PROD.ANALYTICS.ORDERS_FACT
+            SET DATA_RETENTION_TIME_IN_DAYS = 7;
+  Result: recoverable floor returns to 168h, card clears.
+```
+
+Three takeaways:
+
+1. **The account default lies to you.** A green account-level retention can sit on top of a single object with retention zeroed. This card reports the floor, not the average, on purpose.
+2. **Time Travel is your only self-service recovery.** Fail-safe exists, but it is a support ticket, not a command. Treat the Time Travel floor as your real RPO.
+3. **Retention costs storage.** A longer window protects you but inflates Time Travel and Fail-safe bytes, which is why migrations often zero it temporarily. The discipline is to always restore it afterwards, and this card is the safety net that catches when nobody did.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Last Snapshot Age | What the combination tells you |
+| --- | --- | --- |
+| [Cross-Account Replication Lag (s)](/nerve-centre/kpi-cards/snowflake/cross-account-replication-lag-s) | The disaster-recovery peer: replication to a secondary account. | Time Travel protects against logical errors; replication protects against region loss. You want both healthy. |
+| [Storage Used (TB)](/nerve-centre/kpi-cards/snowflake/storage-used-tb) | Longer retention directly inflates Time Travel and Fail-safe bytes. | A jump in retention shows up as a storage bump here; the two trade off. |
+| [Largest Table (GB)](/nerve-centre/kpi-cards/snowflake/largest-table-gb) | High-churn tables accumulate the most Time Travel storage. | Your biggest table is often where retention policy costs the most. |
+| [Snowflake Health Score](/nerve-centre/kpi-cards/snowflake/snowflake-health-score) | The composite that weights recoverability as a resilience input. | A zeroed retention floor pulls the resilience dimension of the score down. |
+| [Failed Logins (24h)](/nerve-centre/kpi-cards/snowflake/failed-logins-24h) | The other side of data-protection: access security. | Recoverability plus access control together describe your data-protection posture. |
+| [Active Warehouses](/nerve-centre/kpi-cards/snowflake/active-warehouses) | Context on whether the account is actively serving when retention drops. | A retention gap on a busy account is higher risk than on an idle one. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake:**
+
+> `SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN ACCOUNT;` for the account default.
+> `SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN TABLE <db>.<schema>.<table>;` for a per-object override.
+> Query `SNOWFLAKE.ACCOUNT_USAGE.TABLES` (column `RETENTION_TIME`) to scan every table's effective retention at once.
+> Test actual recoverability with `SELECT ... AT(OFFSET => -3600)` or `UNDROP TABLE` to prove the floor is real, not just configured.
+
+**Why our number may legitimately differ from Snowflake's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Floor vs default** | Vortex IQ usually lower | Snowsight shows the account default prominently; we report the weakest critical object, which can be far lower. |
+| **Inheritance** | Variable | Effective retention after schema/database inheritance differs from any single `SHOW PARAMETERS` line read in isolation. |
+| **Fail-safe excluded** | Vortex IQ lower | We report self-service Time Travel only; Snowflake's marketing combines Time Travel plus 7-day Fail-safe, which is support-only. |
+| **`ACCOUNT_USAGE` latency** | Brief lag | `ACCOUNT_USAGE.TABLES` can trail real time by up to ~90 minutes after a retention change. |
+| **Transient objects** | Vortex IQ may exclude | Transient/temporary tables have no Fail-safe and often retention 0 by design; we scope to critical persistent objects to avoid false alarms. |
+
+**Cross-connector reconciliation:** recovery depth pairs with replication health. If [Cross-Account Replication Lag (s)](/nerve-centre/kpi-cards/snowflake/cross-account-replication-lag-s) is also degraded, both your logical-error and region-loss safety nets are weak at once, which is the highest-priority resilience surface.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Snowflake does not "take backups", so what is a snapshot here?**
+Correct, there is no backup job. Snowflake continuously retains historical versions of your data for the Time Travel window, then for a further 7-day Fail-safe period. We translate that continuous protection into a single intuitive number: how far back you can still recover. "Snapshot age" is the age of the oldest self-restorable state.
+
+**Why does the card show 24 hours when my account default is 7 days?**
+Almost always a per-object override. A table or schema with `DATA_RETENTION_TIME_IN_DAYS` set below the account default lowers the floor, and this card reports the floor. Run the `ACCOUNT_USAGE.TABLES` scan above to find the object pulling it down.
+
+**What is the difference between Time Travel and Fail-safe?**
+Time Travel is self-service: you run `AT(OFFSET => ...)`, `UNDROP`, or clone to recover, within your retention window. Fail-safe is a non-configurable 7-day period after Time Travel expires, recoverable only via a Snowflake Support ticket. This card reports the Time Travel floor because that is the depth you control.
+
+**Can I set retention to 90 days?**
+Only on Enterprise edition or above, and only up to 90 days. Standard edition caps `DATA_RETENTION_TIME_IN_DAYS` at 1. Longer windows increase Time Travel and Fail-safe storage, so they cost more; see [Storage Used (TB)](/nerve-centre/kpi-cards/snowflake/storage-used-tb).
+
+**Does a retention of 0 mean my data is unrecoverable?**
+For self-service, yes, no Time Travel means no `UNDROP` or time-offset query. Fail-safe may still hold 7 days, but recovery is a support ticket with no SLA guarantee on speed. Treat a 0 floor as effectively no safety net for fast recovery.
+
+**Why does the alert fire above 72 hours? Surely more retention is better?**
+The trigger is a guard, not a "longer is bad" rule. It is configured against your recovery point objective: the card flags when the self-service floor diverges from policy, typically when an override has dropped a critical object's window below the RPO. Set the sensitivity threshold to match your own RPO in the Sensitivity tab.
+
+**Do transient and temporary tables affect this card?**
+By design we scope to persistent critical objects. Transient and temporary tables have no Fail-safe and frequently run retention 0 deliberately (they are throwaway), so including them would generate noise. If you depend on a transient table for recovery, it is the wrong object type for that data.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Last Snapshot Age (hours)* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

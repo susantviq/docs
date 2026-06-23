@@ -1,0 +1,166 @@
+---
+title: "Failover Readiness, kpi"
+sidebarTitle: "Failover Readiness"
+description: "Failover Readiness for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A yes / no readiness verdict: if the primary died this second, is there a healthy standby that could be promoted with near-zero data loss? Readiness is true only when at least one standby is connected, streaming, caught up (lag under one second), and confirmed receiving WAL. This is the card a platform team glances at before every risky deploy, every maintenance window, and every time the pager goes quiet for too long. A green primary with no promotable standby is a single point of failure dressed up as high availability.
+
+| | |
+| --- | --- |
+| **What it tracks** | Whether the cluster can survive losing the primary right now. "Failover Readiness for the selected period." Readiness combines standby presence, streaming state, replication lag, and WAL-receipt confirmation into one verdict. |
+| **Data source** | On the primary: `pg_stat_replication` (one row per connected standby, with `state`, `sync_state`, `write_lsn`, `flush_lsn`, `replay_lsn`). On the standby: `pg_last_wal_receive_lsn()` and `pg_last_wal_replay_lsn()` to confirm it is applying WAL. For managed clusters (RDS Multi-AZ, Aurora, Cloud SQL HA) the engine reads the provider's replica health and the standby's apply lag. |
+| **Time window** | `RT` (real-time, evaluated on the live polling cycle). |
+| **Alert trigger** | `no healthy standby with lag <1s`. If every standby is disconnected, broken, or lagging beyond one second, readiness flips to not-ready and the card pages the on-call DBA. |
+| **Readiness criteria** | (1) At least one standby row in `pg_stat_replication`; (2) its `state` is `streaming`; (3) replay lag under 1 second; (4) WAL is being received (`flush_lsn` advancing). All four must hold. |
+| **What does NOT count** | Standbys in `catchup` or `backup` state (still warming up), cascading replicas behind another standby, logical-replication subscribers (they are not promotable as a physical standby), and async standbys that have fallen far behind. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The verdict is computed every polling cycle from the primary's `pg_stat_replication` view plus a confirmation read from each standby.
+
+For each connected standby the engine derives replay lag two ways:
+
+1. LSN distance: `pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)` on the primary gives the byte gap between what the primary has written and what the standby has replayed. Converted to a time estimate using recent apply throughput.
+2. Time-based: `pg_last_xact_replay_timestamp()` on the standby compared against the current time gives the wall-clock age of the last replayed transaction. This is the figure used for the one-second threshold because it is the closest proxy for "how much committed data would we lose if we promoted right now".
+
+A standby contributes to readiness only if it is in `streaming` state with time-based replay lag under one second. The card then reports:
+
+- **Ready** when at least one synchronous or low-lag asynchronous standby meets every criterion.
+- **Not ready** when no standby qualifies: none connected, the only standby is in `catchup`, lag exceeds one second, or WAL receipt has stalled.
+
+A subtlety: a synchronous standby (`sync_state = sync`) guarantees zero data loss on promotion because the primary waits for it to flush before acknowledging commits. An asynchronous standby under one second of lag is "almost zero loss" but not guaranteed. The card treats both as ready but the drill-down distinguishes them, because for a strict RPO of zero only a synchronous standby qualifies.
+
+On managed HA (RDS Multi-AZ, Aurora, Cloud SQL HA) the provider abstracts the standby, so the engine reads the provider's reported replica health and apply lag rather than `pg_stat_replication` directly. The readiness logic is the same: a healthy, low-lag standby equals ready.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a self-managed PostgreSQL 16 cluster: one primary, one synchronous standby in the same region, one asynchronous standby in a DR region. Snapshot taken on 22 May 26 at 16:40 BST, fifteen minutes before a planned schema migration.
+
+| Standby | `state` | `sync_state` | Replay lag | Qualifies? |
+| --- | --- | --- | --- | --- |
+| db-standby-a (same region) | `streaming` | `sync` | 0.2 s | Yes |
+| db-standby-b (DR region) | `streaming` | `async` | 0.9 s | Yes |
+
+The card reads **Ready**, green, with the synchronous standby noted as the zero-RPO promotion target. The DBA proceeds with the migration confident that a mid-migration primary failure could be recovered with no committed-data loss by promoting db-standby-a.
+
+Now contrast the same cluster at 17:05, mid-migration, when an `ALTER TABLE` on a 200 GB table generates a flood of WAL:
+
+| Standby | `state` | `sync_state` | Replay lag | Qualifies? |
+| --- | --- | --- | --- | --- |
+| db-standby-a (same region) | `streaming` | `sync` | 0.4 s | Yes |
+| db-standby-b (DR region) | `streaming` | `async` | 47 s | No (lag > 1 s) |
+
+The DR standby has fallen 47 seconds behind because the cross-region link cannot ship WAL as fast as the migration generates it. Readiness is **still Ready** overall because db-standby-a qualifies, but the drill-down warns that the DR copy is no longer a near-zero-loss option.
+
+```text
+What the DBA reads from this:
+  - Local HA is intact: a primary failure now still promotes db-standby-a
+    with ~0.4s of exposure. The migration can continue.
+  - DR is temporarily degraded: a simultaneous loss of BOTH the primary and
+    the local standby would force promotion of a 47s-behind copy = up to
+    47s of committed orders lost. Low probability, but worth noting.
+  - Action: let the migration finish, then confirm db-standby-b catches back
+    up below 1s before declaring the maintenance window closed.
+```
+
+The worst case this card exists to catch is a third snapshot: a cluster that has been running for months where the only standby silently entered `catchup` after a network blip and never recovered. The primary looks perfectly healthy. Readiness reads **Not ready** and pages the DBA, who discovers there has been no promotable standby for six days. Without this card, that gap would only be discovered the moment the primary actually failed, which is the most expensive possible time to learn it.
+
+Three lessons platform teams should carry:
+
+1. **A healthy primary tells you nothing about failover safety.** The whole point of this card is that the primary can be perfectly green while you have zero ability to recover from its loss. Read readiness independently of primary health.
+2. **Lag is the data-loss meter.** The one-second threshold is a proxy for RPO. A standby 47 seconds behind means promoting it loses up to 47 seconds of committed transactions. For strict zero-loss requirements, only a synchronous standby counts.
+3. **Standbys fail silently.** A standby can drop into `catchup`, stall on WAL receipt, or fall behind a slow link without anyone noticing, because nothing user-facing breaks until you actually need it. Continuous readiness monitoring is the only reliable way to know.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Failover Readiness | What the combination tells you |
+| --- | --- | --- |
+| [Replication Lag (seconds)](/nerve-centre/kpi-cards/postgresql/replication-lag-seconds) | The raw lag number that drives the readiness verdict. | Lag creeping toward one second is your early warning that readiness is about to flip. |
+| [Active Streaming Replicas](/nerve-centre/kpi-cards/postgresql/active-streaming-replicas) | The count of standbys actually streaming. | A drop here is the most common reason readiness goes not-ready: a standby disconnected. |
+| [WAL Lag Bytes (primary to standby)](/nerve-centre/kpi-cards/postgresql/wal-lag-bytes-primary-standby) | The byte gap underlying time-based lag. | Sustained WAL-byte growth means the standby cannot keep up and readiness will degrade. |
+| [Replication Lag Exceeds Threshold or Standby Unreachable](/nerve-centre/kpi-cards/postgresql/replication-lag-exceeds-threshold-or-standby-unreachable) | The alert feed for broken replication. | An entry here usually corresponds to readiness flipping to not-ready. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The composite that includes replication health as a component. | Not-ready failover drags the composite down even when latency and errors look fine. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/postgresql/last-successful-backup-hours-ago) | The other half of your recovery story: PITR if failover is impossible. | No promotable standby plus stale backup equals you have no recovery path at all. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/postgresql/database-disk-usage) | A full standby disk stops WAL apply and breaks readiness. | High standby disk plus rising lag equals the standby is about to stall. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL:**
+
+> **On the primary:** `SELECT application_name, state, sync_state, replay_lag, pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS bytes_behind FROM pg_stat_replication;` shows every connected standby, its state, and how far behind it is.
+> **On the standby:** `SELECT pg_is_in_recovery();` should return true, and `SELECT now() - pg_last_xact_replay_timestamp() AS replay_age;` gives the wall-clock lag that the one-second threshold compares against.
+> **WAL receipt confirmation:** `SELECT pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn();` on the standby; if receive is advancing but replay is stuck, the standby is receiving but not applying.
+> **Managed HA:** the RDS / Aurora console shows the Multi-AZ standby and replica lag under the instance detail; Cloud SQL shows the HA failover replica health on the instance overview.
+
+**Why our verdict may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sampling moment** | Either way | A manual `pg_stat_replication` query and our poll can land seconds apart; during a deploy lag can swing across the one-second line between them. |
+| **Time-based vs LSN lag** | Either way | We use `pg_last_xact_replay_timestamp()` for the threshold; an LSN-byte check can look fine on a quiet write workload (few bytes behind) yet the time figure tells the true RPO story. |
+| **Sync vs async treatment** | We may read ready when you expect not | We count a sub-one-second async standby as ready; if your policy requires synchronous-only, the drill-down flags whether the qualifying standby is sync or async. |
+| **Managed abstraction** | Possible gap | On RDS / Aurora we read the provider's reported health, which can lag the actual apply state by the provider's own publish interval. |
+
+**Cross-source reconciliation:**
+
+| Source | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| `pg_stat_replication` on primary | Should match our standby list and states | A standby just connected or just dropped between samples. |
+| `pg_last_xact_replay_timestamp()` on standby | Should match our time-based lag | Clock skew between primary and standby hosts skews the comparison; keep NTP tight. |
+| Provider HA console (RDS/Aurora/Cloud SQL) | Should agree on standby health | Provider publish interval lags live state by up to a minute. |
+
+<details>
+<summary><em>A note on synchronous_standby_names</em></summary>
+
+Readiness with strict zero RPO depends on `synchronous_standby_names` being set so the primary waits for a standby to flush before acknowledging commits. If that setting is empty, every standby is asynchronous and even a "ready" verdict carries a small data-loss window on promotion. The drill-down surfaces the synchronous configuration so you can confirm your RPO assumption matches reality. A common and dangerous misconfiguration is believing you have synchronous replication when the setting was never applied.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The primary is perfectly healthy. Why is this card paging me about failover?**
+Because primary health and failover safety are independent. This card warns that if the primary failed right now, you have no good way to recover: no standby is connected, the only one is too far behind, or WAL apply has stalled. A green primary with no promotable standby is a single point of failure. The page is telling you to fix the standby before you need it, which is the only cheap time to do so.
+
+**What is the difference between this card and Replication Lag?**
+Replication Lag gives you the raw number of seconds a standby is behind. Failover Readiness turns that, plus standby presence, streaming state, and WAL receipt, into a single actionable verdict: can you fail over safely or not. Lag is the input; readiness is the decision. You can have low lag and still be not-ready if the standby just disconnected.
+
+**My standby shows lag under one second but the card says not ready. Why?**
+Check its `state`. A standby in `catchup` or `backup` state is warming up and not yet a valid promotion target even if its current LSN gap looks small. Also confirm WAL is actually being received and replayed: `pg_last_wal_receive_lsn()` should be advancing. A standby that is "connected" but not applying WAL is not promotable, so readiness correctly reads not-ready.
+
+**Does a logical-replication subscriber count as a standby for failover?**
+No. Logical replication copies selected tables, not the whole cluster, and a subscriber is a full read-write primary in its own right, not a physical standby you can promote to take over the original's identity and full dataset. Only physical streaming standbys count toward readiness. If your only "replica" is a logical subscriber, the card will read not-ready, which is correct.
+
+**On RDS Multi-AZ I never see the standby in `pg_stat_replication`. Is the card guessing?**
+RDS Multi-AZ hides the standby; you cannot query it or see it in `pg_stat_replication` from the primary. On managed HA the engine reads the provider's reported replica health and apply lag instead. The readiness logic is identical, but the data source is the provider's metrics rather than the PostgreSQL view. The verdict is as reliable as the provider's own health reporting.
+
+**Why one second and not a more relaxed threshold?**
+One second is a strict but practical RPO target: it means promotion would lose at most about a second of committed transactions. Teams with looser recovery objectives can raise the sensitivity threshold in the Sensitivity tab so an async DR standby a few seconds behind still counts as ready. The default is deliberately conservative because most teams underestimate how much a few seconds of lost orders costs.
+
+**Can this card actually trigger a failover?**
+No. It is a readiness verdict, not an automation. It tells you whether a safe failover is possible; the actual promotion (`pg_ctl promote`, a Patroni / repmgr action, or the managed provider's failover button) is a human or orchestrator decision. The card's job is to make sure that when you reach for that button, the standby behind it is actually ready.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Failover Readiness* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

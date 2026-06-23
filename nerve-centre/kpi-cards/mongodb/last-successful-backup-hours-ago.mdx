@@ -1,0 +1,144 @@
+---
+title: "Last Successful Backup (hours ago), MongoDB"
+sidebarTitle: "Last Successful Backup (hours ago)"
+description: "Last Successful Backup (hours ago) for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Backup](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The age, in hours, of your most recent verified-successful backup of this MongoDB deployment. This is the single most important number for a DBA to know is healthy, because it sets the floor on how much data you can lose. A reading of "2h" means a catastrophic failure right now would cost you at most two hours of writes. A reading of "97h" means your backup pipeline has been silently broken for four days and a failure would be a four-day data loss event. The card turns red at `>72h`: at that point you are operating without a usable recovery point.
+
+| | |
+| --- | --- |
+| **What it tracks** | Hours elapsed since the completion timestamp of the last backup that finished in a success state. Source depends on deployment: a self-managed `mongodump` job's last successful run, an Atlas Cloud Backup snapshot, an Ops Manager / Cloud Manager snapshot, or a filesystem / volume snapshot. |
+| **Data source** | Last `mongodump` completion / Atlas continuous backup / snapshot. For Atlas the engine reads the **Cloud Backups** dashboard (snapshot list with `status: completed` and `createdAt`). For self-managed the engine reads the timestamp recorded by the backup job (cron log marker, S3 object `LastModified`, or Ops Manager snapshot metadata). |
+| **Time window** | `RT` (real-time). The value is the current clock time minus the last successful backup timestamp, recomputed every refresh cycle (every 60 seconds). |
+| **Alert trigger** | `>72h`. Any deployment whose newest successful backup is older than 72 hours raises a sensitivity alert. Most teams tighten this well below 72h once a daily or continuous schedule is in place. |
+| **What counts as "successful"** | A backup that reached a terminal success state: `mongodump` exit code 0 with a non-empty archive, an Atlas snapshot with `status: completed`, an Ops Manager snapshot marked complete, or a verified volume snapshot. |
+| **What does NOT count** | In-progress backups, failed or aborted runs, partial dumps, snapshots still replicating, and backups that completed but failed a restore-test verification (if restore testing is wired in). |
+| **Roles** | owner, platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card resolves the timestamp of the most recent successful backup and subtracts it from the current time:
+
+```text
+last_backup_age_hours = (now_utc - last_successful_backup_completed_at_utc) / 3600
+```
+
+How `last_successful_backup_completed_at_utc` is resolved depends on how the deployment is backed up:
+
+- **Atlas Cloud Backups:** the engine queries the snapshot list for the cluster and takes the newest entry where `status == "completed"`, using its `createdAt` (snapshot completion) timestamp. Continuous Cloud Backup also exposes an oplog window; when continuous backup is active the effective recovery point is near-real-time, so the card reflects the latest snapshot marker rather than the oplog tail.
+- **Self-managed `mongodump`:** the engine reads the success marker your backup job records (a sentinel object in object storage, the archive file's modification time, or a status row your job writes). Only runs that exited 0 with a non-empty archive count.
+- **Ops Manager / Cloud Manager:** the engine reads the latest snapshot metadata for the deployment and uses the completion timestamp of the newest snapshot in a complete state.
+- **Filesystem / volume snapshots:** the completion time of the newest snapshot tagged for this deployment.
+
+All timestamps are normalised to UTC before subtraction, then the result is rendered in the merchant's display time zone for any chart axes. The headline is a single duration in hours.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 3-node MongoDB 6.0 replica set on Atlas (M30) backing an order-processing service. Daily Cloud Backup snapshots are scheduled for 02:00 UTC, with continuous backup enabled for a 24-hour oplog window. Snapshot taken on 14 Apr 26 at 09:15 UTC.
+
+| Field | Value |
+| --- | --- |
+| Last successful snapshot `createdAt` | 14 Apr 26, 02:04 UTC |
+| Snapshot status | `completed` |
+| Current time | 14 Apr 26, 09:15 UTC |
+| **Card reading** | **7.2h ago** (green) |
+
+The card shows **7h** in green. The on-call DBA reads this as healthy: a total-loss event right now would cost at most the writes since 02:04, and because continuous backup is on, the real recoverable point is within minutes, not hours. The 7h figure simply reflects the last full snapshot marker.
+
+Now contrast a failure scenario two weeks later. The scheduled snapshot job started failing on 26 Apr 26 because the Atlas project's backup storage quota was exhausted, but nobody was watching the Atlas alert. Snapshot taken on 29 Apr 26 at 10:00 UTC.
+
+```text
+Last successful snapshot:  26 Apr 26, 02:03 UTC  (status: completed)
+Subsequent runs:          27, 28, 29 Apr, all status: failed (quota exceeded)
+Current time:             29 Apr 26, 10:00 UTC
+last_backup_age_hours  =  (29 Apr 10:00  -  26 Apr 02:03) / 3600  =  79.95h
+```
+
+The card now reads **80h in red**, having crossed the `>72h` threshold at roughly 02:00 on 29 Apr. This is exactly the signal the card exists to surface: three consecutive snapshot failures that the team would otherwise only discover when they tried to restore. The DBA's response is, in order: (1) confirm the deployment itself is healthy and writes are still landing, (2) find the root cause of the failed snapshots (here, the quota), (3) clear the blocker and trigger an on-demand snapshot immediately rather than waiting for the next 02:00 window, (4) once the on-demand snapshot reaches `completed`, the card drops back to single digits.
+
+Three things worth remembering:
+
+1. **A low number is necessary but not sufficient.** "2h ago" only means a backup completed 2 hours ago. It does not prove the backup is restorable. Pair this card with periodic restore tests; a backup you have never restored is a hypothesis, not a recovery point.
+2. **The threshold is a ceiling, not a target.** `>72h` is the alert line, but if your business can only tolerate one hour of data loss, your real target RPO is one hour and you should be on continuous backup, not daily snapshots. Configure the sensitivity threshold to match your actual RPO.
+3. **Watch the trend, not just the value.** A backup age that climbs smoothly from 2h to 26h over a day and then snaps back to 2h is a healthy daily cycle. A backup age that climbs past one cycle boundary without resetting is the early sign of a broken job, visible hours before it crosses the red line.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Last Successful Backup | What the combination tells you |
+| --- | --- | --- |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | Backup age is a weighted input into the composite health score. | A stale backup alone can pull the health score below its threshold even when live metrics look fine. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mongodb/database-disk-usage) | Disk pressure is a common cause of failed snapshots and dumps. | Rising disk usage plus a climbing backup age often share one root cause: no space to write the snapshot. |
+| [Replica Lag (seconds)](/nerve-centre/kpi-cards/mongodb/replica-lag-seconds) | Backups frequently run off a secondary; high lag means the backup source is behind. | A backup taken from a lagging secondary captures stale data even if it completes successfully. |
+| [Replica Set Members (state)](/nerve-centre/kpi-cards/mongodb/replica-set-members-state) | Confirms a healthy secondary exists to back up from. | A set with no healthy secondary forces backups onto the primary, adding load during the snapshot. |
+| [Instance Uptime](/nerve-centre/kpi-cards/mongodb/instance-uptime) | A recent restart can interrupt an in-flight backup job. | Uptime shorter than your backup interval explains a missing recent backup. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | Write volume sets how much data is at risk per hour of backup age. | High ops per second multiplies the cost of every hour the backup is stale. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to confirm the number in MongoDB's own tooling:**
+
+> **Atlas:** the **Cloud Backups** dashboard for the cluster lists every snapshot with its status and completion time; the newest `completed` row is the basis for this card. Atlas also exposes the continuous-backup oplog window here.
+> **Ops Manager / Cloud Manager:** the **Backup** tab for the deployment shows the snapshot schedule and the latest snapshot's completion time.
+> **Self-managed `mongodump`:** check your backup job's logs and the archive's timestamp directly, for example the `LastModified` on the S3 object or the file mtime, and confirm the run exited 0.
+
+**Why our number may legitimately differ from the native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Time zone** | Apparent age shifts | Atlas renders snapshot times in the project's display zone; Vortex IQ stores UTC and renders age in your profile zone. The duration is identical once both are in the same zone. |
+| **Snapshot vs oplog recovery point** | Vortex IQ age higher | With continuous backup, the true recoverable point is near-real-time, but this card reports the last full snapshot marker, which can be hours old, by design. |
+| **Polling interval** | Up to one cycle | The card refreshes every 60 seconds; a snapshot that just completed may take one cycle to be reflected. |
+| **Success definition** | Vortex IQ age higher | If a snapshot completed but failed a wired-in restore test, Vortex IQ does not count it as successful; the native console may still show it as `completed`. |
+| **Multi-source deployments** | Either | If both Atlas snapshots and an independent `mongodump` exist, Vortex IQ reports the freshest of the two; the native console shows only its own. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mongodb/database-disk-usage) | Disk near full and backup age climbing usually point to the same cause. | If disk is healthy but backup age still climbs, the cause is the backup pipeline (credentials, quota, network) rather than the database. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | A red backup age should drag the health score down. | If health score stays green with a stale backup, check the score's backup weighting in your sensitivity profile. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My backup completed an hour ago but the card still shows the old age. Why?**
+The card refreshes on a 60-second cycle and, for Atlas, depends on the snapshot reaching a `completed` status in the Cloud Backups API. A snapshot that is still finalising or replicating shows as in-progress and does not reset the age until it terminates successfully. Allow one refresh cycle after the native console shows `completed`.
+
+**Does a low backup age guarantee I can restore?**
+No. This card proves a backup finished, not that it restores cleanly. The only way to prove restorability is to actually restore, ideally on a schedule into an isolated environment. Treat a green reading as "a recovery point exists" and back it with periodic restore tests for "the recovery point works".
+
+**I have continuous backup enabled, so why does the card sometimes read several hours?**
+Continuous (point-in-time) backup gives you a recoverable point within the oplog window, often minutes, but this card reports the last full snapshot marker, which still follows your snapshot schedule. The headline being a few hours old is normal and healthy when continuous backup is on; your effective RPO is much smaller than the number shown.
+
+**Why is the alert at 72h rather than 24h?**
+72h is a deliberately conservative default so it does not cry wolf on weekly or every-other-day schedules. It is the line past which most teams have no usable recovery point. If your RPO is tighter, lower the sensitivity threshold to one or two backup intervals so you are warned after a single missed run, not three.
+
+**We back up from a secondary. Does that affect this card?**
+Not directly: the card reports completion age regardless of which member the backup ran against. But a backup taken from a heavily lagging secondary can complete successfully while capturing stale data. Pair this card with [Replica Lag (seconds)](/nerve-centre/kpi-cards/mongodb/replica-lag-seconds) so a fresh-looking backup is not quietly behind the primary.
+
+**The card shows no value at all. What does that mean?**
+A blank or null reading means the engine found no successful backup record for this deployment: either backups have never been configured, the connector cannot see the backup metadata (missing Atlas backup read scope, or a self-managed job that records no success marker), or every recorded run has failed. Treat an empty value as more urgent than a high value: it usually means there is no backup at all.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Last Successful Backup (hours ago)* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

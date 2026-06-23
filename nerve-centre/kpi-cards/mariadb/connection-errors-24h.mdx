@@ -1,0 +1,146 @@
+---
+title: "Connection Errors (24h), MariaDB"
+sidebarTitle: "Connection Errors (24h)"
+description: "Connection Errors (24h) for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The total count of server-side connection errors over the last 24 hours, drawn from MariaDB's `Connection_errors_*` status counter family. These are failures that occur at the point of accepting or establishing a connection, before a session is fully usable: the connection ceiling was hit, the accept() call failed, the peer address could not be resolved, an internal error or out-of-memory condition stopped the handshake, or tcpwrapper rejected the host. Unlike aborted connects (mostly bad credentials), connection errors skew towards infrastructure and capacity problems. For a DBA a rising count here usually means the server is struggling to take on new work, not that a client typed the wrong password.
+
+| | |
+| --- | --- |
+| **What it tracks** | Connection Errors (24h): the sum of the `Connection_errors_*` status counters over a rolling 24-hour window. Captures server-side connection-establishment failures by reason. |
+| **Data source** | `SHOW GLOBAL STATUS LIKE 'Connection_errors_%'`: `max_connections`, `accept`, `internal`, `peer_address`, `select`, `tcpwrap`. Polled on the Nerve Centre sampling interval and differenced to a per-window count. |
+| **Distinct from** | `Aborted_connects` (pre-auth failures, mostly credentials/handshake) and `Aborted_clients` (post-auth disconnects). The `Connection_errors_*` family is specifically about the server failing to accept or set up the connection. |
+| **Time window** | `24h` rolling. The headline is the count of connection errors across the trailing 24 hours. |
+| **Alert trigger** | `> 100` connection errors in the 24-hour window. Above this the card turns amber and surfaces in the Sensitivity feed. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+MariaDB exposes a set of monotonic counters under the `Connection_errors_*` prefix, each incrementing for a distinct failure reason at connection time. The card sums them and differences over the window:
+
+```text
+connection_errors_24h = SUM(Connection_errors_*)(now)
+                      -  SUM(Connection_errors_*)(now - 24h)
+```
+
+The constituent counters and what each means:
+
+| Counter | Increments when |
+| --- | --- |
+| `Connection_errors_max_connections` | A client was refused because `Threads_connected` had reached `max_connections`. |
+| `Connection_errors_accept` | The `accept()` system call on the listening socket failed. |
+| `Connection_errors_internal` | The server could not handle the connection due to an internal error (often out of memory or thread-creation failure). |
+| `Connection_errors_peer_address` | The server could not look up the connecting client's IP address. |
+| `Connection_errors_select` | The `select()`/`poll()` call on the listening socket failed. |
+| `Connection_errors_tcpwrap` | The libwrap (TCP wrappers) layer refused the client. |
+
+Because each counter is cumulative and resets only on restart (or `FLUSH STATUS`), the card reports the delta over 24 hours. A restart inside the window resets the counters to zero, so the engine clamps a negative delta to the current cumulative value.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs MariaDB 10.6 with `max_connections = 400` behind an auto-scaling application tier. Snapshot taken on 16 Apr 26 at 08:00 BST.
+
+| Counter | 24h ago | Now | Delta |
+| --- | --- | --- | --- |
+| `Connection_errors_max_connections` | 1,204 | 1,338 | **134** |
+| `Connection_errors_accept` | 12 | 12 | 0 |
+| `Connection_errors_internal` | 3 | 3 | 0 |
+| `Connection_errors_peer_address` | 7 | 8 | 1 |
+| **Total (24h)** | | | **135** |
+
+135 over 24 hours has tripped the amber threshold, and the breakdown is decisive: 134 of the 135 are `max_connections` refusals. This is not an auth problem and not a network problem; it is capacity. The server hit its connection ceiling 134 times in the day, each time turning a real client away with `ERROR 1040: Too many connections`.
+
+The DBA cross-checked the timing against the saturation history:
+
+```sql
+-- Confirm the breakdown and the high-water mark
+SHOW GLOBAL STATUS LIKE 'Connection_errors_%';
+SHOW GLOBAL STATUS LIKE 'Max_used_connections';
+SHOW GLOBAL STATUS LIKE 'Max_used_connections_time';
+```
+
+`Max_used_connections` read 400 (the ceiling itself) and the timestamp lined up with the morning traffic ramp. The refusals clustered in two five-minute windows during marketing-email send peaks. The fix had two parts: tune the application pool down (it was holding too many idle connections, inflating `Threads_connected`) and add a connection proxy to multiplex, rather than simply raising `max_connections` past what memory allowed.
+
+Three takeaways:
+
+1. **Always read the breakdown, not just the total.** A count of 135 means very different things if it is 134 `max_connections` (capacity) versus 134 `peer_address` (DNS/network) versus 134 `internal` (memory/thread exhaustion). The constituent counter is the diagnosis.
+2. **`max_connections` errors are the most common and the most actionable.** They mean clients are being refused at the ceiling. Pair with the saturation cards to see how often and how close you run. The fix is pool tuning or a proxy first, raising the ceiling (and memory) second.
+3. **`internal` errors are the scariest.** They often indicate the server could not create a thread or allocate memory for the connection, a sign of genuine resource exhaustion. A rising `internal` count warrants checking [Memory Usage %](/nerve-centre/kpi-cards/mariadb/memory-usage) and the error log immediately.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Connection Errors | What the combination tells you |
+| --- | --- | --- |
+| [Aborted Connects (24h)](/nerve-centre/kpi-cards/mariadb/aborted-connects-24h) | The pre-auth failure counter (credentials, handshake). | Connection errors plus low aborts equals infra/capacity; high aborts plus low connection errors equals bad credentials. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/mariadb/connection-pool-at-90-saturation) | The real-time exhaustion alert. | If `Connection_errors_max_connections` is the driver, this alert almost certainly fired in the same window. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation) | The saturation gauge. | Confirms whether the errors are caused by running at the ceiling. |
+| [Connections In Use](/nerve-centre/kpi-cards/mariadb/connections-in-use) | The live thread count. | High idle connections inflating the count explain `max_connections` refusals without real load. |
+| [Memory Usage %](/nerve-centre/kpi-cards/mariadb/memory-usage) | The constraint behind `internal` errors. | Rising `internal` errors with high memory means thread/alloc failures, not capacity policy. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mariadb/query-error-rate) | Post-connection statement failures. | Connection errors are at the door; query errors are inside. Together they bracket the full lifecycle. |
+| [Instance Uptime](/nerve-centre/kpi-cards/mariadb/instance-uptime) | Detects restarts that reset counters. | A recent restart explains a clamped or low delta. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite roll-up. | A sustained connection-error spike pulls the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> `SHOW GLOBAL STATUS LIKE 'Connection_errors_%';` for the full per-reason breakdown (the authoritative source).
+> `SHOW GLOBAL STATUS LIKE 'Max_used_connections';` and `'Max_used_connections_time';` to confirm whether and when you hit the ceiling.
+> `SHOW VARIABLES LIKE 'max_connections';` for the configured ceiling.
+> The MariaDB error log for `internal` and `accept` failures, which usually log a more specific OS-level cause.
+
+**Why our number may legitimately differ from a raw `SHOW STATUS`:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Windowing** | Ours is smaller | `SHOW GLOBAL STATUS` shows cumulative counts since startup; our card shows only the trailing 24 hours. |
+| **Restart inside the window** | Ours may read low | The counters reset to zero on restart; we clamp the negative delta and report from the restart point. |
+| **Counter set by version** | Variable | Older MariaDB builds expose a subset of the `Connection_errors_*` family; the sum reflects whatever counters the server publishes. |
+| **`FLUSH STATUS` run manually** | Ours may read low | An operator running `FLUSH STATUS` resets the counters and restarts our delta from zero. |
+
+**On managed services:** Amazon RDS / Aurora for MariaDB exposes the `Connection_errors_*` counters via `SHOW GLOBAL STATUS` and surfaces refused connections indirectly through CloudWatch (`DatabaseConnections` against the instance limit). SkySQL and Azure Database for MariaDB expose the same status counters. The per-reason breakdown is only available from `SHOW STATUS`; the managed consoles typically show only the aggregate connection count, so use `SHOW STATUS` to attribute the cause.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Q: How is this different from Aborted Connects?**
+[Aborted Connects (24h)](/nerve-centre/kpi-cards/mariadb/aborted-connects-24h) counts attempts that failed during authentication (bad password, handshake timeout, TLS failure). Connection Errors counts failures where the server itself could not accept or establish the connection (ceiling reached, accept() failed, internal/memory error, address lookup failed). Aborted connects point at clients; connection errors point at the server and its capacity. Read both to know which side owns the problem.
+
+**Q: My count is dominated by Connection_errors_max_connections. What do I do?**
+That is the server refusing clients because it is at `max_connections`. The first fix is rarely to raise the ceiling. Check whether your application pool is holding too many idle connections (see [Connections In Use](/nerve-centre/kpi-cards/mariadb/connections-in-use)), tune the pool down, and consider a connection proxy (MaxScale or ProxySQL) to multiplex many app connections onto fewer server connections. Only raise `max_connections` after confirming you have the [Memory Usage %](/nerve-centre/kpi-cards/mariadb/memory-usage) headroom.
+
+**Q: I see Connection_errors_internal climbing. Is that serious?**
+Yes, treat it as urgent. `internal` errors usually mean the server could not create a thread or allocate memory for a new connection, a genuine resource-exhaustion signal. Check memory immediately, look for a per-connection buffer set too large (`sort_buffer_size`, `join_buffer_size`), and review the error log for the specific OS error. Left unchecked, internal connection errors often precede an out-of-memory kill.
+
+**Q: Connection_errors_peer_address is incrementing. What causes that?**
+The server could not resolve the connecting client's IP address, typically a DNS or reverse-lookup problem on the database host, or libwrap/`skip_name_resolve` interactions. If you do not rely on hostname-based grants, setting `skip_name_resolve = ON` avoids reverse lookups entirely and removes this class of error (it also speeds up connection setup). Confirm your grants use IP addresses, not hostnames, before enabling it.
+
+**Q: Why did the count suddenly drop to near zero?**
+A server restart (or `FLUSH STATUS`) resets the underlying counters. Cross-check [Instance Uptime](/nerve-centre/kpi-cards/mariadb/instance-uptime): a low uptime explains the reset. The card clamps the negative delta so you will not see a misleading negative number, but the historical detail before the restart is gone from the live counters.
+
+**Q: Some background noise is normal, right? What threshold should I really use?**
+A handful of `accept`/`select` errors over a day can be normal transient OS conditions. The `> 100` per 24h default is a generic starting point. The thing to watch is not the raw total but a *change* in the breakdown: a sudden run of `max_connections` (capacity) or `internal` (memory) errors matters far more than a steady trickle of `peer_address`. Establish your baseline and retune in the Sensitivity tab if your healthy noise floor sits higher.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connection Errors (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,149 @@
+---
+title: "Operations per Second (live), Redis"
+sidebarTitle: "Operations per Second (live)"
+description: "Operations per Second for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of commands Redis is processing right now, per second. It is Redis's pulse: a single live number that captures how hard the instance is working. A healthy Redis instance can comfortably handle tens of thousands of operations per second on modest hardware, so the headline figure rarely indicates a problem on its own. Its real value is as a baseline and a change detector: you learn your normal range, and then sudden departures from it (a spike with no business reason, or a drop to near zero during business hours) are the signal. This is why it sits in the Executive Overview as a Hero card without a fixed alert threshold: the meaning is in the movement, not in any single value.
+
+| | |
+| --- | --- |
+| **What it tracks** | `instantaneous_ops_per_sec`, the rate of commands processed by the server, sampled by Redis itself. |
+| **Data source** | `instantaneous_ops_per_sec` from `INFO stats`. |
+| **Time window** | `RT` (real-time, re-evaluated on every Nerve Centre poll, typically every 60 seconds). |
+| **Alert trigger** | None by default (`-`). This is a baseline / trend metric; anomaly detection on departures from the learned baseline does the alerting, not a fixed number. |
+| **Units** | Operations (commands) per second. |
+| **How Redis computes it** | Redis maintains a short rolling sample of recent command counts and reports the instantaneous rate, so it reflects the last moment rather than a long average. |
+| **What it does NOT tell you** | Which commands, how expensive each one is, or whether they are reads vs writes. A single `MGET` of 1,000 keys counts as one operation. Pair with SLOWLOG and latency cards for the cost dimension. |
+| **Roles** | owner, dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card reports a value Redis computes internally and exposes directly:
+
+```text
+ops_per_sec = instantaneous_ops_per_sec   (from INFO stats)
+```
+
+Redis tracks the total number of commands processed (`total_commands_processed`, also in `INFO stats`) and maintains a small rolling window of recent samples. `instantaneous_ops_per_sec` is the rate derived from that recent window, so it is a near-live snapshot rather than a long-run average. Two consequences matter when reading the card:
+
+- **It is a snapshot, not an integral.** Because it reflects only the most recent sampling window, a very brief spike between Vortex IQ polls can be missed, and a value read at one instant may differ from one read a few seconds later on a bursty workload. For trend analysis the card stores the polled series; for true sub-second bursts, `redis-cli --stat` or the MONITOR-adjacent tooling gives finer resolution.
+- **Every command is one operation, regardless of cost.** A trivial `GET` and an expensive `SUNIONSTORE` over millions of members both increment the count by one. So ops/sec measures command throughput, not work done or CPU spent. A falling ops/sec with rising latency can actually mean the server is busier (each command is heavier), not quieter. This is why the card is always read alongside the latency and SLOWLOG cards.
+
+For a cross-check, you can derive an average rate yourself from two `INFO` reads: `(total_commands_processed_2 - total_commands_processed_1) / seconds_between`. That average will smooth out the bursts the instantaneous figure captures.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Redis 7.2 instance as the cache and session layer for an ecommerce site. Over the last month they have learned the baseline: roughly 18,000 to 24,000 ops/sec during business hours, dipping to about 3,000 overnight. Snapshot taken on 03 Jun 26 at 11:55 UTC, mid-morning.
+
+| Signal | Value | Source |
+| --- | --- | --- |
+| `instantaneous_ops_per_sec` | **71,400** | `INFO stats` |
+| Learned business-hours baseline | 18,000 to 24,000 | Nerve Centre trend |
+| `keyspace_hits` rate | climbing fast | `INFO stats` |
+| `keyspace_misses` rate | climbing faster | `INFO stats` |
+| `instantaneous_ops_per_sec` 10 min earlier | 21,800 | Nerve Centre trend |
+
+The card reads **71,400**, roughly 3x the normal mid-morning baseline, with no scheduled campaign or known traffic event. There is no fixed alert threshold, but the anomaly detector has flagged the departure. The DBA's read:
+
+1. **A 3x spike with no business cause is suspicious, not celebratory.** If marketing had launched a flash sale, 71k ops/sec might be legitimate demand. With nothing scheduled, the more likely explanations are a cache stampede (many clients all missing the same expired key and recomputing simultaneously), a retry storm from a downstream service, or bot / scraper traffic hammering a session-backed endpoint.
+2. **The hit/miss split points to a stampede.** Misses are climbing faster than hits, which is the signature of a stampede: a hot key expired, every request now misses, and the application is re-querying the backing store and re-writing the same key thousands of times per second. Pair with [Keyspace Hit Rate %](/nerve-centre/kpi-cards/redis/keyspace-hit-rate), which will be dropping during this event.
+3. **The risk is downstream, not in Redis itself.** Redis may absorb 71k ops/sec without breaking a sweat, but the database or service behind it (the one being hammered on every miss) usually cannot. So the ops/sec spike is an early warning of a backend overload about to follow. The mitigation is a request-coalescing / single-flight lock around the hot-key recompute, plus a jittered TTL so keys do not all expire at once.
+
+```text
+Anomaly assessment at 11:55 UTC on 03 Jun 26:
+  - Current ops/sec:        71,400 (~3x baseline)
+  - Baseline (this hour):   18,000 to 24,000
+  - Scheduled event?        none
+  - Hit/miss pattern:       misses outpacing hits -> cache stampede signature
+  - Real risk:              backend behind Redis overloads on every miss
+  - Mitigation:             single-flight lock on hot-key recompute + jittered TTL
+  - Cross-check:            keyspace-hit-rate (falling), command-latency-p95 (rising?)
+```
+
+Three takeaways:
+
+1. **The number is meaningless without your baseline.** 71,400 ops/sec is alarming for an instance that normally runs 20k and unremarkable for one that runs 60k. Always read this card against your own learned range, which is exactly what the anomaly layer does.
+2. **A spike is not inherently good or bad.** Legitimate demand and a cache stampede produce the same headline. The interpretation comes from context: is there a business reason, and what is the hit/miss pattern doing? Pair with [Keyspace Hit Rate %](/nerve-centre/kpi-cards/redis/keyspace-hit-rate) and the cross-channel [Redis OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/redis/redis-ops-spike-vs-ecom-order-rate) to separate the two.
+3. **Throughput is not cost.** Ops/sec counts commands, not work. A drop in ops/sec with rising latency can mean the server is doing more expensive work per command, not less work overall. Always read ops/sec next to [Command Latency p95 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p95-ms) and the SLOWLOG cards.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards DBAs should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Operations per Second | What the combination tells you |
+| --- | --- | --- |
+| [Keyspace Hit Rate %](/nerve-centre/kpi-cards/redis/keyspace-hit-rate) | Separates legitimate demand from a cache stampede. | An ops spike with falling hit rate equals a stampede; an ops spike with steady hit rate equals real traffic. |
+| [Command Latency p95 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p95-ms) | Throughput vs cost. | Rising ops with stable p95 equals healthy scale; falling ops with rising p95 equals expensive commands clogging the server. |
+| [SLOWLOG Entries (15m)](/nerve-centre/kpi-cards/redis/slowlog-entries-15m) | Identifies the heavy commands behind a load change. | An ops change plus rising SLOWLOG entries points to specific slow commands, not raw volume. |
+| [Clients vs maxclients %](/nerve-centre/kpi-cards/redis/clients-vs-maxclients) | A throughput surge often rides a connection surge. | High ops plus high client saturation equals risk of rejected connections during the burst. |
+| [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) | Write-heavy throughput drives memory growth and eviction. | High write ops plus high memory usage equals eviction pressure incoming. |
+| [Redis OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/redis/redis-ops-spike-vs-ecom-order-rate) | Cross-channel sanity check against business demand. | An ops spike with no order spike equals a stampede or bot, not real customers. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis's own tooling:**
+
+> **`INFO stats`** for `instantaneous_ops_per_sec` (the exact value this card reports), plus `total_commands_processed`, `keyspace_hits`, `keyspace_misses`, and `total_net_input_bytes` / `total_net_output_bytes` for the bandwidth dimension.
+> **`redis-cli --stat`** prints a live, refreshing line of ops/sec, memory, clients, and more, at sub-second cadence, the best way to watch a burst in real time.
+> **`redis-cli INFO commandstats`** (or `INFO commandstats`) breaks throughput down per command type, so you can see which command is driving a spike.
+> **`redis-cli LATENCY HISTORY`** and **`SLOWLOG GET`** for the cost behind the throughput.
+> **ElastiCache / MemoryDB:** the CloudWatch metrics `GetTypeCmds`, `SetTypeCmds`, and the per-command-class counters, which together approximate ops/sec; AWS does not expose a single `instantaneous_ops_per_sec` metric, so the sum of command-class rates is the closest equivalent.
+
+**Why our number may legitimately differ from what you see:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Snapshot vs average** | Either | `instantaneous_ops_per_sec` reflects a short recent window; an average derived from `total_commands_processed` over a minute will smooth out bursts and read differently. |
+| **Polling cadence** | Spikes missed | A burst that lives entirely between two Vortex IQ polls may not appear on the card; `--stat` will catch it. |
+| **Managed-service approximation** | Different number | ElastiCache has no single ops/sec metric; summing CloudWatch command-class counters approximates but does not exactly equal Redis's own figure. |
+| **Per-node vs cluster** | Lower per node | In a cluster, each node reports its own ops/sec; the cluster total is the sum across nodes. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`redis.redis-ops-spike-vs-ecom-order-rate`](/nerve-centre/kpi-cards/redis/redis-ops-spike-vs-ecom-order-rate) | Ops should broadly track business demand. | Ops spike with no order spike equals a stampede, bot, or retry storm, not real traffic. |
+| ElastiCache CloudWatch command counters | Sum of command-class rates should approximate this card. | Persistent gaps usually reflect CloudWatch aggregation granularity (typically 1-minute) vs Redis's instantaneous sample. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is there no alert threshold on this card?**
+Because there is no universally "bad" ops/sec. The same number is healthy for one instance and alarming for another, and the meaning is entirely in the departure from your own baseline. A fixed threshold would either page constantly on a busy instance or never fire on a quiet one. Instead, Nerve Centre learns your normal range per hour-of-day and flags anomalies (sudden spikes or drops). If you want a hard ceiling for capacity planning, you can add one in the Sensitivity tab, but the default is baseline-relative.
+
+**My ops/sec dropped to almost zero during business hours. Is the instance broken?**
+Possibly, and this is one of the most useful uses of the card. A near-zero reading in business hours can mean (1) the application lost its connection to Redis (check [Clients vs maxclients %](/nerve-centre/kpi-cards/redis/clients-vs-maxclients) and `connected_clients`), (2) an upstream outage stopped traffic reaching the app, or (3) a deploy disabled the cache layer. A sudden drop is as much a signal as a spike; do not assume low ops/sec is always good.
+
+**Does a high ops/sec mean Redis is overloaded?**
+Not by itself. Redis is extremely fast and can sustain very high command rates on modest hardware. High ops/sec only becomes a concern when it is paired with rising latency, climbing SLOWLOG entries, or connection saturation. Read this card next to [Command Latency p95 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p95-ms): if latency is flat while ops climb, Redis is scaling happily.
+
+**Why does ops/sec sometimes fall while my service feels slower?**
+Because ops/sec counts commands, not the cost of each command. If a few very expensive commands (a large `KEYS`, a big `SORT`, a heavy Lua script, an `O(N)` operation on a huge collection) start running, they block the single-threaded command loop, so fewer commands complete per second even though the server is working harder. Falling ops/sec with rising p95/p99 latency and new SLOWLOG entries is the classic signature. Hunt the offending command via [Top 10 SLOWLOG Commands](/nerve-centre/kpi-cards/redis/top-10-slowlog-commands).
+
+**I see a spike but my business traffic is flat. What is going on?**
+This is the cache-stampede / bot / retry-storm pattern. When a hot cached key expires, every request that needs it misses at once and the application recomputes and rewrites it simultaneously, multiplying ops/sec without any extra real users. Bots scraping a session-backed endpoint and a downstream service stuck in a tight retry loop produce the same shape. Confirm with the cross-channel [Redis OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/redis/redis-ops-spike-vs-ecom-order-rate) and the hit/miss pattern; mitigate stampedes with a single-flight lock and jittered TTLs.
+
+**How does the instantaneous figure relate to `total_commands_processed`?**
+`total_commands_processed` is a monotonically increasing counter of every command since startup; `instantaneous_ops_per_sec` is the recent rate Redis derives from a rolling sample of that counter. If you want a stable average over a window, read `total_commands_processed` twice and divide the difference by the elapsed seconds. The instantaneous value is better for catching bursts; the derived average is better for capacity planning because it does not jitter.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Operations per Second (live)* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,151 @@
+---
+title: "Operations per Second (live), MongoDB"
+sidebarTitle: "Operations per Second (live)"
+description: "Operations per Second (live) for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The total throughput of your MongoDB deployment right now, in operations per second, summed across reads, writes, and internal commands. This is the headline "how busy is the database" number. It is the one figure an SRE glances at to know whether the deployment is idling, running at its normal weekday rhythm, or being hammered. On its own it has no good or bad value; its meaning comes from comparison against your own baseline and from whether the shape of the traffic makes sense for what your application is doing.
+
+| | |
+| --- | --- |
+| **What it tracks** | Live operations per second across all operation types: queries, inserts, updates, deletes, getmores (cursor continuations) and commands, summed into one throughput figure. |
+| **Data source** | `opcounters` delta from `serverStatus`. The engine reads `serverStatus.opcounters` (`query + insert + update + delete + getmore + command`) on each poll, takes the difference from the previous poll, and divides by the elapsed seconds to produce a per-second rate. |
+| **Time window** | `RT` (real-time). Computed as a delta between consecutive polls, refreshed every 60 seconds. The headline is an instantaneous rate, not an average over the day. |
+| **Alert trigger** | None by default. This is a context and trend card, not a threshold card: there is no universally "bad" ops-per-second value. Pair it with the latency and error cards for the alerting layer. |
+| **What counts** | All six `opcounters` buckets summed. `getmore` is included because cursor-heavy workloads (large result sets, change streams) drive real load through it. `command` includes aggregation, admin, and driver-issued commands. |
+| **What does NOT count** | Replication traffic applied by secondaries (that is `opcountersRepl`, a separate counter), and internal operations that do not increment `opcounters`. The figure reflects client-driven load on this member. |
+| **Roles** | owner, platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card derives a rate from two consecutive snapshots of the cumulative `opcounters` document in `serverStatus`. `opcounters` values are monotonic counters that only ever increase since the process started, so a single read is meaningless; the rate comes from the delta between two reads:
+
+```text
+total_ops(t) = opcounters.query   + opcounters.insert + opcounters.update
+             + opcounters.delete  + opcounters.getmore + opcounters.command
+
+ops_per_sec  = ( total_ops(t2) - total_ops(t1) ) / ( t2 - t1 )    in seconds
+```
+
+Practical details that affect the reading:
+
+- **Counters reset on restart.** `opcounters` resets to near-zero when the `mongod` process restarts. If a restart falls between two polls, the engine detects the counter going backwards and discards that interval rather than reporting a nonsensical negative or huge value.
+- **Per-member, not cluster-wide.** `serverStatus` is per-`mongod`. On a replica set the card reports the member it polls (normally the primary, which takes all writes and any primary-preferred reads). Secondaries serving reads have their own throughput; a true cluster total is the sum across members.
+- **`getmore` can dominate cursor workloads.** A workload that streams large result sets or uses change streams can show high `getmore` rates that are entirely healthy. The summed figure reflects total work, so do not read a high number as a problem without checking which bucket is driving it.
+- **The window is the poll interval.** Because it is a delta over roughly 60 seconds, a 5-second burst between polls is averaged in, not shown as a spike. For sub-minute spikes, the latency and error cards react faster.
+
+The result is a single live throughput figure, with the per-bucket breakdown available on drill-down.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MongoDB 7.0 replica set behind a product-catalogue and order API. They want to understand a normal day before setting any alerts. Three readings taken on 22 May 26.
+
+| Time (UTC) | query | insert | update | delete | getmore | command | total/s | Note |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 03:00 | 220 | 8 | 14 | 1 | 40 | 110 | **393/s** | Overnight trough |
+| 11:00 | 1,840 | 90 | 410 | 12 | 380 | 720 | **3,452/s** | Weekday peak |
+| 11:01 | 9,600 | 95 | 405 | 11 | 410 | 760 | **11,281/s** | Read storm |
+
+The 03:00 and 11:00 readings describe a normal daily curve: a quiet trough and a busy mid-morning peak, dominated by `query` and `command`, with writes a small fraction of the total. This is exactly the shape an order/catalogue API should have: read-heavy, modest writes.
+
+The 11:01 reading is the interesting one. Total throughput jumped from 3,452/s to 11,281/s in a single minute, and almost the entire increase is in the `query` bucket while `insert`, `update`, and `delete` barely moved. The SRE reads this immediately: a read storm with no corresponding write growth. Orders are not surging (writes are flat), so this is not real business demand. The likely causes, in order of probability:
+
+```text
+Diagnosis of the 11:01 spike:
+  - query/s     +7,760   (5.2x)   <- almost all the growth
+  - insert/s    +5                <- flat
+  - update/s    -5                <- flat
+  - getmore/s   +30               <- flat
+  Conclusion: read-only volume, no write/order growth
+  Most likely:  (1) a scraper / bot hitting product pages
+                (2) a cache layer failure pushing reads through to the DB
+                (3) a newly deployed query path doing a COLLSCAN per request
+```
+
+The SRE's next moves are to check [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) (is the storm hurting response times?), [COLLSCAN Operations (24h)](/nerve-centre/kpi-cards/mongodb/collscan-operations-24h) (is a missing index turning each query into a full scan?), and the cross-channel [MongoDB OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mongodb/mongodb-ops-spike-vs-ecom-order-rate) card, which exists precisely to confirm whether an ops spike is matched by an order spike. If orders are flat, the traffic is almost certainly a bot or a cache miss, not customers.
+
+Three takeaways:
+
+1. **The number means nothing without your own baseline.** 3,452/s is high for one deployment and trivially low for another. Watch this card for a week to learn your trough, your peak, and your weekday/weekend shape before you decide what "abnormal" looks like.
+2. **The bucket breakdown is where the diagnosis lives.** A spike that is all `query` tells a different story from a spike that is all `command` (often aggregation) or all `getmore` (cursor streaming). Always drill into which bucket grew.
+3. **Pair throughput with latency and orders.** Throughput up with latency flat is just more work handled cleanly. Throughput up with latency up is a saturation warning. Throughput up with orders flat is suspicious traffic. The single number is only a prompt to look at its companions.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Operations per Second | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) | Latency is the quality side of the throughput coin. | Throughput up with p95 flat is healthy scaling; throughput up with p95 climbing is saturation. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p99-ms) | The tail latency that throughput spikes hit first. | A p99 spike during an ops spike means a subset of operations is starving for resources. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mongodb/connection-pool-saturation) | Throughput is delivered through connections. | High ops plus high pool saturation means you are near a connection ceiling, not just busy. |
+| [COLLSCAN Operations (24h)](/nerve-centre/kpi-cards/mongodb/collscan-operations-24h) | Explains an ops spike that is disproportionately expensive. | An ops spike alongside rising COLLSCANs means a query path is missing an index. |
+| [WiredTiger Cache Hit Rate %](/nerve-centre/kpi-cards/mongodb/wiredtiger-cache-hit-rate) | High read throughput stresses the cache. | Ops up and cache hit rate down means the working set no longer fits in cache. |
+| [MongoDB OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mongodb/mongodb-ops-spike-vs-ecom-order-rate) | Separates real demand from bot or cache-miss traffic. | An ops spike with no order spike is the signature of a scraper or a broken cache. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to confirm the number in MongoDB's own tooling:**
+
+> **`mongosh`:** run `db.serverStatus().opcounters` twice a few seconds apart and compute the delta yourself, or run `db.serverStatus().opcountersRepl` to see replicated ops separately.
+> **`mongostat`:** the classic CLI shows live per-second rates for inserts, queries, updates, deletes, getmores, and commands in named columns; summing those columns reproduces this card almost exactly.
+> **Atlas:** the **Metrics** tab for the cluster has an **Opcounters** chart with the same six series; select a tight time range to compare against the live card.
+
+**Why our number may legitimately differ from the native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Averaging window** | Smoother | Vortex IQ averages over the roughly 60-second poll interval; `mongostat` defaults to a 1-second window and shows sharper peaks and troughs. |
+| **Member polled** | Either | The card reads one `mongod` (normally the primary). `mongostat` or the Atlas chart may be aggregating or pointed at a different member. |
+| **Repl ops** | Native may read higher | If you accidentally include `opcountersRepl`, the native total is higher; this card deliberately excludes replicated ops. |
+| **Counter reset** | Brief gap | A restart between polls makes Vortex IQ skip that interval; a native 1-second sampler may show a momentary zero instead. |
+| **Time zone** | Axis only | Chart axes render in your profile zone; the rate itself is zone-independent. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [MongoDB OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mongodb/mongodb-ops-spike-vs-ecom-order-rate) | Ops and order rate should rise and fall together for an order-backing database. | Ops rising while orders stay flat points to bots, scrapers, or a cache-miss storm rather than real demand. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | Sustained high throughput with healthy latency keeps the score green. | Throughput alone does not move the score; it moves only when latency, errors, or saturation follow it up. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Is there a "good" or "bad" number for ops per second?**
+No. A healthy deployment can sit at 50/s or 50,000/s depending on its workload and hardware. The figure only becomes meaningful relative to your own baseline and relative to the latency and saturation it is producing. Learn your normal curve first; then "abnormal" means a departure from that curve, not a fixed threshold.
+
+**Why does the card sometimes drop to near zero for a moment after a deploy?**
+A `mongod` restart resets the `opcounters` to zero, and the engine discards the interval that spans the restart to avoid reporting a false negative or a huge artificial spike. You will see one interval with no value or a low value immediately after a restart, then normal readings resume. [Instance Uptime](/nerve-centre/kpi-cards/mongodb/instance-uptime) confirms a recent restart.
+
+**The card shows high getmore. Is that a problem?**
+Not inherently. `getmore` is the operation that fetches the next batch from an open cursor, so any workload that streams large result sets, paginates with cursors, or uses change streams will show meaningful `getmore` rates. It only warrants attention if it is unexpectedly high for your application or if it coincides with rising latency. Drill into the bucket breakdown to see whether `getmore` growth is expected.
+
+**Does this number include reads served by secondaries?**
+No. `serverStatus.opcounters` is per-member, and the card normally polls the primary. Reads routed to secondaries (via a `secondary` or `secondaryPreferred` read preference) increment those secondaries' counters, not the primary's. To understand total cluster throughput you would sum the per-member figures; the headline reflects the polled member.
+
+**Throughput looks normal but the application feels slow. What now?**
+Throughput tells you the database is doing a normal amount of work, not that each operation is fast. A normal ops rate with high [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) means individual operations are slow despite normal volume, often a missing index, a cache that no longer fits the working set, or lock contention. Always read throughput next to latency, never alone.
+
+**Can I alert on this card?**
+You can, but a raw throughput threshold is usually the wrong alert because the "right" number changes by time of day. The more useful alerts live on the cards downstream of throughput: latency, error rate, and pool saturation. If you do want a throughput alert, base it on a deviation from your rolling baseline rather than a fixed number, configured in the sensitivity profile.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Operations per Second (live)* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

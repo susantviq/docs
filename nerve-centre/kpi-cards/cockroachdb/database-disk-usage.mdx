@@ -1,0 +1,118 @@
+---
+title: "Database Disk Usage %, CockroachDB"
+sidebarTitle: "Database Disk Usage %"
+description: "Database Disk Usage % for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Database Disk Usage %** is the proportion of provisioned store capacity currently consumed across the cluster, expressed as a percentage. It is the single most important capacity gauge on a CockroachDB cluster, because the storage engine needs free space not just to hold data but to compact, rebalance, and run backups. When usage climbs toward the ceiling the cluster does not simply stop accepting writes politely: it can refuse writes, stall rebalancing, and in the worst case take stores offline. Reading this card daily is the cheapest way to avoid a capacity-driven outage.
+
+| | |
+| --- | --- |
+| **What it tracks** | The percentage of total provisioned store capacity used across the cluster (or the busiest store, depending on profile configuration). |
+| **Data source** | The per-store `capacity` and `capacity.used` (and `capacity.available`) time-series metrics, also visible in `crdb_internal.kv_store_status` as the `capacity` and `used` fields per store. The DB Console Storage / Hardware dashboards and the Cloud Metrics tab show the same used-versus-available breakdown. |
+| **Time window** | `RT` (real-time, refreshed on each poll). |
+| **Alert trigger** | `> 90%`. Above 90% the storage engine loses the headroom it needs for compactions and rebalancing, so the cluster is at risk of write failures. |
+| **Roles** | DBA, platform, SRE, capacity planning |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+For each store, CockroachDB reports total capacity and used bytes. The usage percentage is `used / capacity * 100`. By default the card reports the cluster-wide figure (total used across all stores divided by total capacity), but a profile can be set to report the single busiest store instead, which is the safer reading because CockroachDB stops a store from accepting writes when that individual store crosses its full threshold, regardless of how much room the other stores have.
+
+The "capacity" figure is the provisioned disk available to CockroachDB, which may be the whole volume or a value capped by the `--store=...,size=...` flag. The storage engine reserves a slice of that space (the ballast file and compaction headroom) so the effective usable space is slightly below the raw figure. The 90% alert threshold exists precisely because the last 10% is where the engine's housekeeping (compactions, snapshots for rebalancing, and backup staging) needs room to operate; cross it and those operations start to fail before the disk is literally full.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 5-node CockroachDB cluster (v23.2), each node with a 1 TB store, backing an ecommerce order and event-log workload. Snapshot on 14 Apr 26 at 22:00 BST.
+
+| Store | Capacity | Used | Usage % |
+| --- | --- | --- | --- |
+| n1 | 1.00 TB | 0.62 TB | 62% |
+| n2 | 1.00 TB | 0.64 TB | 64% |
+| n3 | 1.00 TB | 0.63 TB | 63% |
+| n4 | 1.00 TB | 0.61 TB | 61% |
+| n5 | 1.00 TB | 0.65 TB | 65% |
+
+Cluster-wide usage is **63%**: comfortable, well-balanced, plenty of headroom. The card is green.
+
+Three weeks later a misconfigured event-logging job starts writing 40 GB of debug rows per day into a table nobody is pruning. On 05 May 26 at 22:00 BST the card reads:
+
+| Store | Capacity | Used | Usage % |
+| --- | --- | --- | --- |
+| n1 | 1.00 TB | 0.91 TB | 91% |
+| n2 | 1.00 TB | 0.92 TB | 92% |
+| n3 | 1.00 TB | 0.90 TB | 90% |
+| n4 | 1.00 TB | 0.89 TB | 89% |
+| n5 | 1.00 TB | 0.93 TB | 93% |
+
+Cluster-wide usage is **91%**, above the 90% trigger, and the card is red. The danger is real: at this level CockroachDB cannot reliably run compactions or accept new ranges, and a store crossing its full threshold will start refusing writes, which surfaces to the application as failed transactions. The on-call SRE has three levers, fastest first:
+
+1. **Reclaim space now.** Drop or truncate the runaway debug table, then let the storage engine compact. Be aware that disk does not free instantly: CockroachDB keeps deleted data until the garbage-collection TTL (25 hours by default) expires, so usage may stay high for a day after the delete. Lowering the GC TTL on that table speeds reclamation.
+2. **Add capacity.** Grow the volumes or add nodes so the cluster has more total store space to spread into. On CockroachDB Cloud this is a scaling action; on self-hosted it is a disk resize or a new node.
+3. **Stop the source.** Fix the logging job so it stops writing the debug rows in the first place.
+
+Two takeaways:
+
+1. **Watch the busiest store, not just the average.** A cluster averaging 80% can still have one store at 95% that is about to refuse writes. The single-busiest-store reading is the one that predicts an outage.
+2. **Deleting data does not free disk immediately.** The GC TTL means reclaimed space appears only after the TTL window passes. Plan capacity remediation with that lag in mind, and lower the TTL on the offending table if you need space back sooner.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Disk Usage | What the combination tells you |
+| --- | --- | --- |
+| [Memory Usage %](/nerve-centre/kpi-cards/cockroachdb/memory-usage) | The other half of the capacity picture. | Disk and memory both near their ceilings means the cluster is under broad resource pressure, not a single bottleneck. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The composite that disk pressure pulls down via the capacity axis. | A health dip tracking rising disk tells you capacity is the cause. |
+| [Decommissioning Nodes](/nerve-centre/kpi-cards/cockroachdb/decommissioning-nodes) | Stuck decommissions are usually a disk problem on the receiving nodes. | Full receiving nodes plus a stalled decommission share one root cause. |
+| [Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/under-replicated-ranges) | When stores are full the allocator cannot place replicas. | Rising under-replication alongside high disk means rebalancing is blocked by space. |
+| [Replicas per Node](/nerve-centre/kpi-cards/cockroachdb/replicas-per-node) | Uneven replica distribution drives uneven disk usage. | One node far busier on disk than the rest usually has more replicas or larger ranges. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/cockroachdb/last-successful-backup-hours-ago) | Backups need disk headroom to stage. | High disk can cause backups to fail or slow, so an ageing backup may be a capacity symptom. |
+| [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count) | Adding nodes is the durable fix for cluster-wide disk pressure. | More nodes means more total store space to spread into. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+The native source is the per-store capacity reported in `crdb_internal.kv_store_status`: run `SELECT node_id, store_id, capacity, used, available FROM crdb_internal.kv_store_status ORDER BY used DESC;` and compute `used / capacity`. The same numbers drive the DB Console Storage and Hardware dashboards, where the "Capacity" panel shows used, available, and the live store maximum. The `capacity.used` and `capacity` time-series back those panels.
+
+A few legitimate reasons the Vortex IQ percentage may differ from a raw `df` on the host: CockroachDB measures against its provisioned store size (which may be smaller than the physical volume if `--store=...,size=...` is set), it counts the ballast file and pending-GC data as used, and it excludes any non-CockroachDB files on the same volume. On CockroachDB Cloud the Metrics tab and cluster Overview report storage utilisation against the provisioned plan size. If the percentages disagree, reconcile against the store size CockroachDB itself reports rather than the host filesystem, because that is the figure the cluster acts on when it decides whether to accept writes.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is the card red at 91% when the disk is not literally full?**
+Because CockroachDB needs the last slice of headroom for housekeeping: compactions, rebalancing snapshots, and backup staging all consume temporary space. Once usage crosses roughly 90% those operations start to fail before the disk hits 100%, and a store that crosses its full threshold stops accepting writes. The 90% trigger is an early warning, not a "you have run out" alarm.
+
+**I deleted a large table but disk usage barely moved. Why?**
+CockroachDB does not reclaim space immediately. Deleted data is kept until the garbage-collection TTL expires (25 hours by default), and even then the storage engine reclaims it during compaction, not instantly. If you need the space back faster, lower the GC TTL on the affected table (`ALTER TABLE ... CONFIGURE ZONE USING gc.ttlseconds = ...`) and allow a compaction cycle.
+
+**Should I watch the cluster average or a single node?**
+Watch the busiest store. CockroachDB enforces the full threshold per store, so one store at 95% can start refusing writes even if the cluster average is a comfortable 80%. Configure the card to report the busiest store if you want the reading that best predicts an outage; the cluster average is fine for trend and planning.
+
+**What is the fastest safe way to recover from a 90%+ reading?**
+In order: reclaim space (drop or truncate the largest unneeded table and lower its GC TTL), then add capacity (resize volumes or add nodes), then stop whatever is writing so much. Avoid forcibly removing nodes to "rebalance" while disk is high, because draining replicas onto already-full nodes makes things worse, not better.
+
+**Why does one node show much higher disk usage than the others?**
+Usually because it holds more or larger replicas. Check [Replicas per Node](/nerve-centre/kpi-cards/cockroachdb/replicas-per-node): an uneven replica count drives uneven disk. It can also happen if a single very large range or a hot table is concentrated on that node. The allocator normally evens this out, but zone constraints or recent topology changes can leave a node lopsided.
+
+**Does this card account for the ballast file?**
+Yes. CockroachDB writes a small emergency ballast file so that, if a store does fill, an operator can delete it to recover enough space to start the node and intervene. That ballast counts as used capacity, so it is included in the percentage. Never delete the ballast as a routine capacity measure; it exists for the genuine "disk full, node will not start" emergency only.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Database Disk Usage %* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

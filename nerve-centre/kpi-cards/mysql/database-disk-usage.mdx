@@ -1,0 +1,154 @@
+---
+title: "Database Disk Usage %, MySQL"
+sidebarTitle: "Database Disk Usage %"
+description: "Database Disk Usage % for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of the data volume the MySQL instance is allowed to use that is currently consumed. For a DBA, this is the single most consequential capacity gauge, because when a MySQL data volume fills completely the server cannot write: transactions fail, the instance can crash, and on some managed services it is forced into read-only or storage-full state. Below 75% is comfortable, 75 to 90% is "plan an expansion", and above 90% is the alert: you have limited runway before writes stop. Unlike CPU or memory pressure, a full disk does not degrade gracefully; it stops the database hard.
+
+| | |
+| --- | --- |
+| **Data source** | Used bytes against the volume's capacity. On self-managed hosts the engine reads the filesystem holding `@@datadir` (used / total of the mount). On RDS/Aurora it uses the `FreeStorageLocalStorage` / allocated-storage figures behind the `FreeStorageSpace` CloudWatch metric; on Cloud SQL the `disk.bytes_used` / `disk.quota` pair. The headline is `used / capacity * 100`. |
+| **Metric basis** | A point-in-time ratio, not a rate. It reflects everything on the data volume: InnoDB tablespaces (`ibdata`, per-table `.ibd` files), binary logs, redo and undo logs, temporary files, and the slow/general logs if they live on the same mount. |
+| **Aggregation window** | Real-time, recomputed on the live refresh. The gauge shows the current ratio; the drill-down trends it so you can read the fill rate (GB/day) and project days-to-full. |
+| **What consumes it** | (1) Table and index data growth; (2) binary logs accumulating faster than they expire (`binlog_expire_logs_seconds`); (3) long-running transactions bloating the undo log / history list; (4) large temporary tables spilling to disk; (5) failed-to-purge redo or orphaned temp files. |
+| **What does NOT count** | (1) Memory usage (that is [Memory Usage %](/nerve-centre/kpi-cards/mysql/memory-usage)); (2) buffer-pool occupancy (an in-RAM structure); (3) space on volumes other than the one holding `@@datadir`, unless logs are configured onto a separate mount. |
+| **Managed-service note** | RDS reports free space, so the card converts free-against-allocated into a used percentage. Aurora storage auto-scales, so the gauge tracks the used figure against the current allocation rather than a fixed ceiling; treat the alert as "growth is outpacing expectations" rather than "imminent stop" on Aurora. |
+| **Time window** | `RT` (real-time, live refresh) |
+| **Alert trigger** | `> 90%` of the data volume consumed pages the on-call DBA: limited write runway remaining. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The headline is a straightforward ratio of consumed to available capacity on the volume that holds the data directory:
+
+```text
+disk_usage_pct = round( used_bytes / capacity_bytes * 100 )
+
+where, by platform:
+  self-managed : used/total of the filesystem mount containing @@datadir
+  Amazon RDS   : (allocated_storage - FreeStorageSpace) / allocated_storage * 100
+  Aurora       : VolumeBytesUsed / current_allocation * 100   (allocation auto-grows)
+  Cloud SQL    : disk.bytes_used / disk.quota * 100
+```
+
+The drill-down adds the operationally useful part: a fill-rate and a projection. By trending the used figure the engine derives an average GB/day growth and extrapolates a **days-to-full** estimate, which is far more actionable than the raw percentage. It also breaks the consumed space down by contributor where the source allows it, separating table/index data from binary logs and temp files, because the remedy differs sharply: data growth needs more storage or archival, whereas a binary-log pile-up just needs a shorter expiry. A useful native cross-check for the data portion is the sum of `DATA_LENGTH + INDEX_LENGTH` across `information_schema.TABLES`, though that excludes logs and free-but-unreclaimed tablespace pages, so it always reads lower than the filesystem figure.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a self-managed MySQL 8.0 primary on a 500 GB data volume. On 16 Apr 26 at 03:40 BST the gauge crosses **92%**, tripping the `> 90%` alert in the small hours. The drill-down breaks down the 460 GB consumed:
+
+| Contributor | Size | Reading |
+| --- | --- | --- |
+| Table + index data (`.ibd`) | 281 GB | Normal, growing ~2 GB/week. |
+| Binary logs | 158 GB | Anomalous: should be a few days' worth, not weeks'. |
+| Redo + undo logs | 12 GB | Normal. |
+| Temp + misc | 9 GB | Normal. |
+
+The data files are not the problem; the binary logs are. The fill-rate projection reads **days-to-full: 3.1**, which is what makes a 03:40 alert worth acting on rather than deferring.
+
+```text
+Root cause:
+  - binlog_expire_logs_seconds had been left at 2592000 (30 days) after a
+    point-in-time-recovery test, instead of the standard 259200 (3 days).
+  - At ~5 GB/day of binlog generation, 30 days of retention = ~150 GB,
+    matching the 158 GB observed.
+```
+
+The fix is immediate and safe once the DBA confirms no replica still needs those logs (`SHOW REPLICA STATUS` on each replica shows the file each is reading, and `mysqlbinlog` positions confirm none lags behind the purge point): reset the expiry to 3 days and run `PURGE BINARY LOGS BEFORE NOW() - INTERVAL 3 DAY;`. Roughly 140 GB frees instantly, the gauge drops to around 64%, and the days-to-full projection jumps back to comfortable. The longer-term action is to alert on the expiry setting itself so a test config never silently persists again.
+
+Three takeaways:
+
+1. **A full data disk is a hard stop, not a slowdown.** Every other capacity metric degrades gracefully; this one does not. At 100% MySQL cannot write, transactions fail, and the instance may crash or go read-only. That is why the alert sits at 90%, leaving runway to act.
+2. **Read the breakdown before adding storage.** Reflexively growing the volume "fixes" the gauge but hides the cause. Here the answer was a misconfigured binlog expiry, not genuine data growth; adding 200 GB would have masked it for a month and then alerted again.
+3. **Days-to-full beats the raw percentage.** 92% with a 0.5 GB/day fill rate is weeks of runway; 92% with a 50 GB/day rate is hours. Always read the projection, not just the gauge, to decide how urgently to act.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Database Disk Usage % | What the combination tells you |
+| --- | --- | --- |
+| [Memory Usage %](/nerve-centre/kpi-cards/mysql/memory-usage) | The other half of the host-resource picture. | Disk high but memory fine equals a storage/retention problem, not a sizing problem. Both high equals an under-provisioned instance. |
+| [Binlog Backlog (MB) on Primary](/nerve-centre/kpi-cards/mysql/binlog-backlog-mb-on-primary) | Binary logs are a top disk consumer. | Disk climbing plus binlog backlog growing equals a replica that is too far behind for logs to purge; fix the lag before disk fills. |
+| [Replication Lag (Seconds_Behind_Source)](/nerve-centre/kpi-cards/mysql/replication-lag-seconds-behind-source) | A lagging replica blocks binlog purge, so logs pile up. | Lag plus rising disk equals retention pinned by the slow replica; the disk problem is downstream of the lag. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/mysql/last-successful-backup-hours-ago) | Backups can spike temp/snapshot space. | A disk jump coinciding with a backup window is often transient snapshot overhead. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/mysql/last-successful-backup-hours-ago) is also the safety net before any aggressive purge. | Confirm a recent backup exists before deleting binary logs. | Never purge logs you might still need for recovery without a verified backup. |
+| [InnoDB Dirty Pages %](/nerve-centre/kpi-cards/mysql/innodb-dirty-pages) | Heavy write pressure correlates with redo/undo growth on disk. | High dirty pages plus disk growth equals a write-heavy phase consuming redo and undo space. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | Disk usage is a weighted input to the composite. | Disk above 90% can floor the disk sub-score and pull the health score down sharply. |
+| [Instance Uptime](/nerve-centre/kpi-cards/mysql/instance-uptime) | A full disk can crash or restart the instance. | A recent uptime reset alongside a disk-full event confirms the disk caused the outage. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL's own tooling:**
+
+> For the data portion, sum table sizes: `SELECT table_schema, ROUND(SUM(data_length + index_length)/1024/1024/1024, 2) AS gb FROM information_schema.TABLES GROUP BY table_schema ORDER BY gb DESC;`. This excludes logs and unreclaimed free pages, so it reads lower than the filesystem.
+> For binary logs: `SHOW BINARY LOGS;` lists every binlog file and its size; sum the bytes to see the log footprint.
+> For the true volume figure on self-managed hosts, check the OS: `df -h $(mysql -Nse "SELECT @@datadir")` shows used and available on the actual mount, which is what the card reports.
+> `SELECT @@innodb_data_file_path;` and `SELECT @@datadir;` confirm where the tablespaces and data directory live.
+
+**Why our number may legitimately differ from a table-size sum:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Logs and temp files** | Card higher | `information_schema.TABLES` counts only table/index data. The card includes binary logs, redo/undo, and temp files on the same mount, which a table-size sum omits entirely. |
+| **Unreclaimed free pages** | Card higher | Deleting rows frees space inside the tablespace but does not return it to the OS without `OPTIMIZE TABLE` or a rebuild. The filesystem still shows it used; the table-size sum may not. |
+| **Aurora auto-scaling** | Card relative to allocation | Aurora storage grows automatically, so the percentage is against the current allocation, not a fixed ceiling; the figure can fall when the allocation steps up. |
+| **Separate log mounts** | Card may read lower | If binary or slow logs are on a different volume from `@@datadir`, the card tracks only the data mount, so a log mount filling up will not show here. |
+
+**Managed-service cross-checks:**
+
+| Platform | Where to confirm | Note |
+| --- | --- | --- |
+| Amazon RDS | CloudWatch `FreeStorageSpace` against the instance's allocated storage. | Subtract free from allocated to get used; the card does this conversion for you. |
+| Amazon Aurora | CloudWatch `VolumeBytesUsed`. | Storage auto-scales, so treat the alert as a growth-rate warning rather than an imminent stop. |
+| Google Cloud SQL | Cloud Monitoring `disk.bytes_used` and `disk.quota`. | Cloud SQL can auto-increase storage if enabled; the percentage is against the current quota. |
+| Self-managed | `df -h` on the `@@datadir` mount. | The closest 1:1 source; the card mirrors the filesystem figure directly. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My table sizes add up to far less than the card shows. Is the card wrong?**
+Almost certainly not. `information_schema.TABLES` counts only table and index data. The card measures the whole data volume, which also holds binary logs, redo and undo logs, temporary files, and any slow/general logs on the same mount. On a write-heavy instance binary logs alone can be a large fraction of the volume. Run `SHOW BINARY LOGS;` and check the log directory before assuming a discrepancy is an error.
+
+**I deleted millions of rows but the percentage barely moved. Why?**
+InnoDB does not return freed space to the operating system when you delete rows; it marks the pages reusable inside the tablespace. The filesystem (and therefore this card) still counts that space as used until you reclaim it with `OPTIMIZE TABLE` (which rebuilds the table) or a dump-and-reload. Be aware that `OPTIMIZE TABLE` temporarily needs roughly as much free space as the table itself, so it can be impossible to run when you are already near full. Free up binary logs first to create headroom.
+
+**The gauge is at 92%, how long do I actually have?**
+Read the days-to-full projection in the drill-down, not the percentage. The projection divides remaining space by the recent average fill rate. 92% with slow growth is weeks; 92% with a runaway binlog or a long transaction bloating the undo log is hours. The projection is the number that tells you whether this is a tonight problem or a this-quarter problem.
+
+**What actually happens when MySQL hits 100% disk?**
+It cannot write. New transactions fail, `INSERT`/`UPDATE`/`DELETE` error out, and depending on the build and platform the instance may crash or InnoDB may go into a protective read-only state. On RDS the instance can enter a storage-full state requiring a (possibly disruptive) storage scaling. This hard-stop behaviour is precisely why the alert is set well below 100%, at 90%, to leave runway to act.
+
+**Why is my Aurora disk percentage falling when I have not deleted anything?**
+Aurora storage auto-scales: the cluster volume grows in steps as it fills. When it steps up, the used figure is now a smaller fraction of a larger allocation, so the percentage drops even though absolute usage rose. On Aurora, treat this card as a growth-rate signal (is consumption accelerating?) rather than an imminent-stop warning, because Aurora will keep adding capacity up to its hard ceiling.
+
+**Can a single long-running transaction fill the disk?**
+Yes, indirectly. A transaction held open for a long time prevents InnoDB from purging old row versions, so the undo log and history list grow without bound. On a busy instance this can consume significant space surprisingly fast. If disk is climbing with no obvious data or log growth, check `SELECT * FROM information_schema.INNODB_TRX ORDER BY trx_started;` for an ancient open transaction and end it.
+
+**Does this include space used by binary logs on a replica that has fallen behind?**
+On the primary, yes: a lagging replica is the most common reason binary logs cannot be purged and pile up. The primary must keep every binlog until all replicas have read it. If [Replication Lag](/nerve-centre/kpi-cards/mysql/replication-lag-seconds-behind-source) is high, the disk problem on the primary is downstream of the lag, so fix the replica before purging logs, and never purge logs a replica still needs.
+
+**Can I change the 90% threshold?**
+Yes. The `> 90%` trigger is the default sensitivity. A large volume with a slow, predictable fill rate might tolerate alerting at 95%; a small volume with bursty growth might warrant 80% to leave more reaction time. Set it per profile in the Sensitivity tab, ideally informed by your typical fill rate so the alert gives you enough runway to provision or purge before writes are at risk.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Database Disk Usage %* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

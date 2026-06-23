@@ -1,0 +1,181 @@
+---
+title: "Snowflake Health Score, Snowflake"
+sidebarTitle: "Snowflake Health Score"
+description: "Snowflake Health Score for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A single 0 to 100 composite that answers "is my Snowflake account healthy right now?" without making a platform lead read six dashboards. It folds the things that actually degrade a Snowflake account into one gauge: query latency, query errors, warehouse saturation and queueing, credit-burn sanity, replication health, and backup (Time Travel) currency. Each pillar scores 0 to 1; the score is their product, scaled to 100. Because it is multiplicative, any single pillar collapsing drags the whole score down hard, which is the point: one runaway credit burn or one stalled replication target is an emergency even if everything else is green. Read it as a traffic light: green is steady-state, amber means one pillar is wobbling, red means act now. The 7-day trend line turns a slow drift (creeping queue depth, a standby falling steadily behind) into something visible before it becomes an incident.
+
+| | |
+| --- | --- |
+| **Data source** | Composite over Snowflake's `ACCOUNT_USAGE` views: `QUERY_HISTORY` (latency, errors, queueing), `WAREHOUSE_LOAD_HISTORY` (saturation), `METERING_HISTORY` (credit-burn sanity), replication status, and Time Travel retention. Each pillar reads its own source. |
+| **Metric basis** | A multiplicative composite, NOT an average. Each pillar is normalised to a 0 to 1 health fraction, the fractions are multiplied, and the result is scaled to 100. One pillar at 0.5 caps the whole score near 50 even if the rest are perfect. |
+| **The pillars** | (1) **latency healthy**, from [Query Latency p95 (ms)](/nerve-centre/kpi-cards/snowflake/query-latency-p95-ms); (2) **error-free**, from [Query Error Rate %](/nerve-centre/kpi-cards/snowflake/query-error-rate); (3) **capacity headroom**, from [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) and [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse); (4) **cost sanity**, from [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) against its expected band; (5) **replication-healthy**, from [Cross-Account Replication Lag (s)](/nerve-centre/kpi-cards/snowflake/cross-account-replication-lag-s); (6) **recoverable**, from [Last Snapshot Age (hours)](/nerve-centre/kpi-cards/snowflake/last-snapshot-age-hours). |
+| **Aggregation window** | `RT/7D`, a real-time current score plus a 7-day trend so a slow decline is visible before it becomes an outage. |
+| **What does NOT count** | Storage growth is tracked as its own hero card and is not folded in by default; an account can score 95 here while storage is compounding the bill, so read alongside [Storage Used (TB)](/nerve-centre/kpi-cards/snowflake/storage-used-tb). |
+| **Time window** | `RT/7D` (real-time score with a 7-day trend) |
+| **Alert trigger** | `<70`, a composite below 70 raises the sensitivity alert and signals at least one pillar is degraded enough to need attention. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The score is the product of six independent health fractions, each in the range 0 to 1, scaled to 100:
+
+```text
+health = latency_factor
+       × error_free_factor
+       × capacity_factor
+       × cost_sanity_factor
+       × replication_factor
+       × recoverable_factor
+
+score  = round(health × 100)
+```
+
+Each factor is derived from its own source and clamped to 0 to 1:
+
+- **latency factor** reads p95 query execution time from `QUERY_HISTORY`. At or below the healthy threshold it scores 1.0; it decays towards 0 as p95 climbs past the alert level (5,000 ms by default; note Snowflake reports execution time in milliseconds in the view).
+- **error-free factor** reads the rolling query error rate from `QUERY_HISTORY` (`execution_status = 'FAIL'` over total). Zero errors scores 1.0; it decays as the rate rises past the 1% alert level.
+- **capacity factor** reads warehouse saturation from `WAREHOUSE_LOAD_HISTORY` and sustained queue depth from `QUEUED_OVERLOAD_TIME`. Comfortable headroom with an empty queue scores 1.0; it decays as warehouses run at 100% with queries queueing.
+- **cost-sanity factor** reads 24-hour credit burn against its expected band. Burn inside the normal range scores 1.0; a sudden runaway (the `+50%` pattern) decays it, because uncontrolled spend is an account-health problem, not just a finance one.
+- **replication factor** reads cross-account replication lag. Sub-threshold lag with a reachable target scores 1.0; lag growth decays it, and an unreachable target collapses it.
+- **recoverable factor** reads Time Travel snapshot age. Within retention scores 1.0; it decays as the effective recovery floor ages past the threshold (72 hours by default).
+
+The multiplicative form is deliberate. An average would let five healthy pillars mask one failing one. The product makes the score honest: 1.0 x 1.0 x 1.0 x 1.0 x 1.0 x 0.3 = 0.30, a score of 30, which correctly screams that something is broken.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Snowflake account for an ecommerce analytics stack, with cross-account replication to a DR region. Two snapshots, taken on 14 Apr 26.
+
+**Snapshot A, 09:00 BST, steady state:**
+
+| Pillar | Underlying reading | Factor value |
+| --- | --- | --- |
+| latency | p95 1,800 ms (threshold 5,000) | 1.00 |
+| error-free | 0.06% error rate | 0.99 |
+| capacity | top warehouse 48% saturated, queue 0 | 1.00 |
+| cost sanity | 24h burn 240 credits (normal band) | 1.00 |
+| replication | DR lag 3s (threshold 10s) | 1.00 |
+| recoverable | Time Travel floor 6h old | 1.00 |
+
+Composite: 1.00 x 0.99 x 1.00 x 1.00 x 1.00 x 1.00 = **0.99 -> score 99**. Solid green. Nothing to do.
+
+**Snapshot B, 14:20 BST, same day, during a heavy reporting run:**
+
+| Pillar | Underlying reading | Factor value |
+| --- | --- | --- |
+| latency | p95 6,400 ms (over 5,000) | 0.80 |
+| error-free | 0.08% error rate | 0.99 |
+| capacity | `BI_WH` 100% saturated, queue depth 9 sustained | 0.58 |
+| cost sanity | 24h burn 470 credits (+96% vsP) | 0.62 |
+| replication | DR lag 4s | 1.00 |
+| recoverable | Time Travel floor 7h old | 1.00 |
+
+Composite: 0.80 x 0.99 x 0.58 x 0.62 x 1.00 x 1.00 = **0.28 -> score 28**. Red, and the `<70` alert has fired.
+
+The story: a heavy ad-hoc reporting run hit `BI_WH` mid-afternoon. The warehouse is pinned at 100% with 9 queries queued (capacity factor 0.58, the joint-biggest drag), every running second is burning credits so the 24-hour total has nearly doubled (cost-sanity 0.62), and the queueing has pushed p95 over threshold (0.80). Replication and recoverability are untouched. No single pillar is catastrophic, but three simultaneous wobbles multiply into a red 28.
+
+The team's read, in order of leverage:
+
+1. **Capacity is a joint-dominant drag (0.58).** `BI_WH` is saturated with a sustained queue. Open [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) and [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse). The fix is to add a cluster (multi-cluster scale-out for the concurrency) rather than scale up, since the problem is many queued queries, not one giant query.
+2. **Cost sanity is the other dominant drag (0.62).** The burn is up because the warehouse is pinned. This will self-resolve once the queue clears, but if the reporting run is recurring, schedule it off-peak. Cross-check [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h).
+3. **Latency is a symptom, not a cause (0.80).** It is high because of queueing; fix capacity and latency follows. Do not chase it independently.
+
+```text
+Why the score is 28, not "averaged" to 83:
+  Multiplicative:  0.80 × 0.99 × 0.58 × 0.62 × 1.00 × 1.00 = 0.28 → 28  (honest)
+  If it were a mean: (0.80+0.99+0.58+0.62+1.00+1.00)/6     = 0.83 → 83  (misleading)
+  The 0.58 capacity factor would have been hidden by averaging.
+```
+
+Three things worth remembering:
+
+1. **A low score names the broken pillar; the drill-down tells you which one.** Never act on the composite alone. Open the factor breakdown, find the factor nearest 0, and start there. The lowest factor is your highest-leverage fix.
+2. **The score is multiplicative on purpose.** One collapsed pillar should cap the whole score, because in production one collapsed pillar (a runaway burn, a dead DR target) is an emergency regardless of how healthy everything else is.
+3. **Storage lives outside the composite.** Storage growth is excluded so it cannot be masked. A 99 score with storage compounding 25% month on month is still a rising bill; always read this hero card next to [Storage Used (TB)](/nerve-centre/kpi-cards/snowflake/storage-used-tb).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with the Health Score | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/snowflake/query-latency-p95-ms) | The latency pillar. | When this is the lowest factor, the account is slow but functioning. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/snowflake/query-error-rate) | The error-free pillar. | A score drop driven by this factor means statements are failing, not just slowing. |
+| [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) | Half the capacity pillar. | A sharp score drop at peak usually traces to saturation eroding capacity. |
+| [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse) | The other half of capacity. | A sustained queue is the clearest "warehouse undersized" signal behind a score drop. |
+| [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) | The cost-sanity pillar. | A score drop with a burn spike = uncontrolled spend, often a resize or runaway job. |
+| [Cross-Account Replication Lag (s)](/nerve-centre/kpi-cards/snowflake/cross-account-replication-lag-s) | The replication pillar. | A stalled DR target collapses this factor and the score even when everything local is green. |
+| [Last Snapshot Age (hours)](/nerve-centre/kpi-cards/snowflake/last-snapshot-age-hours) | The recoverable pillar. | Health and recoverability are separate concerns; a healthy unrecoverable account is a risk. |
+| [Storage Used (TB)](/nerve-centre/kpi-cards/snowflake/storage-used-tb) | Deliberately excluded from the composite. | A high score with compounding storage is still a rising bill; always read together. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake's own tooling:**
+
+> There is no single native command that produces this score; it is a Vortex IQ composite. To reconcile it, verify each pillar against its own source:
+> **latency:** `SELECT APPROX_PERCENTILE(execution_time, 0.95) FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY WHERE start_time >= DATEADD('hour', -1, CURRENT_TIMESTAMP());`
+> **error rate:** `SELECT COUNT_IF(execution_status='FAIL') / COUNT(*) FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY WHERE start_time >= DATEADD('hour', -1, CURRENT_TIMESTAMP());`
+> **capacity / queue:** `SELECT warehouse_name, AVG(avg_queued_load) FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY WHERE start_time >= DATEADD('hour', -1, CURRENT_TIMESTAMP()) GROUP BY 1;`
+> **cost sanity:** `SELECT SUM(credits_used) FROM SNOWFLAKE.ACCOUNT_USAGE.METERING_HISTORY WHERE start_time >= DATEADD('hour', -24, CURRENT_TIMESTAMP());`
+> **replication:** `SHOW REPLICATION DATABASES;` and `SELECT * FROM TABLE(INFORMATION_SCHEMA.REPLICATION_USAGE_HISTORY());` for lag.
+> **Managed console:** Snowsight's **Admin -> Cost Management** and the **Query History** and **Warehouses** pages cover the same pillars. Each native view maps to one factor.
+
+**Why our number may legitimately differ from a manual factor-by-factor reconstruction:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Multiplicative vs intuitive** | Score lower than expected | Hand-reconciling, people instinctively average the factors; the composite multiplies, so the score is always at or below the mean. This is by design. |
+| **Snapshot timing** | Variable | The real-time score samples all pillars at the same instant; running the queries by hand minutes apart can show a different blend, especially given `ACCOUNT_USAGE` latency. |
+| **Threshold tuning** | Variable | Each factor's decay curve uses the profile's configured alert thresholds; if you tuned p95, error rate, saturation, lag, or snapshot age, the factor values shift accordingly. |
+| **`ACCOUNT_USAGE` latency** | Recent pillars settle | `QUERY_HISTORY` can lag up to 45 minutes, so a very recent reconstruction of latency / errors may differ until late rows land. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`snow_credits_burned_24h`](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) | A burn spike should pull the cost-sanity factor and the composite down together. | Score down but burn normal = a different pillar is the cause; check the breakdown. |
+| [`snow_replication_lag_seconds`](/nerve-centre/kpi-cards/snowflake/cross-account-replication-lag-s) | A lag spike should pull the replication factor and the score down together. | Score steady through a lag blip = the blip stayed below the decay knee. |
+| Application / ecom error rate | A sustained low score usually corresponds to elevated downstream errors. | Downstream errors with a green score = the fault is above the warehouse layer. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is my score 28 when four of the six pillars are perfectly healthy?**
+Because the score multiplies the factors rather than averaging them. Two factors at around 0.6 (a saturated warehouse and a doubled credit burn, say) cap the whole composite far below where an average would put it: 1.0 x 1.0 x 1.0 x 1.0 x 0.58 x 0.62 is only 0.36. This is intentional. In production, a runaway burn or a stalled DR target is an emergency, and an averaging score would let four healthy pillars hide it. Open the factor breakdown, find the factor nearest 0, and fix that.
+
+**Does the score include storage growth?**
+No, deliberately. Storage is tracked as its own hero card and kept out of the composite so it cannot be masked by a healthy compute picture. An account can read 98 here while storage compounds 25% month on month and quietly grows the bill. Always read this card alongside [Storage Used (TB)](/nerve-centre/kpi-cards/snowflake/storage-used-tb).
+
+**My score is amber (around 75) but everything feels fine. Should I worry?**
+Amber usually means one pillar is sitting in its decay zone without having fully collapsed: a warehouse occasionally queueing, a burn a little above its band, latency just over threshold. It is not an emergency, but it is the moment to look, because the multiplicative form means a second wobble while you are already amber pushes you red fast. Treat amber as "investigate before the next peak", not "ignore".
+
+**The score has been slowly declining over the 7-day trend with no obvious incident. What causes that?**
+A slow decline usually means a pillar creeping rather than collapsing: queue depth edging up as the workload grows, replication lag drifting under steady write growth, or credit burn trending up week on week. These are exactly the slow-bleed problems the 7-day window exists to catch. Open the factor breakdown and look for the one factor whose 7-day line is sloping down.
+
+**I do not use cross-account replication. Does the replication pillar break the score?**
+No. If no replication target is configured, the replication factor is set to neutral (1.0) so it neither helps nor harms the composite, since there is nothing that can be unhealthy. The factor only becomes active once a replication target exists.
+
+**Can I change the weighting or the alert threshold?**
+The `<70` alert threshold is configurable per profile in the Sensitivity tab. The per-factor decay curves follow the same thresholds you set on the underlying cards (p95, error rate, saturation, queue depth, lag, snapshot age), so tuning those cards retunes the composite consistently. There is no separate per-factor weight: the factors are equal multiplicands by design, which is what makes a single collapse honest.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Snowflake Health Score* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

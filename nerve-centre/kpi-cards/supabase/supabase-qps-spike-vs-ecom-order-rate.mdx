@@ -1,0 +1,163 @@
+---
+title: "Supabase QPS Spike vs Ecom Order Rate, Supabase"
+sidebarTitle: "Supabase QPS Spike vs Ecom Order Rate"
+description: "Supabase QPS Spike vs Ecom Order Rate for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Two lines on one chart: database queries per second on your Supabase Postgres instance, and orders per minute on the connected storefront (Shopify, BigCommerce or Adobe Commerce). In a healthy system the two move together: more shoppers means more orders means more queries. The card exists to catch the dangerous case where they diverge: a sharp spike in database load with no matching rise in orders. That shape means something is hammering your database that is not real revenue: a runaway sync job, a scraper or bot loop, an N+1 query that exploded after a deploy, or a retry storm. You are paying the capacity cost of a busy database without earning the revenue that usually justifies it. The dual-axis view turns "the database is busy" into "the database is busy for no good reason", which is the moment a platform team needs to act.
+
+| | |
+| --- | --- |
+| **What it tracks** | Database queries per second (left axis) plotted against ecommerce order rate (right axis) on a shared time line, so the correlation, or its absence, is visible at a glance. |
+| **Data source** | Supabase QPS Spike vs Ecom Order Rate for the selected period. QPS comes from the Supabase Postgres statistics (the same basis as the [Database Queries per Second (live)](/nerve-centre/kpi-cards/supabase/database-queries-per-second-live) card, derived from `pg_stat_database` transaction/statement counters). Order rate comes from the live commerce connector's order stream (Shopify, BigCommerce or Adobe Commerce). |
+| **Time window** | `15m`. A rolling 15-minute window with fine granularity, tuned to catch a spike as it happens rather than after the fact. |
+| **Alert trigger** | `qps spike with no order spike`. The card fires when QPS rises sharply above its recent baseline while order rate stays flat, the decorrelation signal, not when QPS is merely high. |
+| **Why it matters** | Database capacity costs money and is finite per tier. A QPS spike that tracks orders is healthy growth; a QPS spike that does not is wasted load that pushes you toward connection-pool exhaustion, slow queries and, on a bad day, an outage during the exact window when real orders are also trying to get through. |
+| **Reading the value** | Lines moving together: normal, ignore. QPS up, orders up: a traffic burst, watch the pool. QPS up, orders flat: investigate now, something non-revenue is driving load. QPS flat, orders up: efficient, or orders are being served from cache/replicas. |
+| **Roles** | platform/SRE, engineering, owner |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card is a two-series correlation, not a single aggregate. Each axis is computed independently and the alert evaluates the relationship between them:
+
+```text
+LEFT AXIS  - Database QPS (queries/sec)
+  Sampled from the Supabase Postgres statistics over the 15m window.
+  Per sample bucket:
+    qps = delta(xact_commit + xact_rollback) / bucket_seconds
+  (the same counter basis as the live QPS card)
+
+RIGHT AXIS - Ecom order rate (orders/min)
+  Orders created on the connected storefront in each bucket,
+  read from the commerce connector's order feed.
+
+DECORRELATION ALERT
+  baseline_qps   = trailing median QPS over the prior window
+  qps_spike      = current_qps > baseline_qps × spike_factor   (e.g. ×2)
+  order_spike    = current_order_rate > baseline_order_rate × spike_factor
+  FIRE when:  qps_spike AND NOT order_spike
+```
+
+The important design choice is that the alert is conditional, not absolute. High QPS on its own is not actionable, a Black Friday burst should not page anyone if orders are spiking too. What is actionable is the *shape*: load rising while revenue does not. That is why the trigger is phrased as "qps spike with no order spike" rather than a fixed QPS number, which would be wrong for every store the moment its traffic profile changed.
+
+The two series are aligned on a common UTC time line before comparison so a clock skew between the database host and the commerce platform cannot create a false divergence.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Supabase-backed app behind a Shopify storefront. Baseline QPS sits around 350, baseline order rate around 4 orders/min during the day. Snapshot taken on 22 Apr 26 between 13:00 and 13:15 BST.
+
+| Time (BST) | QPS | Orders/min | Read |
+| --- | --- | --- | --- |
+| 13:00 | 360 | 4 | Normal, lines tracking |
+| 13:03 | 410 | 5 | Slight rise, both up: healthy |
+| 13:06 | 920 | 4 | QPS jumps 2.5x, orders flat: divergence begins |
+| 13:09 | 1,340 | 4 | QPS climbing hard, orders unchanged |
+| 13:12 | 1,510 | 3 | QPS still high, orders slightly DOWN |
+| 13:15 | 1,480 | 3 | Sustained |
+
+The card fires at 13:06: QPS has crossed 2x baseline while orders have not moved. By 13:12 the divergence is worse, and crucially orders have started to *fall*, because the wasted load is now starving real checkout queries of connections and the pool is filling.
+
+The platform team checks the two siblings that tell them what is eating the database:
+
+- [Slow PostgREST Queries During Checkout Window](/nerve-centre/kpi-cards/supabase/slow-postgrest-queries-during-checkout-window) shows a single query, a category listing with no `LIMIT`, suddenly appearing thousands of times. A deploy at 13:05 removed pagination from one endpoint.
+- [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) has climbed from 40% to 88% in the same nine minutes, confirming the wasted load is consuming connections that checkout needs.
+
+```text
+Cost framing:
+  - QPS up ~4x, orders flat then falling: the extra ~1,150 q/s is pure waste.
+  - Orders drifting from 4/min to 3/min during the spike:
+      ~1 lost order/min × ~£70 AOV = ~£70/min of suppressed revenue
+      while the pool is contended.
+  - 15 minutes of contention before rollback: ~£1,000 exposure,
+    plus the risk of a full pool-exhaustion outage if it continued.
+```
+
+The fix is a rollback of the 13:05 deploy (or a hotfix re-adding the `LIMIT`). Within a refresh after rollback, QPS falls back toward 360, the two lines re-couple, and order rate recovers. The card did its job by separating "busy" from "busy for nothing": without it, a 4x QPS spike looks like a good problem to have (growth) right up until checkout falls over.
+
+Three takeaways:
+
+1. **Correlation is the signal, not magnitude.** A 4x QPS spike is fine if orders are 4x too. The alert deliberately ignores absolute QPS and watches the gap between the lines, which is the only shape that means wasted, revenue-free load.
+2. **Decorrelation is an early outage warning.** Wasted load does not stay free: it consumes connections and slows real queries, so a QPS-without-orders spike is often the first 10 minutes of what becomes a pool-exhaustion incident. Acting on the divergence buys you the time to avoid the outage.
+3. **Pair it with the cause cards immediately.** The dual-axis chart tells you *that* load is wasted; the slow-query and pool-saturation siblings tell you *what* is wasting it. The three together turn a spike into a diagnosis in minutes.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with QPS Spike vs Ecom Order Rate | What the combination tells you |
+| --- | --- | --- |
+| [Database Queries per Second (live)](/nerve-centre/kpi-cards/supabase/database-queries-per-second-live) | The raw QPS series this card plots on its left axis. | Confirms the spike magnitude and lets you see QPS history beyond the 15m window. |
+| [Slow PostgREST Queries During Checkout Window](/nerve-centre/kpi-cards/supabase/slow-postgrest-queries-during-checkout-window) | Identifies the specific queries driving the spike. | A single query exploding in count is the most common cause of QPS-without-orders. |
+| [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) | Wasted QPS consumes pool connections. | Divergence plus rising pool saturation is the path to a pool-exhaustion outage. |
+| [Supabase Products Table vs Ecom Catalog](/nerve-centre/kpi-cards/supabase/supabase-products-table-vs-ecom-catalog) | The other cross-channel revenue-at-risk join. | A runaway sync job can cause both a QPS spike and new catalogue drift at the same time. |
+| [Database Query Error Rate %](/nerve-centre/kpi-cards/supabase/database-query-error-rate) | Spikes often coincide with rising errors as the system strains. | Errors climbing during the divergence confirms the load is degrading service, not just inflating a counter. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The executive composite the divergence drags down. | A dip in the composite during the spike sizes the overall impact for non-engineers. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+Because this card joins two systems, reconcile each axis with its own native tooling.
+
+**The QPS axis (Supabase / Postgres):**
+
+> Confirm live throughput in the **Supabase SQL Editor** against the same statistics view the card uses:
+> `SELECT sum(xact_commit + xact_rollback) FROM pg_stat_database;` taken twice a few seconds apart and divided by the interval gives transactions/sec.
+> For statement-level detail, the **pg_stat_statements** extension (`SELECT query, calls FROM pg_stat_statements ORDER BY calls DESC;`) shows which statements are inflating the count.
+> The project **Reports → Database** view in the Supabase dashboard plots query throughput over time for a visual cross-check.
+
+**The order-rate axis (the commerce platform):**
+
+- **Shopify:** Analytics → Reports → Sales, or the Admin API orders endpoint filtered by created-at, for orders per interval.
+- **BigCommerce:** Analytics → Orders, or the Orders API by date range.
+- **Adobe Commerce:** Reports → Sales → Orders for the same window.
+
+**Why our chart may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Counter basis** | QPS may read lower than "every SQL statement" | The live QPS counter is transaction-based (`xact_commit + xact_rollback`); a single transaction can contain many statements. `pg_stat_statements.calls` will therefore show a higher count than the QPS line. |
+| **Time alignment** | Marginal | We align both series to UTC; a manual comparison using local timestamps from each platform can appear to shift one line against the other. |
+| **Order definition** | Variable | We count orders as the commerce connector reports them (created orders). A manual report that counts paid or fulfilled orders will show a lower, lagging line. |
+| **Bucket size** | Smoothing | The card buckets at fine granularity for the 15m window; a manual hourly report flattens spikes and may not show the divergence at all. |
+| **Replica reads** | QPS axis lower | If reads are routed to a [read replica](/nerve-centre/kpi-cards/supabase/read-replica-lag-seconds), primary-only QPS undercounts total query load; check replica throughput too. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My QPS is always high but orders are low because most traffic is browsing, not buying. Does this card cry wolf?**
+No, because the alert watches change, not absolute level. It learns your baseline QPS-to-order ratio over a trailing window and only fires when QPS *spikes away* from that established relationship. A consistently browse-heavy store simply has a higher baseline ratio; the card adapts to it and only alarms on a sudden divergence from your own normal.
+
+**Orders spiked but QPS did not move. Is that a problem?**
+Usually the opposite of one, it often means your reads are being served efficiently (good caching, a healthy [buffer cache hit rate](/nerve-centre/kpi-cards/supabase/buffer-cache-hit-rate), or reads routed to a replica). It is not the alert condition for this card. Watch it only if it is extreme and sustained, which can occasionally indicate orders are being written somewhere the database is not seeing (a queue backlog), but that is rare.
+
+**What kinds of things cause a QPS-without-orders spike?**
+The common culprits: a sync or import job that started looping or lost its `LIMIT`; an N+1 query introduced by a deploy; a retry storm where failing requests are hammering the database on a tight loop; a bot or scraper crawling product pages that hit the database directly; and analytics or reporting queries scheduled into peak hours. The [Slow PostgREST Queries During Checkout Window](/nerve-centre/kpi-cards/supabase/slow-postgrest-queries-during-checkout-window) card usually names the specific query.
+
+**Does the card distinguish reads from writes?**
+The headline QPS axis is total query throughput. The decorrelation logic does not need the read/write split to fire, but when you drill in, the breakdown helps: a write-heavy spike with no orders points at a sync or import job, while a read-heavy spike points at browsing load, a scraper, or a missing-index query. Use `pg_stat_statements` for the precise split.
+
+**Why a 15-minute window? My incidents last longer than that.**
+The 15m window is for *detection*, tuned to catch the divergence quickly while it is still cheap to fix. Once the card fires, the incident itself can run as long as it needs; the Nerve Centre feed keeps it open. For trend and post-incident review you would look at the longer-window QPS and order cards rather than this short detection window.
+
+**Can a tier limit cause a false divergence?**
+A tier-bound connection or compute cap can *suppress* QPS (queries queue behind a saturated pool rather than executing), which can make the QPS line plateau even as load is really higher. If you see QPS flatten while pool saturation is at the ceiling, the database is not idle, it is throttled. Read this card together with [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) so a capacity ceiling is not mistaken for healthy headroom.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Supabase QPS Spike vs Ecom Order Rate* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,149 @@
+---
+title: "Memory Fragmentation Ratio, Redis"
+sidebarTitle: "Memory Fragmentation Ratio"
+description: "Memory Fragmentation Ratio for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The ratio of physical memory the operating system has handed Redis (RSS) to the memory Redis believes it is actually using for data. It is a single dimensionless number that tells you how efficiently your dataset is laid out in RAM. A ratio comfortably between 1.0 and 1.5 is healthy: a little overhead from the allocator is normal. Above 1.5 means the OS is holding a lot of memory that Redis cannot pack with data, real RAM you are paying for but not using. Below 1.0 is the dangerous reading: it means Redis's data no longer fits in physical RAM and part of it has been swapped to disk, which turns sub-millisecond commands into multi-millisecond disk reads.
+
+| | |
+| --- | --- |
+| **What it tracks** | `mem_fragmentation_ratio = used_memory_rss / used_memory`. RSS is the resident set size the OS reports for the Redis process; `used_memory` is what Redis's allocator says the dataset occupies. |
+| **Data source** | `mem_fragmentation_ratio`, `used_memory_rss`, and `used_memory` from `INFO memory`. |
+| **Time window** | `RT` (real-time, re-evaluated on every Nerve Centre poll, typically every 60 seconds). |
+| **Alert trigger** | `> 1.5`. A sustained ratio above 1.5 indicates significant OS-level waste and turns the card amber/red. |
+| **Critical low reading** | `< 1.0` is treated as a separate, worse condition: it means the OS has swapped part of Redis to disk. This is flagged distinctly because the action is different (it is a memory-shortage emergency, not an allocator inefficiency). |
+| **Healthy band** | Roughly `1.0` to `1.5`. |
+| **What inflates it** | Allocator overhead after large deletes, jemalloc holding freed pages, copy-on-write during `BGSAVE` or replication, and workloads that churn many differently-sized values. |
+| **Roles** | owner, dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The ratio is computed by Redis itself and exposed directly:
+
+```text
+mem_fragmentation_ratio = used_memory_rss / used_memory
+```
+
+- **`used_memory`** is the total number of bytes Redis's allocator (jemalloc by default) has allocated for the dataset, structures, and internal buffers, as Redis accounts for them.
+- **`used_memory_rss`** is the resident set size the operating system reports for the Redis process, the actual physical RAM pages mapped to the process.
+
+The two diverge for understandable reasons:
+
+- **Above 1.0 (normal to high).** The allocator requests memory from the OS in pages and arenas. After keys are deleted, the allocator may hold the freed pages rather than returning them to the OS immediately, so RSS stays high while `used_memory` drops. Mixed value sizes and heavy churn worsen this. A ratio of 1.0 to 1.5 is the expected, healthy range. Sustained above 1.5 means a meaningful chunk of your RAM is held by the OS but unusable for new data.
+- **Below 1.0 (danger).** `used_memory` exceeds the physical RAM the OS is giving the process, which can only happen when pages have been swapped out to disk. The data Redis thinks it has in memory is partly on the swap device. Every access to a swapped key incurs a disk read, destroying Redis's latency profile.
+
+Note: during a `BGSAVE` or full replication sync, copy-on-write temporarily inflates RSS (and therefore the ratio) because the forked child shares pages that the parent then copies on write. A transient spike during a save is expected; a sustained high ratio is the finding. The engine reports the live value and the alert is intended for sustained breaches, not single-poll save spikes.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Redis 7.2 instance as a session and cache store on a node with 8 GB RAM. They recently ran a large `DEL` sweep to expire a stale namespace of about 12 million keys. Snapshot taken on 09 May 26 at 16:45 UTC.
+
+| Signal | Value | Source |
+| --- | --- | --- |
+| `used_memory` | 3.10 GB | `INFO memory` |
+| `used_memory_rss` | 5.27 GB | `INFO memory` |
+| `mem_fragmentation_ratio` | **1.70** | `INFO memory` |
+| `maxmemory` | 6.00 GB | `CONFIG GET maxmemory` |
+| `allocator_frag_ratio` | 1.62 | `INFO memory` |
+
+The card reads **1.70**, above the 1.5 alert, and turns amber. The DBA's read:
+
+1. **This is allocator waste, not swap.** The ratio is above 1.0, so nothing is swapped. RSS is 5.27 GB but the live dataset is only 3.10 GB: roughly 2.17 GB of physical RAM is held by jemalloc but not packed with data. The large `DEL` sweep freed memory inside the allocator's arenas, but jemalloc has not returned those pages to the OS.
+2. **There is a clear cause and a clean fix.** Fragmentation that follows a big delete is textbook. Redis can defragment online: enabling `activedefrag yes` (active defragmentation) lets Redis incrementally relocate values to compact memory and release pages back to the OS, without a restart. On many setups the ratio drifts back toward 1.2 to 1.3 over the following hours.
+3. **Headroom is the real risk to watch.** RSS at 5.27 GB against an 8 GB node leaves under 3 GB of OS headroom, and `maxmemory` is 6 GB. If the dataset grows toward `maxmemory` while RSS is already inflated, the node could approach physical exhaustion and risk swapping (ratio dropping below 1.0). Pair with [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory).
+
+```text
+What the 1.70 reading costs and how to clear it (09 May 26):
+  - Physical RAM held but unused:   5.27 GB RSS - 3.10 GB data = ~2.17 GB
+  - Root cause:                     large DEL sweep freed arenas; pages not returned
+  - Fix (no restart):               CONFIG SET activedefrag yes
+  - Expected outcome:               ratio drifts toward ~1.25 over hours
+  - Watch:                          ratio must NOT drop below 1.0 (= swap)
+```
+
+Three takeaways:
+
+1. **Read the direction, not just the magnitude.** Above 1.5 is wasted RAM (an efficiency problem with a non-disruptive fix). Below 1.0 is swap (a latency emergency). The same card surfaces both, but they are opposite problems demanding opposite urgency.
+2. **Big deletes and TTL sweeps cause expected spikes.** A high ratio right after a mass deletion or a wave of key expirations is normal allocator behaviour. Active defragmentation usually resolves it without a restart; a restart is the last resort, not the first.
+3. **Never let the ratio fall below 1.0.** A sub-1.0 reading means Redis is swapping, the single worst thing for a latency-sensitive store. Treat it as an incident: confirm with `vmstat` / the OS, reduce dataset size or `maxmemory`, add RAM, or move data off the box. Pair with [Command Latency p95 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p95-ms), which will spike hard during swap.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards DBAs should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Memory Fragmentation Ratio | What the combination tells you |
+| --- | --- | --- |
+| [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) | Fragmentation inflates RSS; `maxmemory` governs the data ceiling. | High fragmentation plus high memory usage equals real risk of hitting physical limits and swapping. |
+| [Command Latency p95 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p95-ms) | Swap (ratio < 1.0) destroys latency. | A sub-1.0 ratio with a p95 spike confirms the instance is reading from disk, not RAM. |
+| [Command Latency p99 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p99-ms) | The tail amplifies under memory pressure. | p99 blowing out while the ratio drops toward 1.0 is the early signature of swap. |
+| [Evicted Keys / minute](/nerve-centre/kpi-cards/redis/evicted-keys-minute) | Both react to memory pressure, differently. | Evictions plus high fragmentation means the usable RAM is even smaller than `maxmemory` suggests. |
+| [Last RDB Save (minutes ago)](/nerve-centre/kpi-cards/redis/last-rdb-save-minutes-ago) | `BGSAVE` forks and spikes RSS via copy-on-write. | A transient fragmentation spike that lines up with a save window is expected, not a leak. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The composite folds fragmentation into overall health. | A sub-1.0 ratio drags the score sharply because swap is a severe condition. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis's own tooling:**
+
+> **`INFO memory`** for `mem_fragmentation_ratio`, `used_memory_rss`, `used_memory`, `used_memory_peak`, `allocator_frag_ratio`, `allocator_rss_ratio`, and `mem_allocator` (confirm it is jemalloc). The `allocator_*` ratios in Redis 4+ isolate allocator-level fragmentation from process-level RSS.
+> **`MEMORY DOCTOR`** for a plain-language diagnosis Redis itself generates about memory health, including fragmentation advice.
+> **`MEMORY STATS`** for a detailed breakdown of where memory is going (dataset, overhead, replication buffers, etc.).
+> **The OS view:** `ps -o rss= -p <pid>`, `/proc/<pid>/status` (VmRSS), `vmstat`, and `free -m`. If `mem_fragmentation_ratio < 1.0`, confirm swap usage with `vmstat` (the `si`/`so` columns) or `free`.
+
+**Why our number may legitimately differ from what you see:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Active save window** | Vortex IQ may show higher briefly | `BGSAVE` / full-sync copy-on-write inflates RSS transiently; a single-poll spike is not the same as sustained fragmentation. |
+| **Polling cadence** | Up to ~1 min lag | The card re-reads on poll; a fast-moving allocator can change the ratio between your manual `INFO` and the next Vortex IQ poll. |
+| **allocator vs process ratio** | Different number | `mem_fragmentation_ratio` is RSS-based; `allocator_frag_ratio` isolates jemalloc-level fragmentation. They answer related but different questions. |
+| **Forks and buffers** | Higher | Replication backlog buffers and client output buffers count toward RSS but not toward dataset `used_memory`. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`redis.memory-used-vs-maxmemory`](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) | RSS (fragmentation-inflated) can exceed the data-based usage %. | A high ratio means actual RAM consumed is well above the `used_memory / maxmemory` figure. |
+| OS swap counters (`vmstat si/so`) | A ratio below 1.0 should coincide with active swap-in/out. | If the ratio is below 1.0 but swap is idle, re-check the readings; sustained sub-1.0 nearly always means swap. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My ratio jumped to 1.8 right after a mass key deletion. Is that a problem?**
+It is expected, not a fault. When you delete a large namespace, jemalloc frees the memory internally but often holds the pages rather than returning them to the OS, so RSS stays high while `used_memory` drops, pushing the ratio up. The fix is online active defragmentation: `CONFIG SET activedefrag yes`. Redis will incrementally compact memory over the following hours and the ratio should settle back into the 1.1 to 1.3 range. A restart also clears it but is rarely necessary.
+
+**The card reads below 1.0. Why is that worse than a high reading?**
+A ratio below 1.0 means `used_memory` exceeds the physical RAM the OS is giving Redis, which is only possible if part of the dataset has been swapped to disk. Redis is built on the assumption that all data lives in RAM; once it swaps, every access to a swapped key becomes a disk read and latency collapses (p95 and p99 will spike). Treat sub-1.0 as a memory-shortage incident: confirm swap with `vmstat`, then reduce the dataset, lower `maxmemory`, add RAM, or shard the data off the node.
+
+**What is the difference between `mem_fragmentation_ratio` and `allocator_frag_ratio`?**
+`mem_fragmentation_ratio` is process-level: RSS over `used_memory`, so it includes everything the OS attributes to the process (forks, buffers, allocator overhead). `allocator_frag_ratio` (Redis 4+) isolates fragmentation inside jemalloc specifically. If `mem_fragmentation_ratio` is high but `allocator_frag_ratio` is near 1.0, the inflation is coming from something outside the allocator (often a recent fork or large replication buffers) rather than classic fragmentation.
+
+**Will enabling active defragmentation hurt performance?**
+Active defragmentation runs incrementally in the main thread and is governed by tunables (`active-defrag-ignore-bytes`, `active-defrag-threshold-lower`, `active-defrag-cycle-min`, `active-defrag-cycle-max`). It is designed to use spare CPU cycles and back off under load, so on most workloads the impact is modest. On an extremely CPU-bound instance you may see a small latency uplift while it runs. It only acts above the configured thresholds, so it stays idle when fragmentation is low.
+
+**Does a high ratio mean I am about to run out of memory?**
+Not directly, but it shrinks your effective headroom. If RSS is inflated by fragmentation, the OS is committing more physical RAM than your dataset needs, so you reach the node's physical limit sooner than `used_memory / maxmemory` implies. Read this card together with [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) and the node's total RAM: high fragmentation plus high usage is the combination that ends in swap.
+
+**We use an allocator other than jemalloc. Does this card still apply?**
+The ratio is computed the same way regardless of allocator, but the behaviour differs. jemalloc (the Redis default) supports active defragmentation; libc malloc does not, so a high ratio under libc malloc usually can only be cleared by a restart. Check `mem_allocator` in `INFO memory`. If you are not on jemalloc and see chronic fragmentation, switching to a jemalloc build is often the cleanest long-term fix.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Memory Fragmentation Ratio* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

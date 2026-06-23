@@ -1,0 +1,126 @@
+---
+title: "CockroachDB Health Score, CockroachDB"
+sidebarTitle: "CockroachDB Health Score"
+description: "CockroachDB Health Score for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **CockroachDB Health Score** is a single 0 to 100 composite that rolls up the cluster's most load-bearing signals (node liveness, range availability, replication state, latency, error rate, and capacity headroom) into one number a DBA or on-call SRE can read at a glance. It answers "is the cluster fundamentally healthy right now, or do I need to dig in?" without forcing a tour of fifteen separate gauges. A score at or above 90 is a green, well-balanced cluster; 70 to 89 is functional but with at least one signal drifting; below 70 means something material is wrong and the score fires an alert.
+
+| | |
+| --- | --- |
+| **What it tracks** | A weighted composite health index for the cluster over the selected period. It is a derived score, not a single raw CockroachDB metric. |
+| **Data source** | Computed by Vortex IQ from CockroachDB time-series and `crdb_internal` state: node liveness (`crdb_internal.gossip_liveness`), unavailable and under-replicated range counts (`crdb_internal.kv_store_status` / the `ranges.unavailable` and `ranges.underreplicated` metrics), statement latency percentiles (`sql.service.latency`), statement error rate, and capacity gauges (disk and memory). On CockroachDB Cloud the same inputs are read via the Cloud metrics API and Cluster Overview. |
+| **Time window** | `RT/7D` (a real-time current score, with a 7-day trend line behind it). |
+| **Alert trigger** | `< 70`. A composite below 70 means at least one major sub-signal has degraded enough to pull the whole cluster out of the healthy band. |
+| **Roles** | DBA, platform, SRE, engineering leadership |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The Health Score is a weighted blend of the cluster's core reliability and performance signals, each normalised to a 0 to 100 sub-score and then combined. The exact weights are tuned per profile, but the default shape is:
+
+- **Availability (highest weight).** Driven by unavailable ranges and node liveness. Any unavailable range (a range that has lost quorum) is treated as a hard penalty because it means some data cannot be read or written. A full live node count with zero unavailable ranges scores 100 on this axis.
+- **Replication health.** Driven by under-replicated ranges and decommissioning progress. Transient under-replication during a rebalance is tolerated; sustained under-replication pulls the sub-score down.
+- **Latency.** Driven by statement latency p95 and p99 against their configured thresholds (200ms and 500ms by default). Latency well inside threshold scores high; breaching p99 pulls it down sharply.
+- **Errors.** Driven by the statement error rate against the 1% threshold.
+- **Capacity headroom.** Driven by disk usage and memory usage gauges; the closer to the 90% disk / 85% memory ceilings, the lower this axis scores.
+
+Each axis is clamped to 0 to 100, multiplied by its weight, and summed. The result is the headline score. Because availability carries the most weight, a single unavailable range can drop the composite below 70 on its own, which is by design: a cluster with data offline is not healthy regardless of how good its latency looks.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 6-node CockroachDB cluster (v23.2) backing the order, inventory, and session services for an ecommerce stack. Snapshot taken on 14 Apr 26 at 09:40 BST during the morning traffic ramp.
+
+| Sub-signal | Reading | Sub-score | Notes |
+| --- | --- | --- | --- |
+| Availability | 6/6 nodes live, 0 unavailable ranges | 100 | Full quorum everywhere. |
+| Replication | 14 under-replicated ranges, falling | 88 | Tail of an overnight rebalance, self-healing. |
+| Latency | p95 96ms, p99 410ms | 82 | p99 elevated but inside the 500ms threshold. |
+| Errors | statement error rate 0.3% | 96 | Comfortably under 1%. |
+| Capacity | disk 71%, memory 64% | 90 | Healthy headroom. |
+
+With the default weighting the composite lands at **92**: a green, healthy cluster. The only soft spot is the p99 latency axis, which the team can ignore for now because it is inside threshold and the under-replication is clearing on its own.
+
+Now take the same cluster at 18:15 BST during a flash-sale spike:
+
+| Sub-signal | Reading | Sub-score | Notes |
+| --- | --- | --- | --- |
+| Availability | 6/6 nodes live, 0 unavailable ranges | 100 | Still full quorum. |
+| Replication | 2 under-replicated ranges | 98 | Stable. |
+| Latency | p95 240ms, p99 920ms | 41 | Both thresholds breached. |
+| Errors | statement error rate 2.1% | 38 | Above the 1% trigger. |
+| Capacity | disk 73%, memory 88% | 52 | Memory above its 85% ceiling. |
+
+The composite now falls to **67**, below the 70 trigger, and the card turns red. Nothing is offline, so a node-count-only view would have looked fine, but the combination of breached latency, a rising error rate, and memory pressure tells the on-call SRE the cluster is overloaded, not broken. The right action is to look at [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation) and [Statement Latency p99 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p99-ms) to confirm contention, then either add capacity or shed non-critical query load.
+
+Two takeaways:
+
+1. **The score is only meaningful with its breakdown.** A 67 caused by latency and memory is a "scale or shed load" problem; a 67 caused by an unavailable range is a "page someone now, data is offline" problem. Always read the sub-signals, never just the headline.
+2. **Availability dominates.** Because quorum loss is weighted so heavily, a cluster can have perfect latency and still score in the 50s if even one range is unavailable. That is intentional: offline data is the worst outcome a distributed database can have.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Health Score | What the combination tells you |
+| --- | --- | --- |
+| [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count) | The liveness input behind the availability axis. | A health dip with a node-count dip means a node loss; a health dip with full node count means a software-layer problem (latency, errors, capacity). |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/cockroachdb/database-disk-usage) | The disk side of the capacity axis. | Health falling while disk climbs toward 90% means you are running out of headroom, not failing. |
+| [Memory Usage %](/nerve-centre/kpi-cards/cockroachdb/memory-usage) | The memory side of the capacity axis. | Memory above 85% with falling health points to overload or a query consuming too much working memory. |
+| [Statement Latency p99 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p99-ms) | The tail-latency input. | A p99 breach explains a latency-driven health dip. |
+| [Statement Error Rate %](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate) | The error-rate input. | Rising errors alongside falling health usually means contention or a bad deploy. |
+| [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges) | The hard-penalty input on the availability axis. | Any unavailable range will, on its own, drag the composite below 70. |
+| [Range Lease Balance Skew %](/nerve-centre/kpi-cards/cockroachdb/range-lease-balance-skew) | A hot-node detector that often precedes a latency-driven health dip. | High skew with falling health means one node is overloaded and dragging the cluster. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/cockroachdb/last-successful-backup-hours-ago) | The recoverability companion. | Health covers "is it up"; backup age covers "can I recover if it is not". |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+There is no single native CockroachDB command that prints a "health score", because the score is a Vortex IQ composite. To reconcile it, check each input against its native source:
+
+- **Availability and liveness:** the DB Console Cluster Overview groups nodes as Live, Suspect, and Dead, and shows unavailable and under-replicated range counts. The same figures come from `SELECT * FROM crdb_internal.kv_store_status;` and `crdb_internal.gossip_liveness`.
+- **Latency:** the DB Console SQL dashboard and the `sql.service.latency` time-series expose p50, p95, and p99.
+- **Errors:** the SQL dashboard's error-rate panels, or `crdb_internal.node_statement_statistics`.
+- **Capacity:** the Storage / Hardware dashboards for disk and memory, or `crdb_internal.kv_store_status` for store capacity.
+
+On CockroachDB Cloud, the cluster Overview page and the Metrics tab show the same liveness, range, latency, and capacity signals. If the Vortex IQ score looks worse than the console "feels", it is almost always because one heavily weighted axis (availability or errors) has moved while the others stayed green: open the breakdown and find which sub-signal is pulling the composite down.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is the score below 70 when every node is live and nothing is offline?**
+Availability is only one axis. A live, fully-replicated cluster can still score below 70 if latency is breaching its p99 threshold, the error rate is above 1%, or capacity is near its ceiling. Open the sub-signal breakdown to see which axis is responsible; an "everything is up but the score is low" reading almost always means overload, not failure.
+
+**Why did the score drop sharply when only one range went unavailable?**
+Availability is the highest-weighted axis and an unavailable range is treated as a hard penalty, because that range's data cannot be read or written. A single unavailable range can pull the composite below 70 on its own. This is deliberate: a distributed database with data offline is not healthy, no matter how good the other signals look. Pair with [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges).
+
+**The score wobbles during routine rebalances. Is that expected?**
+Mild dips during rebalancing or rolling restarts are normal, because under-replicated ranges and brief latency bumps move the replication and latency axes. These should recover within minutes as the cluster self-heals. Sustained dips, not transient ones, are what the < 70 alert is designed to catch; if your cluster sits below 70 for more than a few minutes outside a planned maintenance window, treat it as a real signal.
+
+**Can I change the weights or the alert threshold?**
+Yes. The sub-signal weights and the 70 trigger are configurable per profile in the Sensitivity tab. Teams with strict latency SLAs often raise the latency weight; teams running near disk capacity often raise the capacity weight. Tune to your own baseline rather than relying on the generic default.
+
+**How does the score behave during a planned node decommission?**
+Decommissioning moves replicas off a node, which briefly increases under-replicated ranges and can nudge the replication axis down. The score should recover once draining completes. If it stays depressed, check [Decommissioning Nodes](/nerve-centre/kpi-cards/cockroachdb/decommissioning-nodes) for a stuck decommission, which is a genuine problem rather than expected noise.
+
+**Does the score work the same on self-hosted and CockroachDB Cloud?**
+Yes, the inputs are equivalent. On self-hosted clusters Vortex IQ reads `crdb_internal` tables and the DB Console time-series directly; on CockroachDB Cloud it reads the managed metrics API. The composite is computed the same way in both cases, so a Cloud cluster and a self-hosted cluster with identical signals will produce the same score.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*CockroachDB Health Score* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,138 @@
+---
+title: "Avg Cluster CPU Utilisation %, Databricks"
+sidebarTitle: "Avg Cluster CPU Utilisation %"
+description: "Avg Cluster CPU Utilisation % for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The mean CPU utilisation across all running clusters in the workspace over the last hour, weighted by node count. For a platform team this is the single most actionable right-sizing signal Databricks exposes: clusters sitting under 30% are paying for cores they never use, and clusters pinned above 90% are throttling jobs and inflating run times. The whole point of this card is to keep you in the healthy band where you pay for compute you actually consume without queuing work behind saturated nodes.
+
+| | |
+| --- | --- |
+| **Data source** | Cluster node metrics streamed to Databricks via the Ganglia / built-in cluster-metrics agent, surfaced through the Clusters API (`GET /api/2.0/clusters/list` for the running fleet) joined to per-node CPU samples. Where the workspace exposes it, the `system.compute.node_timeline` system table provides the same CPU series for historical reconciliation. |
+| **Metric basis** | CPU busy percentage (`100 - idle%`) averaged per node, then averaged across all nodes in all `RUNNING` clusters, weighted by node count so a 20-node cluster counts more than a 2-node cluster. Driver and worker nodes are both included. |
+| **Aggregation window** | Rolling 1 hour, refreshed on the standard cluster-metrics cadence (roughly every 60 seconds for the live gauge). |
+| **Healthy band** | 30% to 90%. Below 30% is under-utilised (over-provisioned or idle autoscaling floor); above 90% is saturated (jobs CPU-bound, run times stretching). |
+| **What counts** | All clusters in `RUNNING` state: job clusters, all-purpose (interactive) clusters, and the driver of each. |
+| **What does NOT count** | Terminated or pending clusters, SQL warehouses (those have their own saturation card), serverless compute where node-level CPU is not exposed, and clusters in `RESTARTING` state during the restart gap. |
+| **Time window** | `1h` (rolling, refreshed roughly every 60 seconds) |
+| **Alert trigger** | `<30%` (under-utilised, right-size down) or `>90%` (saturated, scale up or split workload) |
+| **Roles** | platform engineering, data engineering, FinOps |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine pulls the running-cluster list from the Clusters API, then for each cluster reads the per-node CPU-busy samples over the trailing hour. Each node's busy percentage is the complement of its idle time (`100% - idle%`, which folds together user, system, and iowait). Node values are averaged within a cluster, then the cluster averages are combined into one workspace figure weighted by node count:
+
+```text
+node_busy%        = 100 - node_idle%                 (per node, per sample)
+cluster_avg%      = mean(node_busy% across cluster)   (trailing 1h)
+workspace_avg%    = Σ(cluster_avg% × cluster_nodes) / Σ(cluster_nodes)
+```
+
+The weighting matters: an unweighted mean would let a single idle 2-node test cluster drag down a busy 40-node production fleet and mask saturation. Weighting by node count keeps the headline honest about where the cores actually are. The gauge plots `workspace_avg%` against the 30/90 band so the colour tells you the action before you read the number.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A retail analytics platform team runs three clusters during the working day. Snapshot taken on 14 Apr 26 at 09:40 BST, trailing-hour view.
+
+| Cluster | Type | Nodes | Trailing-1h CPU avg | Read |
+| --- | --- | --- | --- | --- |
+| `prod-etl-nightly` | Job | 24 | 22% | Under-utilised: the nightly load finished at 06:00, the cluster is held open by a 4-hour auto-termination window doing nothing |
+| `prod-bi-interactive` | All-purpose | 8 | 94% | Saturated: analysts are running ad-hoc joins against un-optimised tables, CPU pinned, query times climbing |
+| `prod-ml-feature` | Job | 4 | 58% | Healthy band |
+
+Weighted workspace average:
+
+```text
+workspace_avg% = (22×24 + 94×8 + 58×4) / (24 + 8 + 4)
+               = (528 + 752 + 232) / 36
+               = 1512 / 36
+               = 42%
+```
+
+The headline gauge reads **42%**, comfortably inside the healthy band, and a team that stopped there would miss two real problems hiding under the average. This is the core lesson of the card: the workspace average can look fine while individual clusters are both bleeding money and throttling work at the same time. The drill-down (DBU by cluster) is where the action lives.
+
+Two decisions fall out of this snapshot:
+
+1. **`prod-etl-nightly` at 22% on 24 nodes is pure waste.** The auto-termination window is too long for a job that finishes at 06:00. Cutting auto-termination from 4 hours to 20 minutes reclaims roughly 3.5 hours of 24-node compute every day. Pair this with [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h) to put a DBU number on it.
+2. **`prod-bi-interactive` at 94% is throttling analysts.** Two fixes: enable autoscaling so it adds workers under load, or push the heavy ad-hoc queries onto a SQL warehouse where saturation is managed separately. Confirm the pain in [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) and [Slow-Query Rate %](/nerve-centre/kpi-cards/databricks/slow-query-rate).
+
+The takeaway: treat 30% and 90% as right-sizing triggers, not as failure thresholds. Sustained sub-30% means you are over-provisioned or your auto-termination is too lax; sustained over-90% means the workload has outgrown the node count and you are paying for it in run time.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Avg Cluster CPU Utilisation | What the combination tells you |
+| --- | --- | --- |
+| [DBU by Cluster (7d)](/nerve-centre/kpi-cards/databricks/dbu-by-cluster-7d) | Turns the utilisation percentage into a cost ranking per cluster. | A low-utilisation cluster near the top of the DBU table is the highest-value right-sizing target. |
+| [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h) | Quantifies the spend behind a sub-30% reading. | Sub-30% utilisation plus high idle DBU equals an auto-termination problem you can cost. |
+| [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) | The total burn this utilisation is producing. | Rising burn with flat utilisation means more clusters, not busier ones. |
+| [SQL Warehouse Saturation %](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation) | The warehouse-side equivalent for SQL compute. | Use both to see whether saturation lives in clusters or warehouses before scaling either. |
+| [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) | The user-visible symptom of saturation. | High CPU plus high p95 confirms the cluster is the bottleneck, not the query plan. |
+| [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) | Saturated CPU stretches run times. | Over-90% utilisation co-occurring with long-running jobs points to CPU-bound work. |
+| [Active Clusters](/nerve-centre/kpi-cards/databricks/active-clusters) | The denominator: how many clusters this average covers. | A low average across many clusters often means several idle ones inflating the count. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **Compute → Clusters → (select cluster) → Metrics tab** for the native per-cluster CPU chart (driver and worker breakdown).
+> **`system.compute.node_timeline`** system table for the historical per-node CPU series if system tables are enabled in your account.
+> **Clusters API** (`GET /api/2.0/clusters/list`) to confirm which clusters were in `RUNNING` state during the window.
+
+**Why our number may legitimately differ from the Databricks UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Per-cluster vs weighted fleet** | Variable | The native Metrics tab shows one cluster at a time; Vortex IQ reports a node-weighted average across all running clusters, so the headline rarely matches any single chart. |
+| **Driver inclusion** | Vortex IQ slightly lower or higher | We include the driver node in the average; if you read only worker charts in the UI, busy-worker clusters look higher there. |
+| **Sampling cadence** | Marginal | The live gauge polls roughly every 60 seconds; the system table aggregates at a coarser interval, so a transient spike can appear in one and not the other. |
+| **Time zone** | Chart alignment | Native charts use the workspace time zone; Vortex IQ stores UTC and renders in your Vortex IQ profile time zone. |
+| **Serverless exclusion** | Vortex IQ may read lower coverage | Serverless compute does not expose node-level CPU; those workloads are absent from this average. |
+
+**Cross-connector reconciliation:** pair with [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume) to check whether high utilisation is doing useful work. Sustained over-90% CPU while order volume is flat is the classic signature of an inefficient pipeline burning cores on the same data.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My average sits at 45% but my Databricks bill keeps climbing. How?**
+A healthy average can hide a fleet of half-idle clusters. Forty-five percent across ten clusters is very different from 45% across two. Always drill into [DBU by Cluster (7d)](/nerve-centre/kpi-cards/databricks/dbu-by-cluster-7d): the bill is driven by node-hours, not by the average percentage, so several lightly used clusters cost more than one busy one at the same headline number.
+
+**Should I aim for 100% utilisation to maximise value?**
+No. The healthy ceiling is 90%. Past that, jobs queue on CPU, autoscaling lags behind demand, and run times stretch non-linearly. A cluster pinned at 100% is usually a cluster that needs more workers or a workload that needs splitting, not a win. Target the middle of the 30 to 90 band.
+
+**Why is serverless compute missing from this average?**
+Serverless does not expose node-level CPU metrics to the workspace; Databricks manages the underlying nodes. The card covers classic job and all-purpose clusters only. For serverless workloads, lean on DBU-based cards instead, which do capture serverless consumption.
+
+**My nightly job cluster reads 0% for most of the day. Is that a fault?**
+Only if the cluster is still running. A 0% reading on a `RUNNING` cluster means it is alive but doing nothing, which is exactly the auto-termination signal this card is built to surface. Shorten the auto-termination window. If the cluster has terminated, it correctly drops out of the average.
+
+**Does iowait count as busy?**
+Yes. We compute busy as `100% - idle%`, which rolls user, system, and iowait together. A cluster stuck on iowait (waiting on slow storage or shuffle) reads as busy here even though the CPUs are stalled. If utilisation is high but throughput is low, suspect IO, not compute, and check shuffle and storage in the native cluster metrics.
+
+**The alert fired at 91% for two minutes then cleared. Should I act?**
+A brief spike during a join or shuffle is normal and self-clears as autoscaling responds. The card surfaces sustained breaches over the rolling hour, not single samples. Act when utilisation holds above 90% across the window, not on a transient blip.
+
+**Can I change the 30/90 thresholds?**
+Yes. The under-utilised and saturated thresholds are configurable per profile in the Sensitivity tab. A team running deliberately bursty batch work may lower the floor; a latency-sensitive interactive team may lower the ceiling to leave headroom.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Avg Cluster CPU Utilisation %* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

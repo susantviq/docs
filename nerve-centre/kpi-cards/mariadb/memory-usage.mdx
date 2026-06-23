@@ -1,0 +1,144 @@
+---
+title: "Memory Usage %, MariaDB"
+sidebarTitle: "Memory Usage %"
+description: "Memory Usage % for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Memory Usage %** is the share of the instance's available RAM that the MariaDB server process and its caches are currently holding, expressed as a percentage of the host (or container) memory limit. For a DBA this is the single number that tells you how much headroom is left before the kernel out-of-memory (OOM) killer starts terminating the `mariadbd` process. The InnoDB buffer pool, the per-connection buffers, and the various session caches all draw from the same pool; once the working set plus connection overhead crosses the physical limit, the database either swaps (slow) or is killed (an outage). This card watches the live figure so you see pressure building before the OOM event, not after.
+
+| | |
+| --- | --- |
+| **What it tracks** | Resident memory held by the MariaDB server as a percentage of the host or container memory limit. Derived from the OS view of the `mariadbd` process (RSS) against `MemTotal`, cross-checked against MariaDB's own accounting where `performance_schema` memory instrumentation is enabled. |
+| **Data source** | Memory Usage % for the selected period, sampled from the host metrics agent and the server's `SHOW GLOBAL STATUS` / `performance_schema.memory_summary_global_by_event_name` accounting. On managed services the figure is read from the provider's instance metrics. |
+| **Time window** | `RT` (real-time, refreshed on the live sampling interval). |
+| **Alert trigger** | `> 85%`. Sustained usage above 85% means the instance is approaching the point where swap or the OOM killer becomes likely; treat as an early warning, not a crisis. |
+| **Metric basis** | Process resident memory plus shared caches, NOT the configured `innodb_buffer_pool_size` alone. A correctly sized buffer pool can still push total usage high once connection buffers and temporary tables are added. |
+| **What does NOT count** | (1) OS page cache held outside the `mariadbd` process; (2) memory used by sidecar agents, backup jobs, or other tenants on the same host; (3) reserved-but-untouched buffer pool pages on instances using lazy allocation. |
+| **Sentiment key** | `maria_memory_usage_pct` |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card expresses used memory as a percentage of the instance limit:
+
+```text
+Memory Usage % = (mariadbd resident memory / host or container memory limit) × 100
+```
+
+The numerator is the resident set size (RSS) of the server process as the host sees it. The denominator is the physical RAM on a bare-metal or VM host, or the cgroup memory limit inside a container or on a managed plan. The two main contributors to the numerator are:
+
+1. **Global, allocated once at startup:** the InnoDB buffer pool (`innodb_buffer_pool_size`), the key buffer, the query cache (deprecated and off by default in modern MariaDB), and `performance_schema` overhead.
+2. **Per-connection, allocated on demand:** `sort_buffer_size`, `join_buffer_size`, `read_buffer_size`, `tmp_table_size`, and `max_heap_table_size`. These multiply by the number of active connections, which is why a connection spike can drive memory up even when the buffer pool is fixed.
+
+The headline figure is the live sample. Because the per-connection component is bursty, the card reads against the `RT` window so a brief in-memory sort does not register as a sustained problem; the `> 85%` alert only fires when the elevated reading persists across consecutive samples.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MariaDB 10.11 primary on a 32 GB instance backing an ecommerce catalogue and order store. The buffer pool is set to 20 GB. Snapshot taken on 14 Apr 26 at 20:05 BST, during an evening promotion.
+
+| Component | Memory held | Notes |
+| --- | --- | --- |
+| InnoDB buffer pool | 20.0 GB | Fixed at startup. |
+| `performance_schema` + dictionary | 1.1 GB | Stable. |
+| Per-connection buffers | 5.4 GB | 420 active connections, several running large sorts. |
+| Misc (binlog cache, temp tables) | 1.0 GB | Spiky. |
+| **Total `mariadbd` RSS** | **27.5 GB** | |
+| **Host limit** | **32 GB** | |
+
+The card reads **86%** and the sensitivity alert trips at 20:05. The DBA reads three things at a glance:
+
+1. **The buffer pool is not the problem; the connections are.** The fixed global pool is 20 GB, comfortably below the limit. The 5.4 GB of per-connection buffers is what pushed the total over 85%, driven by 420 connections during the promotion and a handful running unindexed sorts.
+2. **There is roughly 4.5 GB of headroom left.** At the current per-connection rate that is around 350 more connections before the limit. If [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation) is also climbing, the two cards together predict an OOM within the promotion window.
+3. **The cheapest immediate lever is the application connection pool, not the server.** Lowering the app-side max pool or capping `max_connections` reduces the per-connection multiplier instantly. Resizing the buffer pool requires a restart and would not help here.
+
+```text
+Headroom sizing at 20:05:
+  Limit                32.0 GB
+  Current RSS          27.5 GB
+  Headroom              4.5 GB
+  Per-connection avg   ~13 MB
+  Connections to OOM   ~350 more, IF buffer pool and globals stay flat
+Action: cap app pool at 300, schedule a window to add the two unindexed
+        columns surfaced by Top 10 Slowest Queries.
+```
+
+The lasting fix is not more RAM. It is fixing the queries that allocate large sort and join buffers, so the per-connection footprint stays small even under load.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Memory Usage % | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation) | Connections drive the per-connection memory component. | Rising memory plus rising saturation equals a connection-led OOM risk, not a buffer-pool problem. |
+| [Connections In Use](/nerve-centre/kpi-cards/mariadb/connections-in-use) | The raw connection count behind the multiplier. | Multiply by the per-connection buffer sizes to estimate the memory each connection adds. |
+| [InnoDB / XtraDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mariadb/innodb-xtradb-buffer-pool-hit-rate) | The buffer pool is the largest single memory consumer. | A high hit rate justifies the buffer pool's size; a low hit rate plus high memory suggests the pool is too small for the working set despite the pressure. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mariadb/database-disk-usage) | The other half of the capacity picture. | Both high at once equals a fully constrained instance needing a resize, not just tuning. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mariadb/queries-per-second-live) | Throughput context for the memory reading. | High memory at low QPS suggests leaked or idle-but-allocated connections rather than honest load. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite that takes memory pressure as an input. | Memory above 85% alone can pull the composite down even when latency looks fine. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms) | The first symptom when memory pressure forces swap. | Memory near the limit plus rising p95 equals the instance has started swapping. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> **`SHOW GLOBAL STATUS LIKE 'Memory_used'`** for the server's own accounting of bytes allocated (available when memory instrumentation is on).
+> **`SELECT * FROM performance_schema.memory_summary_global_by_event_name ORDER BY CURRENT_NUMBER_OF_BYTES_USED DESC`** to break memory down by allocator, which separates the buffer pool from per-connection buffers.
+> **`SHOW ENGINE INNODB STATUS\G`** under the BUFFER POOL AND MEMORY section for the InnoDB-specific allocation.
+> **OS-level `free -m`, `ps -o rss -p $(pidof mariadbd)`, or the cgroup `memory.current`** for the resident figure the OOM killer actually sees.
+
+On a managed service, compare against the provider's instance memory metric: the freeable-memory and memory-utilisation graphs on the managed-database console. Those read the same RSS-against-limit ratio this card uses.
+
+**Why our number may legitimately differ from MariaDB's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **RSS vs `Memory_used`** | Card higher | `Memory_used` counts only what MariaDB instrumented; RSS includes glibc allocator overhead and unreturned freed pages, which the OOM killer still counts. |
+| **Container vs host limit** | Card higher inside a container | The card divides by the cgroup limit, not the host's total RAM; inside a constrained container the same RSS is a higher percentage. |
+| **Sampling moment** | Brief spikes | Per-connection buffers are allocated and freed quickly; a sample taken mid-sort reads higher than a query against status one second later. |
+| **OS page cache** | Card lower | Page cache held outside the process is not counted here; some provider metrics fold it into "used", inflating their figure. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My buffer pool is only 60% of RAM but the card reads 88%. How?**
+The buffer pool is the floor, not the ceiling. Per-connection buffers (`sort_buffer_size`, `join_buffer_size`, `tmp_table_size`) are allocated on top of the global pool, once per connection that needs them. A few hundred connections each running a large sort can add several gigabytes. Check [Connections In Use](/nerve-centre/kpi-cards/mariadb/connections-in-use) and the per-connection buffer settings before assuming the buffer pool is at fault.
+
+**Should I just add more RAM when this alert fires?**
+Sometimes, but only after ruling out the cheaper fixes. If the pressure comes from per-connection buffers, lowering the application pool size or capping `max_connections` helps immediately and for free. If the pressure comes from a buffer pool that is genuinely too small for a growing working set (confirmed by a falling [Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mariadb/innodb-xtradb-buffer-pool-hit-rate)), then more RAM is the right answer.
+
+**Why is the threshold 85% and not 95%?**
+Because the OOM killer does not wait politely at 100%. Linux can begin reclaiming and, under memory pressure, kill processes well before the counter reads full, especially inside a cgroup. 85% gives a DBA time to react (cap connections, kill a runaway sort, schedule a resize) before swap thrashing or an OOM kill takes the instance down.
+
+**Does this include the OS page cache?**
+No. The card measures the `mariadbd` process resident memory against the limit. The OS page cache is reclaimable and lives outside the process, so it is excluded. Some managed-service "memory utilisation" graphs include page cache, which is why their figure can read higher than this card.
+
+**My instance swaps but the card never crosses 85%. Why?**
+Aggressive swappiness or a low cgroup limit can push the instance into swap before RSS reads 85% of the host total, particularly on hosts shared with other tenants. Lower `vm.swappiness` for database hosts and confirm the card is dividing by the container limit, not the host total. Pair with [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms): swap shows up as a latency cliff long before it shows as full memory.
+
+**Does a Galera cluster change how I read this card?**
+Yes, watch every node. Galera replicates writes synchronously, so a node under memory pressure can throttle the whole cluster via flow control. A single node at 90% memory while the others sit at 60% is the node that will pause the cluster first. Pair with [Galera Flow Control Paused %](/nerve-centre/kpi-cards/mariadb/galera-flow-control-paused).
+
+**Can a connection leak cause this?**
+Yes. Idle connections that the application never closes still hold their session buffers. If memory climbs while [Queries per Second (live)](/nerve-centre/kpi-cards/mariadb/queries-per-second-live) stays flat or low, suspect a leak: connections accumulating without doing work. Check `SHOW PROCESSLIST` for a growing count of `Sleep` connections and fix the application pool's idle timeout.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Memory Usage %* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

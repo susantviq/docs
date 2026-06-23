@@ -1,0 +1,142 @@
+---
+title: "Active Node Count, Elasticsearch"
+sidebarTitle: "Active Node Count"
+description: "Active Node Count for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cluster Health](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of nodes currently joined to the cluster and reporting healthy. This is the headcount of your cluster. It should be a flat, boring line at exactly the number you provisioned. When it drops, a node has left: it crashed, OOMed, lost network connectivity, or was fenced by the master. Every lost node triggers shard reallocation, raises load on the survivors, and (if it takes a master-eligible node below quorum) can stall the entire cluster. For a DBA, a change in this number is rarely good news unless you made it happen.
+
+| | |
+| --- | --- |
+| **Metric basis** | `number_of_nodes` from `GET /_cluster/health`, cross-checked against `GET /_cat/nodes` for the per-node roster and roles. |
+| **What it counts** | All nodes that have successfully joined the cluster and are reporting to the master: data nodes, master-eligible nodes, coordinating nodes, and ingest nodes. |
+| **What it excludes** | Nodes that are configured but have not joined (a process that is up but failed cluster bootstrap), and nodes the master has already removed after a fault-detection timeout. |
+| **Aggregation window** | `RT`: read live from cluster health each refresh. |
+| **Why it matters** | Node loss is the trigger for the most disruptive cluster events: shard reallocation, recovery load, and, if master-eligible nodes drop below quorum, a cluster that cannot elect a master and stops accepting writes. The count is the single cleanest signal that something left. |
+| **Time zone** | Cluster clock for sampling; rendered in the team's Vortex IQ display time zone. |
+| **Time window** | `RT` (real-time) |
+| **Alert trigger** | `< expected`: any reading below the configured expected node count means a node has been lost, and the sensitivity alarm fires immediately. The expected count is set per cluster in the connector. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The headline is the live `number_of_nodes` value from cluster health:
+
+```text
+node_lost = (expected_node_count - number_of_nodes) > 0
+```
+
+The alert compares the live count against an `expected_node_count` configured per cluster, rather than against a hard-coded number, because every cluster has its own topology. A 3-node cluster and a 30-node cluster both want the same rule: "tell me the moment the count drops below what I provisioned". Because the comparison is "below expected" rather than a fixed threshold, scaling the cluster up (raising the expected count to match) does not generate false alarms.
+
+The card also reads `GET /_cat/nodes` to break the count down by role, which matters enormously for severity. Losing one data node out of ten is a recovery event: shards reallocate, the cluster runs hot for a while, but it stays available. Losing a master-eligible node is different: if the cluster had three master-eligible nodes and drops to two, it is still above the quorum of two, but losing a second takes it to one, below quorum, and the cluster can no longer elect a master. It then refuses writes to protect against split-brain. The role breakdown lets the card and the responder judge whether a single lost node is routine or an emergency.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 7-node Elasticsearch cluster: 3 dedicated master-eligible nodes and 4 data nodes, serving a product-search workload. Expected node count is configured as 7. At 16:40 BST on 21 Apr 26 the headline drops from 7 to 6.
+
+| Time (BST) | Node count | Masters present | Data nodes present | State |
+| --- | --- | --- | --- | --- |
+| 16:39 | 7 | 3 | 4 | GREEN, steady. |
+| 16:40 | 6 | 3 | 3 | One data node (es-data-3) left; alarm fires. |
+| 16:41 | 6 | 3 | 3 | Cluster goes YELLOW; es-data-3's replicas now under-replicated. |
+| 16:42 | 6 | 3 | 3 | Allocator begins rebuilding missing replicas on survivors. |
+| 16:58 | 6 | 3 | 3 | Recovery complete; YELLOW persists (capacity reduced) but no data at risk. |
+
+The headline reads **6 (expected 7)** in red. The on-call DBA's read:
+
+```text
+Node-loss triage:
+  1. Which node and which role? GET /_cat/nodes shows es-data-3 (a DATA node) is gone -> recovery event, not a quorum event. Masters intact at 3.
+  2. Why did it leave? Check the survivors' logs and JVM Heap Used %: if es-data-3 hit ~95% heap before vanishing, it OOMed.
+  3. Confirm masters safe: 3 master-eligible present, quorum is 2, so the cluster can still elect a master and accept writes.
+  4. Watch Initializing / Relocating Shards: replicas for es-data-3's shards rebuild on the remaining data nodes.
+  5. Cluster Status reads YELLOW (replicas missing) not RED (primaries intact) -> data is available, just less redundant.
+```
+
+The cause was an OOM on es-data-3 driven by an unbounded aggregation, the exact failure the JVM heap card is meant to pre-empt. Because the lost node was a data node and the three master-eligible nodes stayed up, the cluster remained available throughout. The team restarted es-data-3, it rejoined, the count returned to 7, and the cluster went GREEN once its shards re-replicated.
+
+Now contrast the dangerous variant: had the lost node been one of three master-eligible nodes, the count drop to 6 would be far more serious. With only two masters left the cluster still meets quorum (2 of 3), but the team is now one node away from losing the ability to elect a master and accept writes. That scenario warrants immediate replacement of the lost master node, not a routine recovery wait.
+
+Three takeaways for an ops team:
+
+1. **The role of the lost node decides the severity.** A lost data node is a recovery event; a lost master-eligible node erodes quorum and can take the whole cluster down if it cascades. Always read the role breakdown, never just the count.
+2. **The count drop is the symptom; find the cause.** Nodes leave for a reason: OOM (check heap), network partition (check connectivity), disk-full fencing (check storage), or a planned restart. The fix differs entirely, so diagnose before you simply restart and move on.
+3. **A node that left will trigger a recovery storm.** Reallocation consumes IO and CPU on the survivors, which can drag search latency up. Pair this card with [Initializing / Relocating Shards](/nerve-centre/kpi-cards/elasticsearch/initializing-relocating-shards) and [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) to gauge the knock-on impact.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Active Node Count | What the combination tells you |
+| --- | --- | --- |
+| [Cluster Status (green / yellow / red)](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) | The data-availability consequence of node loss. | A count drop that pushes status to RED means a primary went down with the node; YELLOW means only redundancy was lost. |
+| [Initializing / Relocating Shards](/nerve-centre/kpi-cards/elasticsearch/initializing-relocating-shards) | The recovery storm a lost node triggers. | A count drop is immediately followed by a spike here as the cluster rebuilds the lost node's shards. |
+| [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) | The interim data-loss risk. | A lost node leaves its shards unassigned until recovery places copies elsewhere. |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | The most common cause of a node leaving. | A heap spike to ~95% just before the count drops points to an OOM as the reason the node left. |
+| [Pending Cluster Tasks](/nerve-centre/kpi-cards/elasticsearch/pending-cluster-tasks) | The master-side load after node loss. | A node leaving floods the master with routing-table updates, spiking pending tasks. |
+| [Elasticsearch Health Score](/nerve-centre/kpi-cards/elasticsearch/elasticsearch-health-score) | The composite that weights node availability. | A lost node drops the composite and surfaces the event on the executive overview. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> **`GET /_cluster/health`** returns `number_of_nodes` and `number_of_data_nodes`; the first is the headline.
+> **`GET /_cat/nodes?v&h=name,node.role,master,heap.percent,disk.used_percent`** lists the live roster with roles, so you can see exactly which node left and whether it was master-eligible.
+> **`GET /_nodes/_local`** and the master node's logs explain why a node was removed (fault-detection timeout, deliberate shutdown, OOM).
+> **`GET /_cluster/state/nodes`** shows the authoritative node list the master is tracking.
+> On Elastic Cloud, **Stack Monitoring** plots node count and per-node status; on AWS OpenSearch, the CloudWatch metric `Nodes` tracks the same count.
+
+**Why our number may legitimately differ from a raw health read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Fault-detection lag** | Brief gap | When a node loses network silently, the master waits out the fault-detection timeout (default 30 seconds, three pings) before removing it; for that window a raw read and our read may both still count it, or differ if sampled either side of the timeout. |
+| **Joining nodes** | Vortex IQ may read lower | A node that has started but not finished joining the cluster is not yet in `number_of_nodes`; the process is up at the host level but not counted here, which is correct. |
+| **Coordinating-only nodes** | Variable | Some operators expect the count to reflect only data nodes; our headline counts all joined nodes (matching `number_of_nodes`), so it may read higher than a data-node-only mental model. |
+
+**Cross-connector reconciliation:** node loss is a pure infrastructure signal with no ecom equivalent, but its downstream effect is real. If a node drop coincides with a search-driven revenue dip, correlate with [ES Search Pool Saturation vs Ecom Burst](/nerve-centre/kpi-cards/elasticsearch/es-search-pool-saturation-vs-ecom-burst): a smaller cluster has less search capacity, so the same traffic now saturates the survivors.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The count dropped during a planned rolling restart. Is the alarm a false positive?**
+Technically the node did leave, so the alarm is accurate, but the event is expected. During a planned rolling restart the count will dip by one as each node restarts and recovers; it should return to expected within a minute or two per node. If you run frequent maintenance, set a maintenance window in the connector so these planned dips do not page on-call.
+
+**Why does losing a master-eligible node matter more than losing a data node?**
+The cluster needs a quorum (a strict majority) of master-eligible nodes to elect a master and accept writes. With three master-eligible nodes the quorum is two; lose one and you are still safe but one failure away from losing write capability. Lose a data node and you only lose capacity and redundancy, which recovery restores automatically. Always check the role of the lost node first.
+
+**A node left and came back on its own. What happened?**
+Usually a transient network partition or a long GC pause that exceeded the fault-detection timeout. The master fenced the node, then the node re-established contact and rejoined. Check the node's GC pause time and network: repeated flapping (leave/rejoin cycles) is more damaging than a single clean loss because each cycle triggers a partial reallocation.
+
+**How do I set the expected node count?**
+It is configured per cluster in the connector settings. Set it to the number of nodes you provisioned. When you scale the cluster up or down deliberately, update the expected count so the alarm reflects your new baseline rather than firing on a planned change.
+
+**The cluster shows GREEN but the count is one below expected. How?**
+This happens when the lost node held only replica shards that have already been rebuilt elsewhere, or when you removed a node deliberately and the cluster fully re-replicated. Status reflects shard availability; the node count reflects headcount. A GREEN cluster with a reduced count is running with less redundancy and capacity than you provisioned, which is worth restoring even though no data is currently at risk.
+
+**Does this count coordinating-only or ingest-only nodes?**
+Yes. `number_of_nodes` includes every node that has joined the cluster regardless of role, so coordinating-only and ingest-only nodes are counted. If you want to track data-node capacity specifically, read `number_of_data_nodes` in `GET /_cluster/health`; the per-role breakdown in the card detail view splits this out.
+
+**Can a node be up at the host level but not counted here?**
+Yes. A node process can be running but stuck before joining the cluster (failed discovery, bootstrap-check failure, version mismatch, or wrong cluster name). It does not appear in `number_of_nodes` until it successfully joins, so the host shows "up" to your infrastructure monitoring while this card correctly shows it as not part of the cluster.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Active Node Count* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

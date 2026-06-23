@@ -1,0 +1,145 @@
+---
+title: "Galera Cluster Status, MariaDB"
+sidebarTitle: "Galera Cluster Status"
+description: "Galera Cluster Status for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Galera Cluster](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The state of the Galera cluster as the polled node sees it, read from the `wsrep_cluster_status` status variable. The healthy value is `Primary`, meaning the node is part of a quorum-holding majority and is allowed to accept writes. Any other value (`Non-Primary` or `Disconnected`) means the node has lost contact with a majority of the cluster and will refuse writes to protect data consistency. For a DBA this is the binary "can my application still write to the database?" verdict, and it is one of the most distinctive signals MariaDB Galera offers over standalone MySQL.
+
+| | |
+| --- | --- |
+| **Status variable** | `wsrep_cluster_status` from `SHOW GLOBAL STATUS LIKE 'wsrep_cluster_status'`. A string: `Primary`, `Non-Primary`, or `Disconnected`. |
+| **Metric basis** | Galera Primary-Component membership verdict, NOT a connection test or ping. It reflects whether the node believes it is in the quorum-holding partition. |
+| **Aggregation window** | Real-time, polled on the Nerve Centre refresh cycle. The value is instantaneous. |
+| **Healthy value** | `Primary`. The node is in the majority partition and writes are accepted. |
+| **What it means** | `Primary` = healthy quorum; `Non-Primary` = split-brain risk, node refuses writes; `Disconnected` = node cannot reach the group at all. |
+| **What does NOT change it** | (1) High query latency; (2) a full disk (that is a separate failure mode); (3) async-replica lag; (4) router health. The variable is purely about Galera group membership. |
+| **Time window** | `RT` (real-time, polled each refresh cycle) |
+| **Alert trigger** | `!= Primary`, any value other than `Primary` is an immediate write-availability incident. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card runs `SHOW GLOBAL STATUS LIKE 'wsrep_cluster_status'` against the connected node and surfaces the string verbatim. There is no derivation; Galera sets this value itself as the group-communication layer evaluates quorum.
+
+The three possible values map to states as follows:
+
+```text
+Primary       => healthy. Node is in the majority partition; writes accepted.
+Non-Primary   => critical. Node sees the group but is NOT in the majority;
+                 it goes read-only and rejects writes to avoid split-brain.
+Disconnected  => critical. Node cannot reach the Galera group at all
+                 (network fault, all peers down, or it just started).
+```
+
+The alert fires on anything that is not `Primary`. This is deliberately strict: a `Non-Primary` node is not a degraded-but-usable state, it is a node that has stopped serving writes entirely. The card therefore reads as a clean binary for dashboards: green when `Primary`, red otherwise. It pairs naturally with [Galera Cluster Size](/nerve-centre/kpi-cards/mariadb/galera-cluster-size), which explains *why* a node has gone Non-Primary (membership fell below the quorum floor).
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 3-node MariaDB Galera cluster split across two availability zones: db-galera-01 and db-galera-02 in zone A, db-galera-03 in zone B. On 22 May 26 at 14:05 BST a network partition severs zone A from zone B.
+
+| Node | Zone | Peers it can see | `wsrep_cluster_status` | Writes? |
+| --- | --- | --- | --- | --- |
+| db-galera-01 | A | db-galera-02 (2 of 3) | **Primary** | Yes |
+| db-galera-02 | A | db-galera-01 (2 of 3) | **Primary** | Yes |
+| db-galera-03 | B | none (1 of 3) | **Non-Primary** | No |
+
+The Vortex IQ headline for the zone-B connector turns **red: Non-Primary**, while the zone-A nodes stay green. The DBA reads three things:
+
+1. **Galera is doing exactly the right thing.** The 2-node majority in zone A retained quorum and stays writable. The lone node in zone B correctly went Non-Primary rather than accept conflicting writes. This is split-brain prevention working as designed, not a database bug.
+2. **The application must route to the majority.** If the load balancer or MaxScale is still sending writes to db-galera-03, those writes are now being rejected with `WSREP has not yet prepared node for application use`. The fix is routing, not the database: point writes at the zone-A Primary partition.
+3. **There is no data loss, only a stalled minority.** When the network heals, db-galera-03 rejoins the Primary Component, performs an IST to catch the writes it missed, and returns to `Primary`. The team should not force-bootstrap zone B as its own Primary, doing so would create a genuine split-brain with two divergent datasets.
+
+```text
+Decision during the partition:
+  - Majority partition (zone A): writable, keep serving traffic here.
+  - Minority node (zone B): read-only, drain it from the write path.
+  - DO NOT pc.bootstrap zone B (would create divergent histories).
+  - On network recovery: zone B IST-rejoins automatically; status returns to Primary.
+```
+
+When the partition clears at 14:31, db-galera-03 reports `Primary` again, the card returns to green, and writes resume cluster-wide. The lesson the team should carry: a `Non-Primary` reading is a *routing* emergency, not a *repair* emergency; never force a minority node back to Primary to "fix" the card.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Galera Cluster Status | What the combination tells you |
+| --- | --- | --- |
+| [Galera Cluster Size](/nerve-centre/kpi-cards/mariadb/galera-cluster-size) | Explains why a node went Non-Primary. | Size below quorum floor is the usual cause of a Non-Primary status. |
+| [Galera Cluster Not in Primary State or Node Lost](/nerve-centre/kpi-cards/mariadb/galera-cluster-not-in-primary-state-or-node-lost) | The alert-list card that fires on this exact condition. | A Non-Primary reading should always appear as a row in this feed. |
+| [Galera Flow Control Paused %](/nerve-centre/kpi-cards/mariadb/galera-flow-control-paused) | Pre-cursor signal: a struggling node before it drops out. | Sustained flow control can precede a node leaving and a status flip. |
+| [Failover Readiness](/nerve-centre/kpi-cards/mariadb/failover-readiness) | Whether a standby can take over writes. | Non-Primary plus no healthy standby equals a hard write outage. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite that takes cluster state as a major input. | A Non-Primary node sharply drops the composite. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mariadb/connection-errors-24h) | Apps hitting a Non-Primary node log write rejections. | A status flip often co-occurs with a spike in connection/write errors. |
+| [Async Replication Lag (seconds)](/nerve-centre/kpi-cards/mariadb/async-replication-lag-seconds) | Downstream async replicas read from the cluster. | A Non-Primary source can stall async replicas feeding from it. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> Run `SHOW GLOBAL STATUS LIKE 'wsrep_cluster_status';` on each node, this is the exact variable the card reads.
+> Run `SHOW GLOBAL STATUS LIKE 'wsrep_ready';` (`ON`/`OFF`) and `LIKE 'wsrep_connected';` for the companion readiness flags.
+> Check `wsrep_local_state_comment` for the human-readable node state (`Synced`, `Donor/Desynced`, `Joining`, `Initialized`).
+> On a managed service, the provider console (for example SkySQL or your cloud MariaDB cluster view) shows the same Primary/Non-Primary topology.
+
+**Why our reading may legitimately differ between nodes:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Which node you query** | Can differ during a partition | Each node reports its own view. During a split, majority nodes read `Primary` while the minority reads `Non-Primary`. Vortex IQ polls the configured endpoint. |
+| **Poll timing** | Brief lag | A status flip between polls is not reflected until the next refresh cycle. |
+| **Just-started node** | Transient Disconnected/Joining | A node booting reads `Disconnected` then `Joining` before reaching `Primary`; this is normal startup, not a fault. |
+| **Router masking** | None to value | MaxScale may stop routing to a Non-Primary node, but the backend node still reports its true status. |
+
+**Cross-source reconciliation:**
+
+| Source | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| `wsrep_ready` | Should be `ON` whenever status is `Primary`. | If status is `Primary` but `wsrep_ready` is `OFF`, the node is in a transitional state (for example desynced as a donor) and is not serving normally. |
+| Provider console topology | Should agree on which partition is Primary. | A console may lag the live group-comms decision by a few seconds during a fast partition. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My node says Non-Primary but the database process is running fine. Is it broken?**
+The process is healthy; the node has simply lost quorum and is refusing writes on purpose to prevent split-brain. This is Galera protecting your data, not a crash. The fix is to restore connectivity so the node rejoins a majority, or to route your application at the majority partition. Never confuse "process up" with "writable".
+
+**Reads still work on a Non-Primary node, why?**
+By default a Non-Primary node rejects both reads and writes (it returns `WSREP has not yet prepared node`). If reads appear to work, you likely have `wsrep_dirty_reads=ON` set, which permits stale reads from a node that has fallen out of the cluster. That is acceptable for some reporting use cases but dangerous for anything that then writes back; understand the trade-off before relying on it.
+
+**Can I force a Non-Primary node back to Primary?**
+You can, with `SET GLOBAL wsrep_provider_options='pc.bootstrap=YES'`, but you almost never should. Forcing a minority node to bootstrap creates a second independent Primary with a divergent write history, which is the genuine split-brain catastrophe Galera was preventing. Only bootstrap deliberately when you have confirmed all other nodes are truly dead and you are intentionally recovering from the most-advanced survivor.
+
+**What is the difference between Non-Primary and Disconnected?**
+`Non-Primary` means the node can talk to some peers but they do not form a majority. `Disconnected` means the node cannot reach the Galera group at all (every peer is unreachable, or the node has just started and not yet connected). Both are write-unavailable; Disconnected usually points at a network/firewall problem on the Galera ports, while Non-Primary points at a quorum split.
+
+**How fast does the card detect a flip?**
+As fast as the poll cycle. Galera itself decides quorum within its group-communication timeout (sub-second to a few seconds), and the card surfaces the new value on the next Nerve Centre refresh. For the strictest real-time signal, pair this card with the [alert-list card](/nerve-centre/kpi-cards/mariadb/galera-cluster-not-in-primary-state-or-node-lost), which is designed to page on the transition.
+
+**Does this card apply to a standalone MariaDB server?**
+No. `wsrep_cluster_status` only exists when the Galera (wsrep) provider is loaded. A standalone server has no concept of cluster status; for single-server write availability rely on uptime, disk, and connection-error cards instead.
+
+**During a rolling upgrade one node briefly shows Joining, not Primary. Should I worry?**
+No. A rejoining node passes through `Disconnected` then `Joining` (during IST/SST) before reaching `Primary`. That sequence is the expected recovery path. Only worry if a node stays stuck in `Joining` for an unusually long time, which usually signals a slow or failing SST.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Galera Cluster Status* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

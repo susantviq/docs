@@ -1,0 +1,122 @@
+---
+title: "Redis OPS Spike vs Ecom Order Rate, Redis"
+sidebarTitle: "Redis OPS Spike vs Ecom Order Rate"
+description: "Redis OPS Spike vs Ecom Order Rate for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This card plots Redis command throughput (`instantaneous_ops_per_sec`) on one axis against the storefront order rate on the other, over the same minutes. In a healthy store the two lines move together: more shoppers means more orders means more Redis operations. The dangerous pattern is divergence. When Redis operations spike but orders stay flat, work is being done that produces no revenue. That is the fingerprint of a cache stampede (many workers recomputing the same expired key at once) or a bot crawl hammering the cache. The card surfaces that gap while it is open so you can act before it tips into a latency incident.
+
+| | |
+| --- | --- |
+| **What it tracks** | Two synchronised series: Redis operations per second and the linked storefront's order rate, plotted on a dual axis so divergence is visible at a glance. |
+| **Data source** | Redis side: `instantaneous_ops_per_sec` from `INFO stats`. Ecommerce side: the live order rate from the linked Shopify, BigCommerce or Adobe Commerce connector, windowed to the same minutes. |
+| **Time window** | `15m` rolling. |
+| **Alert trigger** | `ops spike with no order spike` (a Redis throughput surge with no matching rise in orders), which points to a cache stampede or bot traffic. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+The card samples `instantaneous_ops_per_sec` from `INFO stats` (Redis's own rolling estimate of commands per second) and the storefront order rate from the linked connector at the same cadence across the 15-minute window. It then looks for divergence: a statistically meaningful spike in operations that is not accompanied by a comparable spike in orders. The alert fires on that asymmetry, not on high ops alone. High ops during a genuine sales surge is exactly what you want to see; high ops with flat orders is wasted or hostile work. The join is what makes the card actionable: by itself, `instantaneous_ops_per_sec` cannot tell a Black Friday surge apart from a stampede, because both look like "Redis is busy".
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A homeware retailer on BigCommerce caches its category and product pages in Redis with a 60-second TTL. On 22 Apr 26 a popular product page's cache entry expires at 13:00 just as an influencer post drives a crawl of bots and curious browsers to that exact URL. The platform team has the dual-axis card open.
+
+| Minute (BST) | Redis ops/sec | Orders/min | Pattern |
+| --- | --- | --- | --- |
+| 12:58 | 41,000 | 38 | tracking |
+| 12:59 | 43,500 | 41 | tracking |
+| 13:00 | 96,200 | 40 | **ops spike, orders flat** |
+| 13:01 | 118,400 | 39 | **ops spike, orders flat** |
+| 13:02 | 121,000 | 37 | **ops spike, orders flat** |
+
+At 13:00 the cache entry expired and dozens of web workers all missed simultaneously, so they all ran the same expensive origin query and all tried to repopulate the same key at once. Redis operations nearly tripled while orders did not move at all. This is a textbook cache stampede (also called a thundering herd or dogpile). Left alone it cascades: the origin database behind Redis takes the recompute load, command latency rises, and eventually real shoppers feel it.
+
+```text
+Why orders stayed flat while ops tripled:
+  - The traffic was a bot / browser crawl plus a single hot expiry, not buying intent.
+  - Every cache miss triggered a recompute, multiplying read+write ops with zero revenue.
+
+Mitigations, in order:
+  1. Add request coalescing / a mutex lock so only one worker recomputes an expired key
+     while the rest wait (single-flight). This collapses the herd.
+  2. Stagger TTLs (add jitter) so popular keys do not all expire on the same second.
+  3. Rate-limit the offending source at the edge if the spike is bot-driven.
+  4. Pre-warm hot keys ahead of known traffic events.
+```
+
+The commercial reading for the owner: nobody bought anything during those three minutes, yet Redis (and the origin database) did three times the normal work. If that pattern recurs at peak it becomes a self-inflicted outage during the exact window when real orders should be flowing. Catching the divergence early turns a future incident into a one-line TTL-jitter change.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this card | What the combination tells you |
+| --- | --- | --- |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live) | The raw throughput series without the order join. | Establishes the baseline ops level so a spike is unmistakable. |
+| [Keyspace Hit Rate %](/nerve-centre/kpi-cards/redis/keyspace-hit-rate) | The miss-rate view of a stampede. | A hit-rate dip co-occurring with an ops spike confirms a stampede over a bot crawl. |
+| [Command Latency p95 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p95-ms) | The latency consequence of an ops spike. | Rising p95 during the spike means the herd is already hurting real requests. |
+| [SLOWLOG Entries (15m)](/nerve-centre/kpi-cards/redis/slowlog-entries-15m) | The slow-command count during the burst. | Slow commands plus ops spike points to expensive recompute or a large key. |
+| [Connected Clients Saturation vs Traffic Burst](/nerve-centre/kpi-cards/redis/connected-clients-saturation-vs-traffic-burst) | The connection-side cross-channel join. | Together they show whether the spike is also exhausting the connection pool. |
+| [Redis Session Keys vs Active Ecom Users](/nerve-centre/kpi-cards/redis/redis-session-keys-vs-active-ecom-users) | The session-side cross-channel join. | Confirms whether the spike traffic is real logged-in users or anonymous bots. |
+| [Evicted Keys / minute](/nerve-centre/kpi-cards/redis/evicted-keys-minute) | The memory-pressure view. | An ops spike that also drives evictions can knock out unrelated cached data. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look natively:**
+
+> `redis-cli INFO stats` for `instantaneous_ops_per_sec`, plus the cumulative `total_commands_processed`, `keyspace_hits` and `keyspace_misses` that explain a stampede.
+> `redis-cli --stat` for a live rolling view of ops/sec, memory, and clients refreshed every second.
+> `redis-cli MONITOR` (use briefly, it is costly) to see the actual commands flooding in and identify the hot key.
+> `redis-cli INFO commandstats` for a per-command call count, useful for proving which command type dominated the spike.
+
+**On Amazon ElastiCache:** the `GetTypeCmds`, `SetTypeCmds`, and `CacheHits` / `CacheMisses` CloudWatch metrics let you reconstruct the ops mix; aggregate command rate is visible via the engine metrics.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| Estimate basis | Marginal | `instantaneous_ops_per_sec` is Redis's own short-window estimate, not an exact count; brief sub-second spikes are smoothed. |
+| Order-rate latency | Our orders lag | Order events from the storefront connector can arrive a few seconds behind the matching Redis ops, so the very leading edge of a divergence may look slightly offset. |
+| Cluster aggregation | Variable | On Redis Cluster, ops are summed across shards while a stampede may concentrate on one shard; the per-shard view in native tooling can read higher than the aggregate. |
+| Time-zone alignment | Marginal | Confirm the storefront connector and Redis sampling share a reporting time zone before treating a small horizontal offset as real divergence. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Ops and orders both spiked together. Should I worry?**
+No, that is the healthy pattern and the alert will not fire. Operations rising in step with orders is exactly what a busy, well-behaved store looks like during a genuine surge. The card only flags divergence, where ops climb without a matching order rise.
+
+**How is a cache stampede different from a bot crawl on this card?**
+Both show ops up with orders flat, so this card flags both. To tell them apart, check siblings: a stampede usually drags [Keyspace Hit Rate %](/nerve-centre/kpi-cards/redis/keyspace-hit-rate) down (lots of misses recomputing the same key), while a bot crawl can keep hit rate high but inflates [Connected Clients](/nerve-centre/kpi-cards/redis/connected-clients) and edge request counts. The fixes differ: TTL jitter and single-flight for stampedes, edge rate-limiting for bots.
+
+**Why use instantaneous_ops_per_sec rather than counting commands myself?**
+`instantaneous_ops_per_sec` is the value Redis itself maintains and the one operators recognise, so the card matches what you would see in `redis-cli --stat`. Computing your own rate from `total_commands_processed` deltas is possible but introduces sampling-window differences that make reconciliation harder.
+
+**We do not cache pages in Redis, only sessions and queues. Is this card still useful?**
+Yes. An ops spike with flat orders on a session/queue instance often means a runaway job, a retry storm, or a misbehaving consumer rather than a page stampede. The divergence signal is the same; the root cause is different. Pair it with [Blocked Clients (BLPOP / BRPOP / WAIT)](/nerve-centre/kpi-cards/redis/blocked-clients-blpop-brpop-wait) to spot queue-side trouble.
+
+**Can the order rate be zero legitimately while ops are normal?**
+Yes, overnight or in quiet hours orders can be near zero while background jobs keep Redis ticking over. The alert is tuned to fire on a spike in ops above the trailing baseline, not on a high ops-to-orders ratio in quiet periods, so steady low-order overnight traffic will not trip it.
+
+**Can I tune the spike sensitivity?**
+Yes. The divergence threshold is configurable per profile in the Sensitivity tab. Stores with naturally spiky cache traffic may widen it to reduce noise, while stores that have been bitten by stampedes may tighten it to catch the herd earlier.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Redis OPS Spike vs Ecom Order Rate* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,165 @@
+---
+title: "Replication Lag (absolute_delay), ClickHouse"
+sidebarTitle: "Replication Lag (absolute_delay)"
+description: "Replication Lag (absolute_delay) for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How far behind a replica is, measured in seconds, taken from `system.replicas.absolute_delay`. In a replicated ClickHouse cluster, every replica replays a shared log of writes to stay in sync with its peers. `absolute_delay` is the time gap between the newest entry in that log and the point the replica has actually reached: in plain terms, how stale a read served by this replica would be. A healthy replica sits at or near zero. A lag of several seconds means recent writes have not yet landed on this node, so any query routed here returns slightly old data. This card is the time-based companion to [Replication Queue Size (Top Tables)](/nerve-centre/kpi-cards/clickhouse/replication-queue-size-top-tables): the queue tells you how much work is pending, this tells you how much time that work represents.
+
+| | |
+| --- | --- |
+| **Data source** | `SELECT max(absolute_delay) FROM system.replicas` (and the per-table breakdown `SELECT database, table, absolute_delay FROM system.replicas ORDER BY absolute_delay DESC`). The value is in seconds. |
+| **What it tracks** | The maximum replication delay across the replicated tables on the node, in seconds. The headline surfaces the worst-lagging table so a DBA sees the staleness ceiling first. |
+| **Metric basis** | `absolute_delay` from `system.replicas`, computed by ClickHouse as the age of the oldest unprocessed log entry relative to now. It is a wall-clock time, not a task count. |
+| **Why it matters** | Lag is the directly user-visible consequence of replication falling behind. Reads from a lagging replica show stale data: dashboards that read the wrong replica display numbers minutes old, and read-after-write consistency breaks if the same client writes to one replica and reads from another. |
+| **Time window** | `RT` (real-time; `system.replicas` reflects the current delay on each refresh). |
+| **Alert trigger** | `>10s`. A replication delay above ten seconds flags the card amber and pages the on-call DBA. Brief sub-second lag is normal under load; a sustained multi-second delay is the signal. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine reads `absolute_delay` from `system.replicas`, which ClickHouse populates per replicated table on each node:
+
+```sql
+SELECT
+    database,
+    table,
+    absolute_delay,        -- seconds this replica is behind
+    queue_size,            -- pending tasks driving the delay
+    is_leader,
+    is_session_expired
+FROM system.replicas
+ORDER BY absolute_delay DESC
+LIMIT 10
+```
+
+`absolute_delay` is calculated by ClickHouse as the difference, in seconds, between the current time and the timestamp of the oldest queue entry this replica has not yet processed. When the queue is empty the delay is zero: the replica is fully caught up. When the queue holds an entry that was logged thirty seconds ago and has not been applied, the delay is roughly thirty seconds.
+
+The headline uses the maximum across tables because staleness is a ceiling, not an average: one table lagging twelve seconds means reads of *that* table are twelve seconds stale even if every other table is current. A DBA needs to see the worst case, then drill into the per-table breakdown to find which table and why.
+
+The 10-second threshold is a practical staleness line. Sub-second lag is normal and constant on a busy cluster: replicas are always a fraction behind the freshest write. Single-digit seconds during a heavy merge or a brief network blip are tolerable. A delay that holds above ten seconds means recent data is meaningfully stale on this replica, which is where dashboards and read-after-write workflows start to misbehave. Because `absolute_delay` is driven by the replication queue, this card and [Replication Queue Size (Top Tables)](/nerve-centre/kpi-cards/clickhouse/replication-queue-size-top-tables) should be read together: the queue is the cause, the delay is the effect.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a three-replica ReplicatedMergeTree cluster serving an analytics product. Read replicas sit behind a load balancer that does not currently prefer in-sync nodes. Snapshot taken on 14 Apr 26 at 17:30 BST.
+
+| Replica | Table | absolute_delay | queue_size |
+| --- | --- | --- | --- |
+| replica-01 (leader) | `clickstream_repl` | 0 s | 0 |
+| replica-02 | `clickstream_repl` | **34 s** | 280 |
+| replica-03 | `clickstream_repl` | 2 s | 14 |
+
+The Nerve Centre headline reads **34s replication lag on replica-02**, outlined amber against the 10-second threshold. The DBA reads three things:
+
+1. **One replica is the problem, not the cluster.** The leader is at zero and replica-03 is at a healthy 2 seconds. Only replica-02 is badly behind, with a queue of 280 entries driving it. This is a single-node issue, almost always capacity (slow disk, saturated network) or a transient catch-up after a restart.
+2. **Reads from replica-02 are 34 seconds stale.** Because the load balancer fans reads across all three replicas, roughly a third of dashboard queries are hitting a node that is missing 34 seconds of recent events. Users see numbers that flicker between current and stale depending on which replica served them.
+3. **The lag and queue agree.** A 34-second delay with a 280-entry queue is internally consistent: the replica has a real backlog. If the delay were high but the queue near zero, that would point at a stuck oldest-entry rather than volume, a different diagnosis.
+
+```text
+Acting on a single-replica lag spike:
+  1. Stop serving stale reads immediately:
+     configure the load balancer / read setting to prefer in-sync replicas, e.g.
+     SET load_balancing = 'in_order' with the lagging node last, or use
+     max_replica_delay_for_distributed_queries to fence off replicas over a threshold.
+  2. Find why replica-02 is behind:
+     SELECT inserts_in_queue, merges_in_queue FROM system.replicas
+     WHERE table = 'clickstream_repl';  -- insert-heavy = fetch/capacity problem
+  3. Check the node's resources: disk I/O, network throughput, CPU.
+  4. If it is a poison entry rather than volume, inspect system.replication_queue
+     for a high num_tries / repeating last_exception.
+```
+
+Here `max_replica_delay_for_distributed_queries` was set to 30 seconds, which immediately fenced replica-02 out of the read pool, restoring consistent reads from the two healthy nodes. The root cause was disk I/O saturation on replica-02 during a large merge; once the merge completed the queue drained and the delay returned to under a second. The durable fix was matching replica-02's storage tier to its peers so it could keep pace.
+
+Three takeaways:
+
+1. **Lag is staleness, and staleness is user-visible.** A high `absolute_delay` means reads from that replica are out of date. The first move is to stop routing reads to the lagging node, not to debug the cause.
+2. **Cross-check lag against queue size.** High lag with a large queue is a volume/capacity problem; high lag with a near-empty queue is a stuck oldest-entry. They need different fixes.
+3. **One lagging replica is a capacity or catch-up issue; all replicas lagging is a Keeper or leader problem.** If every replica's delay climbs together, look at the coordination layer or the write rate on the leader, not at any single node.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Replication Lag | What the combination tells you |
+| --- | --- | --- |
+| [Replication Queue Size (Top Tables)](/nerve-centre/kpi-cards/clickhouse/replication-queue-size-top-tables) | The cause behind the delay. | High lag with a large queue equals a real backlog; high lag with an empty queue equals a stuck entry. |
+| [Active Replicas](/nerve-centre/kpi-cards/clickhouse/active-replicas) | How many replicas are participating. | Lag rising as the active-replica count drops means a node fell out and the rest are absorbing its load. |
+| [Merges In Progress](/nerve-centre/kpi-cards/clickhouse/merges-in-progress) | Heavy merges on a replica raise its delay. | High lag during a merge burst is usually transient and clears when merges finish. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/clickhouse/database-disk-usage) | A full or slow disk throttles fetches and grows lag. | High lag plus high disk usage points at storage as the bottleneck. |
+| [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) | Memory pressure slows merge and fetch throughput. | High lag plus high memory equals a resource-starved replica. |
+| [Active Parts (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) | Lagging merge replication lets parts accumulate. | High lag on merges plus rising parts equals a backlog that can lead to TOO_MANY_PARTS. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that weights replication lag. | A sustained lag breach pulls the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> Read the delay directly from `system.replicas` in `clickhouse-client`:
+> ```sql
+> SELECT database, table, absolute_delay, queue_size
+> FROM system.replicas ORDER BY absolute_delay DESC LIMIT 10
+> ```
+> Cross-check the leader and log pointers with `SELECT is_leader, log_pointer, log_max_index, last_queue_update FROM system.replicas`.
+> For a stuck oldest-entry, inspect `system.replication_queue` (`num_tries`, `last_exception`).
+> On **ClickHouse Cloud**, replication is service-managed, so this card targets self-managed ReplicatedMergeTree clusters; Cloud surfaces replica sync state in its own monitoring view.
+
+**Why our number may legitimately differ from a manual query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Snapshot timing** | Higher or lower | `absolute_delay` is computed against `now()`, so it ticks upward every second a backlog persists. A query run moments later shows a different value. |
+| **Replica scope** | Card reflects one node | The card reads the configured node; `absolute_delay` is per replica, so another replica may show a very different lag. Query each, or use `clusterAllReplicas`. |
+| **Max vs per-table** | Card shows the worst case | The headline uses the maximum delay across tables; a manual query against one table sees only that table's lag. |
+| **Clock skew** | Marginal | `absolute_delay` depends on the node's clock; significant NTP drift between nodes can distort the value. Keep clocks synchronised. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ClickHouse Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/clickhouse/clickhouse-event-ingest-vs-ecom-orders) | If a read replica lags, ingested events appear delayed on that replica's reads even though orders are flowing. | Orders steady but analytics looks behind equals a lagging read replica, not a broken pipeline. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What exactly does absolute_delay measure?**
+It is the age, in seconds, of the oldest replication-log entry this replica has not yet applied, measured against the current time. Put simply, it is how stale a read from this replica would be. Zero means fully caught up; ten means recent writes from the last ten seconds have not yet landed here.
+
+**My lag is a fraction of a second all the time. Is that bad?**
+No, that is healthy. On a busy cluster replicas are always a hair behind the freshest write, so sub-second lag is the normal steady state. The card flags only sustained delay above ten seconds. Persistent single-digit-millisecond or sub-second lag means replication is keeping pace.
+
+**Lag is high but the queue is nearly empty. How is that possible?**
+This is the stuck-oldest-entry case. `absolute_delay` is driven by the *oldest* unprocessed entry, so a single entry that cannot complete (a fetch for a part that no longer exists on the source, for example) keeps the delay climbing even though there is almost nothing else queued. Inspect `system.replication_queue` for an entry with a high `num_tries` and a repeating `last_exception`, and repair the underlying cause.
+
+**How do I stop users seeing stale data while I fix the lag?**
+Fence the lagging replica out of the read path. For distributed queries set `max_replica_delay_for_distributed_queries` so replicas beyond a delay threshold are skipped, and use `load_balancing = 'in_order'` (or `first_or_random`) to prefer the in-sync nodes. This makes reads consistent immediately, buying time to address the underlying capacity or stuck-entry issue.
+
+**All my replicas are lagging at once. What does that point to?**
+A shared cause. The two usual suspects are the coordination layer (Keeper/ZooKeeper under latency, or a degraded quorum, slowing every replica's log processing) and the leader's write rate (inserts arriving faster than any replica can replay). Check Keeper health and the leader's insert rate before treating it as a per-node problem.
+
+**Does clock skew affect this number?**
+Yes. Because `absolute_delay` is computed relative to `now()` on the node reading it, a node whose clock drifts from its peers will report a distorted delay. Keep NTP tight across the cluster; a sudden lag jump on one node with no queue growth can be a clock problem rather than a replication problem.
+
+**On ClickHouse Cloud, is replication lag my responsibility?**
+On ClickHouse Cloud the service manages replication, so the Cloud monitoring view is the primary place to watch sync state. This card is most useful for self-managed ReplicatedMergeTree clusters where you own the replica hardware and the Keeper/ZooKeeper layer and need to diagnose and clear lag yourself.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Replication Lag (absolute_delay)* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

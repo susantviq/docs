@@ -1,0 +1,142 @@
+---
+title: "ClickHouse Health Score, ClickHouse"
+sidebarTitle: "ClickHouse Health Score"
+description: "ClickHouse Health Score for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **ClickHouse Health Score** is a single 0 to 100 composite that rolls up the most load-bearing operational signals on your cluster: query error rate, latency, disk and memory pressure, replication lag, the parts/merge backlog, and recent fatal errors. It answers the question an on-call DBA or a platform lead asks first: "in one number, is this cluster healthy right now?" A score of 90 plus means everything is nominal. A score below 70 fires an alert because at least one underlying signal has crossed into the danger band, and the gauge tells you the cluster needs attention before users feel it.
+
+| | |
+| --- | --- |
+| **What it tracks** | ClickHouse Health Score for the selected period: a weighted composite of the cluster's headline reliability and capacity signals, scored 0 (critical) to 100 (healthy). |
+| **Data source** | Derived inside Vortex IQ from the underlying ClickHouse cards: `system.query_log` (error rate, latency), `system.metrics` (memory, connections), `system.parts` (parts/merge backlog), `system.replicas` (`absolute_delay`), and disk free space. No single ClickHouse table emits this number; it is computed. |
+| **Time window** | `RT/7D`: a real-time gauge for "now", with the 7-day trend line showing whether the cluster is drifting up or down. |
+| **Alert trigger** | `< 70`. Any sustained score under 70 means one or more component signals are in their alert band; the composite is designed so a single severe breach (for example replication lag past threshold) can pull it under 70 on its own. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+The score is a weighted blend of the component cards, each normalised to a 0 to 100 sub-score and then combined. The weighting prioritises signals that directly cause user-visible failure (errors, latency, capacity exhaustion) over signals that are early warnings (parts backlog, cache hit rate). A worked breakdown follows; the exact weights are tuned per profile in the Sensitivity tab, but the default shape is:
+
+| Component signal | Source card | Default weight | Healthy band |
+| --- | --- | --- | --- |
+| Query error rate | [Query Error Rate %](/nerve-centre/kpi-cards/clickhouse/query-error-rate) | 20% | `< 0.5%` |
+| Query latency (p95/p99) | [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) | 15% | p95 `< 200ms` |
+| Disk usage | [Database Disk Usage %](/nerve-centre/kpi-cards/clickhouse/database-disk-usage) | 15% | `< 75%` |
+| Memory usage | [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) | 10% | `< 70%` |
+| Replication lag | [Replication Lag (absolute_delay)](/nerve-centre/kpi-cards/clickhouse/replication-lag-absolute-delay) | 15% | `< 2s` |
+| Parts / merge backlog | [Active Parts (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) | 10% | `< 300 parts/table` |
+| Fatal / fatal-class errors | [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h) | 15% | `0` Too Many Parts / OOM |
+
+Each sub-score degrades from 100 toward 0 as the signal moves through its band; the headline is the weighted sum. A single component sitting deep in its danger zone (for example 18s replication lag against a 10s threshold) zeroes its sub-score and, with a 15% weight, removes 15 points on its own before any other signal is considered.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A SaaS analytics team runs a 3-node ClickHouse cluster behind a customer-facing reporting product. On 14 Apr 26 at 09:40 the morning reporting peak begins and the on-call DBA glances at the Health Score gauge, which has dropped from a steady 94 overnight to **68**, tripping the `< 70` alert.
+
+The gauge alone says "something is wrong". The component breakdown says where:
+
+| Component | Reading | Sub-score | Contribution lost |
+| --- | --- | --- | --- |
+| Query error rate | 0.3% | 96 | -0.8 |
+| Query latency p95 | 240ms | 72 | -4.2 |
+| Disk usage | 71% | 88 | -1.8 |
+| Memory usage | 69% | 82 | -1.8 |
+| Replication lag | 14s | 0 | -15.0 |
+| Parts backlog | 410 parts on `events_local` | 64 | -3.6 |
+| Failed (fatal) queries | 0 | 100 | 0 |
+
+The dominant loss is replication lag: a follower replica is 14s behind the leader, past the 10s threshold, zeroing that sub-score and removing the full 15 points. The secondary contributor is the parts backlog on `events_local`, which at 410 active parts is creeping toward the 1000-part danger line and dragging merge throughput, which in turn lifts latency.
+
+```text
+Reading the composite back to a cause:
+  Health Score now:        68   (alert: < 70)
+  Health Score overnight:  94
+  Biggest single drop:     replication lag (14s vs 10s threshold) = -15 pts
+  Secondary:               parts backlog on events_local (410) = -3.6 pts
+  Tertiary:                p95 latency drift (240ms) = -4.2 pts
+Likely root cause: a heavy backfill INSERT into events_local is
+  (a) creating parts faster than merges can consolidate them, which
+  (b) increases the leader's replication workload, which
+  (c) pushes the follower behind and lifts read latency.
+```
+
+Three takeaways for the DBA:
+
+1. **The composite is a triage tool, not a diagnosis.** A score of 68 tells you to look; the component table tells you to look at replication and parts, not at error rate or disk. Always open the breakdown before acting.
+2. **One severe signal can sink the whole score.** Replication lag alone removed 15 points. Do not assume a 68 means "everything is slightly bad"; it usually means "one thing is badly wrong and a few things are mildly stressed".
+3. **The 7-day trend matters as much as the live value.** A score that dips to 68 every morning at the reporting peak and recovers by 11:00 is a capacity-planning signal (the cluster is undersized for peak). A score that has been sliding from 94 to 68 over a week with no recovery is a leak or an unbounded growth problem (parts, disk) that will eventually become an outage.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with ClickHouse Health Score | What the combination tells you |
+| --- | --- | --- |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/clickhouse/database-disk-usage) | The capacity component most likely to cause a hard stop. | Score down plus disk high equals the cluster is approaching a write-halt; act before it hits 100%. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/clickhouse/query-error-rate) | The reliability component users feel first. | Score down with error rate spiking equals customer-visible failures are happening now. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) | The performance component behind "the dashboard is slow". | Score down with p95 high but errors flat equals degraded, not broken; slow but serving. |
+| [Replication Lag (absolute_delay)](/nerve-centre/kpi-cards/clickhouse/replication-lag-absolute-delay) | A single high-weight signal that can sink the score alone. | Score down with lag past threshold equals stale reads on followers; check the leader's write load. |
+| [Active Parts (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) | The early-warning component before a Too Many Parts halt. | Score sliding with parts climbing equals merge throughput is losing to ingest. |
+| [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) | The capacity component behind OOM kills. | Score down with memory high foreshadows [MEMORY_LIMIT_EXCEEDED (24h)](/nerve-centre/kpi-cards/clickhouse/memory-limit-exceeded-24h). |
+| [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h) | The fatal-error component with the heaviest single-event impact. | Score down with failures rising equals real, logged query failures, not just slowness. |
+| [Instance Uptime](/nerve-centre/kpi-cards/clickhouse/instance-uptime) | Context: was there a restart that explains a transient dip? | A score that recovered right after a restart equals a self-heal, not a fix. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**There is no native ClickHouse "health score".** ClickHouse does not emit a single composite reliability figure, so you cannot run one command and expect to see 68. Instead, you reconcile the components and confirm that the composite is telling the truth.
+
+| What to check | Native command / table | What it confirms |
+| --- | --- | --- |
+| Error rate component | `SELECT countIf(type='ExceptionWhileProcessing') / count() FROM system.query_log WHERE event_time > now() - INTERVAL 5 MINUTE` | Matches the [Query Error Rate %](/nerve-centre/kpi-cards/clickhouse/query-error-rate) sub-score input. |
+| Latency component | `SELECT quantile(0.95)(query_duration_ms) FROM system.query_log WHERE event_time > now() - INTERVAL 5 MINUTE AND type='QueryFinish'` | Matches the p95 latency input. |
+| Replication component | `SELECT database, table, absolute_delay FROM system.replicas WHERE absolute_delay > 0` | Confirms the lag that zeroed a sub-score. |
+| Parts component | `SELECT table, count() FROM system.parts WHERE active GROUP BY table ORDER BY count() DESC LIMIT 10` | Confirms the parts backlog input. |
+| Capacity components | `SELECT metric, value FROM system.metrics WHERE metric IN ('MemoryTracking')` and `SELECT free_space, total_space FROM system.disks` | Confirms memory and disk inputs. |
+
+**On ClickHouse Cloud**, the service Monitoring tab and Advanced Dashboard surface the same underlying metrics (CPU, memory, parts, query rate); the composite is still Vortex IQ's own roll-up, so reconcile the Cloud charts against the component cards, not against the score itself.
+
+**Why our number may legitimately differ from a hand calculation:** the sub-score curves are non-linear (a signal halfway through its band is not a 50, it is weighted by severity), the weights are tunable per profile, and the live gauge samples at a slightly different instant than your manual queries. Reconcile the components, not the headline arithmetic.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The score is 68 but every dashboard I check looks fine. Why?**
+Open the component breakdown. The composite weights signals that are not always visible on a generic dashboard, replication lag and parts backlog in particular. A cluster can serve reads perfectly while a follower replica drifts behind or a table accumulates parts; both are real problems that will surface later. The score is doing its job: surfacing the slow-bleed signal before it becomes an outage.
+
+**Can a single component drag the whole score below 70?**
+Yes, by design. Replication lag, error rate, and disk usage each carry enough weight (15 to 20%) that a severe breach of one zeroes its sub-score and can pull the composite under 70 on its own. This is intentional: one badly broken thing is an alert-worthy state even if everything else is green.
+
+**Why is there no native ClickHouse command that returns this number?**
+ClickHouse exposes raw metrics and system tables, not opinionated composites. The Health Score is Vortex IQ's roll-up of those raw signals into a single triage figure. To verify it, reconcile each component against its `system.*` table as shown above.
+
+**How do I change which signals count and how much?**
+The default weights live in the profile's Sensitivity tab. A team that runs single-node (no replication) should drop the replication weight to zero and redistribute it; a team with cheap, auto-expanding disk may lower the disk weight. Tune the composite to your topology rather than accepting the generic default.
+
+**Does the score account for a planned restart or maintenance window?**
+Not automatically. A restart resets uptime and briefly perturbs latency and connection counts, which can dip the score for a few minutes. Cross-check [Instance Uptime](/nerve-centre/kpi-cards/clickhouse/instance-uptime); a dip that coincides with a low uptime value is a restart artefact, not a fault. Maintenance-window suppression is configured per profile.
+
+**The score recovered on its own. Was the problem fixed?**
+Not necessarily. Many ClickHouse stresses are self-limiting: a heavy backfill finishes, merges catch up, replication closes the gap. The score recovers because the transient load passed, not because the underlying capacity issue was resolved. If the same dip recurs at the same time each day, treat it as a capacity-planning signal, not a one-off.
+
+**We run a single node with no replicas. Does the replication weight hurt our score?**
+On a single node `system.replicas` is empty, so the replication sub-score defaults to healthy (100) and contributes its full weight as a positive. If you prefer the weight redistributed to capacity and error signals, set the replication weight to zero in the Sensitivity tab.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*ClickHouse Health Score* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

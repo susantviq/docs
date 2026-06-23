@@ -1,0 +1,149 @@
+---
+title: "Connection Pool at >90% Saturation, CockroachDB"
+sidebarTitle: "Connection Pool at >90% Saturation"
+description: "Connection Pool at >90% Saturation alerts for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Alerts for **Connection Pool at >90% Saturation**: the firing list of moments where open SQL connections crossed 90% of the cluster's configured connection ceiling and stayed there for a sustained minute. This is the "we are about to start refusing connections" warning. When this card lights up, application workers are queuing for a session slot, request latency climbs, and the next deploy or traffic spike will start throwing connection errors. For a DBA or SRE team this is a capacity emergency in slow motion: you usually have minutes, not seconds, to act before clients see failures.
+
+| | |
+| --- | --- |
+| **What it tracks** | Alerts for Connection Pool at >90% Saturation: each firing is a sustained breach of the 90% saturation threshold. |
+| **Data source** | Ratio of `sql.conns` (open SQL connections, summed across live nodes) to the configured ceiling: the cluster setting `server.max_connections_per_gateway` multiplied by gateway nodes, or the CockroachDB Cloud plan connection limit. Same series shown in the DB Console SQL dashboard "Open SQL Sessions" panel. |
+| **Metric basis** | Saturation percentage, not raw connection count. A small cluster at 95% is more urgent than a large cluster at 60% even though the large one has more absolute connections. |
+| **Time window** | `RT`, evaluated continuously; the alert requires the breach to be **sustained for 1 minute** to avoid firing on momentary bursts. |
+| **Alert trigger** | `>90% sustained 1m`: saturation above 90% held for at least one continuous minute. |
+| **What counts as a firing** | A minute-long window where pool saturation stayed above 90%. A 20-second spike to 99% that recovers does not fire; a steady 91% for 60 seconds does. |
+| **What does NOT fire** | (1) Transient spikes shorter than the 1-minute sustain; (2) High connection count that is still comfortably under 90% of the ceiling; (3) Per-node hotspots that average out below 90% cluster-wide (watch [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation) for the per-node view). |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The underlying signal is connection-pool saturation, defined as:
+
+```text
+saturation% = (open SQL connections / configured connection ceiling) * 100
+```
+
+The numerator is the cluster-wide sum of the `sql.conns` gauge (open SQL connections per node). The denominator is the connection ceiling: on self-hosted clusters this is `server.max_connections_per_gateway` applied across the gateway nodes that accept client traffic; on CockroachDB Cloud it is the plan's connection limit (visible on the cluster's Overview and enforced by the managed proxy).
+
+The alert engine evaluates saturation on every poll and opens a firing only when the value stays above 90% for a continuous 60-second window. The 1-minute sustain is deliberate: connection counts are spiky (a batch job opening 50 sessions then releasing them is normal), and alerting on every spike would bury the genuine "the pool is full and staying full" signal. Each firing carries the peak saturation reached, the gateway node(s) most loaded, and the open-connection count at trigger time so the on-call engineer can size the response.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 5-node CockroachDB self-hosted cluster backing the order and inventory services for a high-traffic retail API. `server.max_connections_per_gateway` is set to 500, and all 5 nodes accept client traffic, giving a cluster ceiling of 2,500 connections. Snapshot taken on 14 Apr 26 at 20:05 BST, during an evening flash-sale ramp.
+
+| Time (BST) | Open connections | Ceiling | Saturation | State |
+| --- | --- | --- | --- | --- |
+| 19:55 | 1,420 | 2,500 | 57% | healthy |
+| 20:01 | 2,180 | 2,500 | 87% | climbing |
+| 20:03 | 2,295 | 2,500 | 92% | breach starts |
+| 20:04 | 2,340 | 2,500 | 94% | sustained |
+| 20:05 | 2,360 | 2,500 | **94%** | **alert fires** |
+
+Saturation crossed 90% at 20:03 and stayed above it. By 20:04 the breach had been sustained for a full minute, so the card fired at 20:05 with peak saturation 94% and 2,360 open connections, concentrated on gateway nodes 2 and 4 (which sit behind the load balancer's primary targets).
+
+What the on-call SRE does with this:
+
+1. **Confirm the cause is real demand, not a leak.** Pull [Connections In Use](/nerve-centre/kpi-cards/cockroachdb/connections-in-use) trend. A smooth ramp tracking traffic means genuine load; a vertical climb with flat request volume means a client pool is leaking sessions (often a service that opens connections but never returns them to its pool).
+2. **Check whether it is hurting yet.** Cross-read [Statement Latency p95 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms). If p95 has climbed in step with saturation, application workers are already waiting on session acquisition.
+3. **Relieve pressure in the right order.** Short term: shed non-critical sessions (pause the analytics/BI pool, throttle the batch importer). Medium term: raise `server.max_connections_per_gateway` if node memory allows, or add a gateway node to widen the ceiling. Correct long-term fix: front the cluster with a connection pooler so thousands of app threads multiplex onto a bounded server-side pool.
+
+```text
+Cost framing of leaving it unaddressed:
+  - At 94% with traffic still ramping, the next +6% of demand exhausts the pool.
+  - Once full, new connections are refused: app workers throw "too many clients" errors.
+  - During a flash sale, refused connections map directly to failed checkouts.
+  - Acting at 94% (now) is a 5-minute config change; acting after exhaustion is an incident.
+```
+
+Three takeaways for the team:
+
+1. **90% is the act line, not the panic line.** The 1-minute sustain means a firing is a real, settled condition, not noise. Treat every firing as "fix within minutes", because the headroom above 90% disappears fast under load.
+2. **Saturation, not count, is the truth.** "2,360 connections" sounds large but is meaningless without the ceiling. The same 2,360 on a 10-node cluster with a 5,000 ceiling is a calm 47%. Always read the percentage.
+3. **A pooler is the structural answer.** Repeated firings during normal peaks mean the cluster is being asked to manage connection concurrency it should not. A pgbouncer-style pooler in front of CockroachDB bounds server-side connections regardless of how many app threads exist.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Connection Pool at >90% Saturation | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation) | The continuous gauge this alert is built on. | The alert tells you it crossed 90%; the gauge shows the live value and per-node spread. |
+| [Connections In Use](/nerve-centre/kpi-cards/cockroachdb/connections-in-use) | The raw numerator behind saturation. | Smooth climb equals real demand; vertical climb at flat traffic equals a pool leak. |
+| [Statement Latency p95 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms) | The first place saturation pain shows up for users. | p95 rising with saturation means workers are already waiting on session acquisition. |
+| [Statement Error Rate %](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate) | Where exhaustion finally surfaces as errors. | Error rate climbing after saturation equals connections now being refused. |
+| [Memory Usage %](/nerve-centre/kpi-cards/cockroachdb/memory-usage) | Each connection consumes memory. | High saturation plus high memory means raising the ceiling is unsafe; add nodes instead. |
+| [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live) | The workload driving connection demand. | QPS flat while connections climb confirms a leak rather than load. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The executive composite that this alert feeds. | A sustained pool breach drags the health score down even while ranges stay healthy. |
+| [CRDB Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/cockroachdb/crdb-pool-saturation-vs-traffic-burst) | The cross-channel view tying saturation to front-end traffic. | Saturation breach during a traffic burst is expected; during quiet traffic it is a leak. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look natively:**
+
+> **DB Console SQL dashboard** ("Open SQL Sessions" panel) for the live `sql.conns` series per node.
+> **`SHOW SESSIONS;`** or **`SELECT count(*) FROM crdb_internal.cluster_sessions;`** for the exact open-connection count at a moment.
+> **`SHOW CLUSTER SETTING server.max_connections_per_gateway;`** to confirm the ceiling the saturation percentage divides by.
+> **CockroachDB Cloud Metrics tab** plots the same connection series, and the cluster Overview shows the plan connection limit.
+
+**Why our number may legitimately differ from the native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Ceiling source** | Either way | Vortex IQ divides by the configured `max_connections_per_gateway` ceiling (or the Cloud plan limit). If the setting was changed but not reloaded, the native panel may compute against a stale denominator. |
+| **Per-node vs cluster** | Vortex IQ may read lower | This card uses cluster-wide saturation; the DB Console panel can show a single hot node at a higher local percentage. |
+| **Poll cadence** | Brief lag | Connection counts move per second. A polled saturation value can trail the instantaneous DB Console graph by one poll interval. |
+| **Sustain filter** | Vortex IQ fires less often | The native graph shows every momentary spike to 90%+; this card only fires on a sustained 1-minute breach. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [CRDB Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/cockroachdb/crdb-pool-saturation-vs-traffic-burst) | A firing should coincide with a front-end traffic burst. | A firing with no burst points to a connection leak in an application service, not real demand. |
+| [CRDB Statements Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/cockroachdb/crdb-statements-spike-vs-ecom-order-rate) | Saturation breaches usually accompany a statements spike. | Connections climbing without a statements spike means idle sessions are accumulating, not active queries. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My connection count looks high but this card has not fired. Why?**
+The card alerts on saturation (count divided by the configured ceiling), not on the raw count, and only after a sustained 1-minute breach above 90%. A high absolute count that is still under 90% of your ceiling, or a brief spike that recovers within a minute, will not fire. Check [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation) for the live percentage.
+
+**Should I just raise `server.max_connections_per_gateway` whenever this fires?**
+Only if node memory allows. Each connection consumes server memory, so raising the ceiling on a memory-constrained cluster trades a connection wall for an out-of-memory risk. Read [Memory Usage %](/nerve-centre/kpi-cards/cockroachdb/memory-usage) first. The durable fix for repeated firings is a connection pooler (pgbouncer-style) in front of the cluster so thousands of app threads multiplex onto a bounded server-side pool.
+
+**On CockroachDB Cloud I cannot change `max_connections_per_gateway`. What is the ceiling then?**
+On Cloud the connection limit is set by your plan and enforced by the managed proxy, not by the cluster setting. Vortex IQ divides by that plan limit. If you are repeatedly saturating it, the levers are: add a connection pooler, reduce client pool sizes, or move to a larger plan tier.
+
+**The alert fired but our application is not throwing errors yet. Is it a false alarm?**
+No. 90% is the early-warning line precisely so you can act before exhaustion. At 90%+ you have little headroom; the next traffic increment or deploy can push you to 100%, at which point new connections are refused with "too many clients" errors. Treat the firing as a window to act, not as proof that damage has already happened.
+
+**Why a 1-minute sustain instead of firing immediately at 90%?**
+Connection counts are inherently spiky: a batch import or a BI refresh can open dozens of sessions briefly and release them. Firing on every momentary spike would bury the genuine "the pool is full and staying full" signal. The 1-minute sustain confirms the condition has settled and is not transient.
+
+**Can a single hot gateway node trigger this even if the cluster average is under 90%?**
+This card evaluates cluster-wide saturation, so a single hot node averaging out below 90% will not fire it. To catch per-node hotspots, watch [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation), which exposes the per-node spread, and check whether your load balancer is distributing connections evenly across gateways.
+
+**What is the relationship between this card and pool saturation on the client side?**
+This card measures the server-side ceiling (CockroachDB's view of open sessions). Your application's client pool (HikariCP, pgbouncer, etc.) has its own limit. Client-side pool exhaustion can occur even while the server is comfortable, and vice versa. When this server-side card fires, also inspect client pool metrics; the two together tell you whether to widen the server ceiling or resize client pools.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connection Pool at >90% Saturation* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

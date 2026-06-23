@@ -1,0 +1,147 @@
+---
+title: "Connection Pool Saturation %, MariaDB"
+sidebarTitle: "Connection Pool Saturation %"
+description: "Connection Pool Saturation % for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Connection Pool Saturation %** is the share of the server's connection capacity that is currently in use, expressed as a percentage of `max_connections`. It answers one urgent question for a DBA: how close is the instance to refusing new connections? When saturation hits 100%, MariaDB returns `ER_CON_COUNT_ERROR` ("Too many connections") to every new client, which to an application looks like a total database outage even though the server is otherwise healthy. This card is a hero pulse because connection exhaustion is one of the most common and most avoidable ways a database takes down a storefront, and it almost always announces itself with a rising saturation reading minutes before the wall is hit.
+
+| | |
+| --- | --- |
+| **What it tracks** | Active and reserved connections as a percentage of the configured `max_connections` ceiling. Connection Pool Saturation % for the selected period. |
+| **Data source** | `SHOW GLOBAL STATUS LIKE 'Threads_connected'` against `SHOW GLOBAL VARIABLES LIKE 'max_connections'`, plus `Max_used_connections` for the high-water mark. On managed services the figure is read from the provider's connection metric. |
+| **Time window** | `RT/1m` (real-time sample, evaluated against a one-minute sustained window for alerting). |
+| **Alert trigger** | `> 90%`. Sustained saturation above 90% means the instance is within a handful of connections of refusing clients; treat as imminent. |
+| **Metric basis** | Established connections (`Threads_connected`), NOT active queries (`Threads_running`). A pool can be 95% saturated while almost every connection sits idle in `Sleep`. |
+| **What does NOT count** | (1) Connections reserved for `SUPER` / admin via `extra_max_connections` on a separate port; (2) connections to other instances behind the same proxy; (3) the application-side pool's own idle slots that have not yet opened a server connection. |
+| **Sentiment key** | `maria_pool_saturation` |
+| **Roles** | dba, platform, sre, engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card divides current connections by the ceiling:
+
+```text
+Connection Pool Saturation % = (Threads_connected / max_connections) × 100
+```
+
+`Threads_connected` is the count of currently open client connections, whether they are running a query or sitting idle. `max_connections` is the hard ceiling the server enforces; once `Threads_connected` reaches it, the next client receives "Too many connections" and is rejected.
+
+Two subtleties matter when reading the number:
+
+1. **Idle counts the same as busy.** A connection in `Sleep` state still occupies a slot and still holds its per-connection buffers. An over-eager application pool that opens 500 connections and uses 20 of them saturates the server just as effectively as 500 busy connections would.
+2. **The high-water mark tells the real story.** `Max_used_connections` records the peak since the last restart. If the live reading is 60% but `Max_used_connections` shows the pool hit 98% earlier today, the instance has already had a near miss; the card surfaces the live value but the peak is the warning.
+
+Because connection counts can spike for a single second (a deploy reconnecting every worker at once), the alert uses the `RT/1m` window: the live sample drives the gauge, but the `> 90%` alert only fires when saturation stays above the line for a sustained minute, filtering out harmless reconnect bursts.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+An SRE team runs a MariaDB 10.6 primary with `max_connections = 500`, serving a Shopify-adjacent inventory service and an internal admin app. Snapshot taken on 22 Mar 26 at 13:40 GMT during a flash sale.
+
+| Reading | Value | Notes |
+| --- | --- | --- |
+| `Threads_connected` | 472 | |
+| `Threads_running` | 31 | Only 31 are actually executing. |
+| `max_connections` | 500 | |
+| `Max_used_connections` | 489 | Peaked two minutes ago. |
+| **Saturation** | **94%** | Alert tripped at 13:39. |
+
+The card reads **94%** and the hero alert fires. The SRE reads three things at a glance:
+
+1. **The server is almost out of slots, but barely working.** Only 31 of 472 connections are running queries; the other 441 are idle in `Sleep`. This is not a load problem, it is a pool-sizing problem on the application side. Some service has opened far more connections than it needs and is holding them open.
+2. **There are 28 slots left, shrinking.** At the current reconnect rate the pool will hit 500 within minutes, at which point new checkout-service connections start failing with "Too many connections". The storefront would then show errors despite the database having spare CPU and memory.
+3. **The fast fix is application-side, not a server restart.** Lowering the offending service's max pool size, or enabling a proxy in front (MaxScale, ProxySQL) to multiplex idle connections, frees slots immediately. Raising `max_connections` is a tempting reflex but each extra slot reserves per-connection memory; pushing it to 1000 without checking [Memory Usage %](/nerve-centre/kpi-cards/mariadb/memory-usage) can simply trade a connection outage for an OOM kill.
+
+```text
+Slot accounting at 13:40:
+  max_connections        500
+  Threads_connected      472   (94%)
+  Threads_running         31   (real work)
+  Idle in Sleep          441
+  Slots remaining         28
+Diagnosis: idle-connection bloat from the admin app pool.
+Action: cap admin app pool to 50; if peak persists, front the
+        primary with ProxySQL to multiplex idle sessions.
+```
+
+The durable fix is to right-size the application pools and, on busy fleets, to put a connection proxy in front so the server sees a small, well-used set of connections rather than every worker's idle slot.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Connection Pool Saturation % | What the combination tells you |
+| --- | --- | --- |
+| [Connections In Use](/nerve-centre/kpi-cards/mariadb/connections-in-use) | The raw count behind the percentage. | Divide by `max_connections` to confirm the gauge; useful when the ceiling changes between samples. |
+| [Aborted Connects (24h)](/nerve-centre/kpi-cards/mariadb/aborted-connects-24h) | What happens after the pool fills. | Saturation at 100% drives aborted connects up; the two cards rising together confirm clients are being refused. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mariadb/connection-errors-24h) | The error-side view of refused connections. | "Too many connections" errors here corroborate a saturation event. |
+| [Memory Usage %](/nerve-centre/kpi-cards/mariadb/memory-usage) | Each connection holds per-connection buffers. | High saturation plus high memory equals a connection-led OOM risk; do not raise `max_connections` without headroom. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mariadb/queries-per-second-live) | Distinguishes honest load from idle bloat. | High saturation with low QPS equals idle-connection bloat; high saturation with high QPS equals genuine demand. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/mariadb/connection-pool-at-90-saturation) | The dedicated alert feed for this metric. | The alert list shows when and for how long the pool crossed the line. |
+| [Pool Saturation Across Galera Nodes vs Traffic](/nerve-centre/kpi-cards/mariadb/pool-saturation-across-galera-nodes-vs-traffic) | The cluster-wide, traffic-correlated view. | Spot whether one Galera node is saturating while others have headroom, and whether it tracks real traffic. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite that weights connection capacity. | Saturation above 90% alone can pull the health score below its threshold. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> **`SHOW GLOBAL STATUS LIKE 'Threads_connected'`** for the live connection count.
+> **`SHOW GLOBAL STATUS LIKE 'Max_used_connections'`** for the peak since restart, and `Max_used_connections_time` for when it occurred.
+> **`SHOW GLOBAL VARIABLES LIKE 'max_connections'`** for the ceiling the percentage divides by.
+> **`SHOW PROCESSLIST`** (or `SELECT * FROM information_schema.PROCESSLIST`) to see which users and hosts hold connections and how many are idle in `Sleep`.
+
+On a managed service, compare against the provider's database-connections metric on the managed-database console, which graphs the same `Threads_connected` value over time.
+
+**Why our number may legitimately differ from MariaDB's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Reserved admin slots** | Card lower | `extra_max_connections` provides admin-only slots on a separate port that the card excludes from the ceiling; the provider metric may fold them in. |
+| **Sampling moment** | Brief spikes | Reconnect bursts during a deploy create a one-second spike the live gauge catches but `Max_used_connections` may not, and vice versa. |
+| **Proxy multiplexing** | Card lower than client count | With ProxySQL or MaxScale in front, the application opens many client connections but the proxy holds few server connections; this card measures the server side. |
+| **Ceiling changes** | Percentage shifts | If `max_connections` is changed live via `SET GLOBAL`, the denominator moves; reconcile by reading the current variable, not a cached value. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Saturation is at 95% but the database feels fine. Is this a false alarm?**
+Probably not a false alarm, but possibly a benign cause. Check [Queries per Second (live)](/nerve-centre/kpi-cards/mariadb/queries-per-second-live) and `Threads_running`. If only a handful of connections are actually running queries, the pool is full of idle `Sleep` connections, an application pool-sizing problem. The database feels fine because it is barely working, but it is still one reconnect away from refusing a real client. Fix the application pool rather than ignoring the card.
+
+**Should I just raise `max_connections`?**
+Only after checking memory. Every connection slot reserves per-connection buffers, so doubling `max_connections` can double the per-connection memory footprint and trade a connection outage for an OOM kill. Read [Memory Usage %](/nerve-centre/kpi-cards/mariadb/memory-usage) first. If there is headroom, a modest increase buys time; the durable fix is to right-size application pools or add a connection proxy.
+
+**What is the difference between connected and running threads?**
+`Threads_connected` is every open connection, including idle ones; this card measures it. `Threads_running` is the subset actually executing a query right now. A pool can be 100% saturated with almost zero running threads (idle bloat) or it can have few connections all running heavy queries (a load problem). Reading both together tells you which problem you have.
+
+**Why the one-minute sustained window before the alert fires?**
+Deploys, autoscaling events, and connection-pool warm-ups can briefly open a burst of connections that close again within seconds. Alerting on the instantaneous reading would page on every deploy. The `RT/1m` window drives the live gauge from the instant sample but only fires the `> 90%` alert when saturation stays above the line for a sustained minute, which is the signature of a real exhaustion event rather than a transient.
+
+**We use ProxySQL. Why does the card read lower than our application's connection count?**
+Because the proxy multiplexes. Your application may hold 2,000 client connections to ProxySQL, but ProxySQL maintains a much smaller pool of actual server connections and reuses them. This card measures the server side (`Threads_connected` on MariaDB), so it correctly reflects the multiplexed figure. That is the whole point of the proxy, and it is why fronting a busy fleet with one is the standard fix for saturation.
+
+**Does this card account for a Galera cluster?**
+This card reads the selected node's saturation. In a Galera cluster, each node has its own `max_connections` and its own connection load, often unbalanced by the load balancer's routing. A single node can saturate while its peers have headroom. For the cluster-wide picture correlated against traffic, use [Pool Saturation Across Galera Nodes vs Traffic](/nerve-centre/kpi-cards/mariadb/pool-saturation-across-galera-nodes-vs-traffic).
+
+**The pool hit 100% and clients got errors, but it is back to 70% now. Did I miss it?**
+The live gauge has recovered, but `Max_used_connections` still records the peak, and [Aborted Connects (24h)](/nerve-centre/kpi-cards/mariadb/aborted-connects-24h) and [Connection Errors (24h)](/nerve-centre/kpi-cards/mariadb/connection-errors-24h) will show the refused clients from the spike. Use those rolling cards to confirm a near miss happened even when the live reading looks calm again.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connection Pool Saturation %* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

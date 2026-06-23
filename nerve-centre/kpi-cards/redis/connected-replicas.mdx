@@ -1,0 +1,125 @@
+---
+title: "Connected Replicas, Redis"
+sidebarTitle: "Connected Replicas"
+description: "Connected Replicas for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication & Cluster](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Connected Replicas** is the number of replica nodes currently attached to and streaming from the primary, read from `connected_slaves` in `INFO replication`. It is a small number with outsized importance: it is your live answer to "if this primary dies right now, is there a copy ready to take over?" A value of zero means there is no automatic failover target. Whatever the topology was designed to be, a drop below the expected replica count is the early warning that your redundancy has quietly evaporated, usually well before anything visibly breaks.
+
+| | |
+| --- | --- |
+| **What it tracks** | The count of replicas currently connected to the primary and receiving the replication stream (`connected_slaves`). |
+| **Data source** | `INFO replication` → `connected_slaves`, read from the primary node. The same section lists each replica's IP, port, state, and offset. |
+| **Time window** | `RT` (real-time snapshot). |
+| **Alert trigger** | `< 1` (no failover available). A primary with zero connected replicas has no hot standby; an unplanned failure means downtime and potential data loss back to the last backup. |
+| **Why it matters** | Replicas serve two jobs: they are the failover target (Sentinel or the managed control plane promotes one when the primary dies) and they offload read traffic. Lose them and you lose both, silently. |
+| **What does NOT count** | A replica that is configured but disconnected (network partition, auth failure, or still doing its initial full sync) does not count until it reaches the `online` state. |
+| **Roles** | engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+The card reads `connected_slaves` from the `Replication` section of `INFO` on the primary. Redis only increments this count for replicas that have completed their handshake and are in the connected, streaming state, so a replica mid-resync or one that has dropped off the network is excluded automatically. The detail behind this card is precise: the figure comes from `connected_slaves` in `INFO replication`, and the alert fires below 1 because a primary with no connected replica has no failover target at all. The same `INFO replication` block also exposes each replica line (`slave0`, `slave1`, and so on) with its `state`, `offset`, and `lag`, which is what the related [Replica Lag (seconds)](/nerve-centre/kpi-cards/redis/replica-lag-seconds) card reads to judge whether the connected replicas are actually keeping up rather than merely attached.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Redis 7.2 primary with two replicas behind Sentinel, the standard "one to promote, one to spare" pattern for a session and cache tier. The expected reading is 2. Snapshot taken on 03 Jun 26 at 16:40 BST.
+
+| Time | Connected Replicas | Replica Lag | What happened |
+| --- | --- | --- | --- |
+| 16:00 | 2 | 0s / 0s | Normal, full redundancy |
+| 16:35 | **1** | 0s | replica-2 dropped off |
+| 16:40 | **1** | 0s | Still 1, alert active |
+
+At 16:35 the card fell from 2 to 1 and held there. The instance is still serving traffic perfectly, and the remaining replica is in sync, so nothing looks broken on a surface dashboard. But the redundancy has halved: there is now exactly one failover target, and if the primary fails before replica-2 rejoins, Sentinel has a single candidate, with no margin if that candidate is also unhealthy.
+
+```text
+Investigation for the 03 Jun replica drop:
+  - INFO replication on primary now shows connected_slaves:1
+  - slave0 (replica-1): state=online, offset matching, lag=0  -> healthy
+  - replica-2: absent from the list entirely
+  - Check replica-2 node: process up, but its log shows
+    "MASTER aborted replication ... Can't handle RDB" after a maxmemory hit
+  - Root cause: replica-2 OOM'd loading the resync RDB; it is stuck retrying
+
+Action:
+  - Raise replica-2 maxmemory / right-size the node so it can hold the dataset
+  - Restart replication; watch connected_slaves return to 2 and lag settle to 0
+  - Until then, treat the tier as single-redundancy: hold deploys, avoid
+    primary-restarting maintenance
+```
+
+The lesson: this card is a redundancy tripwire, not a performance metric. The cluster looked completely healthy on throughput and latency the whole time, but its ability to survive a primary failure had quietly halved. Catching the drop from 2 to 1 (not waiting for the drop to 0) is what keeps you out of a single-point-of-failure window during which an unlucky primary crash becomes real downtime.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Connected Replicas | What the combination tells you |
+| --- | --- | --- |
+| [Replica Lag (seconds)](/nerve-centre/kpi-cards/redis/replica-lag-seconds) | Connected is necessary but not sufficient. | A replica can be connected yet lagging badly; both cards green means the standby is genuinely ready to promote. |
+| [Cluster Slots Assigned (of 16384)](/nerve-centre/kpi-cards/redis/cluster-slots-assigned-of-16384) | Cluster-mode redundancy peer. | In cluster mode, replica health per shard plus full slot coverage is the complete availability picture. |
+| [Cluster Slot Coverage Gap](/nerve-centre/kpi-cards/redis/cluster-slot-coverage-gap-16384-slots-assigned) | The cluster-level failure this prevents. | A primary failing with no replica creates a slot coverage gap; healthy replicas avoid it. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/redis/last-successful-backup-hours-ago) | The fallback when replicas are gone. | Zero replicas plus a stale backup is the worst redundancy posture: no hot standby and a lossy restore. |
+| [Last RDB Save (minutes ago)](/nerve-centre/kpi-cards/redis/last-rdb-save-minutes-ago) | Recovery point if failover is impossible. | If you must restart the primary from disk, this tells you how much data the restart would lose. |
+| [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) | A common cause of replica drops. | A replica that OOMs during resync drops off; high memory on replicas predicts the drop. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The composite. | A replica drop pulls the health score down via its availability weighting. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis's own tooling:**
+
+> `INFO replication` on the primary: read `connected_slaves`, then the per-replica lines (`slave0:ip=...,port=...,state=online,offset=...,lag=...`). `role:master` confirms you are querying the right node.
+> `ROLE` for a compact one-line view of role plus the list of connected replicas and their offsets.
+> If you run Sentinel, `SENTINEL replicas <master-name>` lists every replica Sentinel knows about and its flags, which is useful when a replica is up but Sentinel has marked it `s_down` (subjectively down).
+> `CLUSTER NODES` (cluster mode) shows the master-replica relationships across the whole cluster, with each replica's master ID.
+
+On a managed service, cross-check the console: ElastiCache and MemoryDB show the node group (shard) membership and each replica's status in the cluster view, and CloudWatch exposes replication metrics. Note the managed control plane handles failover itself, so the console's notion of "replicas" is the authoritative redundancy view there, and a healthy console with a transiently odd `INFO` reading usually means a node is mid-recovery.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Resync in progress** | Vortex IQ lower | A replica doing its initial full sync is not yet `online`, so `connected_slaves` excludes it until the sync completes; the console may already list it as a member. |
+| **Which node is queried** | Either | `connected_slaves` is meaningful only on the primary. Query a replica and you get its own (usually zero) downstream replica count, not the topology total. |
+| **Sentinel vs INFO** | Either | Sentinel may flag a replica down before `INFO` drops it, or vice versa, during a partition; the two converge once the partition clears. |
+| **Chained replication** | Either | If replicas replicate from other replicas, the primary's `connected_slaves` counts only its direct downstream, not the full tree. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows 0 but I definitely configured a replica. Where is it?**
+Three usual causes. (1) The replica is still doing its initial full sync and has not reached `online` state, so it is not counted yet; check the replica's log for `MASTER <-> REPLICA sync` progress. (2) The replica cannot authenticate (wrong `masterauth` after a password rotation); its log will show auth failures. (3) A network or security-group rule is blocking the replication port. Run `INFO replication` on the replica itself to see what it thinks its `master_link_status` is.
+
+**Connected Replicas is healthy but should I still worry?**
+Possibly, because "connected" does not mean "in sync". A replica can be attached but lagging by minutes if it cannot keep up with the write rate or is starved of resources. Always read this card alongside [Replica Lag (seconds)](/nerve-centre/kpi-cards/redis/replica-lag-seconds): a connected-but-lagging replica will promote with stale data, which can be worse than an obvious failure.
+
+**Why does the alert fire at below 1 rather than below my designed count?**
+The shipped threshold treats zero as the universal danger line because zero replicas means no automatic failover under any topology. If your design calls for two or three replicas, set a tighter sensitivity threshold per profile so the card alerts when you drop below your own redundancy target, not just when you hit zero. Catching the 2-to-1 transition is usually where the real early warning lives.
+
+**Does this work the same way on a managed service like ElastiCache?**
+The metric still comes from `INFO replication` if you query the node directly, but on a managed service the control plane owns failover, so the console's node-group view is the authoritative redundancy picture. During a managed failover or scaling event, `connected_slaves` can read oddly for a short window while nodes are added or promoted; let the console settle before treating a transient reading as a real drop.
+
+**A replica dropped and came back on its own. Was that a problem?**
+A brief drop with automatic reconnection is often a partial resync after a short network blip, which is normal and harmless. The concern is a replica that drops and then loops on full resyncs (each one reloads the whole dataset), which hammers the primary and can OOM the replica. If you see repeated drops, check the replica's `maxmemory` and the primary's `repl-backlog-size`: too small a backlog forces full resyncs instead of cheap partial ones.
+
+**In cluster mode, what does this card mean per shard?**
+Each shard (hash-slot range) has its own primary and its own replicas, so connected-replica health is a per-shard property. One shard losing its only replica is a single point of failure for that slice of the keyspace even if every other shard is fully redundant. Read this card together with [Cluster Slots Assigned (of 16384)](/nerve-centre/kpi-cards/redis/cluster-slots-assigned-of-16384) to confirm both that slots are covered and that the primary owning each slot range has a standby.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connected Replicas* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

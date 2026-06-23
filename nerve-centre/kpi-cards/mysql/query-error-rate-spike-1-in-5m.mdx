@@ -1,0 +1,147 @@
+---
+title: "Query Error Rate Spike (>1% in 5m), MySQL"
+sidebarTitle: "Query Error Rate Spike (>1% in 5m)"
+description: "Query Error Rate Spike (>1% in 5m) for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The alert that fires when more than 1% of statements return an error over a rolling 5-minute window. A healthy MySQL instance sits well under 0.1%: the odd duplicate-key collision or deadlock retry. When the error rate jumps past 1% and holds, something structural has broken: a missing table after a bad migration, a deadlock storm, a column that no longer exists, or the server refusing connections. This is the hero card that catches a regression in the seconds and minutes after a deploy, long before the slow drip of customer complaints arrives.
+
+| | |
+| --- | --- |
+| **Status source** | Errored statements as a fraction of total statements. Derived from `performance_schema.events_statements_summary_global_by_event_name` (`SUM_ERRORS` over `COUNT_STAR`), or the `Com_*` and error-counter deltas where Performance Schema statement instrumentation is unavailable. |
+| **Metric basis** | `error_rate = errored_statements / total_statements` over the trailing 5 minutes. Counts any statement that returned a non-zero error code to the client. |
+| **Aggregation window** | Rolling 5 minutes, evaluated continuously. The alert requires the rate to stay above 1% for the full sustained window so a single bad query does not page anyone. |
+| **Alert threshold** | `> 1%` sustained for 5 minutes. Below this it is informational; at or above it the card raises a hero alert into the Nerve Centre feed. |
+| **What counts as an error** | Any statement returning an error to the client: syntax errors, missing table/column, access denied, deadlock victims, lock-wait timeouts, constraint violations, and connection-stage refusals reaching the statement layer. |
+| **What does NOT count** | (1) Warnings (a truncated value, an implicit cast) that do not fail the statement; (2) successful statements that returned zero rows; (3) slow-but-successful queries (that is the slow-query card's job); (4) client-side timeouts where the server completed the statement. |
+| **Common causes** | A migration that dropped or renamed an object the app still references; a deadlock storm from a hot-row contention pattern; expired or revoked grants; a full disk turning writes into errors. |
+| **Time zone** | Ratio is time-zone independent; chart axes render in the merchant display time zone set in the Vortex IQ profile. |
+| **Time window** | `5m` (rolling, sustained evaluation). |
+| **Alert trigger** | `> 1%` error rate sustained for 5 minutes. |
+| **Roles** | dba, platform, sre, owner |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine computes, over the trailing 5-minute window:
+
+```text
+error_rate_pct = errored_statements_5m / total_statements_5m * 100
+```
+
+Where Performance Schema statement instrumentation is enabled, both numerator and denominator come from differencing `events_statements_summary_global_by_event_name` (summing `SUM_ERRORS` and `COUNT_STAR` across the `statement/sql/%` event families) between the window's start and end samples. Where that instrumentation is off, the engine falls back to global error counters (`Com_*` totals for the denominator and the sum of relevant error counters for the numerator), which is slightly coarser but tracks the same signal.
+
+The alert is *stateful and sustained*: the rate must exceed 1% across the rolling window for the full duration before it fires, which filters out a one-off bad statement. It clears when the rate falls back under 1%. The card also surfaces the dominant error code over the window (for example, "1062 duplicate entry" or "1213 deadlock") so the first glance tells you the *kind* of failure, not just the volume.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team ships a schema migration to a MySQL 8.0 primary at 14:30 on 02 Jun 26. The deploy renames a column from `customer_ref` to `customer_id` but one application service is still on the old build referencing the old name. Snapshot taken minutes later.
+
+| Sample time | Statements (5m) | Errored | Error rate | Dominant code |
+| --- | --- | --- | --- | --- |
+| 14:25 | 184,200 | 92 | 0.05% | 1213 (deadlock) |
+| 14:30 | 181,900 | 110 | 0.06% | 1213 (deadlock) |
+| 14:32 | 178,400 | 4,120 | 2.31% | 1054 (unknown column) |
+| 14:34 | 176,800 | 5,540 | 3.13% | 1054 (unknown column) |
+| 14:35 | 175,100 | 5,980 | 3.42% | 1054 (unknown column) |
+
+The hero card fires at 14:34 (1% first crossed at 14:32, sustained through the window) and reads **3.42% error rate, dominant code 1054 "Unknown column 'customer_ref'"**. The dominant-code label is the whole diagnosis: the app is asking for a column that no longer exists.
+
+The on-call read:
+
+1. **The baseline tells you what is normal.** Pre-deploy the rate sat at 0.05%, almost entirely deadlock retries (1213), which are self-healing and expected. The jump is a *different* error class (1054), not more of the same, which immediately rules out a load problem and points at a schema mismatch.
+2. **The timing pins the cause.** The error class changed at 14:32, two minutes after the 14:30 migration. A new error code appearing right after a deploy is the textbook regression signature.
+3. **The fix is a rollback decision, not a query tune.** Either roll the lagging service forward to the new build (which references `customer_id`), or roll the migration back if the column rename cannot wait. Because 1054 fails the statement outright, every affected request is erroring, so this is a revenue-impacting incident while it persists.
+
+```text
+Why this is a hero alert:
+  - 1054 is a hard failure: the query returns nothing usable to the app.
+  - At 3.4% of all statements, a meaningful slice of user requests are failing.
+  - It started at a precise time tied to a deploy: fast root cause.
+  - The dominant-code label turned a "database is erroring" page into a one-line diagnosis.
+```
+
+Three takeaways:
+
+1. **The error *class* matters more than the count.** A rise in deadlocks (1213) is a contention problem you tune; a rise in 1054/1146 (missing column/table) is a schema regression you roll back. The dominant-code label is there so you act on the right one.
+2. **Tie the spike to the timeline.** A new error code appearing within minutes of a deploy is a regression until proven otherwise. Always check the change log against the moment the rate crossed 1%.
+3. **Some errors are healthy in small doses.** Deadlock victims (1213) and lock-wait timeouts (1205) are normal at low rates because the app retries them. The alert's job is to catch the *abnormal* spike, which is why the threshold sits at 1% rather than zero.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this alert | What the combination tells you |
+| --- | --- | --- |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mysql/query-error-rate) | The continuous gauge this alert is built on. | The gauge shows the trend and baseline; this card is the threshold breach with the dominant code. |
+| [InnoDB Deadlocks (last 5m)](/nerve-centre/kpi-cards/mysql/innodb-deadlocks-last-5m) | Isolates the 1213 component of the error rate. | If the spike is deadlock-driven, this card spikes in lockstep; if not, the cause is elsewhere. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mysql/connection-errors-24h) | Connection-stage failures that can reach the statement layer. | Distinguishes "queries failing" from "clients cannot connect at all". |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mysql/slow-query-rate) | The other regression signal after a deploy. | A deploy can cause errors *or* slowness; check both to characterise the regression. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | The denominator context. | A 1% rate on huge volume is many more failures than 1% on light traffic; QPS sizes the real impact. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mysql/database-disk-usage) | A full disk turns writes into errors. | If errors are write failures, disk usage near 100% is the likely root cause. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite this alert dominates. | An active error spike drops the health score sharply because it signals broken functionality. |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/mysql/slow-queries-during-checkout-window-5m) | The cross-channel revenue framing. | Confirms whether the error spike overlaps the storefront's revenue-critical path. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL itself:**
+
+> `SELECT EVENT_NAME, COUNT_STAR, SUM_ERRORS FROM performance_schema.events_statements_summary_global_by_event_name WHERE COUNT_STAR > 0 ORDER BY SUM_ERRORS DESC;` for errored statements by type.
+> `SELECT * FROM performance_schema.events_errors_summary_global_by_error ORDER BY SUM_ERROR_RAISED DESC;` (MySQL 8.0) for a breakdown by exact error number.
+> `SHOW GLOBAL STATUS LIKE 'Com_%';` for statement counts, and the InnoDB-specific counters (`SHOW ENGINE INNODB STATUS\G`) for the latest deadlock.
+> The error log (`log_error`) for the verbose text of access-denied, missing-object, and disk-full errors as they happen.
+
+**Why our number may legitimately differ from a raw query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window alignment** | Variable | The card uses a rolling 5-minute window; a manual query over a different range will not match exactly. |
+| **Instrumentation scope** | Card may be lower | If `performance_schema` statement instruments are partially disabled, some statement families are not counted in either numerator or denominator. |
+| **Warnings excluded** | Card lower | Statements that raised only a warning (not an error) are not counted as errors here, but a naive `SHOW WARNINGS`-based view might include them. |
+| **Counter reset** | Card rebaselines | A server restart or a `performance_schema` truncate zeroes the summaries; the card rebaselines rather than reporting a negative delta. |
+
+**Managed-service note:** On Amazon RDS and Aurora, errored statements surface through Performance Insights (top SQL by errors) and the slow/error log exports; there is no single "error rate" CloudWatch metric, so the Performance Schema summaries above are the ground truth. On Google Cloud SQL use the error-log export in Cloud Logging filtered by severity. Align the window to 5 minutes when comparing.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why 1% and not zero? Surely any error is bad.**
+A small constant rate of errors is normal and healthy in a busy OLTP system: deadlock victims that the application retries (1213), occasional duplicate-key collisions on idempotent upserts (1062), and the odd lock-wait timeout (1205). These self-heal. Alerting at zero would page on noise constantly. The 1% sustained threshold catches the *abnormal* spike that signals a real regression while ignoring the healthy background rate.
+
+**The card says the dominant code is 1213 (deadlock). Is that a real problem?**
+At a low rate, no, deadlocks are an expected part of concurrent transactions and the application should retry the victim. But if 1213 is the dominant code *and* the rate has crossed 1%, you have a contention hotspot: many transactions fighting over the same rows in conflicting orders. Cross-reference [InnoDB Deadlocks (last 5m)](/nerve-centre/kpi-cards/mysql/innodb-deadlocks-last-5m) and use `SHOW ENGINE INNODB STATUS` to see the exact statements involved, then fix the access-order or add an index to shrink the locked range.
+
+**My error rate spiked but customers did not notice. How?**
+The errored statements may be on a non-customer-facing path: a background reconciliation job, a reporting query, or a retry that succeeded on the second attempt. The card counts statement-level errors regardless of whether the application masked them. Look at the dominant code and which queries it maps to; if they are all from a batch worker, the customer impact is low even though the rate is high.
+
+**A deploy went out and the rate spiked with code 1146 (table doesn't exist). What happened?**
+A migration almost certainly dropped or renamed a table that some application code still references, or the migration ran on the replica but not the primary (or vice versa). 1146 and 1054 (unknown column) are the signature of a schema/code mismatch. Check that every service is on the build that matches the new schema, and confirm the migration applied everywhere it should have.
+
+**Could a full disk show up here?**
+Yes. When the data volume fills, InnoDB cannot extend tablespaces and write statements start failing (often error 1114 "table is full" or generic write errors). The error rate spikes and is dominated by write codes. Always cross-reference [Database Disk Usage %](/nerve-centre/kpi-cards/mysql/database-disk-usage); if it is near 100%, free space or extend the volume before anything else.
+
+**Does a client-side timeout count as an error here?**
+No. If the client gives up and closes the connection while the server is still executing, the server-side statement may complete successfully and is not counted as an error by this card. That kind of failure shows up as an aborted client and as slow-query pressure, not as a query error. Use the slow-query and latency cards to catch it.
+
+**Can I tune the threshold or sustain window?**
+Yes, both are configurable per profile in the Sensitivity tab. A system with an unusually chatty retry pattern may want a slightly higher threshold; a low-volume system where every error matters may want a shorter sustain window so it fires faster. Tune to your own baseline error rate.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Error Rate Spike (>1% in 5m)* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

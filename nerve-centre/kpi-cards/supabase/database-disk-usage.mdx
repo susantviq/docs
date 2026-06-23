@@ -1,0 +1,154 @@
+---
+title: "Database Disk Usage %, Supabase"
+sidebarTitle: "Database Disk Usage %"
+description: "Database Disk Usage % for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of the project's provisioned disk that is currently consumed. This is the most consequential capacity metric on Supabase because the disk has a tier-bound cap, and hitting that cap does not gracefully degrade: it puts the project into a read-only / restricted mode where writes start failing. For a storefront that means orders cannot be placed, sessions cannot be written and the app effectively stops accepting business, even though the database is otherwise perfectly healthy. The alert fires at 90% precisely because the last 10% can fill faster than you expect (WAL, temp files and autovacuum bloat all eat into it), and recovering from a full disk is far slower than preventing it.
+
+| | |
+| --- | --- |
+| **What it tracks** | The share of the project's provisioned disk that is in use, expressed as a percentage. |
+| **Data source** | `detail`: Supabase tiers cap disk, hitting the cap puts the project in read-only / restricted mode. Read by the Vortex IQ Supabase connector from the project's disk metrics (database size plus WAL, temp and system overhead) against the provisioned disk size. |
+| **Calculation basis** | `disk_used / disk_provisioned * 100`, where `disk_used` includes the database itself, the write-ahead log, temporary files and system overhead, not just table data. |
+| **Time window** | `RT`: a live snapshot, because disk fills continuously and the headroom now is what matters. |
+| **Alert trigger** | `> 90%`. Above 90% the project is close enough to the cap that the final 10% can be consumed quickly and unexpectedly. |
+| **Chart type** | Gauge (0 to 100%), green below 75%, amber 75 to 90%, red above 90%. |
+| **Roles** | owner, engineering, operations (DBA / platform / SRE) |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calc */}
+The card divides used disk by provisioned disk and multiplies by 100. The subtlety, and the reason it can surprise teams, is what counts as "used". The figure is not just the size of your tables. It includes:
+
+- **Table and index data**: the obvious component, what `pg_database_size()` reports.
+- **The write-ahead log (WAL)**: every change is written to WAL first. A long-running transaction, a stalled replication slot, or a burst of writes can grow WAL substantially and temporarily.
+- **Temporary files**: queries that sort or hash more data than `work_mem` allows spill to disk. A single large `ORDER BY` or `GROUP BY` over a big table can briefly consume gigabytes of temp space.
+- **Bloat**: dead tuples left behind by updates and deletes until autovacuum reclaims them. High write churn can outpace vacuum and inflate on-disk size well beyond the live row count.
+
+```text
+disk_usage_pct = (table_data + indexes + wal + temp_files + bloat + system) 
+                 / provisioned_disk * 100
+```
+
+On Supabase the provisioned disk scales with the compute / disk configuration of the tier. The important behaviour is at the ceiling: when the disk fills, Postgres can no longer write, and Supabase places the project into a restricted, read-only-leaning state. Reads may continue, but writes (and therefore orders, sessions, anything that mutates data) fail. This is why the metric is a Hero on the Executive Overview rather than a quiet capacity gauge: a full disk is an outage, not a slowdown.
+
+Because temp files and WAL are transient, a disk reading can spike and recover within a single query's lifetime. The danger is when the *baseline* (table data plus bloat) has crept up so far that a normal temp-file spike now tips the total over the cap.
+{/* /HUMAN_AUTHORED:calc */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Supabase project with an 8 GB provisioned disk behind a growing storefront. The reading on 16 Apr 26 at 21:50 BST is **91%** (red), up from a steady 78% a week earlier. The alert has fired.
+
+Breaking the 7.3 GB of used disk down:
+
+| Component | Size | Note |
+| --- | --- | --- |
+| Table + index data | 5.1 GB | the legitimate live data set |
+| Bloat (dead tuples) | 1.4 GB | a high-churn `sessions` table autovacuum is not keeping up with |
+| WAL | 0.5 GB | normal |
+| Temp files | 0.2 GB | a nightly report spilling to disk |
+| System overhead | 0.1 GB | fixed |
+
+The week-on-week jump from 78% to 91% is not real data growth; it is bloat. The `sessions` table takes heavy update traffic, autovacuum's default settings cannot reclaim dead tuples fast enough, and 1.4 GB of the disk is now reclaimable space pretending to be data.
+
+```text
+What the platform lead does, in order of urgency:
+  1. Immediate headroom: VACUUM (or VACUUM FULL on the sessions table off-peak)
+     to reclaim the 1.4 GB of bloat. Brings usage from 91% back to ~74%.
+       - Note: VACUUM FULL takes an exclusive lock; run it in a quiet window.
+  2. Stop the recurrence: tune autovacuum on the high-churn table
+     (lower autovacuum_vacuum_scale_factor) so dead tuples are reclaimed sooner.
+  3. Structural: if live data is genuinely on track to fill 8 GB,
+     increase the provisioned disk size before it becomes urgent.
+```
+
+Three takeaways a platform team should remember:
+
+1. **Hitting the cap is an outage, not a slowdown.** Unlike CPU or memory pressure, which degrades gracefully, a full disk stops writes dead and puts the project in restricted mode. Orders fail. Treat the 90% alert as a deadline, not a suggestion.
+2. **Used disk is not the same as data size.** A jump in the percentage is often bloat or transient WAL / temp, not real growth. Always break the number down before deciding whether to vacuum (free) or resize the disk (paid and slower). Resizing to fix what was actually bloat just delays the same problem.
+3. **The last 10% fills fastest.** A single large report spilling temp files, or a stalled replication slot pinning WAL, can consume the final gigabytes in minutes. That is why the alert is at 90% and not 98%: you need the runway to act before the cap.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Database Disk Usage | What the combination tells you |
+| --- | --- | --- |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | Disk is a durability component of the composite. | A falling score driven by disk is an imminent-outage warning, not a load issue. |
+| [Last Backup Age (hours)](/nerve-centre/kpi-cards/supabase/last-backup-age-hours) | If disk fills and writes fail, recovery may lean on backups. | High disk plus stale backup is the worst-case durability pairing; fix both. |
+| [Database Queries per Second (live)](/nerve-centre/kpi-cards/supabase/database-queries-per-second-live) | Write-heavy load drives WAL and bloat. | A disk climb at a write-QPS spike points at WAL / churn rather than steady data growth. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate) | Queries that spill to temp files consume disk. | A disk spike co-occurring with slow queries points at a large sort or hash spilling to disk. |
+| [Memory Usage %](/nerve-centre/kpi-cards/supabase/memory-usage) | When memory is tight, more queries spill to disk temp files. | High memory usage plus rising temp-file disk usage are the same root cause: `work_mem` too small for the workload. |
+| [Project Uptime](/nerve-centre/kpi-cards/supabase/project-uptime) | The cap turns into a write outage. | Disk at the cap with uptime still "up" but writes failing is the read-only / restricted state in action. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to confirm this in Supabase's own tooling:**
+
+> **Supabase Studio → Reports → Database** charts disk usage against the provisioned size and is the closest native equivalent of this gauge.
+> **Project Settings → Database** shows the provisioned disk size and offers the disk-size increase control.
+> **SQL Editor / `psql`** confirms the data component:
+> ```sql
+> SELECT pg_size_pretty(pg_database_size(current_database())) AS db_size;
+> ```
+> and bloat / temp can be inspected with `pg_stat_user_tables` (dead tuple counts) and `pg_stat_database.temp_bytes`.
+
+**Why our number may legitimately differ from `pg_database_size()`:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Scope of "used"** | Vortex IQ higher | `pg_database_size()` reports table and index data only. The card includes WAL, temp files and system overhead, which the bare query omits, so the gauge reads higher than the database-size query. |
+| **Bloat counted as used** | Both include it | Dead tuples occupy real disk until vacuumed, so both the native size and the gauge count them; vacuuming reduces both. |
+| **Transient spikes** | Either direction | WAL and temp files move continuously; a reading taken seconds apart from a manual query can differ if a large query was spilling to disk. |
+| **Provisioned vs allocated** | Possible mismatch | The denominator is the provisioned disk for the tier; confirm it in Project Settings if the percentage looks off. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`supabase.supabase-health-score`](/nerve-centre/kpi-cards/supabase/supabase-health-score) | Disk above 90% should drag the composite into amber/red. | A green score with high disk means the disk threshold was relaxed in Sensitivity; revisit it before the cap. |
+| [`supabase.database-queries-per-second-live`](/nerve-centre/kpi-cards/supabase/database-queries-per-second-live) | A write-QPS surge precedes WAL-driven disk climbs. | Disk climbing at flat write QPS points at bloat or a stalled replication slot, not load. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What actually happens when the disk hits the cap?**
+The project enters a restricted, read-only-leaning state. Postgres cannot write, so any statement that mutates data (inserts, updates, deletes, and therefore orders, new sessions, anything transactional) fails, while reads may continue. For a storefront this is an effective outage even though the database process is still running. Recovery means freeing space (vacuum) or increasing the provisioned disk, both of which take time, which is why the 90% alert exists to give you runway.
+
+**My table data is only 5 GB but the gauge says 91% of 8 GB. Where did the rest go?**
+Used disk includes more than table data: the write-ahead log, temporary files from queries that spill to disk, system overhead and, most often, bloat (dead tuples from updates and deletes that autovacuum has not yet reclaimed). Break the figure down before acting; a jump is frequently reclaimable bloat rather than real growth, and a `VACUUM` will return the space for free.
+
+**Should I just increase the disk size when this alerts?**
+Only after you have ruled out bloat and transient spikes. Resizing the disk is the right fix for genuine data growth, but if the climb was actually 1.4 GB of dead tuples, a `VACUUM` is free and instant whereas a resize costs money and only delays the same problem. Diagnose first: vacuum for bloat, tune autovacuum for recurring churn, resize for real growth.
+
+**Can disk usage go down on its own?**
+Partly. Transient components (WAL, temp files) shrink automatically once the transaction or query that created them finishes, and autovacuum reclaims bloat over time. But the live data baseline only ever grows unless you delete data, and deleted rows do not free space until vacuumed. So a gauge that ratchets steadily upward is real growth; one that spikes and recovers is transient.
+
+**Why is the alert at 90% rather than higher?**
+Because the final stretch fills fastest and the consequence is severe. A single large report spilling temp files, a stalled replication slot pinning WAL, or a burst of writes can consume the last gigabytes in minutes, and a full disk is an outage that is slow to recover from. Alerting at 90% gives you the runway to vacuum or resize before the cap. The threshold is configurable per profile in the Sensitivity tab if your baseline genuinely runs hotter.
+
+**Does a stalled replication slot really affect disk?**
+Yes, and it is a classic silent filler. Postgres cannot recycle WAL segments that a replication slot has not yet acknowledged, so an inactive or stuck slot (a dropped read replica, a paused logical-replication consumer) pins WAL on disk indefinitely. Disk creeps up with no data growth and no obvious cause. Check `pg_replication_slots` for inactive slots if disk is climbing inexplicably.
+
+**Free-tier projects have a small disk. Does the metric behave differently?**
+The mechanism is identical; the cap is just lower, so the same temp-file or bloat spike consumes a larger share of the total and tips you over faster. On smaller tiers the headroom between normal usage and the cap is thinner, which makes proactive vacuuming and a watchful eye on this gauge even more important.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Database Disk Usage %* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

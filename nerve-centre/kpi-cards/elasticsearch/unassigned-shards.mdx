@@ -1,0 +1,191 @@
+---
+title: "Unassigned Shards, Elasticsearch"
+sidebarTitle: "Unassigned Shards"
+description: "Unassigned Shards for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cluster Health](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of shards Elasticsearch wants to place but currently cannot, read straight from `GET /_cluster/health`, field `unassigned_shards`. Any unassigned shard is a problem: if it is an unassigned **replica**, you have lost redundancy and that shard's data has no backup right now (a single further failure risks data loss). If it is an unassigned **primary**, part of an index is offline: searches against it return partial results and writes fail. The healthy resting value is **zero**. Anything above zero means the cluster is either still healing from a recent change or genuinely stuck and needs a human. This is the detail card behind a non-green cluster status.
+
+| | |
+| --- | --- |
+| **API endpoint** | Elasticsearch Cluster Health API, `GET /_cluster/health`, field `unassigned_shards`. The same count the cluster reports to itself; no Vortex IQ recomputation. |
+| **Metric basis** | A direct count of shards in the `unassigned` allocation state, summed across all indexes. It mixes unassigned primaries (data offline) and unassigned replicas (redundancy lost); drill in to tell them apart. |
+| **Aggregation window** | `RT` (real-time, polled every 60 seconds). A point-in-time count, not an average. |
+| **Why it matters** | Unassigned replicas mean no backup copy; unassigned primaries mean data is not searchable or writable. Both are availability and durability risks the moment the count rises above zero. |
+| **What turns it positive** | A lost data node (its shards go unassigned until reallocated), the flood-stage disk watermark (node went read-only), too few nodes for the replica count, a corrupted shard, or an allocation rule (awareness, filtering) blocking placement. |
+| **What does NOT change it** | Slow queries, high heap or GC pauses. Unassigned shard count reflects allocation state only, not performance. |
+| **Self-heal behaviour** | Most unassigned shards reallocate automatically once the delayed-allocation timeout passes, provided there is disk headroom and enough nodes. A count that does not fall after a few minutes is stuck and needs the allocation explain API. |
+| **Managed-service note** | Elastic Cloud, AWS OpenSearch/Elasticsearch Service (the `Shards.unassigned` CloudWatch metric) and Bonsai all surface the same count; the value here matches their health views. |
+| **Time window** | `RT` (real-time, polled every 60 seconds) |
+| **Alert trigger** | `> 0`. Any unassigned shard raises the card; a sustained positive count pages the platform on-call. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+There is no arithmetic to this card; the value is the literal `unassigned_shards` integer returned by `GET /_cluster/health`. Elasticsearch counts every shard copy (primary or replica) that the allocation decider has not placed on a node:
+
+```text
+unassigned_shards = count of shard copies in state UNASSIGNED
+                    across all indexes
+
+  includes: replicas with no allocatable node
+  includes: primaries with no allocatable copy
+  excludes: shards that are INITIALIZING or RELOCATING
+            (those are counted separately, see the
+            Initializing / Relocating Shards card)
+```
+
+The distinction the headline number hides, and the one that matters most, is **primary versus replica**. An unassigned replica is a redundancy loss: the data is still served by its primary, you have simply lost the backup. An unassigned primary is an availability loss: that slice of the index is offline. The same count of "3 unassigned" could be three harmless replicas waiting to reallocate, or three offline primaries (a data emergency). Always drill into `GET /_cat/shards?h=index,shard,prirep,state,unassigned.reason` to see which you have. The engine maps any positive count to a warning sentiment and an unassigned primary to critical.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 4-node Elasticsearch 8.x cluster backing storefront search and analytics for a homeware retailer. All indexes use 1 primary + 1 replica. Normal unassigned count is zero. Snapshot taken on 11 Jun 26 at 22:40 BST.
+
+At 22:31 a disk-full alert fires on es-data-03. The card jumps from 0 to **6 unassigned shards**. The on-call drills in immediately:
+
+```text
+GET /_cluster/health
+{ "status": "yellow", "unassigned_shards": 6, ... }
+
+GET /_cat/shards?h=index,shard,prirep,state,unassigned.reason&s=state
+index      shard prirep state      unassigned.reason
+products   0     r      UNASSIGNED NODE_LEFT
+products   2     r      UNASSIGNED NODE_LEFT
+orders     1     r      UNASSIGNED NODE_LEFT
+orders     3     r      UNASSIGNED NODE_LEFT
+analytics  0     r      UNASSIGNED NODE_LEFT
+analytics  4     r      UNASSIGNED NODE_LEFT
+```
+
+All six are **replicas** with reason `NODE_LEFT`: es-data-03 hit the flood-stage watermark (95% disk), went read-only, and its replicas became unassigned. Crucially, every primary is still allocated, so the cluster is **yellow, not red**: search and indexing both still work. This is a redundancy emergency, not an outage.
+
+The decision tree:
+
+1. **Primary or replica?** All replicas. No data is offline. This is urgent (fault tolerance is now zero) but not a customer-facing outage. (Six unassigned *primaries* would be a red, page-everyone event.)
+2. **Why unassigned?** The allocation explain API confirms the cause:
+
+```text
+GET /_cluster/allocation/explain
+{ "index": "products", "shard": 0, "primary": false,
+  "can_allocate": "no",
+  "explanation": "the node is above the high watermark
+                  cluster setting [cluster.routing.allocation
+                  .disk.watermark.high=90%]" }
+```
+
+3. **Fix the blocker.** The replicas cannot allocate because the cluster has no node with disk headroom. The team frees disk (deletes an old analytics index, expands the volume on es-data-03), and once a node drops below the high watermark the six replicas reallocate automatically.
+
+By 23:05, after disk is freed, the count falls 6 to 4 to 0 as replicas reallocate, and the cluster returns to green.
+
+```text
+Why this matters in numbers:
+  - Time with 6 unassigned replicas: 22:31 to 23:05 = 34 minutes
+  - During this window fault tolerance = 0 on 6 shards: a single
+    further node loss touching any of them would have gone RED.
+  - Customer impact: zero (primaries served throughout).
+  - The card's value was the early, specific warning: "6 replicas
+    are unbacked because a node is out of disk", which pointed
+    straight at the disk watermark.
+```
+
+Three takeaways:
+
+1. **Always check primary versus replica first.** The headline count cannot tell you whether data is offline. One unassigned primary is a far worse event than ten unassigned replicas; the reason and `prirep` column decide your urgency.
+2. **The allocation explain API is your first move.** `GET /_cluster/allocation/explain` returns Elasticsearch's own reason a shard cannot be placed, the most common being the disk watermark, all copies on lost nodes, or an allocation filter. It saves guesswork.
+3. **A count that will not fall means a blocker, not a delay.** Unassigned shards normally reallocate within minutes. If the count stays flat, something is actively preventing placement (no disk, no spare node, an allocation rule). That is when you escalate from "wait for self-heal" to "remove the blocker".
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards platform teams should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Unassigned Shards | What the combination tells you |
+| --- | --- | --- |
+| [Cluster Status (green / yellow / red)](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) | The rolled-up colour this card explains. | Unassigned replicas equal yellow; unassigned primaries equal red. This card tells you how many and which. |
+| [Initializing / Relocating Shards](/nerve-centre/kpi-cards/elasticsearch/initializing-relocating-shards) | The self-heal counterpart. | Unassigned falling while initializing rises equals "the cluster is actively rebuilding"; both stuck equals a blocked allocation. |
+| [Storage Usage %](/nerve-centre/kpi-cards/elasticsearch/storage-usage) | The most common blocker. | Unassigned that will not heal plus high disk usage equals "no node has room to take the shards; free disk". |
+| [Active Node Count](/nerve-centre/kpi-cards/elasticsearch/active-node-count) | The usual root cause. | Unassigned jumping the moment a node leaves confirms the lost node as the cause. |
+| [Pending Cluster Tasks](/nerve-centre/kpi-cards/elasticsearch/pending-cluster-tasks) | The master-node backlog that delays reallocation. | High pending tasks plus stuck unassigned equals "the master is overloaded and cannot process allocation updates". |
+| [Cluster Not Green (yellow or red)](/nerve-centre/kpi-cards/elasticsearch/cluster-not-green-yellow-or-red) | The Nerve Centre alert that pages on this. | Unassigned above zero is what tips cluster status non-green and triggers the sustained-5-minute alert. |
+| [Elasticsearch Health Score](/nerve-centre/kpi-cards/elasticsearch/elasticsearch-health-score) | The composite that weights allocation health. | Any unassigned primary drags the composite well below the alert line on its own. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> **`GET /_cluster/health`** for the authoritative `unassigned_shards` count. This is the exact call Vortex IQ makes.
+> **`GET /_cat/shards?h=index,shard,prirep,state,unassigned.reason&s=state`** to list each unassigned shard with whether it is a primary or replica and why it is unassigned.
+> **`GET /_cluster/allocation/explain`** for Elasticsearch's own reason a specific shard cannot be allocated.
+> **`GET /_cat/health?v`** for a one-line summary including the unassigned count.
+
+In managed services the same count appears on the console: Elastic Cloud deployment health, AWS OpenSearch/Elasticsearch Service's `Shards.unassigned` CloudWatch metric and cluster health page, and Bonsai's cluster overview.
+
+**Why our value may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Poll timing** | Brief lag | The card polls every 60 seconds; during an active reallocation the count changes second to second, so a manual call moments later can differ. |
+| **Transient during restart** | Card may look stable | A rolling restart briefly unassigns then reallocates shards per node; the 60-second poll often lands on the settled count. |
+| **Initializing not counted** | Our value may look lower | Shards that have started reallocating are INITIALIZING, not UNASSIGNED, so they leave this count and appear on the Initializing / Relocating card instead. |
+| **Time zone** | Timestamp display only | The count is timezone-independent; only the chart axis renders in your Vortex IQ display timezone. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ES Product Index Doc Count vs Ecom Catalog](/nerve-centre/kpi-cards/elasticsearch/es-product-index-doc-count-vs-ecom-catalog) | An unassigned primary on the product index drops searchable SKUs. | Unassigned primaries on `products` correlate with missing SKUs in storefront search and catalogue drift. |
+| [Search Error Rate %](/nerve-centre/kpi-cards/elasticsearch/search-error-rate) | An unassigned primary causes partial-result and shard-failure errors. | Search errors spike when a query hits an index with an offline primary; replicas-only unassigned does not raise errors. |
+
+<details>
+<summary><em>Documentation cross-reference (same-concept peer)</em></summary>
+
+The unassigned-shard concept is specific to Elasticsearch and OpenSearch (which inherited the same shard model). It is **not** a reconciliation against a parallel system; these references exist only so a team running both engines can map the same concept across docs.
+
+- OpenSearch equivalent: identical `unassigned_shards` field on `GET /_cluster/health`.
+- Generic equivalent on replicated SQL databases: closest analogue is a replica that has fallen out of the replication set or a primary with no available standby, but there is no single rolled-up count.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My single-node cluster permanently shows unassigned shards. Is that a fault?**
+No. A replica is never placed on the same node as its primary, so on a one-node cluster with the default 1 replica every replica is permanently unassigned and the count equals your primary count. This is expected. Either accept it on dev, or set `index.number_of_replicas: 0` so the replicas are not requested and the count drops to zero.
+
+**The count is above zero but search works fine. Why is it not zero?**
+You almost certainly have unassigned *replicas*, not primaries. Replicas are backups; their primaries still serve search and indexing, so functionality is unaffected. The card is correctly warning that you have lost redundancy. Check the `prirep` column: if every unassigned shard is `r`, you are degraded but available. If any is `p`, part of an index is offline.
+
+**The count will not fall back to zero. What is blocking it?**
+Run `GET /_cluster/allocation/explain`. It names the blocker. The usual suspects are: the disk high/flood watermark (no node has room), too few nodes for the replica count (a 2-node cluster cannot place 2 replicas of a shard), all copies on permanently lost nodes, or an allocation filter/awareness rule preventing placement. Fix the named blocker and the shards reallocate automatically.
+
+**A node restart briefly spiked the count then it cleared. Is that a problem?**
+No. During a rolling restart each node's shards go unassigned then reallocate as the node leaves and rejoins, so the count cycles up and back down per node. This is normal planned-maintenance behaviour. The sustained-5-minute condition on the [Cluster Not Green](/nerve-centre/kpi-cards/elasticsearch/cluster-not-green-yellow-or-red) alert exists to avoid paging on these transient spikes.
+
+**What is the difference between unassigned and initializing/relocating?**
+Unassigned means the shard has no node and is not yet being placed. Initializing means a node has accepted the shard and is loading its data. Relocating means it is moving between nodes. As an unassigned shard heals it moves to initializing (leaving this count) and then to active. Watch [Initializing / Relocating Shards](/nerve-centre/kpi-cards/elasticsearch/initializing-relocating-shards) rise as this count falls during a normal recovery.
+
+**I lost a node and want the shards to reallocate faster. Can I?**
+Yes, but carefully. Elasticsearch waits `index.unassigned.node_left.delayed_timeout` (default 60s) before reallocating, on the assumption the node may return shortly (a quick restart) so you avoid a costly full rebuild. If the node is gone for good, you can lower or zero this timeout to start reallocation immediately, but only do so when you are sure the node is not coming back, otherwise you trigger an unnecessary full shard copy.
+
+**Does a high unassigned count mean I have lost data?**
+Not necessarily. Unassigned *replicas* never mean data loss: the primary still holds the data. Unassigned *primaries* mean that slice of the index is currently unavailable, and you have lost data only if every copy of a primary is permanently gone (all nodes holding it destroyed with no snapshot). This is why snapshots matter: check [Last Snapshot Age (hours)](/nerve-centre/kpi-cards/elasticsearch/last-snapshot-age-hours) so that even a worst-case primary loss is recoverable from backup.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Unassigned Shards* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

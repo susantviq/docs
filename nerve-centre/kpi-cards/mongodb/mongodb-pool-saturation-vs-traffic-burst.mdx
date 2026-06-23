@@ -1,0 +1,159 @@
+---
+title: "MongoDB Pool Saturation vs Traffic Burst, MongoDB"
+sidebarTitle: "MongoDB Pool Saturation vs Traffic Burst"
+description: "MongoDB Pool Saturation vs Traffic Burst for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A cross-channel table that puts MongoDB connection-pool saturation side by side with the storefront traffic burst driving it, so you can tell, in one view, whether a saturation spike is "real demand we need to provision for" or "a client leak that has nothing to do with shoppers". Each row pairs a short time slice with both signals: the pool saturation percentage on the database, and the corresponding storefront traffic from the connected ecommerce platform. The card turns red when saturation runs `>90%` during a traffic burst, the combination that most often precedes a checkout-impacting outage during a sale.
+
+| | |
+| --- | --- |
+| **What it tracks** | Connection-pool saturation on the MongoDB deployment correlated against storefront traffic over the same window, presented as a row-by-row table so the database signal and the demand signal can be read together. |
+| **Data source** | MongoDB side: `connections.current / (connections.current + connections.available)` from `serverStatus`. Storefront side: the traffic / session rate from the linked ecommerce connector (Shopify, BigCommerce or Adobe Commerce). The card joins the two on a shared time axis. |
+| **Time window** | `15m` (rolling 15-minute correlation window, refreshed live). Short enough to catch a sale-driven burst as it happens, long enough to smooth single-poll noise. |
+| **Alert trigger** | `>90% during traffic burst`. Saturation above 90% on its own is a capacity warning; saturation above 90% while storefront traffic is also bursting is the high-risk combination that raises this cross-channel alert. |
+| **What counts** | All connections in `connections.current` against the polled `mongod`, joined to storefront traffic from the connected commerce platform for the same 15-minute window. |
+| **What does NOT count** | Saturation on members not polled, and database load that is not connection-bound (CPU or disk pressure shows elsewhere). Traffic from channels not wired into a Vortex IQ commerce connector is not in the storefront column. |
+| **Roles** | owner, platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+This is a cross-channel correlation card, so it computes two series and joins them on time.
+
+```text
+Database series (per 15m window):
+  pool_saturation_pct = connections.current
+                        / ( connections.current + connections.available )
+                        x 100        (from serverStatus.connections)
+
+Storefront series (same 15m window):
+  traffic_burst = storefront sessions / requests per window
+                  from the linked ecommerce connector
+
+Alert condition:
+  saturation > 90%  AND  storefront traffic in a burst state
+```
+
+What the inputs mean:
+
+- **The MongoDB side** is exactly the [Connection Pool Saturation %](/nerve-centre/kpi-cards/mongodb/connection-pool-saturation) gauge: how full the polled member's connection capacity is, where the effective ceiling is `current + available` (the smaller of the configured `maxIncomingConnections` and the OS file-descriptor limit).
+- **The storefront side** is the live traffic / session rate from the connected commerce platform, which is what tells us whether the saturation is being driven by genuine shopper demand.
+- **A "traffic burst"** is storefront traffic running materially above its recent baseline for the window, the same definition the commerce connectors use for their own surge detection.
+
+Important framing points:
+
+- **The whole point is the join.** Saturation alone cannot distinguish a sale-driven surge from an application connection leak. By pairing it with storefront traffic, the card answers the diagnostic question directly: did the connections rise because shoppers arrived, or for some other reason?
+- **The 90% line maps to imminent refusal.** Connection saturation fails as a cliff: everything works until the ceiling, then new connections are refused. Pairing the 90% line with a live traffic burst flags the moment when a sale is most at risk of tipping the database into refusing connections.
+- **Per-member.** The MongoDB side reflects the polled member, normally the primary that carries writes during a checkout-heavy burst.
+
+The output is a table, one row per recent window, with the saturation percentage, the storefront traffic level, and the resulting state (normal / capacity / leak / red).
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MongoDB 6.0 primary behind a Shopify storefront. A flash-sale campaign launches at 14:00. The card's table, read on 13 Jun 26, shows the two signals together.
+
+| Window (UTC) | Pool saturation | Storefront traffic | State |
+| --- | --- | --- | --- |
+| 13:30 | 31% | baseline (1.0x) | Normal |
+| 13:55 | 58% | rising (2.4x) | Capacity, expected |
+| 14:05 | 92% | burst (5.1x) | **Red: saturation during burst** |
+| 14:20 | 89% | burst (4.8x) | Capacity, near ceiling |
+| 16:40 | 93% | baseline (1.1x) | **Leak: saturation without burst** |
+
+Two of these rows are red-adjacent, but they tell opposite stories, which is exactly what the card exists to separate:
+
+- **At 14:05**, saturation hits 92% while storefront traffic is bursting at 5.1x baseline. This is real demand: the sale brought shoppers, the shoppers drove connections, and the database is genuinely near its ceiling. The right response is capacity: raise the host `ulimit -n` and `maxIncomingConnections` to lift the ceiling immediately, and ensure the application's driver pools are sized to ride the burst without exhausting the server.
+- **At 16:40**, saturation is back at 93% but storefront traffic has returned to baseline (1.1x). Nobody is shopping in volume, yet connections are still pinned near the ceiling. This is the leak signature: an application instance that opened connections during the sale never returned them to the pool, or a background job is holding connections open. The fix is on the client side, not the server: find the leaking service and recycle it, then fix the connection-return behaviour.
+
+```text
+The diagnostic in one line:
+  saturation HIGH + traffic HIGH  =  capacity   (provision: lift ceiling, size pools)
+  saturation HIGH + traffic LOW   =  leak       (client bug: connections not returned)
+```
+
+Three takeaways:
+
+1. **Saturation in isolation is ambiguous; this card removes the ambiguity.** The same 90%+ reading means "buy capacity" or "fix a bug" depending entirely on whether traffic is bursting, and you cannot tell which from the database alone.
+2. **During a sale, the red row is a "fix it now" line.** Saturation at 90%+ while traffic is still climbing means the next surge of shoppers may hit refused connections, which presents as failed checkouts. Lift the ceiling before the burst peaks.
+3. **The post-burst leak is the sneaky one.** Saturation that stays high after traffic subsides is easy to miss because the sale is "over", but a leaked pool will eventually exhaust the ceiling and cause an outage with no traffic to explain it. Watch the rows after the burst, not just during it.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Pool Saturation vs Traffic Burst | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mongodb/connection-pool-saturation) | The database half of this card, as a standalone gauge. | The gauge gives the live value; this card adds the traffic context that explains it. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/mongodb/connection-pool-at-90-saturation) | The alert-feed log of each sustained breach. | The log records when; this card records why (burst or leak). |
+| [Connections In Use](/nerve-centre/kpi-cards/mongodb/connections-in-use) | The raw `current` count behind the percentage. | A count that stays high after traffic falls confirms a leak. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mongodb/connection-errors-24h) | The downstream symptom once saturation hits the ceiling. | Errors appearing in a red row confirm refusals are now happening to shoppers. |
+| [MongoDB OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mongodb/mongodb-ops-spike-vs-ecom-order-rate) | The throughput-side cross-channel companion. | Together they show whether a burst is driving connections, operations, or both. |
+| [Slow Ops During Checkout Window (5m)](/nerve-centre/kpi-cards/mongodb/slow-ops-during-checkout-window-5m) | The checkout-impact view during the same burst. | Saturation plus slow checkout ops quantifies the revenue at risk during the sale. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to confirm the number in MongoDB's own tooling:**
+
+> **`mongosh`:** `db.serverStatus().connections` gives `current` and `available`; compute `current / (current + available)` to reproduce the database half of each row.
+> **`mongostat`:** the `conn` column shows the live connection count for spot checks against the table.
+> **Atlas:** the **Metrics** tab **Connections** chart shows current connections against the limit; overlay it mentally with your traffic to do the same correlation by hand.
+> **Storefront side:** the connected commerce platform's own analytics (Shopify, BigCommerce or Adobe Commerce) holds the authoritative traffic / session figures the storefront column is built from.
+
+**Why our number may legitimately differ from the native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Effective vs configured ceiling** | Vortex IQ higher | We derive the ceiling from `current + available` (the real limit). Computing against the configured `maxIncomingConnections` reads lower. |
+| **Window alignment** | Either | The two series are joined on a 15-minute window; if you compare a 1-second `mongostat` peak against a windowed storefront figure they will not line up exactly. |
+| **Member polled** | Either | The database side reads one `mongod` (normally the primary). A native tool pointed at a secondary shows different saturation. |
+| **Traffic definition** | Either | The storefront column uses the commerce connector's session / request basis; a raw page-view count from the platform's UI may differ in scope. |
+| **Time zone** | Axis only | The table renders timestamps in your profile zone; the underlying join is on UTC. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) / [`adobe_commerce.total_revenue`](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | A red row during a burst should coincide with high storefront revenue. | Saturation high with low revenue and low traffic is the leak signature, not a sale. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mongodb/connection-pool-saturation) | The standalone gauge should match this card's database column for the same window. | A mismatch usually means the gauge and the join are reading different members or windows. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What is the practical difference between a "capacity" row and a "leak" row?**
+Both show high saturation, but the traffic column tells them apart. A capacity row has high saturation and a live traffic burst: shoppers arrived, connections rose with them, and the database is genuinely near its ceiling, so the fix is to provision (lift the ceiling, size the pools). A leak row has high saturation but baseline traffic: connections are pinned high with nobody shopping, which means an application is holding connections it should have returned, so the fix is a client-side bug, not more capacity. Misreading one for the other wastes money (over-provisioning for a leak) or causes an outage (ignoring a real capacity wall).
+
+**Why correlate against storefront traffic instead of database operations per second?**
+Storefront traffic is the leading, business-level signal: shoppers arrive before they generate database work, and traffic is what you can forecast for a planned sale. Operations per second is the lagging, technical signal. This card deliberately uses the business signal so an owner, not just a DBA, can read it. The operations-side correlation lives in the companion [MongoDB OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mongodb/mongodb-ops-spike-vs-ecom-order-rate) card.
+
+**The card needs a commerce connector to populate the traffic column. What if I only have MongoDB connected?**
+Without a linked Shopify, BigCommerce or Adobe Commerce connector there is no storefront series to join, so the traffic column is empty and the card cannot classify rows as capacity or leak. In that case use the standalone [Connection Pool Saturation %](/nerve-centre/kpi-cards/mongodb/connection-pool-saturation) gauge, which still shows the database side. Connecting the commerce platform is what unlocks the cross-channel diagnosis.
+
+**Saturation is at 90%+ but my traffic burst is genuine. What should I do during the sale?**
+Provision, fast. The immediate lever is to raise the host file-descriptor limit (`ulimit -n`) and, if it is the binding constraint, `net.maxIncomingConnections`, which lifts the ceiling for new connections without touching the application. In parallel, confirm the application's driver pools are sized to ride the burst rather than exhaust the server. Treat the red row as imminent refusal, because the next surge of shoppers can hit a connection wall that presents as failed checkouts.
+
+**How is a "traffic burst" defined?**
+It is storefront traffic running materially above its recent baseline for the 15-minute window, using the same surge definition the commerce connectors apply for their own spike detection. The multiplier shown in the table (for example 5.1x) is traffic relative to the rolling baseline. This is intentionally relative, not an absolute number, so the card adapts to each store's normal volume rather than assuming a one-size threshold.
+
+**Can this card catch a leak that happens with no sale at all?**
+Yes, and that is one of its most useful modes. A connection leak does not need a traffic burst to occur; an application can slowly accumulate un-returned connections during ordinary operation. On this card that shows as saturation climbing while the traffic column stays at baseline across multiple windows, the unambiguous leak signature. Because the card always shows both signals, a leak surfaces here even when nothing is happening on the storefront.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*MongoDB Pool Saturation vs Traffic Burst* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,167 @@
+---
+title: "Snowflake QPS Spike vs Ecom Order Rate, Snowflake"
+sidebarTitle: "Snowflake QPS Spike vs Ecom Order Rate"
+description: "Snowflake QPS Spike vs Ecom Order Rate for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A dual-axis chart overlaying Snowflake query rate (queries per interval across the account's warehouses) against the storefront's order rate over the trailing hour. In a healthy account these lines correlate loosely: more shopping drives more dashboard refreshes, more ad-hoc analysis, more scheduled reporting, so query volume rises with order volume across the day. The shape this card hunts for is a query spike with no matching order spike. When QPS jumps but orders stay flat, the extra queries are not being driven by genuine business activity. The usual causes are a dashboard storm (a popular Looker or Tableau report set to auto-refresh, or a workbook everyone opened at once), a runaway scheduled job stuck in a retry loop, or a bot or scraper hammering an exposed query endpoint. Every one of those burns credits and can starve the warehouse of capacity for the queries that actually matter, all while contributing nothing to revenue. The `qps spike with no order spike` alert is the divergence detector for exactly this pattern.
+
+| | |
+| --- | --- |
+| **What it tracks** | Two series on one chart over the trailing hour: (1) Snowflake query rate, queries started per interval, derived from `SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY` and live `INFORMATION_SCHEMA.QUERY_HISTORY`; (2) ecom order rate, orders per interval from the linked Shopify, BigCommerce, or Adobe Commerce connector. |
+| **Data source** | Snowflake side: query counts from `QUERY_HISTORY` (account usage for completeness, information-schema table function for low latency). Ecom side: order-rate feed from the joined storefront connector. The card aligns both on a shared minute-bucketed axis. Snowflake QPS Spike vs Ecom Order Rate for the selected period. |
+| **Why it matters** | A query spike that does not track orders is, by definition, demand the business did not generate. It costs credits and consumes warehouse concurrency that paying-customer-facing analytics needs. Catching the divergence early stops both the cost leak and the capacity starvation. |
+| **Aggregation window** | `1h` trailing, minute-bucketed so a sudden storm is sharp and obvious against the smoother order curve. |
+| **Time window** | `1h` |
+| **Alert trigger** | `qps spike with no order spike (= dashboard storm / bot)`, query rate jumps materially above baseline while the order rate stays flat. |
+| **Roles** | owner, engineering, operations, data |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card computes two rate series and looks for query growth uncorrelated with order growth:
+
+```text
+qps(t)        = queries started in bucket t (from QUERY_HISTORY)
+order_rate(t) = orders created in bucket t (from linked ecom connector)
+
+qps_baseline  = rolling median of qps over the prior hour
+alert fires when qps(t) >> qps_baseline
+                 AND order_rate(t) ≈ order_rate_baseline (flat)
+```
+
+What a data and platform team needs to know about how Snowflake query volume behaves, and why a decoupled spike is the warning:
+
+- **Query rate normally tracks human and scheduled demand.** BI dashboards, ad-hoc exploration, and scheduled reports all rise and fall with the business day, which itself tracks shopping activity. That loose correlation is what makes the order line a useful baseline: when QPS rises for a real reason, orders are usually rising too.
+- **A dashboard storm multiplies one action into hundreds of queries.** A single Looker dashboard with twenty tiles set to auto-refresh every minute is twenty queries a minute, per open viewer. A board-meeting report opened by thirty people at 09:00, or an auto-refresh someone left running over a weekend, produces a query wall with zero new orders behind it.
+- **A runaway scheduled job retries silently.** A dbt model or a Snowflake Task that errors and is configured to retry can re-fire on a tight loop, each attempt a fresh query. Query count climbs steeply; the work is the same failing statement over and over; orders are untouched.
+- **Bots and scrapers target exposed endpoints.** Where a reverse ETL tool, an embedded analytics API, or a public data app sits in front of Snowflake, a scraper or a misbehaving integration can drive a flood of identical queries. This is the security-flavoured case and pairs with [Failed Logins (24h)](/nerve-centre/kpi-cards/snowflake/failed-logins-24h) when the source is unauthenticated abuse.
+- **The spike costs twice.** Beyond the direct credit burn, a query flood consumes the warehouse's `MAX_CONCURRENCY_LEVEL` slots. Legitimate queries then queue behind the junk, so a dashboard storm on one warehouse can slow genuine analytics that shares it. This is why the card sits in Revenue at Risk, not just Cost.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs Snowflake behind an ecommerce retailer on BigCommerce. The `BI_WH` warehouse serves a Looker instance; `AD_HOC_WH` serves analysts; orders flow steadily through the morning. Reading taken on 21 May 26.
+
+**Normal mid-morning (20 May 26), the lines correlated:**
+
+| Minute (UTC) | Orders/min (ecom) | Queries/min (Snowflake) |
+| --- | --- | --- |
+| 10:00 | 1.4 | 38 |
+| 10:15 | 1.6 | 44 |
+| 10:30 | 1.5 | 41 |
+| 10:45 | 1.7 | 47 |
+
+Roughly 27 queries per order, stable. Query volume tracks the gentle order ramp.
+
+**The spike (21 May 26):**
+
+| Minute (UTC) | Orders/min (ecom) | Queries/min (Snowflake) |
+| --- | --- | --- |
+| 10:00 | 1.5 | 40 |
+| 10:15 | 1.6 | 43 |
+| 10:30 | 1.5 | **310** |
+| 10:45 | 1.6 | **428** |
+
+At 10:30 the query line rockets to 310, then 428 per minute, while orders stay dead flat at ~1.6. The alert fires: `qps spike with no order spike (= dashboard storm / bot)`. No order spike means no business reason; the queries are coming from somewhere else.
+
+The team's response, in order:
+
+1. **Find who or what is querying.** Run a live query against `INFORMATION_SCHEMA.QUERY_HISTORY` grouped by `user_name`, `role_name`, and `query_text` over the last ten minutes. In this case a single Looker service account is responsible for 88% of the new queries, all variations of the same dashboard tile SQL.
+2. **Identify the trigger.** The Looker dashboard in question had an auto-refresh interval accidentally set to 30 seconds and was left open on a wall-mounted office screen over the weekend, plus a marketing report someone scheduled to email hourly that fans out to forty tiles. Two sources, one signature.
+3. **Stop the bleed, then prevent recurrence.** Short term: kill the runaway sessions if needed (`SELECT SYSTEM$CANCEL_ALL_QUERIES(<session_id>)` per offending session, or set a tighter `STATEMENT_TIMEOUT_IN_SECONDS` on the role). Lengthen the dashboard refresh interval to 15 minutes, enable Looker result caching, and put a [Resource Monitor](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) credit quota on `BI_WH` so a future storm self-suspends the warehouse before the bill runs away.
+
+```text
+Cost and capacity framing of the spike (BI_WH is a Medium, 4 credits/hour, $3/credit):
+  Excess queries over the hour: ~22,000 above baseline
+  These kept BI_WH from auto-suspending all hour: ~4 credits = $12 in raw burn
+  Worse: BI_WH hit its concurrency ceiling, so 9 genuine analyst queries
+    queued for up to 40s each (see Warehouse Saturation and Queue Depth)
+  Had the storm run the full weekend unspotted: ~$430 burn + two days of slow BI
+Caught by the alert at 10:30: refresh-interval change + a resource monitor, minutes.
+```
+
+Three things worth remembering:
+
+1. **A query spike with flat orders is never demand; it is always a mechanism.** Dashboard auto-refresh, a retry loop, or a scraper. The order line is what tells you it is not real business, so you can hunt the mechanism without second-guessing whether it is just a busy day.
+2. **The damage is concurrency, not just credits.** A storm rarely bankrupts you in an hour, but it can quietly push a warehouse to its concurrency ceiling so that real analytics queues. Always read this card next to [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation).
+3. **A resource monitor is the seatbelt.** The durable fix for runaway query cost is a credit quota that suspends the warehouse automatically. The alert catches the event; the resource monitor caps the worst case while you respond.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Snowflake QPS Spike vs Ecom Order Rate | What the combination tells you |
+| --- | --- | --- |
+| [Snowflake Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/snowflake/snowflake-event-ingest-vs-ecom-orders) | The ingest-side cross-channel twin of this query-side card. | A query storm reading data that ingest stalled means dashboards are flooding and serving stale results at once. |
+| [Credit Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/snowflake/credit-burn-vs-ecom-order-volume) | The cost-side view of the same decoupling. | A query spike with flat orders almost always shows up here as credits diverging from orders. |
+| [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) | Tells you whether the storm exhausted concurrency. | High saturation during the spike means genuine queries are queueing behind the junk. |
+| [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse) | Quantifies the capacity damage of the storm. | A queue forming exactly at the spike confirms the flood is starving real work. |
+| [Queries per Hour (live)](/nerve-centre/kpi-cards/snowflake/queries-per-hour-live) | The single-axis query-rate baseline this card overlays. | Use it to confirm the spike's absolute size and where it landed in the day. |
+| [Slow Analytics Queries During Checkout Window](/nerve-centre/kpi-cards/snowflake/slow-analytics-queries-during-checkout-window) | The other revenue-at-risk cross-channel card. | A storm during the checkout window is the worst case: capacity starved exactly when it matters. |
+| [Failed Logins (24h)](/nerve-centre/kpi-cards/snowflake/failed-logins-24h) | The security angle when the source is abuse, not a dashboard. | A query flood alongside a login-failure burst points at an external scraper, not an internal report. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake's own tooling:**
+
+> **Live query rate by source (low latency):** `SELECT user_name, role_name, COUNT(*) FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(END_TIME_RANGE_START=>DATEADD('minute', -15, CURRENT_TIMESTAMP()))) GROUP BY 1, 2 ORDER BY 3 DESC;` localises a storm to a user or service account fast.
+> **Account-wide query counts (complete, some latency):** `SELECT DATE_TRUNC('minute', start_time) AS m, COUNT(*) FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY WHERE start_time >= DATEADD('hour', -1, CURRENT_TIMESTAMP()) GROUP BY 1 ORDER BY 1;`
+> **Repeated identical queries (the dashboard / retry fingerprint):** group `QUERY_HISTORY` by `query_hash` (or a `LEFT(query_text, 80)`) to surface the same statement firing hundreds of times.
+> **Managed console:** Snowsight under **Monitoring -> Query History** offers filters by user, warehouse, and time, and **Admin -> Warehouses** shows live running and queued counts. Resource Monitors live under **Admin -> Cost Management** and are the native way to cap a runaway warehouse.
+
+**Why our number may legitimately differ from a native query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Account Usage latency** | Our line can lag | `ACCOUNT_USAGE.QUERY_HISTORY` lags actual execution by up to ~45 minutes; for live spikes we read the `INFORMATION_SCHEMA` table function, so an ad-hoc `ACCOUNT_USAGE` query will not match minute for minute. |
+| **Warehouse scope** | Our total lower | If the connector is scoped to specific warehouses, an account-wide native count will be higher. |
+| **What counts as a query** | Variable | We count user and scheduled queries; whether trivial metadata or cached-result queries are included depends on the connector filter, which a raw `COUNT(*)` does not apply. |
+| **Bucketing** | Edge buckets shift | We minute-bucket on a trailing window; a native query grouped by clock minute splits a spike straddling a boundary differently. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_orders`](/nerve-centre/kpi-cards/shopify/total-orders) / [`bigcommerce.total_orders`](/nerve-centre/kpi-cards/bigcommerce/total-orders) | The order line should match the storefront connector's own order rate for the same window. | If orders also spiked, the query rise may be legitimate demand, not a storm; check the storefront first. |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) | Flat revenue confirms the query spike is not backed by business activity. | Revenue rising with queries would reframe the spike as healthy load. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**QPS spiked but orders also spiked at the same time. Did the alert misfire?**
+No, and that is the design working. The alert only fires when query rate climbs while orders stay flat. If both rose together (a flash sale, a marketing send, a traffic surge), the extra queries are genuine demand and the alert stays quiet. The order line is precisely what separates a real busy spell from a junk storm.
+
+**How do I tell a dashboard storm from a bot or scraper?**
+Group the spike's queries by `user_name` and `query_hash`. A dashboard storm concentrates on one BI service account running a handful of repeated dashboard-tile statements. A scraper or abusive integration tends to come from a single role hitting an exposed endpoint, often alongside a [Failed Logins (24h)](/nerve-centre/kpi-cards/snowflake/failed-logins-24h) burst. Same symptom on this card; different source, different fix.
+
+**Can I just raise the QPS alert threshold to stop it firing on busy mornings?**
+You should not need to, because the card already conditions on orders being flat. Busy mornings raise orders too, so they do not trip the alert. If you are still seeing false positives, the more likely cause is a legitimately spiky-but-real workload (a scheduled heavy report). Tag and exclude that known job rather than blunting the threshold, which would hide real storms.
+
+**What is the fastest way to stop a runaway storm in progress?**
+Find the offending sessions in `INFORMATION_SCHEMA.QUERY_HISTORY`, then cancel them (`SELECT SYSTEM$CANCEL_ALL_QUERIES(<session_id>)`) or, for a service account, suspend the warehouse it runs on. The durable fix is a Resource Monitor with a credit quota that auto-suspends the warehouse, so the next storm caps itself without a human in the loop.
+
+**Does a query spike actually risk revenue, or just cost?**
+Both, which is why this card lives in Revenue at Risk. The direct cost is credits. The revenue risk is concurrency: a storm can push a warehouse to its `MAX_CONCURRENCY_LEVEL`, queueing the genuine analytics that operations and merchandising rely on during the day. Pair with [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) to see whether real work is being starved.
+
+**The spike came from a single dbt run. Is that a storm?**
+It can be if the run is misconfigured. A healthy dbt run is a bounded burst that completes. A run stuck retrying a failing model, or one that fanned out far more models than expected, looks identical to a storm on this card: queries climbing with no order change. Check the orchestrator's run log; if the same model is re-firing, fix the model or its retry policy rather than the warehouse.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Snowflake QPS Spike vs Ecom Order Rate* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

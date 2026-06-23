@@ -1,0 +1,169 @@
+---
+title: "Replication Queue Size (Top Tables), ClickHouse"
+sidebarTitle: "Replication Queue Size (Top Tables)"
+description: "Replication Queue Size (Top Tables) for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of pending replication tasks queued on each ReplicatedMergeTree table, ranked highest first. In a replicated ClickHouse cluster, every write (insert, merge, mutation) is recorded as an entry in a shared log held in ClickHouse Keeper or ZooKeeper, and each replica works through that log to stay in sync. `system.replicas.queue_size` is the count of log entries a replica still has to apply. A healthy queue drains continuously and sits near zero. A queue that climbs and stays high means a replica is falling behind: it is accepting work faster than it can replay, which leads to stale reads on that replica and, if it persists, growing [Replication Lag (absolute_delay)](/nerve-centre/kpi-cards/clickhouse/replication-lag-absolute-delay). This card is the per-table breakdown so a DBA sees exactly which table is stuck.
+
+| | |
+| --- | --- |
+| **Data source** | `SELECT database, table, queue_size, inserts_in_queue, merges_in_queue FROM system.replicas ORDER BY queue_size DESC LIMIT 10`. One row per replicated table on the node. |
+| **What it tracks** | Per-table count of unprocessed replication-queue entries (`queue_size`), with the insert and merge sub-counts. The headline surfaces the table with the largest queue so the worst offender is visible first. |
+| **Metric basis** | Queue depth from `system.replicas`, a ClickHouse-distinctive view of the replication state machine. This is task count, not time; it pairs with `absolute_delay` for the time dimension. |
+| **Why it matters** | A growing queue is the leading indicator of replica drift. Reads served by a lagging replica return stale data; merges blocked in the queue let parts accumulate; and a queue that never drains can wedge replication entirely until the underlying blocker (Keeper, disk, a poison entry) is cleared. |
+| **Time window** | `RT` (real-time; `system.replicas` reflects current queue state on each refresh). |
+| **Alert trigger** | `>100 sustained`. A queue above 100 entries that does not drain over the window flags the card and pages the on-call DBA. A brief spike during a large merge is normal; sustained depth is the signal. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine reads `system.replicas`, the system table that exposes the replication state of every ReplicatedMergeTree table on the node:
+
+```sql
+SELECT
+    database,
+    table,
+    queue_size,
+    inserts_in_queue,
+    merges_in_queue,
+    is_session_expired,
+    future_parts
+FROM system.replicas
+ORDER BY queue_size DESC
+LIMIT 10
+```
+
+`queue_size` is the headline: the total number of entries this replica still has to fetch and apply from the shared replication log. `inserts_in_queue` and `merges_in_queue` break it down: a queue dominated by inserts means the replica is behind on pulling new data parts from its peers; a queue dominated by merges means it is behind on applying merge operations. The distinction matters for diagnosis, which is why the card carries both sub-counts.
+
+The threshold of 100 sustained is deliberately patient. Queue depth is naturally spiky: a single large merge or a burst of inserts can push the queue into the hundreds for a few seconds before it drains. What you care about is a queue that climbs and stays climbed. The card flags only when depth stays above 100 across the window, filtering out the normal transient spikes that a healthy replica clears on its own.
+
+A non-zero `is_session_expired` or a queue that refuses to drain at all is the serious case: it usually means the replica has lost its Keeper/ZooKeeper session, or a queue entry is failing repeatedly (a "poison" entry, often a fetch that cannot find its source part). Those need direct intervention rather than patience.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a three-replica ReplicatedMergeTree cluster behind an analytics pipeline. Snapshot taken on 14 Apr 26 at 16:05 BST, read from replica-02.
+
+| Database | Table | queue_size | inserts_in_queue | merges_in_queue |
+| --- | --- | --- | --- | --- |
+| events | `clickstream_repl` | **342** | 318 | 22 |
+| events | `order_events_repl` | 41 | 12 | 28 |
+| catalog | `product_snapshots_repl` | 6 | 1 | 5 |
+| events | `cart_events_repl` | 3 | 0 | 3 |
+
+The Nerve Centre headline reads **342 queued tasks on `events.clickstream_repl`**, flagged because it is well above 100 and has not drained over the window. The DBA reads three things:
+
+1. **The queue is insert-dominated (318 of 342).** This replica is behind on fetching new parts from its peers, not on applying merges. The cause is on the fetch path: either this replica's network or disk cannot keep up with the inflow, or the peer it fetches from is itself overloaded.
+2. **Only one table is affected.** `order_events_repl` at 41 is normal merge churn; the rest are near zero. A single insert-heavy table behind on one replica points at that table's write rate outpacing this node's fetch throughput, not a cluster-wide Keeper problem (which would back up every table at once).
+3. **Stale reads are already possible.** Any query routed to replica-02 for `clickstream_repl` is missing up to 318 parts of recent data. If the load balancer does not prefer in-sync replicas, dashboards reading this table may show data that is minutes behind the other replicas.
+
+```text
+Diagnosing an insert-dominated queue:
+  1. Confirm it is not Keeper:
+     SELECT is_session_expired, zookeeper_exception FROM system.replicas
+     WHERE table = 'clickstream_repl';
+     (expired session or a ZK exception = fix Keeper first)
+  2. Confirm the source replica is healthy:
+     a peer that is itself overloaded cannot serve fetches fast enough.
+  3. Check this node's fetch capacity:
+     network saturation or slow disk on replica-02 throttles part fetches.
+  4. If a single entry is stuck (poison), inspect system.replication_queue:
+     SELECT type, last_exception, num_tries FROM system.replication_queue
+     WHERE table = 'clickstream_repl' ORDER BY num_tries DESC;
+     a high num_tries with a repeating last_exception is the blocker.
+```
+
+Here `system.replication_queue` showed all entries progressing (rising `num_postponed` but no stuck entry), Keeper was healthy, and replica-02 sat on a slower disk tier than its peers. The fix was capacity, not a stuck queue: the insert rate on `clickstream_repl` had grown past what replica-02's disk could absorb. Moving that replica to faster storage drained the queue within minutes. Until then, the team pointed reads at the two in-sync replicas.
+
+Three takeaways:
+
+1. **Read the insert-vs-merge split, not just the total.** An insert-heavy queue is a fetch/capacity problem; a merge-heavy queue is a merge-throughput problem. The breakdown tells you where to look.
+2. **One table behind on one replica is a local problem; every table behind is a Keeper problem.** Cluster-wide queue growth points at the coordination layer (Keeper/ZooKeeper session or latency), not at any single table.
+3. **A growing queue means stale reads now, lag later.** Route reads to in-sync replicas while you drain it, and treat sustained depth as the early warning for [Replication Lag (absolute_delay)](/nerve-centre/kpi-cards/clickhouse/replication-lag-absolute-delay).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Replication Queue Size | What the combination tells you |
+| --- | --- | --- |
+| [Replication Lag (absolute_delay)](/nerve-centre/kpi-cards/clickhouse/replication-lag-absolute-delay) | The time dimension of the same problem. | Rising queue plus rising lag confirms the replica is genuinely falling behind, not just spiking. |
+| [Active Replicas](/nerve-centre/kpi-cards/clickhouse/active-replicas) | Confirms how many replicas are participating. | A queue backing up while a replica count drops means a replica went offline and its work is piling up. |
+| [Merges In Progress](/nerve-centre/kpi-cards/clickhouse/merges-in-progress) | The merge-throughput view behind `merges_in_queue`. | A merge-dominated queue plus few merges in progress equals a starved merge scheduler. |
+| [Active Parts (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) | Blocked replication merges let parts accumulate. | Queue stuck on merges plus rising parts equals a backlog that can lead to TOO_MANY_PARTS. |
+| [Too Many Parts Errors (24h)](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h) | The downstream failure if merge replication stalls. | Queue not draining then errors appearing equals replication stall already breaking ingest. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/clickhouse/database-disk-usage) | A full disk blocks fetches and stalls the queue. | High disk plus a stuck queue equals fetches failing for lack of space. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that weights replication health. | A sustained queue breach pulls the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> Run the same query the card uses against `system.replicas` from `clickhouse-client`:
+> ```sql
+> SELECT database, table, queue_size, inserts_in_queue, merges_in_queue
+> FROM system.replicas ORDER BY queue_size DESC LIMIT 10
+> ```
+> Drill into individual stuck entries with `SELECT type, num_tries, last_exception FROM system.replication_queue ORDER BY num_tries DESC`.
+> Check the coordination layer with `SELECT is_session_expired, zookeeper_exception, log_pointer, log_max_index FROM system.replicas` and confirm Keeper/ZooKeeper health.
+> On **ClickHouse Cloud**, replication is managed by the service, so this card and these tables apply to self-managed ReplicatedMergeTree clusters; Cloud's own monitoring view surfaces replica sync state.
+
+**Why our number may legitimately differ from a manual query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Snapshot timing** | Higher or lower | The queue drains continuously; a query run seconds later sees a different depth, especially on a busy table. |
+| **Replica scope** | Card reflects one node | `system.replicas` is per-replica. The card reads the configured node; another replica may have a very different queue. Query each replica or use `clusterAllReplicas('cluster', system.replicas)`. |
+| **Transient spikes** | Card lower (smoothed) | The card flags only sustained depth; a manual query can catch a momentary spike the card deliberately ignores. |
+| **Entry batching** | Marginal | A single large operation can appear as one queue entry or several depending on how it was logged, so raw counts can differ slightly from intuition. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ClickHouse Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/clickhouse/clickhouse-event-ingest-vs-ecom-orders) | A backed-up replication queue can mean event data is not yet visible on read replicas. | Orders flowing but a read replica's queue stuck equals analytics showing stale ingest until it drains. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What is the difference between queue size and replication lag?**
+Queue size is a count of pending tasks; replication lag (`absolute_delay`) is a time, the seconds by which this replica trails the leader. They usually move together but answer different questions. Queue size tells you *how much work* is pending; lag tells you *how stale* a read from this replica would be. A queue of 300 small inserts and a queue of 3 enormous merges can produce very different lag. Read both, on this card and on [Replication Lag (absolute_delay)](/nerve-centre/kpi-cards/clickhouse/replication-lag-absolute-delay).
+
+**My queue spikes to a few hundred and then drains. Should I worry?**
+No. Transient spikes are normal: a large merge, a batch of inserts, or a replica briefly catching up after a restart all push the queue up momentarily. The card flags only sustained depth above 100 for exactly this reason. Worry when the queue climbs and *stays* climbed across multiple refreshes, which means the replica is not keeping pace with inflow.
+
+**The queue is not draining at all. What does that mean?**
+A queue that is completely stuck (depth flat, not falling) usually means one of three things: the replica lost its Keeper/ZooKeeper session (`is_session_expired = 1`), a single queue entry is failing repeatedly (a poison entry, visible in `system.replication_queue` with a high `num_tries` and a repeating `last_exception`), or the disk is full so fetches cannot land. Check Keeper health first, then `system.replication_queue` for a stuck entry, then disk.
+
+**Why is the queue insert-heavy on one replica but not the others?**
+Because each replica fetches new parts independently. If one replica sits on slower storage or a more saturated network link, it cannot pull new parts as fast as its peers, so its insert queue grows while the others stay near zero. This is a capacity asymmetry, not a logical fault: align the replicas' hardware or reduce the write rate on the affected table.
+
+**Does this card cover non-replicated tables?**
+No. Only ReplicatedMergeTree-family tables have a replication queue and appear in `system.replicas`. Plain MergeTree, Log, Memory, and Distributed tables have no replication state and never show on this card. If a table you expect is missing, confirm it is actually using a Replicated engine.
+
+**Can I clear a stuck queue manually?**
+Cautiously, and only after diagnosing the cause. If a poison entry is blocking the queue, the correct response is usually to repair the underlying issue (restore the missing source part, restore the Keeper session) rather than to delete the entry. In severe cases `SYSTEM RESTART REPLICA` or `SYSTEM RESTORE REPLICA` can re-establish a clean queue, but those are interventions to run deliberately, not reflexively, because they re-fetch state. Diagnose with `system.replication_queue` first.
+
+**On ClickHouse Cloud, do I need this card?**
+ClickHouse Cloud manages replication for you, so for Cloud workloads the service's own monitoring is the primary view. This card is most valuable for self-managed ReplicatedMergeTree clusters where you own the Keeper/ZooKeeper layer and the replica hardware, and where a stuck queue is yours to diagnose and clear.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Replication Queue Size (Top Tables)* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

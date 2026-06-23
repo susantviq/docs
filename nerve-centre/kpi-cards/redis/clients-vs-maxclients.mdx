@@ -1,0 +1,155 @@
+---
+title: "Clients vs maxclients %, gauge"
+sidebarTitle: "Clients vs maxclients %"
+description: "Clients vs maxclients % for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Connection-pool saturation expressed as a percentage: `connected_clients / maxclients`. When that ratio reaches 100% Redis stops accepting new connections and returns `ERR max number of clients reached`, which immediately drops every downstream service that needs a fresh connection (a restarting app pod, a cron worker, a new web node scaling in). For a platform team this is "how close am I to the moment Redis refuses to talk to anyone new?" A healthy steady state sits well under 50%; sustained readings above 90% mean a connection leak, an undersized `maxclients`, or a thundering herd of short-lived clients.
+
+| | |
+| --- | --- |
+| **What it tracks** | The live ratio of open client connections to the configured connection ceiling. `connected_clients` and `maxclients` both come from `INFO clients`. Rendered as a gauge from 0 to 100%. |
+| **Data source** | Redis `INFO clients` section: `connected_clients` (current open connections) divided by the `maxclients` config value (`CONFIG GET maxclients`). The detail line: `connected_clients / maxclients. Hitting cap rejects new connections, drops downstream services.` |
+| **Time window** | `RT/1m` (real-time, sampled and smoothed over a rolling 1-minute window so a single noisy poll does not flip the gauge). |
+| **Alert trigger** | `> 90%`. At 90% the gauge turns red and pages the on-call: you are one traffic burst away from rejected connections. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card runs `INFO clients` and reads `connected_clients`, then reads the ceiling from `CONFIG GET maxclients` (cached and re-read whenever the config changes). The gauge value is:
+
+```text
+saturation_pct = (connected_clients / maxclients) * 100
+```
+
+A few Redis-specific subtleties the engine accounts for:
+
+- **`maxclients` is not always what you set.** Redis reserves around 32 file descriptors for its own use (cluster bus, replicas, persistence). If the OS `ulimit -n` is lower than `maxclients + 32`, Redis silently lowers the effective `maxclients` at start-up and logs a warning. The card reads the *effective* value Redis reports through `CONFIG GET maxclients`, not the value in `redis.conf`, so the percentage reflects reality.
+- **Replica and cluster-bus connections count toward `connected_clients`** on some versions. The engine uses the headline `connected_clients` from `INFO clients` as Redis reports it; for cluster nodes this can include a handful of internal links, which is why the denominator matters more than a couple of connections.
+- **Managed services cap `maxclients` for you.** On ElastiCache and MemoryDB the `maxclients` value is fixed per node type (for example 65,000 on most node sizes) and cannot be raised through `CONFIG SET`. The card still reads the live effective value so the gauge is accurate even when you cannot change the ceiling.
+
+The 1-minute smoothing means a short connection spike (a deploy that briefly doubles pods) shows as a bump, not a false 100%, but a genuine sustained climb is surfaced quickly.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a single-primary Redis 7.2 instance on an `r6g.large` ElastiCache node backing session storage and a job queue for a high-traffic storefront. `maxclients` is fixed at 65,000 by the node type. Snapshot taken on 14 Apr 26 at 20:05 BST during an evening traffic peak.
+
+| Reading | Value |
+| --- | --- |
+| `connected_clients` | 9,100 |
+| effective `maxclients` | 65,000 |
+| Gauge | **14%** |
+| Trend over prior hour | flat around 8,800 to 9,200 |
+
+At 14% this is comfortable. Now compare a second instance on the same fleet, an `r6g.medium` cache node fronting product pages, where the application uses a per-request connection pattern instead of a pool:
+
+| Reading | Value |
+| --- | --- |
+| `connected_clients` | 58,900 |
+| effective `maxclients` | 65,000 |
+| Gauge | **91%** |
+| Trend over prior hour | climbing from 41,000 |
+
+The 91% reading trips the alert. The platform engineer reads the gauge and asks the three diagnostic questions:
+
+1. **Is the denominator wrong (too-small `maxclients`)?** No, 65,000 is the node ceiling.
+2. **Is this real demand or a leak?** The climb from 41,000 to 58,900 in one hour with no matching traffic increase is the tell. A connection *leak*: the application opens a connection per request and never returns it to a pool, so connections accumulate until idle ones are reaped (or never are, if `timeout 0` is set).
+3. **What happens at 100%?** New web nodes scaling in for the peak cannot connect and crash-loop, which paradoxically makes the team scale *out* further, opening even more connections and accelerating the climb.
+
+```text
+Cost framing for the leaking instance:
+  - Connections climbing ~300/min toward the 65,000 cap
+  - At current rate the cap is reached in ~20 minutes
+  - At the cap: every new pod and cron worker gets
+    "ERR max number of clients reached"
+  - Mitigation now: deploy the pooled client (PgBouncer-equivalent
+    for Redis is a client-side pool), or set a sane `timeout` so
+    idle connections are reaped, or CONFIG SET maxclients higher
+    (self-hosted only) to buy time
+```
+
+Three takeaways:
+
+1. **The percentage hides the headroom in connection count.** 91% of 65,000 still leaves 6,100 connections, but at a 300/min climb that headroom is 20 minutes, not comfort. Always read the gauge *and* the slope.
+2. **The fix is almost always client-side.** Raising `maxclients` treats the symptom. A connection pool or a non-zero idle `timeout` treats the cause. Pair with [Connected Clients](/nerve-centre/kpi-cards/redis/connected-clients) to watch the raw count after the fix.
+3. **Rejected connections are the lagging confirmation.** Once you cross 100%, [Rejected Connections (24h)](/nerve-centre/kpi-cards/redis/rejected-connections-24h) starts incrementing. If this gauge is green but rejections are non-zero, you had a transient spike that the 1-minute smoothing missed.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Clients vs maxclients | What the combination tells you |
+| --- | --- | --- |
+| [Connected Clients](/nerve-centre/kpi-cards/redis/connected-clients) | The raw numerator without the ratio. | The gauge gives proximity to the cap; this gives the absolute count for trending and leak detection. |
+| [Rejected Connections (24h)](/nerve-centre/kpi-cards/redis/rejected-connections-24h) | The lagging confirmation that you crossed 100%. | Gauge under 90% but rejections non-zero equals a transient burst smoothing missed. |
+| [Connections Rejected Due to maxclients](/nerve-centre/kpi-cards/redis/connections-rejected-due-to-maxclients) | The real-time alert version of rejections. | Gauge climbing plus this alert firing equals the cap has been hit right now. |
+| [Blocked Clients (BLPOP / BRPOP / WAIT)](/nerve-centre/kpi-cards/redis/blocked-clients-blpop-brpop-wait) | Blocked clients still hold a connection slot. | A queue consumer storm inflates both blocked clients and total connections at once. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live) | Throughput context for the connection count. | Many connections but flat ops equals idle/leaked connections, not real load. |
+| [Connected Clients Saturation vs Traffic Burst](/nerve-centre/kpi-cards/redis/connected-clients-saturation-vs-traffic-burst) | The cross-channel view tying saturation to storefront traffic. | Confirms whether the climb is genuine demand or a leak unrelated to traffic. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The composite that weights pool saturation. | A 90%+ gauge alone can pull the composite below its threshold. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis's own tooling:**
+
+> `redis-cli INFO clients` returns `connected_clients`, `blocked_clients`, and `cluster_connections`. This is the numerator straight from the source.
+> `redis-cli CONFIG GET maxclients` returns the effective ceiling (the denominator). Compare it against the value in `redis.conf`; if they differ, the OS file-descriptor limit clipped it.
+> `redis-cli CLIENT LIST` enumerates every open connection with its idle time, address, and last command, the definitive way to find a leak (look for thousands of connections with growing `idle` and `cmd=NULL`).
+> `redis-cli INFO stats` exposes `total_connections_received` and `rejected_connections` for the historical view.
+
+For managed services:
+
+> **ElastiCache / MemoryDB:** CloudWatch metric `CurrConnections` is the numerator; the `maxclients` ceiling is fixed per node type and documented in the AWS node-type reference. Divide to reproduce the gauge.
+> **Azure Cache for Redis:** the `Connected Clients` metric in Azure Monitor; the connection limit is tier-dependent.
+> **Redis Cloud (Redis Enterprise):** the `conns` metric in the database metrics view; the limit is set per database subscription.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **1-minute smoothing** | Gauge lower than a raw poll | A momentary spike is averaged out; `CLIENT LIST` run at the peak instant shows more. |
+| **Effective vs configured `maxclients`** | Denominator differs | We read the effective value Redis reports; `redis.conf` may say 100,000 while the OS clipped it to 10,000. |
+| **Internal connections** | Numerator slightly higher | Replica links and the cluster bus can count toward `connected_clients` on some node roles. |
+| **CloudWatch granularity** | Cross-tool variance | `CurrConnections` is a 1-minute datapoint on ElastiCache; the gauge polls more often. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The gauge says 91% but I have plenty of memory and CPU. Why is this a problem?**
+Connection saturation is independent of memory and CPU pressure. Redis can be almost idle on commands yet still refuse new connections because the *slots* are full. The danger is operational, not throughput: the next pod, cron job, or scaled-in node cannot connect at all. Treat a sustained 90%+ as urgent regardless of how quiet the instance feels.
+
+**Should I just raise `maxclients` to make the alert go away?**
+On self-hosted Redis you can (`CONFIG SET maxclients 100000`), but only if the OS file-descriptor limit allows it, raise `ulimit -n` first or Redis will silently clip the value. On managed services (ElastiCache, MemoryDB, Azure) the ceiling is fixed by node type and you cannot raise it; the fix is to use a connection pool or a larger node. Either way, raising the cap is a stopgap; a leak will refill any headroom you add.
+
+**What is the difference between this card and Rejected Connections?**
+This card is the *leading* indicator (proximity to the cap, in real time). Rejected Connections is the *lagging* confirmation (you actually hit the cap and turned someone away). You want to act on this gauge before the rejection counter ever moves.
+
+**Why might the gauge sit at a non-zero floor even with no real traffic?**
+Replicas, Sentinel connections, monitoring agents (your APM, this connector itself), and the cluster bus all hold connections. A baseline of a few dozen is normal. Use `CLIENT LIST` to see who they are if the floor looks high.
+
+**Does `timeout 0` in my config matter here?**
+Yes, a great deal. With `timeout 0` Redis never closes an idle client connection, so a leaky application accumulates connections forever until it hits `maxclients`. Setting a sensible `timeout` (for example 300 seconds) lets Redis reap abandoned connections and is the single most effective guard against slow connection leaks.
+
+**My cluster has six nodes. Is the gauge per-node or fleet-wide?**
+Per node. Each node has its own `maxclients` and its own `connected_clients`. A hot node (one owning a popular slot range) can saturate while the rest sit idle. Read the gauge per instance, and pair with [Cluster Slots Assigned (of 16384)](/nerve-centre/kpi-cards/redis/cluster-slots-assigned-of-16384) to understand slot distribution.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Clients vs maxclients %* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

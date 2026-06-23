@@ -1,0 +1,147 @@
+---
+title: "Replication Threads Stopped or Lag Exceeds Threshold, MySQL"
+sidebarTitle: "Replication Threads Stopped or Lag Exceeds Threshold"
+description: "Replication Threads Stopped or Lag Exceeds Threshold for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The alert that fires when a replica's IO or SQL thread stops, or when `Seconds_Behind_Source` climbs past 10 seconds. Replication is the safety net behind almost every production MySQL topology: it powers read scaling, it is the basis for failover, and it is what your backups and analytics often run against. When a thread stops, the replica silently freezes in time and stops being a usable failover target. When lag climbs, read replicas start serving stale data. This hero card catches both failure modes the moment they appear, before a failover lands you on a hours-old copy.
+
+| | |
+| --- | --- |
+| **Status source** | `SHOW REPLICA STATUS` (MySQL 8.0.22+; `SHOW SLAVE STATUS` on older builds). The card reads `Replica_IO_Running`, `Replica_SQL_Running`, `Seconds_Behind_Source`, and `Last_Error`/`Last_IO_Error`/`Last_SQL_Error`. |
+| **Metric basis** | A two-part condition: thread health (both IO and SQL must read `Yes`) AND lag (`Seconds_Behind_Source` at or below threshold). Either failing trips the alert. |
+| **Aggregation window** | Real-time, evaluated on each sample across every configured replica. |
+| **Alert threshold** | IO or SQL thread reading anything other than `Yes` (stopped, connecting, or errored), OR `Seconds_Behind_Source > 10`. |
+| **What counts as broken** | (1) `Replica_IO_Running != Yes` (cannot fetch the source binlog); (2) `Replica_SQL_Running != Yes` (cannot apply fetched events); (3) lag over the threshold; (4) `Last_Error` populated with a non-zero code. |
+| **What does NOT count** | (1) A planned `STOP REPLICA` for maintenance, if the connector is told to suppress it; (2) a replica that is intentionally delayed (`SOURCE_DELAY` set) where the configured delay is honoured; (3) lag spikes briefly under a large batch that drain back down within the sample. |
+| **Common causes** | A duplicate-key or missing-row error halting the SQL thread; a network partition stopping the IO thread; a long-running transaction or single-threaded apply falling behind a write-heavy primary; the source binlog being purged before the replica read it. |
+| **Time zone** | Thread state and lag are time-zone independent; chart axes render in the merchant display time zone set in the Vortex IQ profile. |
+| **Time window** | `RT` (real-time). |
+| **Alert trigger** | `IO/SQL thread stopped OR lag > 10s`. |
+| **Roles** | dba, platform, sre, owner |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+On each real-time sample the engine runs `SHOW REPLICA STATUS` against every configured replica and evaluates:
+
+```text
+replica_healthy =
+       Replica_IO_Running  == 'Yes'
+  AND  Replica_SQL_Running == 'Yes'
+  AND  Seconds_Behind_Source <= lag_threshold   (default 10s)
+  AND  Last_Errno == 0
+```
+
+If `replica_healthy` is false for any replica, the alert fires and names the failing replica plus the reason (which thread, or how far behind, plus the error text from `Last_Error` if present). The lag reading is taken straight from `Seconds_Behind_Source`, which MySQL computes as the difference between the replica's clock and the timestamp of the event it is currently applying. The engine is aware of the well-known quirk that `Seconds_Behind_Source` reports `NULL` whenever either thread is not running; a `NULL` is treated as "thread down", not "zero lag", which is the safe interpretation. Where the topology uses GTIDs, the engine also cross-checks `Retrieved_Gtid_Set` against `Executed_Gtid_Set` to confirm the SQL thread is genuinely keeping up with what the IO thread has fetched.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs one primary and two read replicas on MySQL 8.0. Replica B serves the reporting and analytics read traffic. Snapshot taken on 09 Jun 26 at 03:40, during an overnight batch load.
+
+| Replica | `Replica_IO_Running` | `Replica_SQL_Running` | `Seconds_Behind_Source` | Last error |
+| --- | --- | --- | --- | --- |
+| A | Yes | Yes | 1 | (none) |
+| B | Yes | **No** | NULL | 1062: Duplicate entry '88241' for key 'PRIMARY' on `orders` |
+
+The hero card fires for **Replica B: SQL thread stopped, error 1062 duplicate entry**. Replica A is healthy at 1 second behind. Because B's SQL thread is down, `Seconds_Behind_Source` reads `NULL`, the engine correctly reports this as "thread stopped", not "caught up".
+
+The on-call read:
+
+1. **A stopped SQL thread means B is frozen.** It stopped applying events at the exact statement that errored. Every write to the primary since 03:38 is now unreplicated on B. If a failover picked B right now, the team would lose all writes after that point.
+2. **The error explains why.** A 1062 on the SQL thread usually means the row already exists on the replica, classic symptom of a previous failover or a manual write on the replica that diverged it from the primary. The replica has drifted out of sync with the source.
+3. **The fix is a real decision, not a restart.** Blindly skipping the event (`SET GLOBAL sql_replica_skip_counter = 1` or injecting an empty GTID transaction) clears the error but leaves B permanently inconsistent with the primary. The correct fix is usually to re-clone B from a fresh backup or use a consistency tool to reconcile, then resume. Until then, B must be removed from the read pool so it stops serving stale data, and it must not be a failover candidate.
+
+```text
+Why this is a hero alert:
+  - A stopped thread is silent: no errors reach the application, the replica just freezes.
+  - A frozen replica is a failover trap: promote it and you lose every write since it stopped.
+  - Lag on a read replica means customers/reports see stale data with no warning.
+  - The window to act is before, not after, a failover decision is forced.
+```
+
+Three takeaways:
+
+1. **A stopped thread is worse than lag.** Lag drains; a stopped thread does not move at all until a human intervenes, and it quietly disqualifies the replica as a failover target. The alert treats `IO/SQL != Yes` as the most serious state for exactly this reason.
+2. **`NULL` lag is a red flag, not a green one.** When `Seconds_Behind_Source` is `NULL`, replication is not running. Tooling that reads it as "0 = healthy" gets this dangerously backwards; this card treats `NULL` as thread-down.
+3. **Skipping an error is a trap.** It is tempting to skip the offending event and watch replication resume, but every skip widens the drift between replica and primary. Fix the divergence properly (re-clone or reconcile), or you are building a failover target that will silently lose data.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this alert | What the combination tells you |
+| --- | --- | --- |
+| [Replication Lag (Seconds_Behind_Source)](/nerve-centre/kpi-cards/mysql/replication-lag-seconds-behind-source) | The continuous lag gauge this alert builds on. | The gauge shows the lag trend; this card is the breach plus the thread-state and error detail. |
+| [Replication Thread Health (IO/SQL)](/nerve-centre/kpi-cards/mysql/replication-thread-health-iosql) | The dedicated thread-state view. | Pinpoints which of the two threads stopped and surfaces the error text. |
+| [Active Replicas](/nerve-centre/kpi-cards/mysql/active-replicas) | The count of replicas currently connected. | A drop in active replicas confirms a replica fell out of the topology, not just slowed. |
+| [Binlog Backlog (MB) on Primary](/nerve-centre/kpi-cards/mysql/binlog-backlog-mb-on-primary) | The volume of binlog the replica still has to consume. | Growing backlog while a thread is stopped quantifies how far behind the frozen replica is falling. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/mysql/last-successful-backup-hours-ago) | The fallback if a replica must be re-cloned. | If you have to rebuild a diverged replica, backup freshness sets how much primary load the rebuild incurs. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | The write pressure driving apply lag. | High primary QPS with single-threaded apply explains lag that is load-driven rather than error-driven. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite this alert dominates. | A broken replica drops the health score sharply because it compromises both read scaling and disaster recovery. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL itself:**
+
+> `SHOW REPLICA STATUS\G` (or `SHOW SLAVE STATUS\G` pre-8.0.22) for the full picture: `Replica_IO_Running`, `Replica_SQL_Running`, `Seconds_Behind_Source`, `Last_Error`, `Last_IO_Error`, `Last_SQL_Error`.
+> `SELECT * FROM performance_schema.replication_connection_status\G` and `replication_applier_status_by_worker\G` for the modern, per-worker view (especially useful with multi-threaded replication).
+> `SELECT * FROM performance_schema.replication_applier_status_by_coordinator\G` to see the coordinator and any apply errors.
+> On the primary: `SHOW REPLICAS;` (or `SHOW SLAVE HOSTS;`) to confirm which replicas are still connected.
+
+For GTID topologies, compare `Retrieved_Gtid_Set` (fetched) with `Executed_Gtid_Set` (applied) to see the apply gap directly rather than trusting `Seconds_Behind_Source` alone.
+
+**Why our number may legitimately differ from a raw `SHOW REPLICA STATUS`:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **`Seconds_Behind_Source` quirk** | Card safer | When a thread is down, MySQL reports `NULL` lag; the card treats `NULL` as thread-down, not zero, which a naive reader might misread. |
+| **Clock skew** | Variable | `Seconds_Behind_Source` depends on the replica's and primary's clocks agreeing; NTP drift can inflate or deflate the raw value. The card flags large skew where detectable. |
+| **Long-transaction inflation** | Raw spikes | A single long-running statement on the primary can make `Seconds_Behind_Source` jump even when the replica is keeping pace; GTID set comparison gives a truer apply gap. |
+| **Multi-threaded apply** | Card aggregates | With parallel workers, per-worker status differs; the card reports the worst-case worker rather than a single number. |
+
+**Managed-service note:** On Amazon RDS and Aurora, replica lag is the `ReplicaLag` (RDS read replicas) or `AuroraReplicaLag` (Aurora cluster) CloudWatch metric in milliseconds; thread state surfaces in the RDS events log and `SHOW REPLICA STATUS` on the instance. On Google Cloud SQL use `database/mysql/replication/seconds_behind_master` and the replication state in the instance overview. Note that on Aurora, replication is storage-level rather than binlog-based, so the IO/SQL thread concept applies only to binlog replicas, not in-cluster Aurora replicas.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does the card sometimes show NULL lag as a failure?**
+Because `Seconds_Behind_Source` returns `NULL` whenever the IO or SQL thread is not running, not when the replica is caught up. A caught-up replica reads `0`, not `NULL`. The card deliberately treats `NULL` as "thread down" because the alternative, treating it as zero lag, would hide a frozen replica behind a healthy-looking number. This is the most important safety behaviour of the card.
+
+**My replica is 10 seconds behind during a nightly batch and the alert fires every night. Is that wrong?**
+That is a real lag breach, but it may be benign for your topology if the replica only serves analytics that tolerate staleness. Two options: raise the lag threshold for this profile in the Sensitivity tab to match your batch window, or move the batch to a window where lag is acceptable. If the replica is also a failover target, though, do not relax the threshold, lag on a failover candidate is genuine risk.
+
+**The SQL thread stopped with a 1062 duplicate-key error. Can I just skip it?**
+You can (`SET GLOBAL sql_replica_skip_counter = 1`, or inject an empty transaction for the failing GTID), and replication will resume, but skipping leaves the replica permanently inconsistent with the primary because you have dropped an event the primary applied. The correct fix for a diverged replica is usually to re-clone it from a fresh backup or reconcile with a consistency-checking tool. Skipping is acceptable only when you are certain the event is genuinely redundant.
+
+**What is the difference between the IO thread and the SQL thread stopping?**
+The IO thread connects to the primary and copies binlog events into the replica's relay log; if it stops, the replica cannot *fetch* new changes (usually a network or auth issue, or the source binlog was purged). The SQL thread reads the relay log and *applies* those events; if it stops, the replica has the data but cannot apply it (usually a data error like a duplicate key or missing row). Both reaching `Yes` is required for healthy replication.
+
+**Why is a stopped replica dangerous even if the application never errors?**
+Because the failure is silent. The application keeps talking to the primary and sees nothing wrong. But the replica has quietly frozen: it is no longer a valid failover target (promoting it loses every write since it stopped) and, if it is in the read pool, it serves data that is older by the minute. Nothing surfaces this to the application, which is exactly why a hero alert is needed.
+
+**The source purged its binlog before my replica read it. What now?**
+The IO thread errors with "could not find first log file name" (error 1236). The replica cannot fetch the missing events, so it cannot continue from where it left off. The fix is to re-establish the replica from a fresh backup or snapshot and re-point it at a valid binlog position or GTID. To prevent recurrence, increase `binlog_expire_logs_seconds` on the primary so binlogs are retained long enough for replicas to catch up after an outage. Cross-reference [Binlog Backlog (MB) on Primary](/nerve-centre/kpi-cards/mysql/binlog-backlog-mb-on-primary).
+
+**Does this alert understand intentionally delayed replicas?**
+Yes, where configured. A replica with `SOURCE_DELAY` set (a deliberate safety lag, for example a 1-hour delayed replica for accidental-delete recovery) is expected to report lag near its configured delay. Tell the connector the intended delay for that replica so the card measures lag *relative to* the delay rather than firing constantly. The thread-state half of the alert still applies normally.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Replication Threads Stopped or Lag Exceeds Threshold* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

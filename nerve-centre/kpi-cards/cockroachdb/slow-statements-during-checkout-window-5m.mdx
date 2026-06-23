@@ -1,0 +1,154 @@
+---
+title: "Slow Statements During Checkout Window (5m), CockroachDB"
+sidebarTitle: "Slow Statements During Checkout Window (5m)"
+description: "Slow Statements During Checkout Window (5m) for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Slow Statements During Checkout Window (5m)** lists the slow CockroachDB statements that fired in the same 5-minute window as a measured dip in storefront checkout completion. It is a focused, time-boxed join: not every slow query in the cluster, only the slow ones that overlap a checkout drop, so a DBA sees exactly which database statements correlate with shoppers failing to complete. This is the card that turns "checkout conversion fell" from a marketing mystery into a database work item. When five or more slow statements co-occur with a checkout drop, the cluster is very likely the cause, and the listed statements are your prime suspects.
+
+| | |
+| --- | --- |
+| **What it tracks** | A row-per-statement table of slow statements (latency above the slow threshold) observed during a 5-minute window in which storefront checkout completion dropped, joined so only checkout-overlapping slow statements are shown. |
+| **Data source** | CockroachDB side: slow statements from `crdb_internal.cluster_statement_statistics` (and DB Console SQL Activity), filtered by the slow-statement latency threshold, the same population feeding [Slow-Query Rate %](/nerve-centre/kpi-cards/cockroachdb/slow-query-rate). Checkout side: checkout-completion / conversion rate from the linked Shopify / BigCommerce / Adobe Commerce connector. |
+| **Metric basis** | A correlated count plus a statement list, not an average. The signal is co-occurrence: slow statements and a checkout dip in the same 5-minute window. |
+| **Time window** | `5m`: a tight window aligned to checkout behaviour, so the slow statements shown are the ones temporally adjacent to the conversion drop rather than the cluster's all-day slow log. |
+| **Alert trigger** | `>5 slow co-occur with checkout drop`: more than five slow statements observed in the same 5-minute window as a measured checkout-completion drop. |
+| **What counts as a row** | A statement whose execution latency exceeded the slow threshold and whose execution time falls inside a 5-minute window where checkout completion dipped below its baseline. |
+| **What does NOT fire** | (1) Slow statements when checkout is healthy (surfaced on [Slow-Query Rate %](/nerve-centre/kpi-cards/cockroachdb/slow-query-rate), not here); (2) A checkout dip with no slow statements (the cause is elsewhere: payments, front-end, marketing); (3) Five or fewer slow statements during a dip (below the co-occurrence threshold). |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card intersects two signals inside a rolling 5-minute window:
+
+```text
+checkout_drop?  = storefront checkout completion in window < baseline
+slow_statements = statements in window with latency > slow_threshold
+
+if checkout_drop AND count(slow_statements) > 5:
+    show rows: { statement_fingerprint, exec_count, p95_latency, rows_read, last_seen }
+```
+
+The slow-statement population is drawn from CockroachDB's statement statistics (`crdb_internal.cluster_statement_statistics`, the same data DB Console SQL Activity ranks), filtered to statements that exceeded the configured slow-latency threshold during the window. The checkout signal comes from the linked storefront connector's completion or conversion rate, compared against its recent baseline for the same window.
+
+The card only populates when both conditions hold in the same window: checkout dipped and more than five slow statements fired. That intersection is deliberate. Slow statements happen all the time and are mostly harmless; a checkout dip can have many causes that have nothing to do with the database. The value of this card is the overlap, the moments where slow database work and failing checkouts coincide, because that is when the cluster is the prime suspect. Each row shows the statement fingerprint, how many times it ran, its p95 latency in the window, rows read, and when it was last seen, so the on-call DBA can move straight from "checkout is dropping" to "this statement is why".
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs CockroachDB behind the cart, inventory, and order services for a retailer on Adobe Commerce. The slow-statement threshold is 200ms. Marketing flags that checkout completion fell during a Saturday promotion. Snapshot taken on 18 Apr 26 at 11:40 BST, covering the 11:35 to 11:40 window where checkout completion dropped from a baseline of about 71% to 58%.
+
+| Statement (fingerprint) | Exec count | p95 latency | Rows read | Last seen |
+| --- | --- | --- | --- | --- |
+| `SELECT ... FROM inventory WHERE sku = $1 FOR UPDATE` | 940 | 1,180ms | 1 | 11:39:58 |
+| `UPDATE cart_items SET qty = $1 WHERE cart_id = $2` | 610 | 870ms | 1 | 11:39:55 |
+| `SELECT ... FROM promotions WHERE active = true` | 540 | 640ms | 42,000 | 11:39:51 |
+| `INSERT INTO orders (...)` | 120 | 410ms | 1 | 11:39:47 |
+| `SELECT ... FROM customers WHERE id = $1` | 880 | 220ms | 1 | 11:39:59 |
+| `UPDATE inventory SET qty = qty - $1 WHERE sku = $2` | 760 | 1,050ms | 1 | 11:39:60 |
+
+Six slow statements co-occur with the checkout dip, above the five-statement threshold, so the card raises the alert and links the conversion drop to the database. Reading the rows, the pattern is clear: the two inventory statements (`SELECT ... FOR UPDATE` and the decrement `UPDATE`) are the slowest at over 1 second p95 and the most damaging, because they sit directly on the checkout path. The `promotions` scan reading 42,000 rows is the smell of a missing index on `active`, made worse by the promotion driving everyone to the same hot rows.
+
+What the on-call DBA does with this:
+
+1. **Identify the path-critical offenders.** The two inventory statements are on the checkout critical path and are slowest; they are the first to fix. The `FOR UPDATE` and decrement contending on the same hot SKUs during a promotion is a classic contention hotspot. Cross-read [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) and [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) to confirm contention.
+2. **Spot the quick win.** The `promotions` full scan reading 42,000 rows for an `active = true` filter is an obvious missing-index fix that will help every checkout, not just the hot SKUs.
+3. **Size the revenue impact and decide.** A 13-point drop in completion during a promotion is real lost orders. If the inventory contention cannot be relieved immediately (index, retry tuning, splitting the hot range), the short-term call may be to throttle the promotion's traffic so checkouts that do start can complete.
+
+```text
+Cost framing of the checkout drop:
+  - Baseline completion ~71%; in-window completion 58%; gap ~13 points.
+  - During a promotion at, say, 300 checkout starts in 5 minutes, that is ~39 lost orders.
+  - The two inventory statements at >1s p95 are the likeliest cause of abandonment.
+  - Every minute the slow statements persist, the gap keeps converting starts into abandons.
+```
+
+Three takeaways for the team:
+
+1. **Co-occurrence is the whole point.** Slow statements alone are routine; a checkout dip alone is ambiguous. This card only speaks when the two overlap, which is precisely when the database is the suspect worth chasing.
+2. **Read the rows for the critical path first.** Not every slow statement on the list is causing the drop. The ones on the checkout path (inventory locks, order inserts, cart updates) are the suspects; a slow analytics query that merely happened in the same window is noise.
+3. **Rows-read is a fast diagnosis.** A statement reading tens of thousands of rows to return one result is a missing-index tell. It is often the cheapest fix on the list and helps every transaction, not just the hot ones.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow Statements During Checkout Window | What the combination tells you |
+| --- | --- | --- |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/cockroachdb/slow-query-rate) | The cluster-wide slow-statement rate this card time-boxes to checkout. | A high slow rate that overlaps checkout is what populates this card; a high rate with healthy checkout is lower priority. |
+| [Statement Latency p95 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms) | The overall latency trend behind the slow statements. | p95 spiking in the same window confirms the slowness is cluster-wide, not a single statement. |
+| [Statement Latency p99 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p99-ms) | The tail that checkout abandonment is most sensitive to. | A p99 blowout during the window explains abandonment even when p95 looks acceptable. |
+| [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements) | Identifies hot-row contention behind slow checkout writes. | Inventory `FOR UPDATE` slowness plus contention events equals a hot-SKU lock problem. |
+| [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) | Contention on the checkout path forces retries. | High retries during the window mean the slow statements are retrying, compounding latency. |
+| [Statement Error Rate %](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate) | Slow statements can tip into failed ones. | Errors rising with the slow statements means some checkouts are failing outright, not just lagging. |
+| [CRDB Statements Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/cockroachdb/crdb-statements-spike-vs-ecom-order-rate) | The query-volume cross-channel sibling. | A statements spike plus slow checkout statements means excess load is dragging the checkout path. |
+| [CRDB Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/cockroachdb/crdb-pool-saturation-vs-traffic-burst) | A saturated pool makes everything, including checkout, slow. | Slow checkout statements during a saturation breach point at connection starvation, not query plans. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look natively:**
+
+> **DB Console SQL Activity → Statements**, sorted by latency, for the slow statement fingerprints and their execution counts in the window.
+> **`SELECT * FROM crdb_internal.cluster_statement_statistics ORDER BY statistics->'statistics'->'svcLat'->>'mean' DESC;`** to inspect slow statements by service latency.
+> **DB Console SQL dashboard** (latency panels) to confirm the cluster-wide p95 / p99 spike during the same window.
+> The checkout side has no CockroachDB equivalent: confirm the conversion / checkout-completion dip in your Shopify / BigCommerce / Adobe Commerce analytics for the same 5 minutes.
+
+**Why our number may legitimately differ from the native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window scoping** | Vortex IQ shows fewer | DB Console SQL Activity shows all slow statements over its retention window; this card shows only those inside the 5-minute checkout-dip window. The shorter, overlap-only list is intentionally narrower. |
+| **Statistics flush cadence** | Brief lag | CockroachDB flushes statement statistics on an interval; a statement that just ran may appear in the card a flush behind DB Console's live view, or vice versa. |
+| **Threshold definition** | Either way | The slow threshold is configurable in Vortex IQ; if it differs from the latency cut you apply when sorting DB Console, the row counts will not match exactly. |
+| **Fingerprint grouping** | Vortex IQ may group | Statements are grouped by fingerprint; literal-by-literal views in native tooling can show more distinct rows for what is one fingerprint here. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [CRDB Statements Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/cockroachdb/crdb-statements-spike-vs-ecom-order-rate) | Slow checkout statements often coincide with a statements spike. | Slow statements with no spike means a few heavy statements, not volume, are the cause. |
+| [CRDB Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/cockroachdb/crdb-pool-saturation-vs-traffic-burst) | A saturation breach can make checkout statements slow. | Slow checkout statements with no saturation breach point at query plans or contention, not connection starvation. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My cluster has plenty of slow statements but this card is empty. Why?**
+The card only populates when slow statements overlap a measured checkout dip. If checkout completion is healthy, slow statements are surfaced on [Slow-Query Rate %](/nerve-centre/kpi-cards/cockroachdb/slow-query-rate) instead, not here. An empty card during a healthy checkout window is the correct, good-news reading: the database is not currently dragging conversion.
+
+**Checkout dropped but this card shows nothing. Does that clear the database?**
+It strongly suggests the database is not the cause for that window. A checkout dip with five or fewer slow statements points the investigation elsewhere: payment-gateway latency, a front-end or JavaScript error, a marketing or pricing change, or a third-party widget. Use this card to rule the database in or out, then pivot to the front-end and payment signals if it stays empty.
+
+**Why a threshold of more than five statements rather than any slow statement?**
+A single slow statement coinciding with a checkout dip is usually coincidence; slow statements are common and checkout dips have many causes. Requiring more than five co-occurring slow statements raises the confidence that the database is genuinely implicated before the card raises an alert. If you run a very low-traffic cluster where even a few slow statements matter, lower the threshold in the sensitivity settings.
+
+**All six statements are listed, but which one is actually causing the drop?**
+The card shows correlation, not proof. Prioritise by two things: whether the statement sits on the checkout critical path (inventory locks, cart updates, order inserts beat a stray analytics query), and the rows-read figure (a statement reading tens of thousands of rows for one result is a missing-index smell). The path-critical, high-rows-read statements are your prime suspects; confirm with [Top Contended Statements](/nerve-centre/kpi-cards/cockroachdb/top-contended-statements).
+
+**The statement list differs from DB Console SQL Activity. Why?**
+This card scopes to the 5-minute checkout-dip window and shows only overlap, so it is deliberately a shorter list than DB Console's full retention view. Statement-statistics flush cadence can also put the two a flush apart, and a different slow-latency threshold will change the counts. Align the window and threshold before treating a difference as a discrepancy.
+
+**Could connection-pool saturation make checkout statements look slow here?**
+Yes, and that is an important distinction. If [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation) is breaching during the window, the statements may be slow because workers are queuing for sessions, not because the statements themselves are inefficient. In that case the fix is relieving saturation (pooler, more capacity), not rewriting queries. If saturation is healthy, focus on the statements and their indexes.
+
+**How tight is the 5-minute window to the checkout dip?**
+The window is aligned to the measured dip, so the slow statements shown are temporally adjacent to it rather than drawn from the cluster's all-day slow log. Statistics flush cadence means a statement can land a flush before or after its true execution moment, so treat the window as tight but not millisecond-exact. The shape of the overlap across the window is what to trust, not a single row's timestamp.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow Statements During Checkout Window (5m)* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

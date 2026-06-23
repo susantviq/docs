@@ -1,0 +1,169 @@
+---
+title: "Slow-Query Rate %, ClickHouse"
+sidebarTitle: "Slow-Query Rate %"
+description: "Slow-Query Rate % for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The share of queries in the recent window that took longer than one second, expressed as a percentage of all queries. Where the latency-percentile cards ([p50](/nerve-centre/kpi-cards/clickhouse/query-latency-p50-ms), [p95](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms), [p99](/nerve-centre/kpi-cards/clickhouse/query-latency-p99-ms)) describe the shape of the duration distribution, this card answers a blunt operational question: what fraction of my workload is slow? A query crossing one second on an analytical store is the line where interactive feels sluggish and ETL starts to back up. A healthy interactive workload keeps this under a couple of percent. A slow-query rate above 5% means more than one query in twenty is dragging, which is enough to make dashboards feel broken and to put scheduled jobs at risk of overrunning their windows.
+
+| | |
+| --- | --- |
+| **Data source** | `SELECT countIf(query_duration_ms > 1000) / count() * 100 FROM system.query_log WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 15 MINUTE`. The ratio of slow queries to total finished queries. |
+| **What it tracks** | The percentage of completed queries exceeding the 1,000ms slow threshold over the trailing window. It is a rate, not a count: ten slow queries out of a million is healthy, ten out of fifty is not. |
+| **Metric basis** | `query_duration_ms` from `system.query_log`, the server-measured wall-clock duration of each finished query. The 1s slow cut-off is fixed; the denominator is all successful queries in the window. |
+| **Why >5% matters** | At a 5% slow rate, one query in twenty is over a second. For an interactive dashboard that fans out many queries per page, that is enough to make most page loads contain a visibly slow panel, and for batch pipelines it signals jobs creeping toward their time budget. |
+| **Time window** | `15m` (rate computed over the trailing fifteen minutes, refreshed each dashboard cycle). |
+| **Alert trigger** | `>5%`. A slow-query rate above 5% sustained over the window flags the card amber and pages the on-call DBA. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine computes the slow-query rate as a ratio over `system.query_log`:
+
+```sql
+SELECT
+    countIf(query_duration_ms > 1000) AS slow_queries,
+    count()                           AS total_queries,
+    round(countIf(query_duration_ms > 1000) / count() * 100, 2) AS slow_pct
+FROM system.query_log
+WHERE type = 'QueryFinish'
+  AND event_time > now() - INTERVAL 15 MINUTE
+```
+
+`countIf(query_duration_ms > 1000)` is the numerator: queries that took longer than one second. `count()` is the denominator: all queries that finished in the window. The result is the percentage of the workload that was slow. The `type = 'QueryFinish'` filter keeps the denominator to successful completions, so failed queries do not distort the rate; failures are tracked separately on [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h).
+
+The 1,000ms slow threshold is the standard analytical-database slow-query line: under a second a query feels responsive, over a second it feels like waiting. The fifteen-minute window is wider than the five-minute window used by the percentile cards, deliberately: a rate needs enough queries in the denominator to be stable. On a low-QPS instance a five-minute window might hold only a handful of queries, where one slow query swings the percentage wildly. Fifteen minutes gives a steadier reading.
+
+A rate is more robust than a raw count for this signal because it is normalised to traffic. During a quiet period three slow queries out of ten is a 30% rate and a real problem; during peak the same three slow queries out of three thousand is 0.1% and noise. The percentage captures the operational reality that the count alone misses.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs ClickHouse behind an internal analytics product used by analysts during UK business hours. Snapshot taken on 14 Apr 26 at 10:15 BST, mid-morning peak.
+
+| Window metric | Value |
+| --- | --- |
+| Total finished queries (15m) | 6,400 |
+| Queries over 1,000ms | 512 |
+| **Slow-query rate** | **8.0%** |
+| p50 latency | 44 ms |
+| p99 latency | 2,300 ms |
+
+The Nerve Centre headline reads **8.0% slow-query rate**, outlined amber against the 5% threshold. The DBA reads three things:
+
+1. **One query in twelve is over a second.** With analysts actively using the dashboards, that means most users are hitting at least one slow panel per session. The complaint ("the dashboards are crawling this morning") is real and quantified.
+2. **The median is fine, so this is not global saturation.** p50 at 44ms says the typical query is fast; the cluster is not out of CPU or memory across the board. The slowness is concentrated in a slice of queries, consistent with the high p99 (2,300ms).
+3. **The slow slice is large enough to investigate by pattern, not by individual query.** 512 slow queries is too many to read one by one. The move is to group them: which tables, which query shapes, which users are responsible for the slow set.
+
+```text
+Finding the pattern behind a high slow rate:
+  SELECT
+      normalizeQuery(query) AS pattern,
+      count()              AS n,
+      avg(query_duration_ms) AS avg_ms,
+      avg(read_rows)       AS avg_rows
+  FROM system.query_log
+  WHERE type = 'QueryFinish'
+    AND event_time > now() - INTERVAL 15 MINUTE
+    AND query_duration_ms > 1000
+  GROUP BY pattern
+  ORDER BY n DESC
+  LIMIT 10;
+  -- normalizeQuery collapses literals so the same shape groups together.
+  -- High n + high avg_rows on one pattern = a full-scan query repeated often.
+```
+
+Here `normalizeQuery` revealed that 470 of the 512 slow queries shared one shape: a "last 90 days by category" aggregate that an analyst had pinned to a dashboard and that filtered on a non-key column, forcing a full scan on every refresh. The fix was a projection aligned to that access pattern, which dropped the slow rate to 0.6% within the window. The lesson: a high slow rate is usually one bad pattern repeated, not many distinct slow queries.
+
+Three takeaways:
+
+1. **Rate, not count, is the operational truth.** Ten slow queries are fine at peak and a crisis when quiet. The percentage normalises for traffic so the signal means the same thing at any hour.
+2. **A high slow rate with a healthy median means a concentrated cause.** Group the slow queries with `normalizeQuery` to find the repeated pattern; do not chase individual queries.
+3. **The cure is almost always schema or query shape.** Align filters to the sort key, add a projection or materialised view for the hot pattern, or batch the offending workload. Hardware rarely fixes a repeated full scan.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow-Query Rate | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p99-ms) | The tail-latency view of the same slowness. | High slow rate plus high p99 confirms a widening tail, not a single outlier. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) | The next percentile in. | A high slow rate with p95 still healthy means the slow set is a small but persistent slice. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/clickhouse/top-10-slowest-queries) | The drill-down into the slow set. | The slowest queries here are the ones inflating this rate. |
+| [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h) | Slow queries often hit timeouts and become failures. | Slow rate climbing then failures rising equals queries crossing their timeout ceiling. |
+| [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) | Heavy aggregates that run long also pressure memory. | High slow rate plus high memory equals expensive aggregates; tune query limits or spill settings. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/clickhouse/queries-per-second-live) | The traffic denominator behind the rate. | A spike in QPS with a steady slow rate is healthy scaling; QPS flat but slow rate rising is regression. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that weights slow-query rate. | A sustained slow-rate breach pulls the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> Run the same ratio against `system.query_log` from `clickhouse-client`:
+> ```sql
+> SELECT countIf(query_duration_ms > 1000) / count() * 100
+> FROM system.query_log
+> WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 15 MINUTE
+> ```
+> Group the slow set by shape with `normalizeQuery(query)` to find the repeated pattern, and add `read_rows` to spot full scans.
+> Inspect currently running long queries with `SELECT elapsed, query FROM system.processes WHERE elapsed > 1 ORDER BY elapsed DESC`.
+> On **ClickHouse Cloud**, the same `system.query_log` query works in the SQL console, and the managed service surfaces query-performance panels in its monitoring view.
+
+**Why our number may legitimately differ from a manual query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window boundary** | Slightly higher or lower | The card uses a trailing fifteen minutes from the refresh instant; a manual query a moment later samples a different set of queries. |
+| **Low denominator** | Card noisier when quiet | On a low-QPS instance a small denominator makes the percentage jumpy; the fifteen-minute window mitigates but cannot eliminate this. |
+| **Query-log sampling** | Card estimated | If `log_queries_probability` is below 1, both numerator and denominator are sampled and the rate is estimated from that sample. |
+| **Replica scope** | Card may differ | On a cluster the card reads the configured node; another replica serves a different query mix. Use `clusterAllReplicas('cluster', system.query_log)` to aggregate. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Slow Analytics Queries During Checkout Window](/nerve-centre/kpi-cards/clickhouse/slow-analytics-queries-during-checkout-window) | A rising slow rate during a checkout window can correlate with storefront slowness if the same instance is shared. | Slow rate up but no checkout impact means the slow queries are on an internal-only path. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why a rate instead of a count of slow queries?**
+Because a count means different things at different traffic levels. Ten slow queries is trivial during a busy peak and alarming during a quiet period. The rate normalises for traffic, so 8% means "8% of my workload is slow" regardless of whether you ran fifty queries or fifty thousand. That makes the threshold meaningful at any hour.
+
+**Is the 1-second slow cut-off configurable?**
+The card uses a fixed 1,000ms definition of "slow" for the numerator, which is the standard analytical-database line. The alert *threshold* on the rate (5%) is configurable per profile in the Sensitivity tab. If your workload is genuinely batch-heavy, where many queries legitimately run for several seconds, raise the rate threshold rather than treating those queries as a fault.
+
+**My slow rate is high but my median latency is low. Which do I trust?**
+Both, and together they tell the story. A low median with a high slow rate means most queries are fast and a distinct slice is slow: a concentrated cause, usually one query pattern repeated. Group the slow set with `normalizeQuery` to find it. If the median were also high, you would be looking at global resource pressure instead.
+
+**The rate swings a lot during quiet hours. Is the card unreliable?**
+It is doing its job, but a small denominator makes any rate jumpy: two slow queries out of twenty is 10%, and a single extra slow query moves it sharply. The fifteen-minute window is chosen to keep enough queries in the denominator, but on a very low-traffic instance overnight the rate will still be noisy. Read the trend and weight readings taken during real traffic.
+
+**Does a high slow rate mean ClickHouse is broken?**
+Rarely. ClickHouse is fast by design; a sustained high slow rate almost always traces to query shape or schema, not the engine. The usual causes are filters that do not align with the table's sort key (forcing full scans), aggregates over unpartitioned ranges, or large unindexed joins. The fix is to rewrite the offending pattern, add a projection or materialised view, or batch the workload.
+
+**How does this relate to the latency percentile cards?**
+They are complementary views of the same distribution. The percentile cards (p50, p95, p99) describe *how slow* queries are at given points in the distribution; this card describes *how many* cross the slow line. A high p99 tells you the tail is bad; a high slow rate tells you the bad tail is a meaningful share of total traffic. Read them together for the full picture.
+
+**On ClickHouse Cloud, is the slow rate computed the same way?**
+Yes. The card reads `system.query_log` identically on ClickHouse Cloud and self-managed instances. The Cloud console also exposes query-performance views that should track this card once you match the window and node scope.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow-Query Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

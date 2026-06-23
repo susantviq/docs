@@ -1,0 +1,175 @@
+---
+title: "Slow-Query Rate %, Elasticsearch"
+sidebarTitle: "Slow-Query Rate %"
+description: "Slow-Query Rate % for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Slow-Query Rate is the share of searches that breach the slowlog threshold, expressed as a percentage of total searches. By default Elasticsearch logs a query as slow when it crosses the configured search slowlog level (commonly 1 second on the query or fetch phase). This card divides the count of slowlog-flagged searches by the total search count over the window, so 5% means one search in twenty took longer than your slow threshold. Unlike a percentile latency card, which tells you how slow your typical or tail query is, this card tells you **how often** users hit a bad one. It is the card that catches a creeping share of pathological queries before they drag the whole percentile distribution down.
+
+| | |
+| --- | --- |
+| **API endpoint** | Search slowlog counts (from the per-index slowlog and the search thread-pool stats in `GET /_nodes/stats/thread_pool` and `GET /_stats/search`), divided by total search count over the window. |
+| **Metric basis** | A ratio, not a latency. `slow searches / total searches * 100` across the cluster over the window. A search is "slow" if it breached the configured slowlog threshold (default 1s). |
+| **Aggregation window** | `15m` rolling. The rate is computed over the trailing 15 minutes so a brief spike does not dominate and a sustained problem stands out. |
+| **Why it matters** | A rising slow-query share means a growing fraction of users are waiting too long, even if median latency looks fine. It is the early-warning signal for query regressions, mapping problems, or a hot shard. |
+| **What turns it high** | Expensive queries (deep pagination, large aggregations, wildcard/leading-wildcard, scripted sorts), a hot shard capping an index, cold caches after a restart, or heap pressure causing GC pauses mid-query. |
+| **What does NOT change it** | Indexing load on its own, replica count, or cluster colour. Slow-query rate is purely about search timing versus the slowlog threshold. |
+| **Slowlog dependency** | The card relies on the search slowlog threshold being set sensibly. If the threshold is disabled or set absurdly high, the rate reads artificially low; if set very low, everything looks slow. |
+| **Managed-service note** | Elastic Cloud, AWS OpenSearch/Elasticsearch Service and Bonsai all expose slowlog configuration and search stats via the same APIs; the rate is reproducible against their tooling. |
+| **Time window** | `15m` (rolling 15-minute rate) |
+| **Alert trigger** | `> 5%`. A sustained slow-query rate above 5% raises the card. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The rate is the proportion of searches in the window that breached the slowlog threshold, grounded in the slowlog count and the total search count Elasticsearch tracks:
+
+```text
+window = trailing 15 minutes
+slow_searches  = count of searches that exceeded the search
+                 slowlog threshold (default 1s) in the window
+total_searches = total search operations completed in the window
+
+slow_query_rate% = slow_searches / total_searches * 100
+```
+
+The "slow" definition comes from the index search slowlog settings, for example `index.search.slowlog.threshold.query.warn: 1s`. Elasticsearch evaluates this per shard per phase (query phase and fetch phase), so a search that fans out to ten shards is counted slow if it breaches the threshold on the slow shard. Vortex IQ aggregates these to a cluster-wide rate.
+
+The engine maps the rate to a sentiment: under 5% is healthy, 5% to 10% is a warning, and above 10% is critical because at that point more than one search in ten is breaching your own slow bar, which users feel as an inconsistent, sluggish experience. Because the denominator is total search volume, a low-traffic window with a handful of slow queries can read high; the 15-minute window and the headline volume context help avoid overreacting to a quiet period.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 5-node Elasticsearch 8.x cluster serving storefront search for a fashion retailer. The search slowlog query threshold is set to 1s. Normal slow-query rate sits around 1.2%. Snapshot taken on 02 Jun 26 at 11:48 BST.
+
+A new "filter by 30 attributes" faceted-search feature shipped at 11:00. By 11:45 the card has climbed from 1.2% to **8.4%**, comfortably past the 5% alert line, while median latency barely moved (180 ms to 215 ms). The on-call reads it correctly: the median is fine because most searches are still simple keyword lookups, but a growing minority (the new faceted searches with huge aggregations) are blowing past 1s.
+
+```text
+Trailing 15m at 11:48:
+  total_searches = 142,300
+  slow_searches  = 11,953
+  slow_query_rate% = 11,953 / 142,300 = 8.4%
+
+Slowlog sample (GET _index/_settings + the slowlog file):
+  took: 2.7s  query: terms agg over 30 fields, size 0, 8 shards
+  took: 3.1s  query: terms agg over 30 fields + nested sort
+```
+
+The decision tree:
+
+1. **Is it volume or a regression?** A regression. Total search volume is flat; the slow *share* jumped right after a deploy. A volume-driven spike would move both the numerator and the denominator together.
+2. **Which queries are slow?** The on-call pulls the slowlog and [Top 10 Slow Searches](/nerve-centre/kpi-cards/elasticsearch/top-10-slow-searches). Nine of the ten are the new faceted aggregation. The new feature requests `terms` aggregations across 30 high-cardinality fields in one pass.
+3. **Quick mitigation vs proper fix?** Quick: cap the aggregation `size` and lazy-load less-used facets so a single search does not compute all 30 at once. Proper: precompute the expensive facets or move them to a separate, cached aggregation call.
+
+The team ships a hotfix at 12:10 that defers the rarely-used facets. By 12:30 the rate falls back to 1.6%.
+
+```text
+Why this matters in numbers:
+  - At 8.4% slow over ~142k searches/15m, roughly 11,953 shoppers
+    in 15 minutes waited >1s for a faceted search.
+  - Median latency moved only 35 ms: a percentile card alone
+    would have missed this. The RATE card caught it.
+  - The regression was deploy-correlated to the minute, which
+    made root cause fast.
+```
+
+Three takeaways:
+
+1. **Rate catches what percentiles hide.** If most queries are fast, a growing tail of slow ones barely moves the median or even p95, but it directly hurts the unlucky users. Slow-query rate is the "how many people had a bad time" card.
+2. **A deploy-correlated jump usually means a query regression.** When the slow share steps up at a deploy boundary with flat volume, suspect the new query shape first: deep pagination, big aggregations, wildcards, or scripted sorts.
+3. **Tune the slowlog threshold to your SLA, not the default.** The 1s default is generic. If your search SLA is 500 ms, set the slowlog threshold there so this card reflects *your* definition of slow, not Elasticsearch's.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards platform teams should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow-Query Rate | What the combination tells you |
+| --- | --- | --- |
+| [Top 10 Slow Searches](/nerve-centre/kpi-cards/elasticsearch/top-10-slow-searches) | The detail behind a high rate. | A high rate plus the slow-search list names the exact queries to optimise. |
+| [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) | The tail-latency partner metric. | Rate up and p95 up together equals a broad slowdown; rate up but p95 flat equals a narrow tail of very slow queries. |
+| [Search Latency p99 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p99-ms) | The extreme-tail view. | A high slow-query rate almost always drags p99 first; p99 is where the pathological queries live. |
+| [Shard Size Skew %](/nerve-centre/kpi-cards/elasticsearch/shard-size-skew) | A common structural cause. | High skew plus a high slow rate on one index equals "a hot shard is capping that index's latency". |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | The heap-pressure cause. | High heap plus rising slow rate equals "GC pauses are stalling queries mid-flight". |
+| [GC Pause Time (5m total ms)](/nerve-centre/kpi-cards/elasticsearch/gc-pause-time-5m-total-ms) | The direct stall measurement. | Long GC pauses correlate tightly with bursts of slow queries on the affected node. |
+| [Search Queries per Second (live)](/nerve-centre/kpi-cards/elasticsearch/search-queries-per-second-live) | The denominator context. | A spiking slow rate in a low-QPS window may be a few outliers, not a systemic problem. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> **`GET /<index>/_settings?include_defaults=true&filter_path=**.slowlog`** to confirm the slowlog thresholds the rate is measured against.
+> **The search slowlog file** (`<cluster>_index_search_slowlog.json` or `.log`) for the actual slow-query entries with `took`, the query source and the shard.
+> **`GET /_nodes/stats/thread_pool/search`** for completed search counts (the denominator) per node.
+> **`GET /_stats/search`** for per-index search query counts and total time, to cross-check the ratio.
+
+In managed services the slowlog and search stats are exposed the same way: Elastic Cloud ships slowlogs to the deployment's logging, AWS OpenSearch/Elasticsearch Service publishes search slowlogs to CloudWatch Logs when enabled, and Bonsai exposes the slowlog through its dashboard.
+
+**Why our value may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window boundary** | Variable | The card uses a trailing 15-minute window; counting slowlog lines over a different range gives a different rate. Match the window. |
+| **Threshold mismatch** | Variable | If you compute the rate against a different slowlog threshold than the one configured, your "slow" definition differs from the card's. |
+| **Per-shard vs per-search** | Our value may look lower | The slowlog fires per shard per phase; the card counts a search as slow if it breached on any shard, so raw slowlog line counts can exceed slow-search counts. |
+| **Time zone** | Timestamp display only | The rate is timezone-independent; only chart axes render in your Vortex IQ display timezone. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Slow Searches During Checkout Window (5m)](/nerve-centre/kpi-cards/elasticsearch/slow-searches-during-checkout-window-5m) | Slow searches concentrated in checkout windows hurt revenue most. | A high overall slow rate that coincides with checkout traffic is the worst case; the cross-channel card isolates that overlap. |
+| [Search QPS Spike vs Ecom Traffic](/nerve-centre/kpi-cards/elasticsearch/search-qps-spike-vs-ecom-traffic) | A QPS spike from a traffic burst can push the slow rate up. | Slow rate rising in lockstep with an ecommerce traffic spike points to capacity, not a query regression. |
+
+<details>
+<summary><em>Documentation cross-reference (same-concept peer)</em></summary>
+
+The slowlog-based slow-query rate is specific to Elasticsearch and OpenSearch. It is **not** a reconciliation against a parallel system; these references exist only so a team running both engines can map the same concept across docs.
+
+- OpenSearch equivalent: identical search slowlog settings and search thread-pool stats.
+- Generic equivalent on SQL databases: closest analogue is the slow-query log share (for example MySQL's `slow_query_log` or PostgreSQL's `log_min_duration_statement`), but the threshold semantics differ.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My slow-query rate is high but p95 latency looks fine. How?**
+This is exactly what the rate card is for. If most queries are fast, a small but growing tail of very slow ones (say 6% of searches taking 3s) barely moves p95 because p95 is still inside the fast majority. The rate, however, divides slow by total and surfaces that tail. Pair with [Search Latency p99 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p99-ms), which is where those slow queries show up.
+
+**The rate spiked but it was a quiet period with only a few searches. Is it real?**
+Be careful with low-volume windows. With only 40 searches in 15 minutes, two slow ones read as 5%. The 15-minute window and the headline volume context help, but always check [Search Queries per Second (live)](/nerve-centre/kpi-cards/elasticsearch/search-queries-per-second-live) alongside. A high rate over high volume is a real problem; a high rate over a handful of queries is usually noise.
+
+**What threshold defines "slow"? Can I change it?**
+The card uses your index search slowlog threshold, which defaults to 1s on the query phase. You can and should tune it to your search SLA via `index.search.slowlog.threshold.query.warn`. If your storefront target is 500 ms, set the threshold there so the card reflects your standard, not the generic default. Changing the threshold changes what the card counts as slow.
+
+**My slowlog is disabled. Does the card still work?**
+Partially. If the slowlog threshold is unset or disabled, Elasticsearch does not flag slow searches, so the numerator is unreliable and the rate may read near zero even when queries are slow. Enable the search slowlog with a sensible threshold to get an accurate rate. Without it, fall back to [Search Latency p95 (ms)](/nerve-centre/kpi-cards/elasticsearch/search-latency-p95-ms) and [p99](/nerve-centre/kpi-cards/elasticsearch/search-latency-p99-ms).
+
+**A deploy pushed the rate up. How do I find the offending query?**
+Pull [Top 10 Slow Searches](/nerve-centre/kpi-cards/elasticsearch/top-10-slow-searches) and the raw slowlog file, which records the query source for each slow entry. Deploy-correlated rate jumps almost always trace to a new query shape: deep pagination (`from` + `size` into the thousands), large or nested aggregations, leading-wildcard queries, or scripted sorts. The slowlog names the exact query so you can reproduce and optimise it.
+
+**Does indexing load affect the slow-query rate?**
+Indirectly. Heavy indexing competes for CPU, heap and the search thread pool, which can slow searches and lift the rate, but the card itself measures only search timing versus the slowlog threshold. If the rate rises during heavy indexing, check [Indexing Rate (docs/sec)](/nerve-centre/kpi-cards/elasticsearch/indexing-rate-docssec) and [GC Pause Time (5m total ms)](/nerve-centre/kpi-cards/elasticsearch/gc-pause-time-5m-total-ms) to see whether indexing pressure is the cause.
+
+**Right after a restart the rate spikes then settles. Why?**
+Cold caches. After a node restart the page cache, query cache and request cache are empty, so the first searches read from disk and run slower until the caches warm. This produces a transient slow-query spike that settles within minutes. It is expected and not a query regression; do not optimise queries in response to a post-restart warm-up spike.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow-Query Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

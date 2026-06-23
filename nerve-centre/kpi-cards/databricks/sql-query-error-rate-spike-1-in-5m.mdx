@@ -1,0 +1,152 @@
+---
+title: "SQL Query Error Rate Spike (>1% in 5m), Databricks"
+sidebarTitle: "SQL Query Error Rate Spike (>1% in 5m)"
+description: "SQL Query Error Rate Spike for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> An alert that fires when the share of SQL queries returning an error on the connected SQL warehouses exceeds 1% sustained over a rolling 5-minute window. SQL warehouses serve dashboards, BI tools, and ad-hoc analytics, so a query error-rate spike means real people are watching dashboards fail to load or returning empty. A 1% error rate is low in absolute terms but high for a healthy warehouse: well-behaved estates sit far below it, so crossing 1% and holding there is a clear "something just broke" signal.
+
+| | |
+| --- | --- |
+| **Data source** | Databricks `system.query.history` system table (the authoritative record of every SQL statement, its `execution_status`, and its error class), aggregated to error-share per 5-minute bucket. The live SQL Warehouses API provides warehouse state for context. |
+| **Metric basis** | A ratio: `errored_queries / total_queries` within the rolling window, expressed as a percentage. The alert is a spike detector on that ratio, not a raw error count. |
+| **Aggregation window** | `5m` rolling, evaluated continuously. |
+| **Alert trigger** | `>1% sustained 5m`. A momentary blip above 1% that does not persist for the window is suppressed; the rate must hold above the threshold to escalate. |
+| **What counts as an error** | Queries whose `execution_status` is `FAILED` (syntax errors, permission denials, analysis errors, runtime errors such as division by zero, and out-of-memory / spill failures). |
+| **What does NOT count** | (1) Successful queries; (2) `CANCELED` queries (a user or a BI tool aborted them deliberately, often on timeout); (3) queries still `RUNNING` or `QUEUED`; (4) metadata-only operations the warehouse does not log as statements. |
+| **Why "sustained"** | A single failed query in a quiet minute can momentarily push the ratio above 1%. Requiring the rate to hold across the window filters that statistical noise out, so the alert fires on genuine sustained degradation, not one unlucky query. |
+| **Time zone** | Workspace time zone for chart axes; UTC for cross-connector windowing. |
+| **Time window** | `5m` rolling. |
+| **Roles** | owner, platform engineering, analytics / BI on-call |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine computes the error share over a rolling 5-minute window of completed SQL statements:
+
+```text
+error_rate = errored_queries / total_completed_queries   (within trailing 5m)
+
+  errored_queries        = COUNT(query) WHERE execution_status = 'FAILED'
+  total_completed_queries = COUNT(query) WHERE execution_status IN ('FINISHED','FAILED')
+
+FIRE when error_rate > 1% AND it is sustained across the window
+```
+
+Cancelled and queued statements are excluded from both the numerator and the denominator. A `CANCELED` query is almost always a deliberate abort (a user closed a dashboard, a BI tool hit its own client-side timeout) and is not a warehouse failure; counting it would inflate the error rate and fire false alarms during normal interactive use.
+
+The "sustained" qualifier is what makes the threshold usable at 1%. In a low-traffic 5-minute window with only, say, 40 queries, a single failure is already 2.5%. Without the sustain requirement the alert would fire constantly during quiet periods on a single transient error. By requiring the rate to hold above 1% across the rolling window, the engine distinguishes a genuine fault (errors keep arriving) from a one-off (one query failed, the rate decays back below threshold on the next evaluation).
+
+This card measures correctness (are queries erroring), which is distinct from speed (are queries slow). A warehouse can have a 0% error rate while every query is painfully slow, that latency view lives on [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) and [Slow-Query Rate %](/nerve-centre/kpi-cards/databricks/slow-query-rate). The standing gauge for this same ratio is [SQL Query Error Rate %](/nerve-centre/kpi-cards/databricks/sql-query-error-rate); this card is the alerting wrapper that escalates when the gauge spikes.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a SQL warehouse serving the company's BI estate: executive revenue dashboards, a merchandising team's stock-availability views, and ad-hoc analyst queries. Snapshot taken on 14 Apr 26 at 14:05 BST, mid-afternoon peak.
+
+| 5m bucket | Total queries | Failed | Error rate | Note |
+| --- | --- | --- | --- | --- |
+| 13:50 | 920 | 3 | 0.33% | Normal baseline |
+| 13:55 | 880 | 4 | 0.45% | Normal |
+| 14:00 | 910 | 22 | 2.42% | Spike begins |
+| 14:05 | 935 | 31 | 3.32% | Sustained, ALERT |
+
+At 14:00 the error rate jumps to 2.42% and holds at 3.32% through 14:05, comfortably above the 1% threshold for the full window. The card escalates with the headline **SQL error rate 3.3% sustained, 31 failures in 5m**. The on-call engineer works the playbook:
+
+1. **Classify the errors.** The drill-down groups failures by error class. 28 of the 31 share the same message: `TABLE_OR_VIEW_NOT_FOUND: gold.revenue_daily`. This is not a load problem or an out-of-memory issue; a table the dashboards depend on has gone missing.
+2. **Correlate with a recent change.** A deployment at 13:58 renamed `gold.revenue_daily` to `gold.revenue_daily_v2` and missed updating two dashboard datasets. Every refresh of those dashboards now errors. The timing lines up exactly with the spike onset.
+3. **Quantify who is affected.** Because the failing queries all originate from the executive revenue dashboards, the blast radius is the leadership team during their afternoon review, high visibility, low query volume but high importance.
+4. **Fix and confirm decay.** A backward-compatible view (`gold.revenue_daily` pointing at `_v2`) is created as an immediate mitigation. By 14:15 the error rate decays back to 0.4% and the card clears.
+
+```text
+Reading the spike shape tells you the cause:
+  - Errors all one class (TABLE_NOT_FOUND, PERMISSION_DENIED):
+    a schema or grants change just shipped. Fix the reference.
+  - Errors mixed but cluster on OOM / spill:
+    the warehouse is undersized for the query mix. Scale up or
+    check Slow-Query Rate and Warehouse Saturation.
+  - Errors spread across many tables and classes at once:
+    suspect the metastore / Unity Catalog or a warehouse fault,
+    not any single query.
+```
+
+The discipline this card instils: an error-rate spike is a *correctness* alarm, and correctness spikes almost always trace to a change (a deploy, a grant revocation, a renamed object) rather than to load. The first question is always "what shipped in the last ten minutes?"
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with SQL Query Error Rate Spike | What the combination tells you |
+| --- | --- | --- |
+| [SQL Query Error Rate %](/nerve-centre/kpi-cards/databricks/sql-query-error-rate) | The standing gauge this alert wraps. | The gauge shows the live ratio; this card escalates when it spikes and sustains. |
+| [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) | Separates correctness from speed. | Errors plus high p95 equals an overloaded warehouse; errors with normal p95 equals a schema or grants fault. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/databricks/slow-query-rate) | The slowness counterpart of this card. | If both spike together, suspect saturation; if only errors spike, suspect a change. |
+| [SQL Warehouse Saturation %](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation) | Shows whether the warehouse is overloaded. | High saturation alongside the spike points at OOM / spill errors from undersizing. |
+| [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries) | Names the heaviest queries when load is the cause. | A heavy query starving the warehouse can cause both slowness and errors. |
+| [SQL Queries per Hour (live)](/nerve-centre/kpi-cards/databricks/sql-queries-per-hour-live) | The volume context behind the ratio. | A spike during a query-volume surge is load-driven; a spike at flat volume is change-driven. |
+| [Slow SQL Queries During Checkout Window](/nerve-centre/kpi-cards/databricks/slow-sql-queries-during-checkout-window) | The cross-channel view if warehouse SQL backs storefront data. | Errors co-occurring with a checkout dip is a revenue-impacting fault. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **SQL → Query History** in the workspace UI, filtered to the last 5 to 15 minutes and to the Failed status, to see the failing statements and their error messages.
+> **`system.query.history`** system table in Unity Catalog: the authoritative source. Query `execution_status` grouped by 5-minute bucket to reproduce the ratio exactly, and group by error class to classify the spike.
+> **SQL warehouse monitoring** tab for the specific warehouse, to confirm whether the spike correlates with saturation, scaling, or a restart.
+
+**Why our number may legitimately differ from Query History:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Cancelled-query handling** | Vortex IQ rate lower | We exclude `CANCELED` from both numerator and denominator; a UI filter that lumps cancellations in with errors will read higher. |
+| **Window definition** | Variable | This card uses a rolling 5-minute window; Query History defaults to a longer span. Match the range to reconcile. |
+| **system.query.history latency** | Brief lag | The system table can take a short time to record the most recent statements; the live count may trail the UI by a minute. |
+| **Warehouse scope** | Variable | The card aggregates across the connected warehouses; a single-warehouse UI view will differ if you have several. |
+| **Denominator basis** | Variable | We divide by completed queries (`FINISHED` + `FAILED`); if you compute the ratio against all submitted statements (including queued) you will get a different number. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Databricks SQL Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/databricks/databricks-sql-spike-vs-ecom-order-rate) | If warehouse SQL backs storefront features, an error spike may coincide with degraded storefront behaviour. | An error spike with no order-rate change means the failing queries were internal BI, not customer-facing. |
+| [Slow SQL Queries During Checkout Window](/nerve-centre/kpi-cards/databricks/slow-sql-queries-during-checkout-window) | An error spike during the checkout window is the highest-priority case. | Errors outside any checkout-critical path are lower urgency despite the same headline number. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Our error rate briefly hit 5% but the alert never fired. Why?**
+The trigger requires the rate to be *sustained* above 1% across the rolling 5-minute window, not just to touch it. In a low-traffic minute a single failed query can momentarily spike the ratio and then decay on the next evaluation. That is exactly the statistical noise the sustain requirement is designed to suppress. If the rate genuinely held above 1% and still did not fire, check the warehouse scope, the failures may have landed on a warehouse not included in the connector.
+
+**Why is 1% the threshold? That seems very low.**
+For a healthy SQL warehouse it is high. Well-behaved BI estates run their error rate far below 1%, with the rare failure being a malformed ad-hoc query. Sitting at or above 1% for five minutes means failures are arriving systematically, which is the definition of a fault. If your estate runs a lot of exploratory ad-hoc SQL where occasional user errors are normal, raise the threshold in the Sensitivity tab to match your baseline.
+
+**Are cancelled or timed-out queries counted as errors?**
+Cancelled queries (`CANCELED`) are excluded, because a cancellation is a deliberate abort by a user or a BI tool, not a warehouse failure. Client-side timeouts that the BI tool aborts also surface as cancellations and are excluded. Only statements that reached a `FAILED` terminal state count. This keeps the card focused on genuine query failures rather than normal interactive behaviour.
+
+**The spike is all one error class. What does that tell me?**
+A spike dominated by a single error class almost always points at a recent change rather than load. `TABLE_OR_VIEW_NOT_FOUND` means a renamed or dropped object; `PERMISSION_DENIED` means a grant was revoked or a service principal lost access; `PARSE`/`ANALYSIS` errors mean a deployed query is malformed. The first move is to look at what shipped in the last ten minutes, not to scale the warehouse.
+
+**The errors are mixed and many mention spill or out-of-memory. Is that the same problem?**
+No, that is a load problem, not a change problem. OOM and disk-spill failures mean the warehouse is undersized for the query mix it is being asked to run. Read [SQL Warehouse Saturation %](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation) and [Slow-Query Rate %](/nerve-centre/kpi-cards/databricks/slow-query-rate) alongside this card; the fix is usually to scale the warehouse up, enable multi-cluster scaling, or tune the heaviest queries from [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries).
+
+**Does this card cover errors on interactive clusters, or only SQL warehouses?**
+This card reads SQL statement history, which covers queries run against SQL warehouses (the dashboard and BI path). Spark jobs failing on all-purpose or job clusters are a different failure surface and are tracked via [Failed Jobs (24h)](/nerve-centre/kpi-cards/databricks/failed-jobs-24h) and [Failed Job Burst (>5 failures in 1h)](/nerve-centre/kpi-cards/databricks/failed-job-burst-5-failures-in-1h). During a metastore-wide outage you may see both surfaces light up together.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*SQL Query Error Rate Spike (>1% in 5m)* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

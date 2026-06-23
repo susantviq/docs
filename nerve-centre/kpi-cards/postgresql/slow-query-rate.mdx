@@ -1,0 +1,169 @@
+---
+title: "Slow-Query Rate %, PostgreSQL"
+sidebarTitle: "Slow-Query Rate %"
+description: "Slow-Query Rate % for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The share of query executions that are "slow", defined as statements whose mean execution time exceeds 100ms, expressed as a percentage of total calls. Where the percentile cards (p95, p99) tell you *how slow the tail is*, this card tells you *how much of your workload is slow at all*. A 2% slow-query rate on a million-call window means roughly 20,000 executions crossed the 100ms line; a 12% rate means more than one query in eight is dragging. It is the breadth metric: it catches the difference between "one report is slow" (narrow, low rate, possibly high p99) and "a large slice of normal traffic has degraded" (broad, high rate). For a DBA it is the early-warning gauge that an index regression, a stale plan, or a cache miss is spreading across the workload.
+
+| | |
+| --- | --- |
+| **Data source** | `pg_stat_statements`. Vortex IQ samples the view each interval, computes the delta in `calls` and `total_exec_time` per normalised statement, and counts every statement whose windowed `mean_exec_time` exceeds 100ms as "slow". The rate is slow-calls divided by total-calls over the window. |
+| **Metric basis** | Call-weighted: a slow statement that ran 10,000 times contributes 10,000 slow calls, not one. The 100ms threshold is on the per-statement mean for the window, not on individual executions (the view does not store per-execution timing). |
+| **Aggregation window** | `15m`: the rate is computed over a rolling 15-minute window so a transient blip does not swing the gauge, while still surfacing a developing regression within minutes. |
+| **Unit** | Percentage of total query calls (0 to 100). |
+| **What counts** | Every statement captured by `pg_stat_statements` on the monitored database whose windowed mean exec time is above 100ms, weighted by its call count in the window. |
+| **What does NOT count** | (1) Time waiting for a connection from the pool; (2) queries that errored before completing (those are on [Query Error Rate %](/nerve-centre/kpi-cards/postgresql/query-error-rate)); (3) statements running below the `pg_stat_statements.track` granularity; (4) the 100ms threshold means genuinely fast statements never count even if they run billions of times. |
+| **Time window** | `15m` (rate computed over a rolling 15-minute window) |
+| **Alert trigger** | `>5%`. Sustained slow-query rate above 5% means a meaningful and growing share of the workload has crossed the slow line, usually an index, plan, or cache problem rather than a single rogue query. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card derives entirely from deltas on `pg_stat_statements`, so it reflects the live workload rather than lifetime cumulative history. Each interval the engine snapshots the view, and over the rolling 15-minute window it computes, per normalised statement:
+
+```text
+delta_calls            = calls(now)          - calls(window_start)
+delta_total_exec_time  = total_exec_time(now) - total_exec_time(window_start)
+windowed_mean_ms       = delta_total_exec_time / delta_calls
+
+A statement is "slow" for the window if windowed_mean_ms > 100.
+
+slow_calls  = sum of delta_calls over statements where windowed_mean_ms > 100
+total_calls = sum of delta_calls over all statements
+slow_query_rate_pct = 100 * slow_calls / total_calls
+```
+
+Two design choices matter for how you read the gauge:
+
+1. **Threshold is on the windowed mean, not per execution.** Because `pg_stat_statements` stores only a per-statement mean (not a histogram), a statement is classified slow-or-not as a whole for the window. A statement that averages 90ms is fully excluded even if some of its individual runs exceeded 100ms; a statement that averages 110ms contributes all its calls as slow. This is a deliberate, conservative approximation: it tends to slightly under-count slow individual executions and is stable, which is what you want in an alerting gauge. Where a provider exposes a true per-execution histogram (Aurora Performance Insights, Cloud SQL Query Insights), the card prefers that finer source.
+2. **Call-weighting makes the rate represent real traffic.** A nightly maintenance statement that runs twice and takes 3 seconds each barely moves the rate, because it is two calls out of (say) two million. A web-tier lookup that regressed to 120ms and runs 400,000 times in the window dominates the rate. The gauge is therefore a faithful "what fraction of the work my database actually did was slow" measure, not a count of slow statement shapes.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A logistics platform runs PostgreSQL 14 behind a tracking API. The baseline slow-query rate sits around 1.2%. At 08:05 on 17 Apr 26, shortly after a routine deploy, the Nerve Centre gauge climbs to 9.4% and the >5% alert fires. p99 latency is up too, but only modestly; the headline story is the *breadth*, not the depth.
+
+The DBA pulls the window detail:
+
+| Statement (normalised) | Windowed mean | Calls in window | Slow? | Share of slow calls |
+| --- | --- | --- | --- | --- |
+| `SELECT * FROM shipments WHERE tracking_no = $1` | 118ms | 612,000 | yes | 71% |
+| `SELECT ... FROM events WHERE shipment_id = $1` | 140ms | 188,000 | yes | 22% |
+| everything else combined | < 100ms | 5.1M | no | 0% |
+
+One statement shape accounts for 71% of the slow calls. Its windowed mean jumped from 6ms to 118ms across the deploy boundary, which points squarely at a plan or index change.
+
+```text
+Diagnosis:
+  - rate broad (9.4%) but driven by ONE statement at high call volume
+  - that statement was fast yesterday, slow today, deploy in between
+  - EXPLAIN (ANALYZE, BUFFERS) on the tracking_no lookup:
+        was an Index Scan on shipments_tracking_no_idx (0.3ms)
+        is now a Seq Scan on shipments (118ms)
+  - cause: the deploy's migration renamed the column the index was built on,
+           leaving the index unused; the planner fell back to a full scan.
+```
+
+The fix was to rebuild the index against the renamed column. Within one 15-minute window the slow-query rate fell back to 1.3% and p99 recovered. Three takeaways the team recorded:
+
+1. **Rate and percentile answer different questions.** p99 told them "the tail is a bit worse"; the slow-query rate told them "a large, specific slice of normal traffic regressed". A high rate concentrated in one statement is the classic signature of a single broken index or stale plan, which is faster to fix than a diffuse slowdown.
+2. **Always decompose the rate by statement.** A 9% rate spread evenly across hundreds of statements (cache cold after a restart, undersized instance) needs a capacity or configuration fix. A 9% rate concentrated in one statement needs a query or index fix. The gauge is the alarm; the per-statement breakdown is the diagnosis.
+3. **The 100ms line is a convention, not physics.** For this OLTP API, 100ms is a sensible "slow" cut-off. A reporting database where 100ms queries are normal would want the threshold higher, otherwise the gauge reads permanently red. Tune it to your workload in the Sensitivity tab.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow-Query Rate | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p99-ms) | The depth of the tail vs the breadth of the slowness. | High rate plus high p99 equals a broad regression; low rate plus high p99 equals a narrow tail outlier. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p95-ms) | The "most users" tail. | If the slow-query rate is up and p95 moved, the slowness reaches a large share of traffic. |
+| [Query Latency p50 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p50-ms) | The median. | Rate up but p50 flat means the slow statements are a distinct slice, not the whole workload. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/postgresql/top-10-slowest-queries) | Names the statements behind the rate. | The first drill-down when the gauge spikes: which shapes are slow. |
+| [Buffer Cache Hit Rate %](/nerve-centre/kpi-cards/postgresql/buffer-cache-hit-rate) | Cache misses turn fast queries slow. | Rate up plus cache-hit down equals a cold cache or undersized `shared_buffers`, not a query bug. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/postgresql/queries-per-second-live) | The denominator context. | A spike in QPS that pushes the rate up may simply be a traffic surge overwhelming the instance. |
+| [Idle-in-Transaction Backends](/nerve-centre/kpi-cards/postgresql/idle-in-transaction-backends) | Lock contention slows many statements at once. | Rate up plus idle-in-tx backends equals contention dragging unrelated queries. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The composite that weights latency health. | A sustained high slow-query rate pulls the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL's own tooling:**
+
+> **`pg_stat_statements`** is the source. To see which shapes are over the 100ms line right now:
+> ```sql
+> SELECT queryid, calls, mean_exec_time, total_exec_time, query
+> FROM pg_stat_statements
+> WHERE mean_exec_time > 100
+> ORDER BY calls DESC;
+> ```
+> Note this orders by lifetime cumulative means, not the windowed delta the card uses, so the raw list will differ from the gauge's window.
+> **`log_min_duration_statement`** is the other native angle: set it (for example to 100ms) and PostgreSQL logs every statement that crosses the line to the server log, giving you per-execution truth that `pg_stat_statements` cannot.
+> **`auto_explain`** with `auto_explain.log_min_duration` captures the plan of slow statements automatically, which is the fastest way to confirm a plan regression.
+
+**On managed services:**
+
+> **Amazon RDS / Aurora:** Performance Insights surfaces top SQL by load and per-statement latency, and the slow-query log can be enabled via the parameter group. Aurora's per-execution data is finer than `pg_stat_statements`' means.
+> **Google Cloud SQL:** Query Insights ranks queries by latency and shows plan samples.
+> **Azure Database for PostgreSQL:** Query Store plus the `log_min_duration_statement` server parameter.
+
+**Why our number may legitimately differ from a raw `pg_stat_statements` read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Windowed vs cumulative** | Raw `WHERE mean_exec_time > 100` differs both ways | The raw filter uses lifetime means; the card uses a rolling 15-minute delta, so a statement slow historically but fast now is excluded by the card and included by the raw query. |
+| **Mean-vs-execution threshold** | Card may under-count slow runs | The 100ms test is on the windowed mean, not per execution; a statement averaging 95ms with some 200ms runs is not counted slow. A per-execution log (`log_min_duration_statement`) catches those. |
+| **Call-weighting** | Neither is wrong | The card weights by calls; a simple count of slow statement *shapes* would look very different and is less operationally meaningful. |
+| **Reset timing** | Transient | A `pg_stat_statements_reset()` mid-window is skipped by the card but zeroes the raw view. |
+| **`track = top`** | Card may miss nested time | With `track = top`, time in functions and triggers attributes to the top-level statement. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/postgresql/slow-queries-during-checkout-window-5m) | A high overall slow-query rate during a checkout window should co-occur. | If the rate is high but checkout is unaffected, the slow statements are on a non-customer path. |
+| [`datadog.error-rate`](/nerve-centre/kpi-cards/datadog/error-rate) | A query that times out at the app tier may register slow here and as an error there. | App-tier timeouts cut the query off; PostgreSQL may still record the partial execution time. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is the 100ms threshold fixed? My reporting queries are always over 100ms.**
+The 100ms cut-off is a sensible default for OLTP workloads but it is not fixed: adjust it per profile in the Sensitivity tab. On a reporting or analytics database where multi-hundred-millisecond queries are normal and expected, leaving the threshold at 100ms makes the gauge read permanently red and useless. Raise it to a number that represents "slow for this workload", for example 1,000ms. The point of the gauge is deviation from your normal, not a universal speed limit.
+
+**The slow-query rate is high but my p50 and p95 look fine. How can both be true?**
+Easily. The slow-query rate is call-weighted across all statement shapes, while p50 and p95 describe the latency distribution of executions. A modest number of high-volume statements just over 100ms can lift the rate while the bulk of executions (which set p50 and p95) stay fast. This pattern usually means one or two specific statement shapes regressed; decompose the rate by statement to find them.
+
+**Does this count queries that failed or timed out?**
+No. Failed queries are tracked on [Query Error Rate %](/nerve-centre/kpi-cards/postgresql/query-error-rate). However, a query that the application cancelled on its own timeout may still have accumulated execution time in `pg_stat_statements` before the cancel, so a wave of app-tier timeouts can show up here as elevated slowness as well as on the error card. When both move together, suspect statements slow enough to breach the client timeout.
+
+**`pg_stat_statements` is not installed. Can I still get this card?**
+Not directly: the windowed rate depends on the extension. Install it (`shared_preload_libraries` plus `CREATE EXTENSION pg_stat_statements`), or on a managed service enable it via the parameter group. As a fallback, Vortex IQ can approximate the rate from `log_min_duration_statement` server-log volume where the provider exposes logs, but the native extension gives the cleanest reading.
+
+**A single statement is driving the whole rate. Should the gauge really go red for one query?**
+Yes, if that one statement carries a large share of your traffic. The rate is call-weighted precisely so that a high-volume statement that regressed dominates the gauge, because that is what actually degrades user experience. Conversely a rarely-run statement, however slow, barely moves the rate. The gauge measures impact on the workload, not the number of distinct slow shapes.
+
+**How is this different from the latency percentile cards?**
+The percentile cards measure *how slow*: p50 is the median experience, p99 is the worst realistic experience. This card measures *how much*: what fraction of all calls crossed the slow line. You can have a high p99 with a low rate (one narrow tail) or a high rate with a contained p99 (lots of queries just over 100ms but nothing catastrophic). Read them together: the percentiles give depth, the rate gives breadth.
+
+**The gauge swings up and down within a single shift. Is it broken?**
+Probably not. The 15-minute window smooths transients but a workload that genuinely oscillates (batch jobs starting and stopping, traffic bursts, cache warming after a restart) will move the rate legitimately. If the swings correlate with known events, that is the gauge working. If they are random and frequent, suspect an unstable plan that flips between a good and a bad execution path; `auto_explain` on the suspect statement will confirm.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow-Query Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

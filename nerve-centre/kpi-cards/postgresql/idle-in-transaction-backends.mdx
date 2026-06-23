@@ -1,0 +1,176 @@
+---
+title: "Idle-in-Transaction Backends, kpi"
+sidebarTitle: "Idle-in-Transaction Backends"
+description: "Idle-in-Transaction Backends for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of backend connections sitting in the `idle in transaction` state: a client opened a transaction with `BEGIN`, did some work, and then stopped, holding the transaction open without committing or rolling back. This is one of PostgreSQL's most distinctive and dangerous failure modes. An idle-in-transaction backend keeps locks held, pins the transaction horizon so autovacuum cannot reclaim dead tuples, and occupies a connection slot. A handful is normal churn; a sustained pile of them is a leaking application connection pool slowly strangling the database.
+
+| | |
+| --- | --- |
+| **What it tracks** | The count of backends where `pg_stat_activity.state = 'idle in transaction'` (and the related `idle in transaction (aborted)`). "Stuck transactions hold locks and bloat the pool. PostgreSQL-distinctive risk." |
+| **Data source** | `pg_stat_activity`, filtered to `state = 'idle in transaction'`. The drill-down also reports `xact_start` (when the open transaction began), `state_change` (when it went idle), `wait_event`, and the `application_name` so you can attribute the leak to a specific service. |
+| **Time window** | `RT` (real-time, evaluated on the live polling cycle). |
+| **Alert trigger** | `> 10 sustained 5m`. More than ten idle-in-transaction backends held continuously for five minutes pages the on-call DBA. The "sustained" qualifier matters: brief spikes during normal commit churn are ignored; a plateau is the signal. |
+| **Why it matters in PostgreSQL specifically** | Because of MVCC, an open transaction pins the oldest visible transaction ID. Autovacuum cannot remove any dead tuple newer than that horizon, so a single long-idle transaction can block vacuum across the entire cluster, causing table bloat and, in the extreme, transaction-ID wraparound risk. |
+| **What does NOT count** | Plain `idle` backends (connected but with no open transaction, which are harmless and expected from a pool), `active` backends (running a query right now), and `idle in transaction (aborted)` is counted but flagged separately because it cannot do further work until rolled back. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The headline is a straight count from `pg_stat_activity`:
+
+```sql
+SELECT count(*)
+FROM pg_stat_activity
+WHERE state IN ('idle in transaction', 'idle in transaction (aborted)');
+```
+
+The alert applies a sustain filter on top: the count must stay above 10 across the full five-minute window before paging, so the card does not fire on the momentary blips that happen as transactions commit and the pool recycles.
+
+The drill-down enriches each backend with the metrics that tell you how dangerous it is:
+
+- `now() - xact_start` is the age of the open transaction. A backend idle in transaction for 200 milliseconds is fine; one idle for 45 minutes is holding the vacuum horizon back by 45 minutes.
+- `now() - state_change` is how long it has been idle in this transaction specifically (since the last statement finished).
+- `application_name` and `client_addr` attribute the leak to a service or host, which is how you find the offending code path.
+- `pid` is what you feed to `pg_terminate_backend(pid)` if you need to kill it.
+
+The single most important derived figure is the oldest `xact_start` among all idle-in-transaction backends, because that is the one pinning the cluster-wide vacuum horizon. The engine surfaces it prominently: a high count of short idle transactions is annoying, but one ancient idle transaction is what actually blocks vacuum and bloats your tables.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs the primary database behind an order-processing API. The API uses an ORM with an application-side connection pool of 40 connections. Snapshot taken on 03 Jun 26 at 14:20 BST after the card paged at 14:13.
+
+| `application_name` | Count idle-in-tx | Oldest `xact_start` | Idle for |
+| --- | --- | --- | --- |
+| order-api | 23 | 13:51 | 29 min |
+| order-api | (same pool) | 14:02 | 18 min |
+| reporting-worker | 2 | 14:18 | 90 s |
+
+The card reads **25 idle-in-transaction backends**, well over the threshold of 10, and has been above it for seven minutes. The oldest open transaction started at 13:51, so autovacuum has not been able to advance its horizon for 29 minutes. A check of `pg_stat_user_tables` confirms `n_dead_tup` on the busy `orders` table is climbing steadily because vacuum cannot reclaim anything committed after 13:51.
+
+Reading the detail, the pattern is unmistakable: 23 of the 25 belong to a single service, `order-api`. The team pulls the most recent deploy and finds the culprit: a code change wrapped an external payment-gateway call inside an open database transaction.
+
+```text
+The anti-pattern the deploy introduced (simplified):
+
+  BEGIN;
+  UPDATE orders SET status = 'paying' WHERE id = $1;
+  -- transaction left OPEN while the app awaits the payment gateway
+  result = call_payment_gateway(...)   <-- 2 to 30 seconds, sometimes hangs
+  UPDATE orders SET status = 'paid' WHERE id = $1;
+  COMMIT;
+
+Why it piles up:
+  - The gateway call is slow and occasionally stalls.
+  - Every in-flight payment holds a transaction open for the call's duration.
+  - At peak checkout volume, dozens of payments are in flight simultaneously,
+    so dozens of transactions sit idle-in-transaction waiting on the network.
+  - The slow payments pin the vacuum horizon and exhaust the pool.
+```
+
+The immediate mitigation and the durable fix:
+
+1. **Stop the bleeding now.** Set a guard so these cannot accumulate forever: `ALTER SYSTEM SET idle_in_transaction_session_timeout = '30s'; SELECT pg_reload_conf();`. Any transaction idle longer than 30 seconds is terminated by PostgreSQL automatically. This protects the database while the code is fixed.
+2. **Fix the code.** Move the external gateway call outside the transaction. Open a transaction only to write the result: read the order, call the gateway with no open transaction, then `BEGIN; UPDATE ...; COMMIT;` to record the outcome. Network calls must never sit inside an open database transaction.
+
+After the timeout is applied, the count falls to 3 within a minute as the stalled transactions are reaped, the vacuum horizon advances, and `n_dead_tup` on `orders` starts dropping at the next autovacuum pass.
+
+Three lessons platform teams should carry:
+
+1. **Idle-in-transaction is almost always an application bug, not a database problem.** The fix lives in the code: a transaction left open across a slow operation (a network call, a user think-time, a forgotten commit). The database is the victim, not the cause.
+2. **The oldest transaction matters more than the count.** Twenty backends idle for two seconds each are a minor pool nuisance. One backend idle for 40 minutes blocks vacuum cluster-wide and is the real emergency. Read the oldest `xact_start`, not just the headline number.
+3. **`idle_in_transaction_session_timeout` is your seatbelt.** Setting a sane timeout (often 30 to 60 seconds for OLTP) means a leaking code path cannot pin the vacuum horizon indefinitely. It is a safety net, not a substitute for fixing the code, but every production primary should have one.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Idle-in-Transaction Backends | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) | Idle-in-tx backends occupy pool slots without doing work. | Rising idle-in-tx plus rising saturation equals the leak is eating your connection budget. |
+| [Connections In Use](/nerve-centre/kpi-cards/postgresql/connections-in-use) | The raw connection count that idle-in-tx inflates. | Connections high but QPS flat is a classic idle-in-tx fingerprint. |
+| [Oldest Autovacuum Age (hours)](/nerve-centre/kpi-cards/postgresql/oldest-autovacuum-age-hours) | A long idle transaction pins the vacuum horizon. | High vacuum age co-occurring with idle-in-tx confirms the transaction is blocking vacuum. |
+| [Top Tables by Dead Tuples](/nerve-centre/kpi-cards/postgresql/top-tables-by-dead-tuples) | Blocked vacuum lets dead tuples accumulate. | Dead tuples climbing while idle-in-tx is high equals bloat caused by the stuck transaction. |
+| [Deadlocks (last 5m)](/nerve-centre/kpi-cards/postgresql/deadlocks-last-5m) | Idle-in-tx backends hold locks, raising contention. | Idle-in-tx plus deadlocks equals long-held locks are colliding with active work. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/postgresql/query-error-rate) | Aborted idle transactions and lock waits surface as errors. | Error rate rising alongside idle-in-tx points to lock-wait timeouts. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/postgresql/connection-pool-at-90-saturation) | The alert that fires when leaked connections fill the pool. | An entry here often traces straight back to idle-in-transaction leakage. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL:**
+
+> **The live count:** `SELECT count(*) FROM pg_stat_activity WHERE state = 'idle in transaction';`
+> **The offenders, oldest first:** `SELECT pid, application_name, client_addr, state, now() - xact_start AS tx_age, now() - state_change AS idle_for, wait_event FROM pg_stat_activity WHERE state IN ('idle in transaction', 'idle in transaction (aborted)') ORDER BY xact_start;`
+> **The vacuum horizon they pin:** compare the oldest `xact_start` against `SELECT datname, age(datfrozenxid) FROM pg_database;` to see the wraparound pressure they are causing.
+> **Kill one safely:** `SELECT pg_terminate_backend(<pid>);` rolls back the open transaction and frees the slot.
+> **Managed services:** RDS / Aurora and Cloud SQL all expose `pg_stat_activity` directly via a normal client connection; there is no provider abstraction for this metric.
+
+**Why our number may legitimately differ from a manual query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sampling moment** | Either way | `pg_stat_activity` is a live snapshot; a count taken at a different instant catches a different set of in-flight transactions, especially under heavy commit churn. |
+| **Sustain filter** | We may read lower for alerting | The headline count is instantaneous, but the alert only fires when the count stays above 10 for the full five minutes; a manual query catching a transient spike will not match the alert state. |
+| **Aborted state inclusion** | We may read higher | We count `idle in transaction (aborted)` alongside `idle in transaction`; a query filtering only the former misses the aborted ones. |
+| **PgBouncer pooling** | Possible mismatch | In transaction-pooling mode PgBouncer multiplexes client transactions onto fewer server connections; what the app sees and what the server reports can differ. |
+
+**Cross-source reconciliation:**
+
+| Source | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| `pg_stat_activity` count | Should match the headline at the same instant | Snapshot timing under churn. |
+| Application pool metrics | Should roughly correlate | The app counts checked-out connections; not all checked-out connections are idle-in-transaction, only the leaking ones. |
+| PgBouncer `SHOW POOLS` | Server-side connection view | Transaction pooling decouples client and server connection counts. |
+
+<details>
+<summary><em>A note on idle in transaction (aborted)</em></summary>
+
+The `idle in transaction (aborted)` state is a special case: the transaction hit an error and is now in a failed state, but the client has not yet issued `ROLLBACK`. Until it does, the backend can do nothing useful but still holds its snapshot and pins the horizon exactly like an active idle-in-transaction backend. It is frequently a sign of an application that does not handle query errors and re-issue a rollback. We count it in the headline and flag it separately in the drill-down because the fix (proper error handling in the client) differs from the plain idle-in-transaction fix (do not leave transactions open across slow work).
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What is the difference between `idle` and `idle in transaction`?**
+A plain `idle` backend is connected but has no transaction open: it has committed or rolled back its last work and is waiting for the next statement. That is completely normal and expected from a connection pool. An `idle in transaction` backend has an open transaction (it ran `BEGIN` or an implicit transaction and then stopped) and is holding locks and pinning the vacuum horizon while doing nothing. The first is harmless; the second is the one this card warns about.
+
+**Why does one idle transaction cause so much damage?**
+Because of MVCC. PostgreSQL keeps old row versions visible to any transaction that might still need them, determined by the oldest open transaction's snapshot. An idle-in-transaction backend keeps that horizon frozen, so autovacuum cannot remove any dead tuple created after it started, anywhere in the cluster. One long-idle transaction can therefore bloat every busy table and, left for days, push the database toward transaction-ID wraparound. The damage is wildly out of proportion to the single stuck connection.
+
+**Should I just kill them with `pg_terminate_backend`?**
+Killing is a valid emergency action: it rolls back the open transaction and frees the slot. But it treats the symptom, not the cause. If a code path is leaking transactions, the backends will pile right back up. The durable fix is in the application (do not hold a transaction open across slow operations) plus a safety net in the database (`idle_in_transaction_session_timeout`). Reach for `pg_terminate_backend` to stop an active emergency, then fix the code.
+
+**What is a sensible value for `idle_in_transaction_session_timeout`?**
+For OLTP workloads, 30 to 60 seconds is a common starting point: long enough not to interrupt legitimate transactions, short enough to reap genuine leaks before they pin vacuum for long. Batch or ETL workloads that legitimately hold long transactions may need a higher per-session value set explicitly for those connections. Setting it cluster-wide to a sane default is one of the highest-value protective settings on a production primary.
+
+**The count spikes briefly to 15 then falls back. Is that a problem?**
+Probably not. Brief spikes during peak commit churn are normal, which is exactly why the alert requires the count to stay above 10 for a sustained five minutes. A momentary blip that clears on its own is the pool doing its job. A plateau that does not clear is the leak you need to act on. Watch for sustained elevation and a climbing oldest `xact_start`, not transient peaks.
+
+**Does PgBouncer in transaction-pooling mode hide this problem?**
+It can change where you see it. In transaction-pooling mode, PgBouncer returns a server connection to the pool at transaction end, so an application that leaks a transaction holds a PgBouncer client slot and, behind it, a server connection that stays idle-in-transaction. The server-side count this card reads still rises, but you may also need PgBouncer's `SHOW POOLS` and `SHOW CLIENTS` to attribute it. Transaction pooling does not prevent idle-in-transaction; it just adds a layer to trace through.
+
+**Can read replicas have idle-in-transaction backends?**
+Yes. Read-only transactions on a standby (for reporting or read scaling) can be left open just as easily, and on a standby a long-running query or open transaction can conflict with WAL replay, causing the standby to either delay applying changes or cancel the query (`hot_standby_feedback` and `max_standby_streaming_delay` govern this). So idle-in-transaction on a replica has its own distinct risk: it can stall replication apply. The card tracks each instance separately.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Idle-in-Transaction Backends* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

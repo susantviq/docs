@@ -1,0 +1,123 @@
+---
+title: "Connection Pool Saturation %, CockroachDB"
+sidebarTitle: "Connection Pool Saturation %"
+description: "Connection Pool Saturation % for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Connection Pool Saturation %** is how full the SQL connection capacity is: open connections as a percentage of the configured maximum. CockroachDB caps concurrent SQL connections per node (`server.max_connections_per_gateway`), and applications front the database with their own pools (HikariCP, pgbouncer, pgx, and similar). When saturation approaches 100%, new connection attempts queue or are refused, so application threads block waiting for a connection and user-facing requests stall or error, even though the database itself may be perfectly healthy on CPU and disk. This card is the early-warning signal for "the database is fine, but nobody can get in."
+
+| | |
+| --- | --- |
+| **What it tracks** | Connection Pool Saturation % for the selected period: current open SQL connections divided by the configured connection ceiling, surfaced as the busiest gateway node. |
+| **Data source** | The `sql.conns` time-series metric (open SQL connections per node) measured against `server.max_connections_per_gateway` (or the effective pool limit where an external pooler fronts the cluster). The DB Console SQL dashboard shows Open SQL Connections per node. |
+| **Time window** | `RT/1m`. Read live, with a 1-minute sustained view so a momentary connection burst does not page on its own. |
+| **Alert trigger** | `> 90%`. Saturation above 90% means headroom for new connections is nearly gone; the next traffic burst risks connection refusals. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card reads the open SQL connection count per node (`sql.conns`) and divides it by the connection ceiling in force. On the database side that ceiling is `server.max_connections_per_gateway`, the per-node cap on concurrent SQL connections. Where an external pooler (pgbouncer) or an application pool (HikariCP) sits in front, the effective ceiling is the smaller of the application pool size and the database cap, because whichever is reached first is what blocks requests. Saturation is computed per node and the card surfaces the busiest gateway, since connection exhaustion is felt at the node a client happens to connect to, not as a cluster average.
+
+The 1-minute window matters. A short spike, a deploy that reconnects every worker at once, or a batch job that opens a burst of sessions, can briefly touch a high percentage and then settle as idle connections are reaped. The card requires the high reading to persist across the 1-minute view before it is treated as sustained saturation, which separates genuine capacity pressure (the pool is staying full) from transient churn (the pool spiked and recovered). Sustained high saturation is the actionable state because it means application threads are now routinely waiting for a free connection.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 4-node CockroachDB cluster with `server.max_connections_per_gateway = 500`. The order service runs 12 application instances, each with a HikariCP pool of `maximumPoolSize = 40`, so the application alone can demand up to 480 connections, close to the per-node cap if they land unevenly. Snapshot taken on 03 Jun 26 at 12:48 BST, during a flash-sale traffic burst.
+
+| Node | Open connections | Ceiling | Saturation % | State |
+| --- | --- | --- | --- | --- |
+| n1 | 210 | 500 | 42% | healthy |
+| n2 | **470** | 500 | **94%** | alert |
+| n3 | 240 | 500 | 48% | healthy |
+| n4 | 215 | 500 | 43% | healthy |
+
+The card headline reads **94%** in the red band, reporting n2, the busiest gateway. The 1-minute view confirms it has stayed above 90% for the full window, so this is sustained, not a blip. The diagnostic is the skew: n2 is near its cap while the others have headroom. The load balancer in front of the cluster is favouring n2, so connection demand is concentrating there rather than spreading.
+
+The DBA correlates with siblings. [Connections In Use](/nerve-centre/kpi-cards/cockroachdb/connections-in-use) confirms the raw count on n2. [Statement Latency p95 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms) is climbing on n2 as requests queue for a connection slot. [Memory Usage %](/nerve-centre/kpi-cards/cockroachdb/memory-usage) on n2 is also elevated, because each connection carries SQL working memory.
+
+```text
+What happens if n2 hits 100%:
+  - New connection attempts to n2 are refused (the cap is reached).
+  - HikariCP pools waiting on n2 exhaust their wait timeout and throw.
+  - Order-service threads block, then fail with "connection timeout".
+  - User-facing checkout requests routed to n2 start erroring.
+  - The database CPU/disk are fine; the outage is purely "can't get in".
+```
+
+Actions, in order: (1) Fix the imbalance, adjust the load balancer to distribute connections evenly across all four nodes, which alone drops n2 from 94% to roughly 55%. (2) Right-size the application pools: 12 instances times 40 is more connections than the workload needs; trimming `maximumPoolSize` to 25 cuts demand without hurting throughput. (3) Consider a dedicated pooler (pgbouncer) so connection churn is absorbed before it reaches the database cap. Three takeaways:
+
+1. **A saturated pool is an outage that looks nothing like a database problem.** CPU, disk, and ranges can all be green while users get connection timeouts. Always check saturation when "the site is slow but the database looks fine."
+2. **Skew across nodes is usually a load-balancer or pool-distribution issue, not a sizing issue.** Rebalancing connections is faster and cheaper than raising the cap or adding nodes.
+3. **More application connections is not more throughput.** Past a point, extra connections add memory and contention without serving more requests; right-sizing the pool often improves both saturation and latency.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Connection Pool Saturation % | What the combination tells you |
+| --- | --- | --- |
+| [Connections In Use](/nerve-centre/kpi-cards/cockroachdb/connections-in-use) | The raw connection count behind the percentage. | The absolute number plus the cap shows exactly how much headroom remains. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/cockroachdb/connection-pool-at-90-saturation) | The alert-list view of sustained breaches. | When this gauge sustains above 90%, the alert card lists the affected nodes and onset time. |
+| [Memory Usage %](/nerve-centre/kpi-cards/cockroachdb/memory-usage) | Each connection consumes SQL memory. | High saturation plus high memory equals connections inflating the SQL pool; cap connections before adding RAM. |
+| [Statement Latency p95 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms) | Queued connections show up as tail latency. | Rising p95 with rising saturation equals requests waiting for a connection slot, not slow queries. |
+| [Statements per Second (live)](/nerve-centre/kpi-cards/cockroachdb/statements-per-second-live) | The traffic driving connection demand. | Saturation rising with QPS is load growth; rising with flat QPS is leaked or unbalanced connections. |
+| [CRDB Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/cockroachdb/crdb-pool-saturation-vs-traffic-burst) | The cross-channel revenue framing. | Confirms saturation is coinciding with a real traffic burst that puts revenue at risk. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The composite capacity view. | Sustained saturation pulls the health score down even while CPU and disk stay green. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+To confirm the figure natively, open the DB Console **SQL** dashboard and read **Open SQL Connections** per node, or query `crdb_internal.node_metrics` for the `sql.conns` metric. Confirm the ceiling with `SHOW CLUSTER SETTING server.max_connections_per_gateway`. Where pgbouncer fronts the cluster, its own `SHOW POOLS` / `SHOW STATS` reports the pooled view, and HikariCP exposes active/idle/pending via JMX or its metrics registry. On CockroachDB Cloud the open-connections chart appears on the cluster **Metrics** page.
+
+| Reason our number may differ | Direction | Why |
+| --- | --- | --- |
+| **Effective ceiling.** Database cap vs the smaller application/pgbouncer pool limit. | Variable | The card uses whichever ceiling binds first; a native view against the raw database cap can read lower saturation. |
+| **Busiest node vs total.** The card surfaces the worst gateway. | Vortex IQ usually higher | A cluster-summed view dilutes a single hot node; saturation is felt per node. |
+| **Idle reaping cadence.** Pools close idle connections on a timer. | Marginal | A reading taken just before reaping is higher than one taken just after. |
+| **External pooler in front.** pgbouncer multiplexes many client connections onto few server connections. | Variable | The database may show low `sql.conns` while pgbouncer's client side is saturated; check both layers. |
+
+For divergence investigations use Vortex Mind to trace which application pools and which gateway nodes are driving the saturation.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My CPU and disk are fine but users get errors. Could this be the cause?**
+Yes, this is the classic signature. When the connection pool saturates, application threads cannot acquire a connection and requests fail with connection timeouts, while the database itself is idle on CPU and disk. Always check saturation when the symptoms are user-facing errors but the database resource metrics look healthy.
+
+**One node is saturated and the others are not. Do I raise the cap?**
+Usually not first. Skew points to uneven connection distribution, from the load balancer or from application pools pinning to one node. Rebalancing connections across nodes drops the hot node's saturation immediately and is cheaper than raising `server.max_connections_per_gateway` or adding capacity.
+
+**Will increasing my application pool size help throughput?**
+Rarely past a point. Beyond the level of true concurrency the workload needs, extra connections add memory pressure and lock contention without serving more requests, and they bring you closer to the database cap. Right-sizing the pool down often improves both saturation and latency at once.
+
+**What is the difference between this and Connections In Use?**
+[Connections In Use](/nerve-centre/kpi-cards/cockroachdb/connections-in-use) is the raw count of open connections; this card is that count as a percentage of the ceiling. The percentage is what tells you how close you are to refusal, the raw count alone does not, because it depends on what the cap is set to.
+
+**Why a 1-minute window instead of pure real-time?**
+To suppress noise. A deploy that reconnects all workers, or a batch job opening a burst of sessions, can spike saturation for a few seconds and then settle. The 1-minute sustained view distinguishes that transient churn from a pool that is genuinely staying full, which is the actionable condition.
+
+**Should I add a connection pooler like pgbouncer?**
+If you have many short-lived client connections (typical of serverless or high-fan-out application tiers), yes. pgbouncer multiplexes many client connections onto a small set of server connections, absorbing churn before it reaches the database cap. Note that with a pooler the database-side `sql.conns` can look low while the pooler's client side is saturated, so monitor both layers.
+
+**Does a saturated pool risk node loss?**
+Not directly, the node stays live and healthy. The damage is refused connections and queued application requests, not a crash. That said, the SQL memory each connection holds can contribute to memory pressure, so a severely over-connected node can compound into a memory problem; pair this card with [Memory Usage %](/nerve-centre/kpi-cards/cockroachdb/memory-usage).
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connection Pool Saturation %* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

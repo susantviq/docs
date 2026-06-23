@@ -1,0 +1,160 @@
+---
+title: "PostgREST 5xx Error Spike (>1% in 5m), Supabase"
+sidebarTitle: "PostgREST 5xx Error Spike (>1% in 5m)"
+description: "PostgREST 5xx Error Spike (>1% in 5m) for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> An alert pulse that fires when more than 1% of requests to the project's PostgREST API return a 5xx status, sustained over a 5-minute window. This card is Supabase-distinctive: PostgREST is the auto-generated REST layer that the application actually calls for almost every read and write. When PostgREST returns 5xx, the application is, for practical purposes, down: the endpoints the front end depends on are failing server-side. A 5xx spike here is not a background metric, it is the closest thing Supabase has to "the app is broken right now".
+
+| | |
+| --- | --- |
+| **Data source** | PostgREST request logs and the project metrics endpoint. The card counts responses with status 500 to 599 from the PostgREST service (the `rest/v1` API) against total PostgREST responses in the window. |
+| **Metric basis** | 5xx rate = PostgREST responses with status 5xx divided by total PostgREST responses, as a percentage. Server-side failures only; 4xx (client errors, auth rejections, malformed requests) are excluded by design. |
+| **Aggregation window** | `5m` rolling. The rate is evaluated over the trailing 5 minutes and the alert requires the breach to be sustained across that window. |
+| **Alert threshold** | `> 1% 5xx sustained for 5m`. A single failed request or a brief blip does not fire; a genuine, sustained elevation above 1% does. |
+| **Why it matters** | PostgREST is the merchant app's real API surface. 5xx here equals failed page loads, failed add-to-cart, failed checkout writes. It is the most direct "is the application serving traffic" signal in the Supabase stack. |
+| **What counts** | Status 500 to 599 from the PostgREST `rest/v1` endpoint, including errors PostgREST raises when the database refuses or drops a connection. |
+| **What does NOT count** | 4xx responses (401/403 auth, 400 bad request, 404), Edge Function errors (tracked separately), and Auth or Storage service errors, which have their own service surfaces. |
+| **Time window** | `5m` (rolling 5-minute window) |
+| **Alert trigger** | `> 1% 5xx sustained 5m` |
+| **Roles** | owner, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card counts PostgREST responses whose HTTP status falls in the 5xx range and divides by the total number of PostgREST responses in the trailing 5-minute window:
+
+```text
+postgrest_5xx_rate = (postgrest_responses_5xx / postgrest_responses_total) * 100
+                     over a rolling 5-minute window
+```
+
+Both counts come from the PostgREST request stream for the project (the `rest/v1` API), read from the request logs and the metrics endpoint. Only server-side failures count. Client errors in the 4xx range are deliberately excluded, because a 401 from an expired token or a 400 from a malformed filter is a client problem, not an outage, and folding them in would mask real server failures behind routine client noise.
+
+The alert is sustained, not instantaneous. A single 5xx, or a handful in one second, will not fire: PostgREST will occasionally return a 5xx when a backend connection is dropped mid-flight, and that is recoverable noise. The pulse raises only when the 5xx rate stays above 1% across the full 5-minute window, which is the signature of a real, ongoing fault (the database is down, the connection pool is exhausted, or PostgREST itself is failing to reach Postgres).
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a headless storefront whose entire data layer is Supabase. The front end calls the PostgREST `rest/v1` API for catalogue reads, cart writes, and order creation. Snapshot taken on 22 May 26 at 13:05 BST.
+
+| Window (BST) | PostgREST requests | 5xx responses | 5xx rate |
+| --- | --- | --- | --- |
+| 12:55 to 13:00 | 41,200 | 18 | 0.04% |
+| 13:00 to 13:05 | 39,800 | 1,512 | 3.80% |
+
+The 5xx rate jumped from a baseline 0.04% to 3.80% and held across the 13:00 to 13:05 window, so the sustained-5-minute condition was met and the pulse fired. The Nerve Centre headline shows **PostgREST 5xx Error Spike at 3.80%** outlined in red.
+
+What the platform team should read into this:
+
+1. **This is a user-facing outage, not a slow page.** At 3.8% sustained, roughly one in 26 requests is failing server-side. Because PostgREST is the app's real API, that translates directly into failed catalogue loads and, critically, failed cart and checkout writes. The customer experience is "the site is throwing errors", not "the site is slow".
+2. **The most likely root cause is below PostgREST.** PostgREST itself rarely fails in isolation. A 5xx spike at this layer almost always means PostgREST cannot complete work against Postgres: the connection pool is exhausted (check [Supavisor Pool at >90% Saturation](/nerve-centre/kpi-cards/supabase/supavisor-pool-at-90-saturation)), the database is rejecting queries (check [Database Query Error Rate Spike (>1% in 5m)](/nerve-centre/kpi-cards/supabase/database-query-error-rate-spike-1-in-5m)), or the project has hit a hard resource limit such as disk going read-only.
+3. **The action is triage by elimination, in order.** First confirm whether the pool is saturated; if so, the fix is connection-shaped (shed load, reduce app pool sizes). If the pool is healthy, check the database query error rate; a parallel spike there points at a bad migration, a missing object, or a permissions change. If both are clean, the fault is in PostgREST or its config (a recent schema cache reload, a broken view, a role grant change).
+
+```text
+Impact framing for this event:
+  - 5-minute window: 39,800 PostgREST requests
+  - Failed (5xx): 1,512 (3.80%)
+  - If this is the catalogue + cart path, ~1 in 26 shopper actions errored
+  - Sustained at this rate, that is ~18,000 failed requests/hour
+  - Revenue-bearing writes (cart, order) are in this failing set
+```
+
+The single most useful pairing is [Database Query Error Rate Spike (>1% in 5m)](/nerve-centre/kpi-cards/supabase/database-query-error-rate-spike-1-in-5m): if both fire together, the fault is at or below the database and PostgREST is simply relaying the failure; if the query error rate is clean while PostgREST 5xx spikes, the fault is in the PostgREST layer itself (its connection to Postgres, its schema cache, or its configuration).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with PostgREST 5xx Error Spike | What the combination tells you |
+| --- | --- | --- |
+| [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) | The continuous gauge this alert is built on. | The alert says the line was crossed; the gauge shows the shape and severity of the spike over time. |
+| [Database Query Error Rate Spike (>1% in 5m)](/nerve-centre/kpi-cards/supabase/database-query-error-rate-spike-1-in-5m) | The layer below PostgREST. | Both firing equals a database-level fault relayed upward; PostgREST alone equals an API-layer fault. |
+| [Supavisor Pool at >90% Saturation](/nerve-centre/kpi-cards/supabase/supavisor-pool-at-90-saturation) | The most common upstream cause of PostgREST 5xx. | Pool saturated plus 5xx spike equals connection refusals surfacing as API errors. |
+| [PostgREST API Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgrest-api-latency-p95-ms) | The latency view of the same API. | Latency climbing then 5xx spiking is the classic "slow, then failing" degradation curve. |
+| [PostgREST Request Rate (req/sec)](/nerve-centre/kpi-cards/supabase/postgrest-request-rate-reqsec) | The traffic context for the error rate. | A 5xx spike with flat traffic is a fault; with surging traffic it may be overload. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/supabase/database-disk-usage) | Disk hitting the cap forces the project into restricted mode. | Disk near 100% plus PostgREST 5xx equals write failures from a read-only database. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite this alert feeds. | An open PostgREST 5xx spike drops the composite sharply, reflecting a live outage. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase's own tooling:**
+
+> **Logs → API (PostgREST)** in the managed-service console for the per-request log stream with status codes; filter to `status >= 500` to see the failing requests directly.
+> **Logs → Postgres** to check whether the database was raising errors in the same window, which is the most common upstream cause.
+> **Project metrics endpoint** (`/customer/v1/privileged/metrics`, Prometheus format) for the request-rate and error-count series Vortex IQ reads.
+> **Reports → API** for the request volume and error-rate graphs over time.
+
+**Confirm the database-side picture with native SQL:**
+
+```sql
+-- Errors the database itself rolled back in the recent window. If this is
+-- elevated at the same time as the PostgREST 5xx spike, the fault is below
+-- PostgREST:
+SELECT datname, xact_commit, xact_rollback,
+       round(100.0 * xact_rollback / nullif(xact_commit + xact_rollback, 0), 2) AS rollback_pct
+FROM pg_stat_database
+WHERE datname = current_database();
+
+-- Whether the database is in a degraded state (e.g. read-only from disk cap):
+SHOW default_transaction_read_only;
+```
+
+**Why our number may legitimately differ from the console log view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **4xx exclusion** | Card lower | The card counts only 5xx; a raw "errors" filter in the console that includes 4xx will read higher. |
+| **Window alignment** | Variable | The card uses a rolling 5-minute window; a console graph on calendar buckets can split a spike across two bars. |
+| **Log sampling** | Brief lag | High-volume log streams can lag the live metrics by a scrape interval. |
+| **Service scope** | Card narrower | This card is PostgREST only; a combined "API errors" view in the console may fold in Auth, Storage, and Edge Functions. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Database Query Error Rate Spike (>1% in 5m)](/nerve-centre/kpi-cards/supabase/database-query-error-rate-spike-1-in-5m) | Usually co-occurs when the cause is below PostgREST. | PostgREST 5xx with a clean query error rate isolates the fault to the API layer. |
+| [Supavisor Pool at >90% Saturation](/nerve-centre/kpi-cards/supabase/supavisor-pool-at-90-saturation) | Pool exhaustion is a leading cause of 5xx. | 5xx with a healthy pool rules connection exhaustion out. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does this exclude 4xx errors?**
+4xx responses are client problems: an expired JWT (401), a forbidden row from a row-level-security policy (403), a malformed filter (400), or a missing resource (404). They are routine and often expected, especially auth rejections. Folding them into the rate would bury genuine server failures behind everyday client noise. A 5xx, by contrast, means the server could not complete a request it should have been able to, which is the outage signal you actually want to page on.
+
+**PostgREST is spiking but my Postgres query error rate is clean. What does that mean?**
+The fault is in the PostgREST layer or its link to Postgres, not in your queries. Common causes: a recent schema change that PostgREST's schema cache has not reloaded cleanly, a broken view or function PostgREST is routing to, a role or grant change that PostgREST cannot use, or the pooler refusing PostgREST's own connections. Check the API logs for the specific error body, and confirm the pool is not saturated.
+
+**Can a single bad deploy cause this?**
+Yes, and it is one of the most common triggers. A migration that drops or renames an object the app still calls, a row-level-security policy that suddenly rejects writes, or a function signature change can all turn into a 5xx spike the moment the app hits the changed path. If the spike starts within minutes of a deploy, treat the deploy as the prime suspect and consider rolling it back first, debugging second.
+
+**What is the relationship between this and the connection pool card?**
+Pool exhaustion is the single most common upstream cause of a PostgREST 5xx spike. When Supavisor is at 100%, PostgREST cannot get a connection to run its query, so it returns a 5xx. If [Supavisor Pool at >90% Saturation](/nerve-centre/kpi-cards/supabase/supavisor-pool-at-90-saturation) is also open, fix the connection problem first and the 5xx will usually clear with it.
+
+**Why a 5-minute window rather than firing on the first error?**
+PostgREST will occasionally return a 5xx when a backend connection is dropped mid-request, and that is recoverable noise, not an outage. Paging on a single error would be unusable. The 5-minute sustained window means the pulse fires on a real, ongoing fault rather than a transient blip, which keeps it credible enough to wake someone for.
+
+**Does this cover Edge Functions or the Auth and Storage APIs?**
+No. This card is scoped to the PostgREST `rest/v1` API only. Edge Function failures are covered by [Edge Function Error Rate %](/nerve-centre/kpi-cards/supabase/edge-function-error-rate), and Auth flow failures by [Auth Sign-In Error Rate %](/nerve-centre/kpi-cards/supabase/auth-sign-in-error-rate). Each service has its own failure surface because their causes and fixes differ.
+
+**Can I tune the 1% threshold?**
+Yes, it is configurable per project in the Sensitivity tab. 1% is a deliberately low bar because PostgREST 5xx is so directly user-facing. Some teams with very high baseline traffic and aggressive retry logic raise it slightly; most leave it where it is, because a sustained 1% server-error rate on your primary API is already worth a page.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*PostgREST 5xx Error Spike (>1% in 5m)* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

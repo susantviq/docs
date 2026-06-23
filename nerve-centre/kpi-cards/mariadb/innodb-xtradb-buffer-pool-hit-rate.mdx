@@ -1,0 +1,152 @@
+---
+title: "InnoDB / XtraDB Buffer Pool Hit Rate %, MariaDB"
+sidebarTitle: "InnoDB / XtraDB Buffer Pool Hit Rate %"
+description: "InnoDB / XtraDB Buffer Pool Hit Rate % for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Galera Cluster](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of page reads that InnoDB (or XtraDB on Percona/Galera builds) served from its in-memory buffer pool rather than going to disk. The buffer pool is the cache that holds table and index pages in RAM; the higher the hit rate, the more queries are answered from memory and the faster the database runs. A drop below the healthy band almost always means the working set no longer fits in RAM, so the engine is hitting disk for pages it used to find in memory. For a DBA this is the leading indicator of a memory-bound slowdown, and it usually moves before query latency does.
+
+| | |
+| --- | --- |
+| **Status basis** | Derived from `Innodb_buffer_pool_read_requests` (logical reads served from the pool) and `Innodb_buffer_pool_reads` (reads that had to fetch from disk), via `SHOW GLOBAL STATUS`. |
+| **Metric basis** | Cache-efficiency ratio, NOT a throughput count. It measures how often a needed page was already in RAM. |
+| **Aggregation window** | Real-time gauge with a 1-hour smoothing option (`RT/1h`). The 1-hour view filters out the warm-up noise of a freshly started node. |
+| **Healthy value** | 99%+ on a well-sized instance; anything below 95% is flagged. Most production OLTP databases sit at 99.5% or higher. |
+| **What drives it down** | (1) Working set larger than the buffer pool; (2) a cold node just after restart or Galera SST; (3) a large analytical scan evicting hot pages; (4) an undersized `innodb_buffer_pool_size`; (5) growing data without growing RAM. |
+| **What does NOT change it** | Query syntax quality (that affects rows examined, tracked elsewhere), network latency, or async-replica lag. |
+| **Time window** | `RT/1h` (real-time gauge, optionally smoothed over the last hour) |
+| **Alert trigger** | `<95%`, below this band the instance is going to disk too often and latency will follow. |
+| **Roles** | owner, engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The hit rate is the ratio of logical page reads served from the pool to total logical page reads, expressed as a percentage. MariaDB exposes the two raw counters via `SHOW GLOBAL STATUS`:
+
+```text
+read_requests = Innodb_buffer_pool_read_requests   (pages found in RAM)
+disk_reads    = Innodb_buffer_pool_reads           (pages fetched from disk)
+
+hit_rate % = (read_requests - disk_reads) / read_requests * 100
+```
+
+Because the raw counters are cumulative since server start, a naive ratio reflects the lifetime average and barely moves day to day. The card instead computes the **delta** between two samples so the gauge reflects current behaviour, and offers a 1-hour smoothed view to suppress the dramatic dip that any node shows immediately after a restart (when the pool is empty and almost every read is a disk read).
+
+```text
+state = healthy   if hit_rate >= 99%
+        watch     if 95% <= hit_rate < 99%
+        alert     if hit_rate < 95%
+```
+
+A small absolute drop hides a large relative one: going from 99.9% to 99% sounds tiny but means disk reads have risen tenfold. Read the trend, not just the headline number.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MariaDB 10.11 Galera cluster backing an ecommerce catalogue. Each node has 64 GB RAM with `innodb_buffer_pool_size` set to 48 GB. The dataset has grown steadily over the quarter. On 09 Apr 26 the team notices the card slipping.
+
+| Sample | `Innodb_buffer_pool_read_requests` (delta) | `Innodb_buffer_pool_reads` (delta) | Hit rate |
+| --- | --- | --- | --- |
+| 08:00 baseline | 42,000,000 | 84,000 | 99.80% |
+| 12:00 (catalogue grew) | 45,000,000 | 540,000 | 98.80% |
+| 16:00 (peak traffic) | 51,000,000 | 1,790,000 | 96.49% |
+
+The Vortex IQ gauge has fallen from a comfortable 99.8% to **96.5%**, amber and trending toward the 95% alert. The DBA reads three things:
+
+1. **The working set has outgrown the pool.** Disk reads rose more than 20x across the day while logical reads grew only modestly. The hot pages that used to live in RAM are now being evicted and re-fetched, the classic sign that the active data no longer fits in 48 GB.
+2. **Latency is about to follow.** Buffer-pool hit rate leads query latency: a disk page read is orders of magnitude slower than a RAM read. The team correlates with [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms), which has crept from 35 ms to 90 ms over the same window. Acting on hit rate now heads off the latency breach.
+3. **In a Galera cluster, every node needs the headroom.** Because all nodes hold the same data, sizing one node correctly means sizing them all. A node that restarts and SSTs will show a cold-pool dip until it warms; that transient is expected and the 1-hour smoothed view absorbs it.
+
+```text
+Sizing decision:
+  - Current pool: 48 GB, hit rate trending to 96%.
+  - Active dataset (estimated from eviction rate): ~60 GB.
+  - Options: (a) raise innodb_buffer_pool_size after adding RAM,
+             (b) prune cold data / archive old orders,
+             (c) add covering indexes so fewer pages are touched.
+  - Chosen: scale nodes to 96 GB RAM, set pool to 72 GB.
+```
+
+After the upgrade the gauge returns to 99.7% at peak and p95 settles back to 38 ms. The lesson the team should carry: the buffer-pool hit rate is the cheapest early warning of a memory squeeze; watch its trend, not just whether it has crossed the line today.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Buffer Pool Hit Rate | What the combination tells you |
+| --- | --- | --- |
+| [Memory Usage %](/nerve-centre/kpi-cards/mariadb/memory-usage) | The pool is the largest consumer of database RAM. | Hit rate falling while memory is maxed equals the pool cannot grow without more RAM. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms) | Disk reads from a low hit rate slow tail latency. | Hit rate down plus p95 up equals a memory-bound slowdown. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p99-ms) | The tail feels cache misses first. | A worsening p99 often precedes a visible hit-rate dip. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mariadb/slow-query-rate) | Cache misses turn fast queries into slow ones. | Hit rate down plus slow-query rate up equals queries going to disk. |
+| [Galera Cluster Size](/nerve-centre/kpi-cards/mariadb/galera-cluster-size) | A rejoined node starts with a cold pool. | A size change can explain a temporary hit-rate dip on the fresh node. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite that weights cache efficiency. | A sustained low hit rate drags the composite down. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mariadb/database-disk-usage) | Growing data lowers the share that fits in RAM. | Disk usage climbing alongside a falling hit rate equals data outgrowing memory. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> Run `SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_read%';` to see the two raw counters the card divides.
+> Run `SHOW ENGINE INNODB STATUS\G` and read the BUFFER POOL AND MEMORY section, which prints a "Buffer pool hit rate" line directly.
+> Query `information_schema.INNODB_BUFFER_POOL_STATS` for `POOL_SIZE`, `PAGES_DATA`, and the per-pool hit-rate fields.
+> On a managed service, the provider's InnoDB metrics dashboard exposes the same buffer-pool series.
+
+**Why our number may legitimately differ from a manual query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Cumulative vs delta** | Manual ratio higher and flatter | A hand calculation from `SHOW GLOBAL STATUS` uses lifetime totals, which average out recent disk reads. The card uses the delta between samples, so it reacts faster and reads lower during a squeeze. |
+| **`SHOW ENGINE INNODB STATUS` window** | Differs slightly | That command reports the hit rate over its own short internal interval (per 1000 reads), which is a different window again. |
+| **Cold-start dip** | Card lower right after restart | A freshly started or SST'd node has an empty pool; the RT gauge dips until it warms. The 1-hour view smooths this. |
+| **Multiple buffer-pool instances** | None to value | With several `innodb_buffer_pool_instances`, the aggregate counters still sum correctly. |
+
+**Cross-source reconciliation:**
+
+| Source | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| `INNODB_BUFFER_POOL_STATS.PAGES_FREE` | Near zero on a well-used instance; a low hit rate with many free pages is odd. | Many free pages plus a low hit rate suggests churn from large scans, not a too-small pool. |
+| `SHOW ENGINE INNODB STATUS` hit-rate line | Should be in the same ballpark as the card. | Differences come from the different measurement windows described above. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My hit rate is 99.9% but the card still feels conservative. Is 95% really a problem?**
+For most OLTP workloads, yes. Healthy production instances sit at 99.5% or higher, so 95% already represents ten times more disk reads than a well-tuned pool. The alert is set at 95% deliberately to give you room to act before latency degrades. If your workload is genuinely scan-heavy (reporting, analytics), a lower steady state may be normal for you; tune the sensitivity threshold to your baseline.
+
+**The hit rate cratered right after a restart. Should I worry?**
+No. A freshly started node, or one that has just completed a Galera SST, has an empty buffer pool, so almost every read is a disk read until the pool warms. This cold-start dip is expected and recovers within minutes to an hour depending on workload. The 1-hour smoothed view exists precisely to stop this transient from paging you.
+
+**Will simply increasing `innodb_buffer_pool_size` fix a low hit rate?**
+Often, but not always, and only if you have free RAM. If the working set genuinely exceeds available memory, a bigger pool helps. But if the low hit rate comes from a single rogue full-table-scan evicting hot pages, the fix is an index or a query rewrite, not more RAM. Diagnose the cause (check [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mariadb/top-10-slowest-queries-digest)) before throwing memory at it.
+
+**Does this card apply to MyISAM or Aria tables?**
+No. The buffer pool is an InnoDB/XtraDB structure. MyISAM uses the key cache and Aria uses the page cache, which have their own hit-rate mechanics. This card only reflects InnoDB/XtraDB, which is the default and recommended engine, especially under Galera (Galera requires InnoDB/XtraDB).
+
+**Why does the card say "InnoDB / XtraDB"?**
+XtraDB is Percona's enhanced fork of InnoDB, used in some MariaDB and Galera-based builds. The buffer-pool status variables are identical between the two, so the card covers both and labels them together to avoid confusion about which storage engine you are running.
+
+**Can a high hit rate hide a slow database?**
+Yes. A 99.9% hit rate only means reads are served from RAM; it says nothing about lock contention, deadlocks, flow control in a Galera cluster, or genuinely expensive in-memory operations. Read this card alongside latency, slow-query, and flow-control cards for the full picture. A high hit rate is necessary for speed, not sufficient.
+
+**Multiple buffer-pool instances are configured. Does the card aggregate them correctly?**
+Yes. When `innodb_buffer_pool_instances` is greater than 1, the global status counters sum across all instances, so the card's ratio reflects the whole pool. For per-instance detail you can query `information_schema.INNODB_BUFFER_POOL_STATS`, but the headline gauge gives you the aggregate, which is what matters for capacity decisions.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*InnoDB / XtraDB Buffer Pool Hit Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

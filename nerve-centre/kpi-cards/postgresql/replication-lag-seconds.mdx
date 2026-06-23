@@ -1,0 +1,182 @@
+---
+title: "Replication Lag (seconds), PostgreSQL"
+sidebarTitle: "Replication Lag (seconds)"
+description: "Replication Lag (seconds) for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How far behind the primary each streaming standby is, measured in seconds. Replication lag is the gap between "data committed on the primary" and "data visible on the replica". When lag is zero (or sub-second) your read replicas are serving fresh data and a failover would lose nothing. When lag grows, two risks appear at once: read replicas start returning stale data to your application, and your recovery point objective (RPO) widens, because a primary failure now loses every transaction the standby has not yet caught up on. For a DBA this is the single most important number on a high-availability cluster.
+
+| | |
+| --- | --- |
+| **Data source** | `pg_stat_replication` on the primary (one row per connected standby) and `pg_last_xact_replay_timestamp()` on each standby. Vortex IQ reports the time-based lag: `now() - pg_last_xact_replay_timestamp()` on the standby, cross-checked against the byte lag derived from `sent_lsn`, `replay_lsn` on the primary. On RDS / Aurora the value is reconciled with the provider's `ReplicaLag` / `AuroraReplicaLag` CloudWatch metric. |
+| **Metric basis** | Time-based replay lag in seconds, the most operationally meaningful form. Byte lag (see [WAL Lag Bytes](/nerve-centre/kpi-cards/postgresql/wal-lag-bytes-primary-standby)) is tracked separately because a quiet primary can show zero byte lag but rising time lag, and vice versa. |
+| **Aggregation window** | `RT`: real-time, refreshed roughly every 60 seconds. The headline shows the worst (highest) lag across all standbys; per-standby detail is available on drill-down. |
+| **Unit** | Seconds. |
+| **What counts** | Every standby that appears in `pg_stat_replication` with a recognised `state` (`streaming`, `catchup`, `backup`). Cascading replicas chained off another standby are included where reachable. |
+| **What does NOT count** | (1) Logical replication subscribers using `pg_stat_subscription` are tracked on their own; this card is physical streaming replication. (2) A standby that has fully disconnected (no row in `pg_stat_replication`) is not "lagging", it is missing, and surfaces on [Replication Lag Exceeds Threshold or Standby Unreachable](/nerve-centre/kpi-cards/postgresql/replication-lag-exceeds-threshold-or-standby-unreachable). (3) Archive-based (WAL shipping) recovery lag is reported separately. |
+| **Time window** | `RT` (real-time, refreshed every 60 seconds, worst-standby headline) |
+| **Alert trigger** | `>10s`. Sustained lag above 10 seconds means read replicas are serving meaningfully stale data and your RPO has widened past what most HA designs tolerate. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+PostgreSQL exposes replication progress through log sequence numbers (LSNs), monotonic pointers into the write-ahead log. The primary records, per standby, the LSN it has sent, the LSN the standby has written, the LSN the standby has flushed to disk, and the LSN the standby has replayed into the visible database. Vortex IQ derives lag two ways and reports the more operationally meaningful one.
+
+**Time-based lag (the headline).** Run on each standby:
+
+```sql
+SELECT now() - pg_last_xact_replay_timestamp() AS replay_lag;
+```
+
+This is "how old is the most recent transaction the replica has applied". It is the number a DBA actually cares about, because it answers "if I read from this replica, how stale could the answer be?" and "if the primary dies right now, how much time of writes do I lose?".
+
+**Byte-based lag (the cross-check).** Run on the primary:
+
+```sql
+SELECT application_name, state,
+       pg_wal_lsn_diff(sent_lsn,  replay_lsn) AS replay_bytes_behind
+FROM pg_stat_replication;
+```
+
+The two can disagree, and the disagreement is informative:
+
+```text
+High byte lag + low time lag   -> a burst of writes just happened; the
+                                  standby is shipping fast and will catch up.
+Low byte lag + high time lag    -> the PRIMARY is idle (no new WAL), so the
+                                  "age of last replayed transaction" grows even
+                                  though there is nothing to ship. Usually benign.
+High byte lag + high time lag   -> the standby genuinely cannot keep up:
+                                  network saturation, slow standby disk, or a
+                                  long-running query on the standby blocking
+                                  WAL replay (hot_standby_feedback contention).
+```
+
+The engine reports the time-based figure as the headline, flags the byte-vs-time pattern on drill-down, and on managed services reconciles against the provider's own `ReplicaLag` metric so a CloudWatch alarm and the Nerve Centre card agree.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A high-availability cluster backs an order-management system: one primary, two streaming standbys (`standby-a` used for read traffic, `standby-b` reserved as the failover target). At 21:40 on 03 Jun 26 the SRE on call gets a Nerve Centre alert: replication lag has crossed 10 seconds and is climbing.
+
+The per-standby snapshot:
+
+| Standby | Role | Time lag | Byte lag | State |
+| --- | --- | --- | --- | --- |
+| standby-a | read replica | 47s | 1.9 GB | streaming |
+| standby-b | failover target | 2s | 40 MB | streaming |
+
+Only `standby-a` is lagging, and both its time lag and byte lag are high. That pattern (high-and-high on one standby, healthy on the other) rules out a primary-side cause: if the primary were the problem, both standbys would lag together. The issue is specific to `standby-a`.
+
+```text
+Diagnosis path:
+  - standby-b healthy   -> primary is fine, WAL is being generated normally
+  - standby-a high/high  -> something on standby-a cannot replay WAL fast enough
+  - check pg_stat_activity on standby-a:
+        a reporting query has been running 12 minutes with hot_standby_feedback on,
+        and WAL replay is paused behind it to avoid replay conflicts.
+```
+
+The root cause was a long analytics query on the read replica. With `max_standby_streaming_delay` set high, PostgreSQL chose to delay WAL replay rather than cancel the query, so the replica fell behind. The SRE had two levers: cancel the reporting query (replay resumes, lag drains in under a minute) or lower `max_standby_streaming_delay` so future long queries get cancelled instead of stalling replay. They cancelled the query; lag on `standby-a` dropped to 1s within 90 seconds.
+
+Three takeaways the team recorded:
+
+1. **The failover target lagging is a different severity from a read replica lagging.** `standby-b` at 2s means a failover would lose ~2 seconds of writes, acceptable. If `standby-b` had been the one at 47s, the RPO exposure would be the headline and pre-empting a failover would be the priority. Always read which standby is lagging, not just the worst number.
+2. **A long query on a hot standby can stall replay.** This is PostgreSQL-specific: the replica must choose between honouring a long read query and applying conflicting WAL. `max_standby_streaming_delay` controls the trade-off. If your read replicas run heavy reporting, expect lag spikes unless you tune this.
+3. **Time lag without byte lag is usually benign.** Had the primary simply been idle overnight, the time lag would climb while byte lag stayed near zero. That is not an incident; it is arithmetic. The high-and-high pattern is what makes this a real event.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Replication Lag | What the combination tells you |
+| --- | --- | --- |
+| [WAL Lag Bytes (primary to standby)](/nerve-centre/kpi-cards/postgresql/wal-lag-bytes-primary-standby) | The byte-based view of the same gap. | High time lag plus high byte lag equals a standby that genuinely cannot keep up; high time, low byte equals an idle primary. |
+| [Active Streaming Replicas](/nerve-centre/kpi-cards/postgresql/active-streaming-replicas) | Counts how many standbys are connected at all. | If a standby vanishes from the count, "lag" becomes "unreachable", a worse state. |
+| [Failover Readiness](/nerve-centre/kpi-cards/postgresql/failover-readiness) | Whether any standby is fresh enough to promote safely. | Lag above 10s on your failover target drops readiness; this is the RPO consequence made explicit. |
+| [Replication Lag Exceeds Threshold or Standby Unreachable](/nerve-centre/kpi-cards/postgresql/replication-lag-exceeds-threshold-or-standby-unreachable) | The alert wrapper around this metric. | The KPI shows the trend; the alert card shows the active breach and which standby. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p99-ms) | A long query on a hot standby can stall replay. | p99 spike on the replica plus rising lag equals a reporting query blocking WAL apply. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/postgresql/database-disk-usage) | A lagging standby forces the primary to retain WAL. | Rising lag plus rising primary disk equals WAL accumulating because the standby has not consumed it. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/postgresql/last-successful-backup-hours-ago) | The other half of your recovery posture. | Lag widens RPO in real time; backup age widens it on the cold-recovery path. Read together for total exposure. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | Replication health is a weighted component. | Sustained lag drops the composite even when latency and errors look fine. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL's own tooling:**
+
+> **On the primary**, the master view is `pg_stat_replication`:
+> ```sql
+> SELECT application_name, state, sync_state,
+>        pg_wal_lsn_diff(sent_lsn, replay_lsn) AS replay_bytes_behind,
+>        write_lag, flush_lag, replay_lag
+> FROM pg_stat_replication;
+> ```
+> The `replay_lag` interval column (PostgreSQL 10+) is the primary's own estimate of time-based lag and is the closest native equivalent to this card.
+> **On each standby**, `SELECT now() - pg_last_xact_replay_timestamp();` gives the replica's view of its own staleness, and `SELECT pg_is_in_recovery();` confirms it is still a standby.
+
+**On managed services:**
+
+> **Amazon RDS:** the `ReplicaLag` CloudWatch metric (seconds) is the native equivalent for read replicas. **Aurora PostgreSQL** uses `AuroraReplicaLag` (milliseconds), which is typically far lower because Aurora replicates at the storage layer, not via WAL streaming.
+> **Google Cloud SQL:** the `database/replication/replica_lag` metric in Cloud Monitoring.
+> **Azure Database for PostgreSQL:** the `physical_replication_delay_in_seconds` metric.
+
+**Why our number may legitimately differ from a raw read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Idle primary** | Raw `now() - replay_timestamp` looks worse | On a quiet primary, time lag grows with no real WAL to ship. The card cross-checks byte lag and annotates "primary idle" so the headline is not misread. |
+| **Aurora storage replication** | Aurora reads far lower | Aurora does not stream WAL between instances; `AuroraReplicaLag` measures storage-layer lag in ms, not the WAL-replay seconds this card models for vanilla streaming. |
+| **Clock skew** | Variable | Time-based lag depends on the standby's clock matching the primary's. Significant NTP drift distorts the seconds figure; the byte cross-check is clock-independent. |
+| **Worst-standby headline** | Card may look worse than one standby | The headline is the highest lag across all standbys; a single slow replica sets it even if the failover target is fresh. Drill down for per-standby detail. |
+| **Sampling cadence** | Brief smoothing | The card samples every ~60s; a sub-minute spike that drains immediately may be smoothed. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| `datadog.replication-lag` | If Datadog's PostgreSQL integration scrapes the same `pg_stat_replication`, the two should agree closely. | Different scrape intervals or Datadog using byte lag vs this card's time lag. |
+| Provider CloudWatch / Cloud Monitoring alarm | Should fire in step with this card's >10s trigger. | Provider metric granularity (1-minute CloudWatch resolution) can lag a real-time card by up to a minute. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My replication lag shows several seconds but byte lag is near zero. Is this a real problem?**
+Almost certainly not. That pattern means the primary is idle: no new WAL is being generated, so the "age of the last replayed transaction" simply grows with wall-clock time. The replica is fully caught up; there is just nothing new to apply. Vortex IQ annotates this as "primary idle" on drill-down. The lag will drop to near zero the instant write traffic resumes. Watch the high-time-and-high-byte combination, that is the real event.
+
+**Lag spikes whenever a big report runs on my read replica. Why, and how do I stop it?**
+This is PostgreSQL's standby replay-conflict behaviour. A long read query on a hot standby conflicts with WAL records that would remove rows the query still needs. With `max_standby_streaming_delay` set high, PostgreSQL pauses WAL replay to let the query finish, and lag grows. With it set low, PostgreSQL cancels the query (you see "canceling statement due to conflict with recovery"). Tune `max_standby_streaming_delay` to your tolerance, or enable `hot_standby_feedback` so the primary holds off vacuuming rows the replica needs, at the cost of some bloat on the primary.
+
+**What is the difference between this card and WAL Lag Bytes?**
+This card measures lag in seconds (time-based: how stale is the replica's data). [WAL Lag Bytes](/nerve-centre/kpi-cards/postgresql/wal-lag-bytes-primary-standby) measures it in bytes (how much WAL is still queued to ship). Time lag answers "how old is my replica's data and what is my RPO?"; byte lag answers "how much data is in flight?". They diverge on an idle or bursty primary, which is exactly why both are tracked.
+
+**Aurora reports almost no lag but vanilla PostgreSQL with the same load lags seconds. Why?**
+Aurora does not use WAL streaming between instances. All Aurora replicas read from the same shared storage volume, so replication is a storage-layer operation measured in milliseconds (`AuroraReplicaLag`). Vanilla streaming replication ships and replays WAL over the network, which is inherently slower and load-sensitive. The two are not comparable; the card models them with the appropriate native metric per platform.
+
+**A standby disappeared entirely. Does that show as infinite lag?**
+No. A standby that drops out of `pg_stat_replication` is no longer "lagging", it is unreachable, which is a distinct and more serious state. That condition surfaces on [Replication Lag Exceeds Threshold or Standby Unreachable](/nerve-centre/kpi-cards/postgresql/replication-lag-exceeds-threshold-or-standby-unreachable) and drops [Active Streaming Replicas](/nerve-centre/kpi-cards/postgresql/active-streaming-replicas). This card only reflects standbys that are still connected.
+
+**The 10-second alert default is wrong for my use case.**
+Tune it in the Sensitivity tab. A synchronous-replication cluster might want a sub-second threshold because any lag indicates trouble; an analytics read replica where five-minute staleness is acceptable might want 60 seconds or more. Set the threshold against the staleness your application can actually tolerate and the RPO your business has signed off on.
+
+**Does sustained lag put my primary at risk, not just the replica?**
+It can. If a standby falls far behind, the primary must retain the WAL the standby has not yet consumed (especially with a replication slot configured). That WAL accumulates in `pg_wal` and consumes primary disk. A badly lagging standby with a slot can, in the worst case, fill the primary's disk and take down the whole cluster. Watch [Database Disk Usage %](/nerve-centre/kpi-cards/postgresql/database-disk-usage) on the primary whenever lag is high and a slot is in use.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Replication Lag (seconds)* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

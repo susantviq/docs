@@ -1,0 +1,171 @@
+---
+title: "Supabase Products Table vs Ecom Catalog, Supabase"
+sidebarTitle: "Supabase Products Table vs Ecom Catalog"
+description: "Supabase Products Table vs Ecom Catalog for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The count of SKUs that disagree between your Supabase `products` table (the source of truth your app reads from) and the live ecommerce catalogue (Shopify, BigCommerce or Adobe Commerce) the storefront actually sells from. When the two drift apart, customers see prices, stock levels or product states that no longer match your database: a SKU marked active in Postgres but hidden on the storefront, a price that updated in one system but not the other, or stock that says 12 in Supabase and 0 in Shopify. Every drifting SKU is a potential mispriced order, an oversell, or a product nobody can buy. The card compares row-by-row and surfaces the count of disagreements so a platform team can catch a broken sync before finance does.
+
+| | |
+| --- | --- |
+| **What it tracks** | The number of SKUs where the Supabase `products` table and the connected ecommerce catalogue disagree on a watched field (price, inventory quantity, active/published state, or title). A drift is a single SKU with at least one mismatched field. |
+| **Data source** | Supabase Products Table vs Ecom Catalog for the selected period. Two reads are joined on SKU: the left side is the project's `products` table over the Supabase Postgres connection (or PostgREST); the right side is the catalogue pulled from the live commerce connector (Shopify Admin API, BigCommerce Catalog API or Adobe Commerce REST). |
+| **Time window** | `RT/24h`. The headline drift count is recomputed in near real time as rows change; the trend strip shows drift over the last 24 hours so you can see whether a sync break is new or chronic. |
+| **Alert trigger** | `>0 SKUs drifting`. This card is deliberately strict: a healthy bidirectional sync should hold zero drift, so any non-zero count feeds the Nerve Centre incident feed for review. |
+| **Why it matters** | This is the cross-channel revenue-at-risk join. A drift between your database and your storefront is not a graph that wobbles, it is money: a price that never propagated, an item still on sale that you have discontinued, or stock you do not actually hold. The card turns a silent integration failure into a visible, costed number. |
+| **Reading the value** | 0 is the only resting state. A small steady count (1 to 5) usually means a single stuck product or a partial sync run. A sudden jump into the tens or hundreds means the sync job has stopped, a credential has expired, or a bulk import wrote to one system only. |
+| **Roles** | platform/SRE, engineering, owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card performs a keyed set comparison, not a metric aggregation. The logic, grounded in the data sources above:
+
+```text
+1. Read the Supabase source-of-truth set:
+     SELECT sku, price, inventory_qty, is_active, title
+     FROM products
+   (over the project's Postgres / PostgREST connection)
+
+2. Read the live ecom catalogue for the same connector:
+     - Shopify:        Admin API products + variants (variant SKU is the join key)
+     - BigCommerce:    Catalog API products (sku field)
+     - Adobe Commerce: REST products endpoint (sku attribute)
+
+3. Inner-join both sets on SKU.
+
+4. For each matched SKU, compare the watched fields:
+     price            (money, compared to 2 dp in the catalogue currency)
+     inventory_qty    (integer)
+     is_active/state  (active/published vs draft/disabled/archived)
+     title            (normalised, trimmed, case-folded)
+
+5. A SKU is "drifting" if ANY watched field disagrees.
+   Count = number of drifting SKUs.
+```
+
+Two edge cases are handled explicitly so they do not inflate the count:
+
+- **Orphans** (a SKU present in one system but absent from the other) are reported as a separate sub-count, not as a drift, because the cause is different (a create or delete that did not propagate, rather than a field that did not update).
+- **In-flight writes**: a SKU that changed within the last refresh interval is given one grace cycle before it is counted, so a normal sync lag of a few seconds does not register as drift.
+
+The card reports the count, not the rows. The drilldown table (and the [Slow PostgREST Queries During Checkout Window](/nerve-centre/kpi-cards/supabase/slow-postgrest-queries-during-checkout-window) sibling) is where you see which SKUs and which fields.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a headless storefront: Shopify is the storefront and checkout, but the app reads product data from a Supabase `products` table that is kept in sync by a nightly job plus a webhook for live edits. Snapshot taken on 14 Apr 26 at 09:20 BST.
+
+The card reads **7 SKUs drifting**, up from 0 the previous morning. The drilldown:
+
+| SKU | Field | Supabase value | Shopify value | Likely cause |
+| --- | --- | --- | --- | --- |
+| GLTC-CANDLE-AMBER | price | £18.00 | £24.00 | Price rise applied in Shopify only |
+| GLTC-CANDLE-CEDAR | price | £18.00 | £24.00 | Same batch price rise |
+| GLTC-CANDLE-FIG | price | £18.00 | £24.00 | Same batch price rise |
+| GLTC-DIFF-100ML | inventory_qty | 12 | 0 | Oversell risk: app shows in stock |
+| GLTC-DIFF-200ML | inventory_qty | 6 | 0 | Oversell risk |
+| GLTC-GIFTSET-A | is_active | active | archived | Discontinued in Shopify, still live in app |
+| GLTC-GIFTSET-B | is_active | active | archived | Same |
+
+The pattern tells the story without a war room. Three candle SKUs disagree on price by exactly £6: a marketing-led price rise went into Shopify but the webhook back to Supabase failed (or was never wired for price changes), so the app is quoting the old £18. Any order placed through a path that trusts the Supabase price is underbilling by £6. Two diffuser SKUs show stock in Supabase but zero in Shopify: if the app gates "add to basket" on the Supabase number, customers can order items the storefront knows are sold out. Two gift sets were archived in Shopify but never deactivated in the database.
+
+```text
+Cost framing for the price drift alone:
+  - 3 SKUs underpriced by £6 each in the app's view
+  - Combined ~40 units/day across the three SKUs
+  - If 25% of orders route through the stale price path:
+      40 × 0.25 × £6 = £60/day leaking
+  - Plus the oversell exposure on 2 diffusers: ~18 units of stock
+    the app would happily sell that do not exist.
+```
+
+The fix is operational, not heroic: re-run the price webhook for the affected SKUs (or a full reconcile), confirm the count returns to 0, and add price to the set of fields the webhook watches so the gap does not reopen. The value of the card is that the team found this at 09:20 from a single number, not three weeks later from a finance reconciliation.
+
+Three takeaways:
+
+1. **Drift is money, not noise.** Unlike a latency graph, every unit on this card maps to a concrete SKU that can be mispriced, oversold, or unbuyable. Treat a non-zero count as a financial incident, not a monitoring curiosity.
+2. **The field column is the diagnosis.** A wall of `price` mismatches points at a pricing sync; a wall of `inventory_qty` points at stock sync; mixed fields point at a stalled job that touches everything. Read the breakdown, not just the count.
+3. **Direction matters for risk.** Supabase-high / ecom-low on stock is an oversell risk; ecom-high / Supabase-low is a missed-sale risk. The drilldown shows which way each SKU leans so you can triage by blast radius.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Products Table vs Ecom Catalog | What the combination tells you |
+| --- | --- | --- |
+| [Supabase QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/supabase/supabase-qps-spike-vs-ecom-order-rate) | The other cross-channel revenue-at-risk join. | Drift plus a QPS spike with no matching order spike can mean a sync or import job is hammering the database, which is also what broke the catalogue parity. |
+| [Slow PostgREST Queries During Checkout Window](/nerve-centre/kpi-cards/supabase/slow-postgrest-queries-during-checkout-window) | The query-level view during the moment that matters. | If the sync read is itself one of the slow queries, parity breaks because the reconcile cannot keep up. |
+| [Database Query Error Rate %](/nerve-centre/kpi-cards/supabase/database-query-error-rate) | The failure rate of the queries that drive the sync. | A rising error rate on the sync's writes is the most common silent cause of new drift. |
+| [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) | If the sync runs over PostgREST, 5xx on that layer stops propagation. | 5xx spike plus rising drift equals "the API the sync uses is failing". |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The executive composite. | Drift on a healthy database isolates the problem to the integration, not the data store. |
+| [Last Backup Age (hours)](/nerve-centre/kpi-cards/supabase/last-backup-age-hours) | Your recovery position before you reconcile. | Before a bulk reconcile that mass-updates rows, confirm a recent backup exists. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+This card is itself a reconciliation, so "reconciling against the source" means checking each side independently with its own native tooling.
+
+**The Supabase side (your source of truth):**
+
+> Run the comparison query directly in the **Supabase SQL Editor** (Database → SQL Editor) or via `psql` over the project connection string:
+> `SELECT sku, price, inventory_qty, is_active FROM products ORDER BY sku;`
+> Cross-check counts with the **Table Editor** row count and with `pg_stat_user_tables.n_live_tup` for the `products` table to confirm you are reading the full set, not a filtered view affected by row-level security.
+
+**The ecommerce side (what the storefront sells):**
+
+- **Shopify:** the Admin API `products` and `variants` endpoints, or a CSV export from Products → Export. The variant SKU is the join key, not the product ID.
+- **BigCommerce:** the Catalog API `/v3/catalog/products`, or Products → Export in the control panel.
+- **Adobe Commerce:** the REST `GET /V1/products` endpoint, or a product export from Catalog → Products.
+
+**Why our count may legitimately differ from a manual spot-check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Refresh grace cycle** | Vortex IQ count lower | A SKU edited within the last cycle is held back one refresh, so a manual check during a sync run can show a transient mismatch we have not yet counted. |
+| **Currency rounding** | Variable | We compare price to 2 dp in the catalogue currency; a manual check against a raw decimal column may flag rounding differences we treat as equal. |
+| **Row-level security** | Vortex IQ count differs | If the connection role is subject to RLS, the Supabase set may exclude rows you can see as the project owner in the SQL Editor. Use the service role for parity, or scope your manual query to match. |
+| **Orphans counted separately** | Vortex IQ count lower | A SKU present in only one system is reported as an orphan, not a drift, so the headline drift number excludes it. |
+| **Watched-field scope** | Vortex IQ count lower | We compare a fixed field set (price, inventory, state, title). A field outside that set (a custom metafield) will not register as drift here even if it differs. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My `products` table is not called `products`, or the SKU column has a different name. Does the card still work?**
+Yes, but it needs to be told where to look. The card reads the table and column mapping from the connector configuration (Settings → Supabase → Catalogue mapping). Point it at your table and the column that holds the SKU, plus which columns map to price, inventory and state. Until that mapping is set, the card cannot join the two sides and will read as not configured rather than zero.
+
+**The count is non-zero but every SKU listed looks correct when I check by hand.**
+Three usual causes: (1) a price stored as a string vs a numeric in one system, which compares unequal even when the value matches, fix by normalising the column type; (2) trailing whitespace or case differences in the title field; (3) an RLS-filtered read so the two sides are not seeing the same rows. Check the field column in the drilldown: if every drift is on the same field, the cause is almost always a type or formatting mismatch, not real data divergence.
+
+**What is the difference between a drift and an orphan?**
+A drift is a SKU present in both systems that disagrees on a watched field, that is a sync that ran but wrote the wrong value or only updated one side. An orphan is a SKU present in only one system, that is a create or delete that never propagated. They feed the same card but are counted separately because the remediation differs: a drift needs a field re-sync, an orphan needs a create/delete to be replayed.
+
+**Does a non-zero count automatically pause anything, like ad spend or checkout?**
+No. The card is a detection signal, not a control. It raises a Nerve Centre incident at `>0` so a human can decide. Whether to pause a sync, hold a price-sensitive campaign, or gate add-to-basket is an operational call, and the right call depends on which field is drifting and in which direction.
+
+**How fast will the count clear after I fix the sync?**
+On the next refresh cycle once both sides agree, subject to the one-cycle grace period for rows that changed during the fix. If you run a bulk reconcile, expect the count to tick down as rows settle rather than snap to zero instantly, because each corrected SKU passes through the grace window once.
+
+**The Free tier of Supabase, does this card work there?**
+The comparison works on any tier because it only needs read access to your `products` table and the commerce connector. There is no backup or PITR dependency here (unlike [Last Backup Age (hours)](/nerve-centre/kpi-cards/supabase/last-backup-age-hours)). The only tier-sensitive concern is that heavy reconcile reads on a small Free-tier instance can compete with app traffic; schedule large reconciles off-peak.
+
+**Can the card tell me which direction is authoritative?**
+It does not assume one. It reports the value on each side and the field that disagrees, leaving authority to you. Most teams treat the ecommerce platform as authoritative for price and state (because that is what the customer transacts against) and the database as authoritative for richer attributes, but the card does not enforce a direction, it only surfaces the disagreement.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Supabase Products Table vs Ecom Catalog* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

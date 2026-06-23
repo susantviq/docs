@@ -1,0 +1,145 @@
+---
+title: "MySQL QPS Spike vs Ecom Order Rate, MySQL"
+sidebarTitle: "MySQL QPS Spike vs Ecom Order Rate"
+description: "MySQL QPS Spike vs Ecom Order Rate for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> MySQL queries per second plotted on one axis against the storefront order rate on the other, in real time. The two should rise and fall together: more shoppers means more queries means more orders. When query volume spikes but the order rate stays flat, the extra load is not coming from real customers. It is almost always a bot, a scraper, or a misbehaving integration hammering the database for no commercial return. This card is the database-side detector for that pattern, and it protects both your infrastructure cost and your real shoppers' performance.
+
+| | |
+| --- | --- |
+| **What it tracks** | MySQL queries per second overlaid against the linked ecom connector's live order rate, on a dual-axis chart, so you can see whether query load is matched by commercial activity. |
+| **Data source** | MySQL side: `Questions` delta from `SHOW GLOBAL STATUS`, sampled to derive queries-per-second. Ecom side: live order rate (orders per minute / per interval) from the linked Shopify, BigCommerce, or Adobe Commerce connector. |
+| **Why it matters** | A QPS spike that does not produce orders is load you are paying for with zero revenue, and it degrades performance for real shoppers. Detecting the decoupling early lets you rate-limit or block the source before it saturates connections or inflates your bill. |
+| **Reading the value** | The two lines tracking together is healthy. QPS climbing while order rate stays flat is the alert pattern: query volume without commercial intent, the signature of a scraper or bot. |
+| **Time window** | `15m` (rolling, real-time sampled) |
+| **Alert trigger** | `qps spike with no order spike (= bot / scraper)`: a sustained rise in QPS not accompanied by a corresponding rise in order rate. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The MySQL side derives queries per second from the `Questions` status counter, which increments on every statement the server executes (the related `Queries` counter additionally includes statements run inside stored procedures; `Questions` is the cleaner shopper-traffic proxy). The card samples the counter and divides the delta by the elapsed time:
+
+```text
+qps = (Questions_now − Questions_previous) / seconds_elapsed
+```
+
+The ecom side reads the linked connector's live order rate (orders completed per interval). Both series are joined on a shared 15-minute rolling window and drawn on a dual-axis chart, QPS on one axis, order rate on the other, so the human eye can see whether they move together.
+
+The alert logic looks for *decoupling*: QPS rising materially above its recent baseline while order rate stays flat or falls. Healthy traffic produces correlated lines because every real shopper journey (browse, search, add to cart, checkout) generates a predictable bundle of queries that eventually resolves into orders. A scraper generates the browse-and-search queries (often far more aggressively than a human) but never checks out, so it inflates QPS while leaving the order axis untouched. That divergence is the fingerprint the card is built to catch.
+
+The card is descriptive, not a firewall: it tells you the decoupling is happening so you can act (rate-limit at the CDN or WAF, block an IP range, throttle a runaway integration). It does not itself block traffic.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A storefront runs at a steady evening baseline of around 1,400 QPS and 6 orders per minute. On 14 Apr 26 at 21:10 BST a price-scraping bot discovers the catalogue search endpoint and starts crawling it hard. Snapshot of the 15-minute rolling window:
+
+| Time (BST) | QPS | Orders/min | Notes |
+| --- | --- | --- | --- |
+| 21:05 | 1,420 | 6 | Normal evening baseline |
+| 21:10 | 2,650 | 6 | QPS up 87%, orders flat |
+| 21:13 | 3,900 | 5 | QPS up 175%, orders slightly down |
+| 21:16 | 4,200 | 5 | Real shoppers now feeling the slowdown |
+
+At 21:10 the card flags the decoupling: QPS nearly doubled while the order rate did not move. By 21:13 QPS has more than doubled and the order rate has actually dipped, because the scraper is competing with real shoppers for query capacity and slowing their pages down.
+
+```text
+What the spike costs even though it buys nothing:
+  - Extra QPS from the scraper: ~2,800 queries/sec of pure overhead
+  - Buffer-pool churn: the scraper's wide catalogue scans evict hot pages,
+    so real shoppers' queries miss cache and run slower
+  - Order rate dipped 6 -> 5/min: ~1 lost order/min during the event
+  - 20-minute event, AOV £58  ->  ~£1,160 of suppressed orders
+  - Plus the infrastructure cost of serving load with zero revenue
+```
+
+The platform team's response: identify the source (one IP range, a non-browser user-agent, hitting only `/catalog/search`), then rate-limit or block it at the CDN / WAF. Within minutes QPS falls back to baseline, the buffer-pool hit rate recovers, and the order rate returns to 6/min. The card confirms the fix by showing the QPS line drop back into alignment with the order line.
+
+Three takeaways:
+
+1. **Correlation is health; decoupling is the alarm.** Two lines moving together means real shoppers. QPS without orders means load without commercial intent, and that is almost always something to stop.
+2. **A scraper hurts twice.** It costs infrastructure to serve, and it degrades real shoppers' performance by evicting hot pages from the buffer pool. Pair with [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) to see the second effect.
+3. **The fix lives upstream.** The database cannot tell a bot from a human; the CDN, WAF, or application rate-limiter can. This card tells you to go there; it does not block traffic itself.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with QPS Spike vs Order Rate | What the combination tells you |
+| --- | --- | --- |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | The raw QPS reading without the order overlay. | This card adds the commercial context that tells a healthy spike from a bot spike. |
+| [MySQL Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/mysql/mysql-pool-saturation-vs-traffic-burst) | The connection-side cross-channel peer. | A bot spike can saturate the pool too; together they show the full load picture. |
+| [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) | Scraper scans evict hot pages from cache. | Hit rate dropping during the QPS spike confirms the bot is hurting real shoppers' performance. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) | Added load slows everyone's queries. | Rising p95 during the spike quantifies the slowdown real shoppers feel. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mysql/slow-query-rate) | Bot-driven scans often trip the slow-query log. | A slow-query spike co-occurring with the QPS spike points at expensive scraper queries. |
+| [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest) | Identifies the exact query pattern the bot is running. | The scraper's search query usually jumps to the top of this list during the event. |
+| [Aborted Connects (24h)](/nerve-centre/kpi-cards/mysql/aborted-connects-24h) | Some bots open and abandon connections. | A connect-abort spike alongside the QPS spike helps fingerprint the source. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL directly:**
+
+> `SHOW GLOBAL STATUS LIKE 'Questions';` sampled twice a few seconds apart, then divide the delta by elapsed seconds for QPS.
+> `SHOW GLOBAL STATUS LIKE 'Queries';` for the broader count including stored-procedure statements.
+> `SELECT * FROM performance_schema.events_statements_summary_by_digest ORDER BY COUNT_STAR DESC LIMIT 10;` to see which query pattern the volume is coming from.
+> `SHOW PROCESSLIST;` during the spike to spot a single host or user driving the load.
+
+On managed services, RDS and Aurora expose `Queries` per second in CloudWatch and Performance Insights; Cloud SQL exposes queries per second in Cloud Monitoring and Query Insights. All compute QPS from the same `Questions`/`Queries` counters, so the database figure should reconcile cleanly; the order rate comes from the ecom connector, not from MySQL.
+
+**Why our number may legitimately differ from the native tooling:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **`Questions` vs `Queries`** | Native value higher | Some dashboards chart `Queries` (includes statements inside stored procedures and prepared-statement internals); the card uses `Questions` as the cleaner shopper-traffic proxy. |
+| **Sampling interval** | Peaks smoothed | The card derives QPS over its sampling cadence; an instantaneous native reading can show a sharper momentary peak. |
+| **Order-rate source** | Not comparable | The order axis comes from the ecom connector and has no MySQL equivalent to reconcile against; reconcile it against the storefront's own order report instead. |
+| **Time zone** | Row timestamps shift | The card renders in the merchant's display timezone; native tooling uses the server / account timezone. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / linked ecom connector | The order-rate axis should match the connector's live order feed. | A mismatch means the connector link is stale; reconcile the order axis against the storefront's own report. |
+| [`mysql_qps`](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | The QPS axis should equal the standalone live QPS card. | They read the same `Questions` counter; any difference is sampling timing. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**QPS spiked but orders also spiked. Should I worry?**
+No, that is exactly the healthy pattern: real shoppers arriving, querying, and converting. The card only alerts when QPS rises *without* a matching rise in orders. Correlated spikes are a flash sale or a campaign landing well; enjoy them, and check capacity cards like [MySQL Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/mysql/mysql-pool-saturation-vs-traffic-burst) to be sure the database can carry the load.
+
+**Could a legitimate event cause QPS without orders?**
+Yes, a few. A new analytics or reporting integration that queries heavily but never places orders, a search-index rebuild, a cache warm-up job, or a price-comparison feed you actually authorised. The card cannot tell an authorised heavy reader from a hostile scraper; it tells you the decoupling is happening so a human can judge intent. Whitelist known heavy readers so they do not cry wolf.
+
+**The order axis comes from the storefront, not the database. Why mix the two?**
+Because the insight lives in the relationship between them, not in either number alone. The database knows how hard it is being worked; the storefront knows how much commerce that work produced. Putting them on one chart turns two ambiguous numbers into one clear question: is this load earning its keep? That is the whole point of a cross-channel card.
+
+**How do I act on a confirmed bot spike?**
+The database cannot block traffic, so act upstream. Identify the source from `SHOW PROCESSLIST` and the access logs (usually one IP range, a non-browser user-agent, hitting a narrow set of endpoints), then rate-limit or block it at the CDN, WAF, or application layer. Watch the card afterwards: a successful block shows the QPS line dropping back into alignment with the order line.
+
+**A scraper that only reads should not affect my shoppers. Why does the order rate dip?**
+Because reads are not free. Heavy catalogue scans evict hot pages from the InnoDB buffer pool, so real shoppers' queries start missing cache and running slower (visible on [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate)). Slower pages mean some shoppers abandon, so the order rate dips even though the bot never bought anything. That second-order harm is exactly why catching the spike early matters.
+
+**Does this distinguish read QPS from write QPS?**
+The headline uses `Questions`, which counts all statement types. To separate them, drill into `SHOW GLOBAL STATUS LIKE 'Com_select';` (reads) versus `Com_insert`/`Com_update`/`Com_delete` (writes). A scraper spike is almost entirely `Com_select` with no corresponding `Com_insert` for orders, which is another way to confirm the pattern.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*MySQL QPS Spike vs Ecom Order Rate* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,147 @@
+---
+title: "Long-Running Jobs (>1h), Databricks"
+sidebarTitle: "Long-Running Jobs (>1h)"
+description: "Long-Running Jobs (>1h) for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Jobs & Workflows](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The count of Databricks jobs currently running past their expected duration, where "long" is defined as still in `RUNNING` state for more than one hour. For a platform team this is the single clearest early-warning sign of a cost-runaway: a job stuck in a retry loop, blocked on a lock, scanning far more data than usual, or spinning up an over-sized cluster that never finishes. A long-running job burns DBU every minute it stays alive, so this card is as much a budget control as an operational one. The headline shows how many runs are over the threshold right now; the drill-down lists each one with its elapsed time and cluster.
+
+| | |
+| --- | --- |
+| **What it tracks** | Count of job runs in `RUNNING` state whose elapsed time exceeds one hour, as `dbx_long_running_jobs`. The drill-down lists run ID, job name, elapsed minutes, and the cluster carrying the run. |
+| **Data source** | The Jobs API run list (`GET /api/2.1/jobs/runs/list` filtered to active runs) plus, where the system schema is enabled, `system.lakeflow.job_run_timeline`. Elapsed time is current-time minus the run's `start_time`. |
+| **Why it matters** | A run past its normal duration is the most common cost-runaway pattern in Databricks. Every extra minute on a live cluster is billable DBU, so an unnoticed stuck job can quietly double a day's spend. |
+| **Time window** | `RT` (real-time): recomputed each refresh against currently-active runs. |
+| **Alert trigger** | `> 0 unexpected`. Any run over one hour that is not on the allow-list of known long jobs (large back-fills, model training) raises the card. |
+| **Sentiment** | Lower is healthier. The expected steady-state for most workspaces is zero unexpected long runs. |
+| **Roles** | owner, engineering, operations (DBA / platform / SRE) |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+For every job run currently reported by the Jobs API as `RUNNING` (or `PENDING` that has since started), Vortex IQ computes elapsed time as:
+
+```text
+elapsed_minutes = (now_utc - run.start_time) / 60
+long_running    = elapsed_minutes > 60
+```
+
+The raw count of runs where `long_running` is true is the technical value. The card then applies an expectation filter so the headline reflects *unexpected* long runs only. Each job can carry an expected-duration baseline, taken from the trailing median of its own recent successful runs (or an explicit override set in the connector). A run that exceeds one hour but is still inside its own historical norm (for example, a nightly model-training job that always takes 90 minutes) is counted as expected and excluded from the alerting headline, though it remains visible in the drill-down.
+
+This two-layer design matters: a flat "over 1h" count would constantly flag legitimate heavy jobs and train the team to ignore the card. By comparing each run to its own baseline, the alert fires only when a job is behaving abnormally for itself, which is the genuine cost-runaway signal.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs roughly 140 scheduled jobs against an ecommerce lakehouse. Most finish inside 20 minutes; a handful of back-fills run an hour or more by design. Snapshot taken on 22 Apr 26 at 14:10 UTC.
+
+| Run ID | Job | Elapsed (min) | Cluster | Expected? |
+| --- | --- | --- | --- | --- |
+| 9182734 | `nightly-model-train` | 88 | `ml-train-pool` | Yes (median 90m) |
+| 9182810 | `silver-orders-merge` | 142 | `job-cluster-auto` | **No** (median 12m) |
+| 9182455 | `gold-customer-360-backfill` | 210 | `backfill-large` | Yes (one-off back-fill) |
+
+The raw "over 1h" count is 3, but the headline shows **1 unexpected long-running job**: `silver-orders-merge`, normally a 12-minute incremental merge, has been running for 142 minutes. The platform engineer drills in.
+
+```text
+Cost framing for the runaway:
+  - Cluster: job-cluster-auto, 8 workers, ~6 DBU/hour each plus driver
+  - Approx DBU rate while running: ~52 DBU/hour
+  - Normal run cost: 12 min = ~10 DBU
+  - Current run so far: 142 min = ~123 DBU and climbing
+  - If left until the 4h job timeout: ~210 DBU, a 21x overspend for one run
+```
+
+The root cause turns out to be a `MERGE` whose source side lost its partition pruning after a schema change, so it now full-scans a 4 TB target instead of touching one day's partition. The engineer's decisions, in order:
+
+1. **Cancel the run.** A 21x overspend with no end in sight is not worth waiting out. Cancelling stops the DBU bleed immediately; the merge is idempotent and can re-run once fixed.
+2. **Fix the predicate, not the timeout.** Lengthening the job timeout would only let the runaway burn longer. The real fix is restoring the partition filter in the `MERGE ... ON` clause.
+3. **Set an explicit max-duration guard.** Adding a timeout of, say, 30 minutes to this specific job means a future regression self-cancels at roughly 2.5x normal rather than running to the 4-hour ceiling.
+
+Two things to remember:
+
+1. **The expected-duration filter is what makes this card usable.** Without it, the two genuinely-long jobs would have hidden the one runaway in plain sight. Always read the "unexpected" headline, then use the drill-down for the full picture.
+2. **A long run and a cost spike are the same event seen from two angles.** The same incident will lift [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) and, if it recurs across the week, [Avg DBU per Job Run](/nerve-centre/kpi-cards/databricks/avg-dbu-per-job-run). Treat this card as the live trigger and those as the trend.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Long-Running Jobs | What the combination tells you |
+| --- | --- | --- |
+| [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) | Long runs are the main driver of unexpected DBU. | A DBU spike with an unexpected long run named is a closed-loop diagnosis. |
+| [Avg DBU per Job Run](/nerve-centre/kpi-cards/databricks/avg-dbu-per-job-run) | The trend view of per-run cost. | A rising average plus recurring long runs equals a job that needs re-engineering, not just cancelling. |
+| [Failed Jobs (24h)](/nerve-centre/kpi-cards/databricks/failed-jobs-24h) | Stuck jobs often end in failure once the timeout hits. | A long run today that becomes a failed job tomorrow confirms a hard fault, not slow input. |
+| [Failed Job Burst (>5 failures in 1h)](/nerve-centre/kpi-cards/databricks/failed-job-burst-5-failures-in-1h) | Retry storms can present as several concurrent long runs. | Both firing at once equals a systemic upstream problem (a dependency or a data source). |
+| [Top 10 Failing Workflows (7d)](/nerve-centre/kpi-cards/databricks/top-10-failing-workflows-7d) | Identifies whether the runaway is a repeat offender. | A long-running job that also tops the failing list is a chronic problem. |
+| [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h) | The other half of the DBU-waste picture. | Long runs waste DBU through over-work; idle clusters waste it through under-use. |
+| [Avg Cluster CPU Utilisation %](/nerve-centre/kpi-cards/databricks/avg-cluster-cpu-utilisation) | Tells you whether the long run is busy or blocked. | High CPU equals genuinely heavy work; low CPU on a long run equals a lock or a wait. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> Open **Workflows → Jobs → Job runs** and sort by **Start time** ascending; the active runs at the top are the longest-lived. Each run shows elapsed time and the cluster.
+> Run `SELECT * FROM system.lakeflow.job_run_timeline WHERE result_state IS NULL` (where the system schema is enabled) for an account-wide list of in-flight runs.
+> For a single run, the **Spark UI** and the cluster's **Metrics** tab show whether the run is CPU-busy or stalled.
+> The Jobs CLI / REST `runs/list --active-only` returns the same active set programmatically.
+
+**Why our number may legitimately differ from the Databricks UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Expected-duration filter** | Vortex IQ count lower | The headline excludes runs that are long but normal for themselves; the UI shows all active runs regardless. |
+| **Threshold boundary** | Edge cases differ | A run at exactly 60 minutes is borderline; small clock differences between our poll and the UI can flip it. |
+| **Continuous / streaming jobs** | Vortex IQ count lower | Continuously-running structured-streaming jobs are excluded by design (they are meant to run forever); the UI lists them as active. |
+| **Refresh latency** | Brief | A run that crosses one hour appears at our next poll, which can lag the live UI by the refresh interval. |
+| **Time zone** | Display only | Start times render in the workspace session time zone in the UI and in your profile time zone in Vortex IQ; elapsed minutes are identical. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume) | A runaway lifts DBU with no matching order growth. | DBU rising in step with orders is demand, not a runaway. |
+| [Pipeline Lag vs Ecom Order Flow](/nerve-centre/kpi-cards/databricks/pipeline-lag-vs-ecom-order-flow) | A stuck job feeding a pipeline raises lag downstream. | Lag rising with no long run points at the source feed, not the job. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My nightly training job always runs over an hour. Will it alert every night?**
+No. The expected-duration filter compares each run to its own trailing median. A job that habitually runs 90 minutes is counted as expected and stays out of the alerting headline. It still appears in the drill-down so you have full visibility, but it will not page you. If you want to suppress it entirely, add it to the connector's long-job allow-list.
+
+**Does this card cover continuous (streaming) jobs?**
+No. Structured-streaming jobs and other continuously-running workloads are designed never to finish, so a "running over 1h" rule would always trip. They are excluded from this card. Monitor streaming health through pipeline lag and cluster utilisation instead.
+
+**Why one hour as the threshold and not the job's own baseline alone?**
+One hour is the floor below which the card does not even consider a run "long", to avoid noise from the many short jobs. Above that floor, the per-job baseline decides whether it is *unexpected*. So a 12-minute job that runs 70 minutes is flagged; a 5-minute job that runs 8 minutes is not, even though it tripled.
+
+**A run shows high elapsed time but low CPU. Is it a cost-runaway?**
+It is still costing DBU, but the cause is different. Low CPU on a long run usually means the job is blocked: waiting on a table lock, a slow external source, a `MERGE` serialising on concurrent writers, or an under-provisioned upstream API. Cancelling stops the spend, but the fix is to remove the contention, not to add compute. Pair with [Avg Cluster CPU Utilisation %](/nerve-centre/kpi-cards/databricks/avg-cluster-cpu-utilisation).
+
+**Should I just set a global job timeout and stop watching this card?**
+A per-job timeout is a good safety net and we recommend it, but it is a blunt instrument. A timeout only fires at the ceiling, by which point significant DBU is already spent, and it gives no early signal that a job is drifting. This card flags the drift while it is happening, so you can intervene before the timeout (and the bill) is reached.
+
+**Can a long run be a sign of an under-sized cluster rather than a fault?**
+Yes. If a job's input has grown steadily and its runtime has crept up with it, the run is not stuck, it is simply doing more work on too little compute. The tell is high, sustained CPU and a runtime that scales with input volume rather than spiking suddenly. The fix there is right-sizing or autoscaling the cluster, not cancelling.
+
+**Does cancelling a long run risk data corruption?**
+For Delta writes, no: Delta operations are atomic, so a cancelled `MERGE` or `INSERT` either committed or it did not, with no partial state. Non-Delta side effects (external API calls, writes to other systems) are the exception and depend on the job's own idempotency. Confirm the job is safe to re-run before cancelling, which well-built ETL almost always is.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Long-Running Jobs (>1h)* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

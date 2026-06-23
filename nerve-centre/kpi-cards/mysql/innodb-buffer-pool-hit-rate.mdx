@@ -1,0 +1,154 @@
+---
+title: "InnoDB Buffer Pool Hit Rate %, MySQL"
+sidebarTitle: "InnoDB Buffer Pool Hit Rate %"
+description: "InnoDB Buffer Pool Hit Rate % for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [InnoDB Buffer Pool](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of InnoDB page reads that were served from the in-memory buffer pool rather than from disk. This is the single most important read-path health signal on any MySQL OLTP instance: the buffer pool caches data and index pages, and every page that has to be fetched from disk instead of memory costs the workload hundreds of microseconds to milliseconds. A hit rate of 99.9%+ is normal and healthy on a warm instance; anything below 95% means the working set no longer fits in RAM and queries are paying a disk-IO tax on a large fraction of reads.
+
+| | |
+| --- | --- |
+| **What it tracks** | `1 - (Innodb_buffer_pool_reads / Innodb_buffer_pool_read_requests)`, expressed as a percentage. `Innodb_buffer_pool_read_requests` counts logical read requests for pages; `Innodb_buffer_pool_reads` counts the subset that could not be satisfied from the pool and had to read from disk. The ratio of misses to requests is the miss rate; one minus the miss rate is the hit rate. |
+| **Data source** | `SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_read%'`, sampled on a rolling window. On RDS / Aurora the same counters are exposed via Performance Insights and the `innodb_buffer_pool_read_requests` / `innodb_buffer_pool_reads` CloudWatch-adjacent metrics. MySQL-distinctive: this counter set has no equivalent in Postgres-shaped tooling and drives every OLTP workload. |
+| **Calculation basis** | Delta-based. Both status counters are monotonically increasing since the last server restart, so Vortex IQ samples them at the start and end of the window and computes the ratio on the deltas, not on the lifetime totals. This makes the headline reflect recent behaviour rather than a cold-start average smeared across weeks of uptime. |
+| **Time window** | `RT/1h` (real-time gauge with a 1-hour delta baseline). |
+| **Alert trigger** | `< 95%`. A sustained reading below 95% means a material share of reads are hitting disk; on spinning disk or throttled EBS this shows up immediately as query-latency inflation. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card reads two global status counters and computes the hit rate from their deltas over the window:
+
+```text
+hit_rate_% = (1 - (delta(Innodb_buffer_pool_reads) / delta(Innodb_buffer_pool_read_requests))) * 100
+
+where
+  delta(X) = X_at_window_end - X_at_window_start
+```
+
+Two subtleties matter when reading this number:
+
+1. **Lifetime vs windowed.** If you run `SHOW GLOBAL STATUS` by hand and compute the ratio on the raw totals, you get the average hit rate since the last restart. An instance that has been up for 40 days with a cold first hour will report a flattering lifetime hit rate even if the last 10 minutes have been thrashing. Vortex IQ deliberately uses the windowed delta so the gauge reflects current pressure, which is why the card value can differ from a naive `SHOW STATUS` calculation.
+2. **Read requests, not all requests.** This counter covers page reads only. Writes, change-buffer merges, and adaptive-hash-index lookups are accounted elsewhere. A 99.99% read hit rate does not by itself mean the instance is healthy; pair it with [InnoDB Dirty Pages %](/nerve-centre/kpi-cards/mysql/innodb-dirty-pages) and [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) to see the write and tail-latency side.
+
+A read request that is satisfied from the pool is a "logical read"; one that falls through to storage is a "physical read". The hit rate is therefore the share of logical reads that avoided a physical read.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 64 GB MySQL 8.0 primary on a managed instance, with `innodb_buffer_pool_size` set to 48 GB. The application is a B2B ordering backend. Snapshot taken on 14 Apr 26 at 09:40 BST during the morning order rush.
+
+| Counter | Value at 09:39:40 | Value at 09:40:40 | Delta (1 min) |
+| --- | --- | --- | --- |
+| `Innodb_buffer_pool_read_requests` | 8,412,990,001 | 8,413,640,001 | 650,000 |
+| `Innodb_buffer_pool_reads` | 44,120,500 | 44,159,500 | 39,000 |
+
+```text
+miss_rate = 39,000 / 650,000        = 0.0600  (6.00%)
+hit_rate  = 1 - 0.0600              = 0.9400  (94.00%)
+```
+
+The gauge reads **94.0%**, below the 95% alert line, and Nerve Centre raises the sensitivity flag. What it means in practice:
+
+1. **The working set has outgrown the pool.** A 6% miss rate is high for an OLTP primary. The likely cause is that a recently added reporting query, or a quarter-end batch, is scanning large cold tables and evicting hot pages, so subsequent OLTP reads miss. Confirm with [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest): a full-table-scan digest near the top of the list is the usual culprit.
+2. **Latency is already inflating.** At 39,000 physical reads/minute, even at a generous 0.5 ms per read that is 19.5 seconds of cumulative disk wait per minute spread across worker threads. [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) will be drifting upward in the same window.
+3. **The fix is not always more RAM.** Three remediation paths, cheapest first: (a) kill or reschedule the cold-scan query off the primary onto a replica, which restores the hot working set within minutes; (b) add a covering index so the offending query reads far fewer pages; (c) raise `innodb_buffer_pool_size` (and, if needed, the instance class) so the working set fits. Option (a) is reversible and fast; option (c) costs money every month, so reach for it only after confirming the working set genuinely exceeds RAM rather than being evicted by a one-off scan.
+
+```text
+Sizing sanity check the DBA should run:
+  - active data + index size for hot tables (from information_schema.tables): ~41 GB
+  - innodb_buffer_pool_size:                                                 48 GB
+  - headroom:                                                                ~7 GB
+  Conclusion: pool is large enough for steady state; the 94% read is an
+  eviction event from a cold scan, not a chronic undersize. Reschedule the
+  scan, do not upsize the instance.
+```
+
+Three takeaways:
+
+1. **Below 95% is a "something changed" signal, not a permanent verdict.** A healthy instance sits at 99.9%+; a drop to 94% almost always traces to a specific new query or job, not gradual decay.
+2. **Read the delta, not the lifetime average.** A reassuring `SHOW STATUS` lifetime number can hide a thrashing last 5 minutes. This card windows deliberately.
+3. **Pair with dirty pages and latency.** Hit rate is the read side; on its own it cannot tell you whether the instance is also under write pressure.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Buffer Pool Hit Rate | What the combination tells you |
+| --- | --- | --- |
+| [InnoDB Dirty Pages %](/nerve-centre/kpi-cards/mysql/innodb-dirty-pages) | The write-side companion to this read-side metric. | High hit rate plus high dirty pages equals a read-healthy but write-pressured instance; flush tuning, not RAM, is the lever. |
+| [InnoDB Free Pages](/nerve-centre/kpi-cards/mysql/innodb-free-pages) | Shows how much of the pool is unallocated. | Low free pages plus falling hit rate equals a genuinely full pool evicting hot data. |
+| [Memory Usage %](/nerve-centre/kpi-cards/mysql/memory-usage) | Host-level RAM pressure behind the pool. | Hit rate dropping while host memory is maxed means there is no room to grow the pool in place. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) | The user-visible symptom of pool misses. | p95 rising in lockstep with the miss rate confirms disk IO is the bottleneck. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mysql/slow-query-rate) | Cold scans that evict the pool usually log as slow queries. | A slow-query spike co-timed with a hit-rate dip points straight at the offending query. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | Workload volume context. | A hit-rate dip with flat QPS means the query mix changed, not the load. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite that weights buffer-pool health. | A sub-95% hit rate visibly pulls the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL's own tooling:**
+
+> **`SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_read%';`** for the raw counters. Compute `1 - (Innodb_buffer_pool_reads / Innodb_buffer_pool_read_requests)` over two samples taken a minute apart to match the card's windowing.
+> **`SHOW ENGINE INNODB STATUS\G`** , the BUFFER POOL AND MEMORY section, which prints a live "Buffer pool hit rate N / 1000" reading over a short internal interval. This is the closest native equivalent to the card.
+> **`sys.innodb_buffer_stats_by_table`** (from the `sys` schema) for a per-table breakdown of what is actually resident in the pool.
+> On Amazon RDS / Aurora, **Performance Insights** and the buffer-pool CloudWatch-adjacent counters; on Google Cloud SQL, the **`mysql.innodb_buffer_pool_*`** metrics in Cloud Monitoring.
+
+**Why our number may legitimately differ from a hand calculation:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Lifetime vs windowed** | Hand calc usually higher | `SHOW STATUS` totals average over full uptime; Vortex IQ uses a 1-hour rolling delta, so a recent dip shows on the card before it shows in the lifetime ratio. |
+| **`SHOW ENGINE INNODB STATUS` interval** | Either direction | The engine-status hit rate uses MySQL's own short internal interval (often a few seconds), which can be noisier than the card's 1-hour baseline. |
+| **Sample timing** | Marginal | Two samples taken at slightly different points in a bursty workload will not match to the decimal; both are correct snapshots. |
+| **Counter reset on restart** | One-off | A restart zeroes both counters; the first window after restart reads as a cold-cache low until the pool warms. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Memory Usage %](/nerve-centre/kpi-cards/mysql/memory-usage) | A falling hit rate on a memory-maxed host means the pool cannot grow in place. | Hit rate dropping while host memory has headroom means `innodb_buffer_pool_size` is set too low, not that the box is out of RAM. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) | Miss rate and p95 should move together. | p95 rising while hit rate holds steady points at lock contention or slow disk on writes, not read misses. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My lifetime hit rate from `SHOW STATUS` is 99.97% but the card says 94%. Which is right?**
+Both are right; they measure different windows. The card uses a 1-hour rolling delta so it reflects current behaviour, while the raw `SHOW STATUS` ratio averages over the entire uptime and is dominated by the long healthy history. When they diverge, trust the card for "what is happening now" and the lifetime figure for "how the instance behaves on average".
+
+**Is 99.9% always good and 94% always bad?**
+99.9%+ is the normal healthy band for a warm OLTP instance and needs no action. The 95% alert line is a pragmatic floor: below it, a meaningful share of reads are hitting disk and latency is materially affected. A read-heavy analytics replica that legitimately scans cold data may sit lower without it being a problem; tune the sensitivity threshold per instance rather than treating 95% as universal.
+
+**The hit rate dropped right after a restart and recovered on its own. Why?**
+A restart empties the buffer pool, so the first reads after startup all miss until the working set is paged back in. This cold-cache dip is expected and self-heals within minutes to tens of minutes depending on workload. MySQL 8.0 can speed this up with `innodb_buffer_pool_dump_at_shutdown` and `innodb_buffer_pool_load_at_startup`, which persist and reload the page set across restarts.
+
+**Does a high hit rate mean my queries are fast?**
+Not necessarily. The hit rate only measures the read path's cache efficiency. A query can hit the pool 100% of the time and still be slow because it scans millions of in-memory rows, holds locks, or sorts on disk. Pair this card with [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) and [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest) for the full picture.
+
+**Should I just keep raising `innodb_buffer_pool_size` to push the hit rate up?**
+Only up to the working-set size, and never past leaving headroom for the OS and per-connection buffers. Sizing the pool larger than the active data plus index footprint yields no further hit-rate gain and risks the host swapping, which is far worse than a cache miss. Confirm the working set first (via `information_schema.tables` sizes and `sys.innodb_buffer_stats_by_table`) before upsizing.
+
+**Why is the metric MySQL-specific? My other databases do not have this card.**
+The counters `Innodb_buffer_pool_reads` and `Innodb_buffer_pool_read_requests` are InnoDB-specific status variables. Other engines expose conceptually similar cache-hit metrics under different names and semantics, so Vortex IQ surfaces them as separate, correctly-named cards per connector rather than forcing a single cross-engine metric that would mislead.
+
+**Can a one-off batch job really tank the hit rate?**
+Yes, and this is the most common cause of a sudden dip. A large analytical scan or backup-style read pulls cold pages into the pool and evicts the hot OLTP working set, so subsequent OLTP reads miss until the hot set is re-warmed. The fix is to run such jobs against a replica, not the primary. Watch [Slow-Query Rate %](/nerve-centre/kpi-cards/mysql/slow-query-rate) for the co-timed spike.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*InnoDB Buffer Pool Hit Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

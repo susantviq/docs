@@ -1,0 +1,168 @@
+---
+title: "Deadlocks (last 5m), PostgreSQL"
+sidebarTitle: "Deadlocks (last 5m)"
+description: "Deadlocks (last 5m) for PostgreSQL databases. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of deadlocks PostgreSQL has detected and broken in the last five minutes. A deadlock is two (or more) transactions each holding a lock the other needs, frozen forever unless the database steps in. PostgreSQL detects the cycle, picks a victim, and aborts it with `ERROR: deadlock detected`, freeing the survivor. So a deadlock is never silent: one transaction always dies, which means one user request always fails (or one job always retries). The healthy reading is zero. Any non-zero count means application code is acquiring locks in inconsistent orders, and the database is paying for it in aborted transactions. This is a hero card because a deadlock storm during a write-heavy window (a sale, a batch job, a migration) turns into a visible wall of failed requests.
+
+| | |
+| --- | --- |
+| **Data source** | `deadlocks` column from `pg_stat_database`, delta over a 5m window. The card reads the cumulative `deadlocks` counter for the monitored database at the start and end of each 5-minute window and reports the difference. The PostgreSQL server log (lines `ERROR: deadlock detected`) provides the per-event detail and the involved process IDs. |
+| **Metric basis** | A count of detected deadlock *cycles*, NOT a count of aborted transactions or lock waits. Each detected cycle increments the counter once even though it always kills at least one transaction. Ordinary lock waits that resolve on their own (one transaction simply waits and then proceeds) are NOT deadlocks and are not counted here. |
+| **Aggregation window** | Trailing 5 minutes, computed as the delta of the cumulative `pg_stat_database.deadlocks` counter. The counter only resets when statistics are reset (`pg_stat_reset()`) or the database is recreated, so the card always works from deltas, never the raw cumulative total. |
+| **What counts** | Any lock cycle the deadlock detector resolves, across row locks, table locks, advisory locks, and `SELECT ... FOR UPDATE` contention. |
+| **What does NOT count** | (1) Plain lock waits that resolve without a cycle; (2) `lock_timeout` / `statement_timeout` aborts that are not deadlocks; (3) serialization failures under `SERIALIZABLE` isolation (those are `could not serialize access`, a different error); (4) application-level retries of a deadlocked transaction (the retry is new work, the original deadlock counted once). |
+| **Time window** | `5m` (delta of the cumulative counter over the trailing 5 minutes) |
+| **Alert trigger** | `>0`, any deadlock at all in the window raises the sensitivity alert. The healthy target is zero. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+PostgreSQL maintains a single cumulative counter per database, `deadlocks`, in the `pg_stat_database` view. Every time the deadlock detector finds a lock cycle and aborts a victim to break it, that counter increments by one. The counter is monotonic: it only goes up, and only resets when someone calls `pg_stat_reset()` or the database is dropped and recreated.
+
+The card cannot show the raw cumulative value (a database up for a year might read 14,000, which says nothing about now), so it works from deltas:
+
+```text
+deadlocks_5m = deadlocks(now) − deadlocks(5 minutes ago)
+```
+
+where both readings come from:
+
+```sql
+SELECT deadlocks FROM pg_stat_database WHERE datname = current_database();
+```
+
+A delta of zero is the healthy state. Any positive delta means the detector fired at least that many times in the window, and every firing killed at least one transaction. For the per-event detail, the card joins the count to the server log: with `log_lock_waits = on` and the default deadlock logging, PostgreSQL writes an `ERROR: deadlock detected` line plus a `DETAIL` block naming the two process IDs, the relations, and the conflicting statements, which is what populates the drill-down.
+
+On managed services the same `pg_stat_database.deadlocks` counter is available directly over a normal connection, and the provider also surfaces an equivalent metric (for example the RDS / Aurora `Deadlocks` CloudWatch metric, or Cloud SQL's deadlock metric) that Vortex IQ uses to corroborate the delta when log access is restricted.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a PostgreSQL 15 primary behind an orders API. During a flash promotion on 18 Apr 26, the on-call engineer sees the Deadlocks card go red. Snapshot taken at 20:14 BST.
+
+| 5m window (BST) | Deadlocks delta | Notes |
+| --- | --- | --- |
+| 19:55 to 20:00 | 0 | Healthy, pre-promotion |
+| 20:00 to 20:05 | 0 | Promotion live, traffic climbing |
+| 20:05 to 20:10 | 3 | First deadlocks appear |
+| 20:10 to 20:14 | 11 | **Storm** |
+
+The headline reads **11 deadlocks (last 5m)** and the card is red because the threshold is `>0`. Eleven deadlocks in four minutes means at least eleven aborted transactions, each one an order submission that returned an error to a customer.
+
+The drill-down (from the server log) shows every deadlock involves the same two statements:
+
+```text
+ERROR:  deadlock detected
+DETAIL: Process 41822 waits for ShareLock on transaction 998211; blocked by process 41809.
+        Process 41809 waits for ShareLock on transaction 998207; blocked by process 41822.
+        Process 41822: UPDATE inventory SET qty = qty - 1 WHERE sku_id = 5567;
+        Process 41809: UPDATE inventory SET qty = qty - 1 WHERE sku_id = 5567;
+```
+
+The story: the promotion drove a flood of concurrent orders for the same few hot SKUs. The checkout transaction updates the `inventory` row and the `orders` row, but two code paths do it in opposite orders (one updates inventory then orders, the other orders then inventory). Under low traffic this never collides. Under the promotion's concurrency, two transactions grab each other's locks and deadlock. PostgreSQL kills one of each pair to break the cycle.
+
+The engineer's read, in order:
+
+1. **Every deadlock is a failed customer order.** Eleven deadlocks in this window = eleven customers who got an error at checkout. The number is small but the user impact is direct and immediate, which is why the threshold is zero.
+2. **The cause is lock-ordering, not load.** The load merely exposed it. Two code paths touch the same rows in opposite orders. The durable fix is to make every transaction acquire locks in the same canonical order (always `inventory` before `orders`, for instance), which makes a cycle impossible.
+3. **The stopgap is application retry.** A deadlocked transaction is safe to retry because it was fully rolled back. Wrapping the checkout transaction in a bounded retry-on-`40P01` loop converts most deadlocks into a transparent second attempt while the lock-ordering fix is shipped.
+
+```text
+Impact framing for the storm window (20:10 to 20:14):
+  - Deadlocks detected: 11
+  - Aborted transactions (one victim each): ≥ 11
+  - Each abort = 1 customer checkout returning an error
+  - Without retry logic: 11 lost orders
+  - With bounded retry on 40P01: most recover on second attempt
+```
+
+Three things worth remembering:
+
+1. **Zero is the only good number.** Unlike latency or saturation, where a low-but-nonzero reading is fine, any deadlock means a transaction died. The threshold is `>0` for that reason. A steady trickle of one or two per hour is not "noise to ignore", it is a lock-ordering bug that just has not stormed yet.
+2. **Deadlocks are an application problem the database surfaces.** PostgreSQL is doing exactly the right thing by detecting and breaking the cycle. The fix is almost never a database setting; it is making transactions acquire locks in a consistent order and keeping transactions short.
+3. **Retry is the safety net, ordering is the cure.** A deadlocked transaction rolled back cleanly, so it is always safe to retry on SQLSTATE `40P01`. Add retry to stop the bleeding, then fix the lock ordering to stop the deadlock happening at all.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Deadlocks | What the combination tells you |
+| --- | --- | --- |
+| [Idle-in-Transaction Backends](/nerve-centre/kpi-cards/postgresql/idle-in-transaction-backends) | Long-open transactions hold locks far longer, widening the deadlock window. | High idle-in-transaction plus deadlocks = transactions are held open too long; shorten them. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/postgresql/query-error-rate) | Every deadlock victim is an aborted statement, so deadlocks lift the error rate. | A deadlock storm should show a matching bump in query errors; if not, retries are absorbing them. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p95-ms) | Lock contention inflates latency before it tips into deadlock. | Rising p95 with deadlocks appearing = contention is escalating, not just slow queries. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/postgresql/slow-query-rate) | Slow transactions hold locks longer, raising deadlock odds. | Slow queries plus deadlocks on the same tables = optimise those queries to shrink lock duration. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/postgresql/top-10-slowest-queries) | Identifies the long-running statements most likely to be in the deadlock cycle. | The statements in the deadlock DETAIL often appear here too. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | A deadlock burst dents the error-free factor in the composite. | A score drop with deadlocks present points the composite at this card. |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/postgresql/slow-queries-during-checkout-window-5m) | The cross-channel view tying contention to revenue-critical windows. | Deadlocks co-occurring with a checkout drop = contention is directly costing orders. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL's own tooling:**
+
+> **`pg_stat_database`** is the authoritative counter: `SELECT datname, deadlocks FROM pg_stat_database WHERE datname = current_database();` gives the cumulative total. Sample it twice five minutes apart and subtract to reproduce the card's delta.
+> **Server log** holds the per-event detail. Each `ERROR: deadlock detected` line is followed by a `DETAIL` block naming the conflicting process IDs, relations, and statements. Grep the log for `deadlock detected` to see exactly which transactions collided.
+> **`pg_locks`** shows live lock state: `SELECT * FROM pg_locks WHERE NOT granted;` reveals transactions currently waiting on locks (the precondition for a deadlock), useful for catching a building storm in real time.
+> **Managed-service console:** on Amazon RDS / Aurora, the `Deadlocks` CloudWatch metric and Performance Insights, plus the PostgreSQL error log in the RDS console. On Cloud SQL, the deadlock metric in Cloud Monitoring and the error log in Cloud Logging. On Azure Database for PostgreSQL, the `deadlocks` metric in Azure Monitor.
+
+**Why our number may legitimately differ from a raw counter read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Stats reset** | Apparent dip / spike | If `pg_stat_reset()` runs mid-window, the cumulative counter drops; the card handles this by treating a negative delta as a reset and resampling, but a manual raw subtraction across the reset would read negative. |
+| **Per-database scope** | Vortex IQ may count fewer | `pg_stat_database.deadlocks` is per database. If your instance hosts several databases, the card reports the monitored database only, while an instance-wide provider metric sums all of them. |
+| **Window boundary** | Variable | The 5-minute delta is bucketed to the card's sampling clock; a raw read taken at a slightly different pair of timestamps will catch a different slice. |
+| **Log vs counter** | Detail vs count | The counter is the source of truth for the *number*; the log is the source for the *detail*. If log lines were rotated out, the count is still correct but the drill-down detail may be incomplete. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`pg_query_error_rate`](/nerve-centre/kpi-cards/postgresql/query-error-rate) | A deadlock burst should lift the query error rate by roughly the same count. | Deadlocks present but error rate flat = the application is retrying and absorbing the victims. |
+| Application 5xx / failed-checkout rate (ecom / app connector) | Deadlocks during a write-heavy window usually correspond to failed customer actions. | Deadlocks with no app-side failures = retry logic is converting them into transparent second attempts. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows 1 deadlock and clears next window. Is one deadlock really worth alerting on?**
+Yes, the threshold is `>0` deliberately. A single deadlock means one transaction was aborted, which means one request failed or one job had to retry. More importantly, a single deadlock is evidence of a lock-ordering inconsistency in your code that simply has not stormed yet. One deadlock under light load becomes fifty under a promotion. Treat the first one as the warning shot, not noise.
+
+**What is the difference between a deadlock and a plain lock wait?**
+A lock wait is normal: one transaction wants a lock another holds, so it waits, and when the holder commits, it proceeds. A deadlock is a *cycle* of waits, A waits on B while B waits on A, which can never resolve on its own. PostgreSQL detects the cycle and aborts a victim to break it. Only the cycle counts here; ordinary waits do not, even long ones.
+
+**How do I find which queries are deadlocking?**
+Open the drill-down, which reads the server log's `ERROR: deadlock detected` lines. Each one carries a `DETAIL` block naming the two process IDs, the relations involved, and the conflicting statements. That block tells you exactly which two code paths collided. If the log has been rotated, the count is still accurate but you may need to enable longer log retention to catch the detail next time.
+
+**What is the actual fix for recurring deadlocks?**
+Two layers. The cure is consistent lock ordering: make every transaction acquire locks on the same tables/rows in the same canonical order, which makes a cycle mathematically impossible. The safety net is retry: a deadlocked transaction was fully rolled back, so it is always safe to retry on SQLSTATE `40P01`. Ship retry first to stop the customer impact, then fix the ordering to stop the deadlocks happening.
+
+**Could raising or lowering `deadlock_timeout` help?**
+`deadlock_timeout` only controls how long PostgreSQL waits before *checking* for a deadlock; it does not prevent deadlocks. The default is 1 second. Lowering it makes detection faster (victims abort sooner) but adds CPU overhead from more frequent checks; raising it lets genuine deadlocks sit longer before being broken. Neither addresses the root cause, which is application lock ordering. Leave it at the default unless you have a specific diagnosed reason.
+
+**My instance hosts several databases. Does this card sum all of them?**
+No. `pg_stat_database.deadlocks` is per database, and the card reports the monitored database only. If you watch multiple databases on one instance, each has its own card. A provider-level instance metric (such as a single CloudWatch `Deadlocks` figure) may sum across databases, which is why it can read higher than this card.
+
+**Are serialization failures under SERIALIZABLE isolation counted here?**
+No. Under `SERIALIZABLE` isolation, PostgreSQL can abort a transaction with `ERROR: could not serialize access due to ...` (SQLSTATE `40001`), which is a serialization failure, not a deadlock (`40P01`). Those are a separate, expected part of serializable workloads and do not increment the `deadlocks` counter. They show up in the query error rate but not on this card.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Deadlocks (last 5m)* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

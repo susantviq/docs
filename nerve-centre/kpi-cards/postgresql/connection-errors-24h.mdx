@@ -1,0 +1,148 @@
+---
+title: "Connection Errors (24h), PostgreSQL"
+sidebarTitle: "Connection Errors (24h)"
+description: "Connection Errors (24h) for PostgreSQL databases. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The count of failed connection attempts to your PostgreSQL instance over the trailing 24 hours. For a platform team, this is "how often did something try to connect and get turned away?" A handful of errors is background noise (a restarting pod, a stale credential rotating out). A wall of them means clients cannot reach the database: the pool is exhausted, `max_connections` is too low, `pg_hba.conf` is rejecting hosts, or the instance is refusing logins during recovery. Sustained connection errors translate directly into application 5xx responses, so this is an early warning that surfaces before your app-tier dashboards light up.
+
+| | |
+| --- | --- |
+| **Data source** | Connection Errors (24h) for the selected period. Derived from PostgreSQL server logs (lines matching `FATAL` connection events such as `too many clients already`, `password authentication failed`, `no pg_hba.conf entry`, `the database system is starting up`) plus the failed-auth counters surfaced by the platform. On managed services the figure is reconciled against the provider's connection-failure metric. |
+| **Metric basis** | A count of rejected or failed connection attempts, NOT the count of active sessions. A client that connects successfully and later disconnects cleanly does not register here; only attempts that never establish a usable backend are counted. |
+| **Aggregation window** | Trailing 24 hours, rolling. The headline is the running total over that window; the spark line shows the per-hour distribution so a single bad deploy spike is distinguishable from a slow constant drip. |
+| **Error categories counted** | (1) Pool / slot exhaustion (`FATAL: sorry, too many clients already`); (2) Authentication failures (`password authentication failed for user`); (3) Host-based rejections (`no pg_hba.conf entry for host`); (4) Startup / recovery rejections (`the database system is starting up` / `is in recovery mode`); (5) SSL negotiation failures. |
+| **What does NOT count** | Successful connections that later error on a query (see [Query Error Rate %](/nerve-centre/kpi-cards/postgresql/query-error-rate)); clean disconnects; client-side timeouts that never reached the server; idle-session terminations from `idle_in_transaction_session_timeout`. |
+| **Time window** | `24h` (rolling 24-hour total) |
+| **Alert trigger** | `>100`, more than 100 connection errors in the trailing 24 hours raises the sensitivity alert. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card counts every connection attempt that failed to produce a usable backend in the trailing 24 hours. The primary signal is the PostgreSQL server log: Vortex IQ matches log lines emitted at `FATAL` severity during the connection-establishment phase, classifying each into one of the five categories listed above. Where `log_connections` and `log_disconnections` are enabled, the engine cross-checks the count of connection-authorised lines against connection-received lines to catch failures that never reached the log filter.
+
+On a self-managed instance the dominant contributors are visible directly in the log and, for slot exhaustion specifically, can be inferred from `pg_stat_activity` hitting `max_connections`. On managed services (Amazon RDS / Aurora, Cloud SQL, Azure Database for PostgreSQL) the raw log access is supplemented by the provider's own failed-connection metric (for example the RDS `DatabaseConnections` ceiling against `max_connections`, or Cloud SQL's connection-error counter) so the figure stays accurate even when log retention is short.
+
+The result is a single integer: the total number of rejected connection attempts in the window. The alert fires when that integer exceeds 100.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A SaaS platform team runs a primary PostgreSQL 15 instance behind PgBouncer, serving an order-management API. `max_connections` is set to 200; PgBouncer holds a server pool of 180. Snapshot taken on 14 Apr 26 at 09:50 BST, the morning after a release.
+
+| Hour (BST) | Connection errors | Dominant category |
+| --- | --- | --- |
+| 00:00 to 07:00 | 4 total | Auth (a rotating service credential) |
+| 07:00 to 08:00 | 6 | Auth |
+| 08:00 to 08:30 | 9 | Pool exhaustion |
+| 08:30 to 09:00 | 142 | **Pool exhaustion** |
+| 09:00 to 09:50 | 71 | Pool exhaustion |
+
+The Nerve Centre headline reads **232 connection errors (24h)** and the card is amber because the threshold of 100 has been crossed. The shape matters more than the total: the first seven hours are flat background noise (a credential rotation generating a few auth failures, entirely benign). The signal is the cliff at 08:30, where pool exhaustion errors jump from single digits to 142 in thirty minutes.
+
+What happened: the 08:00 release introduced a code path that opened a new connection per request instead of reusing the pooled connection. As morning traffic ramped, the application drained PgBouncer's server pool, then PgBouncer itself began failing to hand out client slots, and PostgreSQL started returning `FATAL: sorry, too many clients already`. Every one of those 142 + 71 errors is a request the API could not serve: a 503 to a customer.
+
+The platform team's read, in order:
+
+1. **Ignore the overnight auth errors.** Four to ten per hour from a rotating credential is expected and is not what tripped the alert. Filtering by category in the drill-down confirms they are flat.
+2. **Confirm the cause is the pool, not the database.** Cross-reference [Connections In Use](/nerve-centre/kpi-cards/postgresql/connections-in-use) and [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation). If saturation is pinned at 100% during the 08:30 cliff, the database is healthy but the pool is starved, which points at the application, not at `max_connections`.
+3. **Decide the mitigation.** Short term: roll back the 08:00 release or raise the PgBouncer pool size. Long term: fix the connection-per-request leak. Raising `max_connections` is the wrong lever here because the problem is client behaviour, and more backends means more memory pressure (each backend costs roughly `work_mem` plus overhead).
+
+```text
+Cost framing for the pool-exhaustion window:
+  - Errors during the cliff (08:30 to 09:50): 142 + 71 = 213 failed connections
+  - Each failed connection = ~1 customer API request returning 503
+  - Approx affected requests/min during the cliff: ~2.5
+  - Window length: 80 minutes
+  - Estimated failed customer actions: ~200
+  - These are order submissions and status checks, directly customer-visible
+```
+
+Three things worth remembering:
+
+1. **Read the shape, not just the total.** 232 errors spread evenly over 24 hours (background credential churn) is a different world from 232 concentrated in a 90-minute cliff. The sensitivity alert fires on the total, but the drill-down spark line tells you whether you have a chronic config problem or an acute incident.
+2. **Connection errors are an upstream leading indicator.** They show up here before they show up as 5xx on your app dashboards, because the failure happens at connect time. Treat a rising count as a head start.
+3. **The fix is rarely "more connections".** Pool exhaustion almost always means a client misbehaving (leaking connections, not pooling) rather than a database that is genuinely too small. Diagnose with the saturation and in-use cards before changing `max_connections`.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Connection Errors | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) | The leading cause of connection errors is a saturated pool. | Saturation pinned at 100% during the error spike confirms the pool, not the database, is the bottleneck. |
+| [Connections In Use](/nerve-centre/kpi-cards/postgresql/connections-in-use) | Shows how close active backends are to `max_connections`. | In-use near the ceiling at the moment errors spike = slot exhaustion; in-use low while errors spike = auth or `pg_hba` rejection. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/postgresql/connection-pool-at-90-saturation) | The real-time alert that usually precedes a connection-error spike. | If this alert fired minutes before errors climbed, you have your root cause and timeline. |
+| [Idle-in-Transaction Backends](/nerve-centre/kpi-cards/postgresql/idle-in-transaction-backends) | Stuck transactions consume pool slots without doing work. | High idle-in-transaction plus rising connection errors = leaked transactions are eating the pool. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/postgresql/query-error-rate) | The downstream counterpart: errors on connections that did succeed. | Connection errors flat but query errors up = the problem is in queries, not connectivity. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The composite that folds pool headroom and error-free operation into one figure. | A connection-error spike drags pool-headroom and error-free factors down, pulling the score below 70. |
+| [PgBouncer Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/postgresql/pgbouncer-pool-saturation-vs-traffic-burst) | The cross-channel view tying pool pressure to incoming traffic. | Confirms whether the error spike lines up with a genuine traffic burst or a client-side leak. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL's own tooling:**
+
+> **Server log** is the authoritative source. With `log_connections = on`, every accepted connection is logged; failed attempts are logged at `FATAL` regardless. Grep the log for `too many clients`, `password authentication failed`, and `no pg_hba.conf entry` to reproduce the per-category counts.
+> **`pg_stat_activity`** shows the live backend count: `SELECT count(*) FROM pg_stat_activity;` against `SHOW max_connections;` tells you how close you are to slot exhaustion right now.
+> **`pg_stat_database`** exposes `xact_commit` and `xact_rollback` for committed work, but note that connection rejections never create a backend, so they do not appear here, the server log is the only complete record.
+> **Managed-service console:** on Amazon RDS / Aurora, the CloudWatch `DatabaseConnections` metric against the `max_connections` parameter, plus the Enhanced Monitoring and Performance Insights connection panes. On Cloud SQL, the `database/postgresql/num_backends` metric and the connection-error logs in Cloud Logging. On Azure Database for PostgreSQL, the `connections_failed` and `active_connections` metrics in Azure Monitor.
+
+**Why our number may legitimately differ from a raw log grep:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Log retention** | Vortex IQ may count more | On managed services with short log retention, Vortex IQ reconciles against the provider's failure metric, capturing failures the rotated-out log no longer holds. |
+| **Category filtering** | Vortex IQ may count fewer | We classify into five connection-failure categories; a custom log line that does not match any category is excluded from the headline but visible in the raw drill-down. |
+| **Time zone** | Hour buckets shift | The server log uses `log_timezone`; Vortex IQ renders the 24h window in your configured display time zone, so per-hour buckets can appear offset against a raw `tail -f`. |
+| **Pooler interposition** | Vortex IQ may count fewer at the DB | When PgBouncer rejects a client before reaching PostgreSQL, the DB log never sees it. Vortex IQ folds PgBouncer's own error log in where the connector has access; without that access, pooler-side rejections are undercounted at the DB layer. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`pg_pool_saturation`](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) | Connection-error spikes should line up with saturation peaks. | Errors without saturation = auth / `pg_hba` rejection, not slot exhaustion. |
+| Application 5xx rate (ecom / app connector) | A sustained connection-error spike usually corresponds to a rise in app-tier 5xx. | App 5xx without DB connection errors = the failure is elsewhere in the stack (CDN, app server, downstream API). |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My count is non-zero every day even when nothing is wrong. Is that normal?**
+Yes. A small, flat background level of connection errors is expected in almost every environment: pods restart, credentials rotate, health-check probes occasionally race a restart, and the odd misconfigured client tries the wrong password. The threshold sits at 100 over 24 hours precisely so this background noise does not page anyone. Watch the shape: a flat low line is healthy; a sudden cliff is the signal.
+
+**I use PgBouncer. Does this card see errors that PgBouncer rejects before they reach PostgreSQL?**
+Only if the connector has access to PgBouncer's own log or its `SHOW STATS` / `SHOW POOLS` output. When PgBouncer turns a client away at its own pool boundary, the PostgreSQL server log never records it. Where Vortex IQ can read the pooler, those rejections are folded in; where it cannot, pooler-side rejections are undercounted at the database layer. Pair with [PgBouncer Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/postgresql/pgbouncer-pool-saturation-vs-traffic-burst) for the pooler-side view.
+
+**The card spiked but `pg_stat_activity` shows plenty of free slots. What does that mean?**
+Slot headroom rules out `too many clients`, so the errors are a different category: almost certainly authentication failures or `pg_hba.conf` rejections. Filter the drill-down by category. A burst of `password authentication failed` usually means a credential rotated and a client did not pick up the new secret; a burst of `no pg_hba.conf entry` means a new host or subnet is trying to connect and is not allow-listed.
+
+**Should I raise `max_connections` to stop the errors?**
+Usually no. If the cause is pool exhaustion, the real problem is a client that is not pooling or is leaking connections, and raising `max_connections` just defers the wall while increasing memory pressure (each backend consumes memory). Fix the client first. Raise `max_connections` only when you have genuinely outgrown capacity and have confirmed the pooler is sized correctly.
+
+**Connection errors are zero but my app is returning database errors. Why?**
+Because those are query errors, not connection errors. The app connected fine, then a query failed (a statement timeout, a constraint violation, a lock wait, a deadlock). This card only counts failures at connect time. Look at [Query Error Rate %](/nerve-centre/kpi-cards/postgresql/query-error-rate) and [Deadlocks (last 5m)](/nerve-centre/kpi-cards/postgresql/deadlocks-last-5m) for the post-connection failure picture.
+
+**Does a restart of the database inflate this count?**
+Briefly, yes. During startup and crash recovery PostgreSQL rejects connections with `the database system is starting up` / `is in recovery mode`. Clients retrying during that window each register an error. A short burst immediately after a planned restart is expected and self-clears; correlate the spike timestamp with [Instance Uptime](/nerve-centre/kpi-cards/postgresql/instance-uptime) to confirm it lines up with a restart rather than an ongoing fault.
+
+**Can I change the alert threshold of 100?**
+Yes. The threshold is configurable per profile in the Sensitivity tab. A high-churn microservices environment with aggressive credential rotation may need a higher floor; a small, stable single-app database may want it lower so any meaningful uptick is caught. Tune it to your own baseline rather than the generic default.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connection Errors (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

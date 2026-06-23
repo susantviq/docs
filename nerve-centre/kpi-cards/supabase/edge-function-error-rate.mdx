@@ -1,0 +1,151 @@
+---
+title: "Edge Function Error Rate %, Supabase"
+sidebarTitle: "Edge Function Error Rate %"
+description: "Edge Function Error Rate % for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of Supabase Edge Function invocations that failed in the last hour. Edge Functions are the serverless Deno workers that run your custom server-side logic: webhook receivers, payment confirmations, scheduled jobs, third-party API calls, and the glue between your app and external services. When this number climbs, a slice of your custom backend logic is silently failing. Anything above 2% means real user journeys (or background jobs you depend on) are breaking, and the failures often do not surface as front-end errors because Edge Functions run out of band.
+
+| | |
+| --- | --- |
+| **What it tracks** | The share of Edge Function invocations returning a non-2xx outcome (uncaught exceptions, non-zero exits, timeouts, boot failures, and explicit 4xx/5xx responses your handler returns) over the rolling window. Expressed as failed invocations divided by total invocations, times 100. |
+| **Data source** | Supabase Edge Function logs and invocation metrics, surfaced via the project Logs (Edge Functions) and the Functions analytics endpoint. The runtime is Deno; each invocation emits a structured log line with status and execution time. |
+| **Time window** | `1h` rolling. Short enough to catch a regression minutes after a deploy, long enough to smooth out single one-off failures. |
+| **Alert trigger** | `>2%`. Above this, the card turns amber/red and feeds the Nerve Centre incident feed. Tune per project in the Sensitivity tab. |
+| **Why it matters** | Edge Functions usually sit on the revenue path: Stripe webhook handlers, order-confirmation emailers, inventory sync workers. A failing function does not throw a visible 500 in the browser, so a 5% error rate can run for hours before anyone notices a backlog of unprocessed webhooks. |
+| **Reading the value** | 0 to 1% is normal background noise (the occasional upstream timeout). 2 to 5% means a specific function is degraded; drill into which slug. Above 5% means a deploy regression or an upstream dependency outage. |
+| **Roles** | engineering, platform/SRE, owner |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card aggregates Edge Function invocation outcomes over the rolling 1-hour window and computes:
+
+```text
+Edge Function Error Rate % = (failed invocations / total invocations) × 100
+```
+
+A "failed" invocation is any of the following, as recorded in the Edge Function logs:
+
+- An uncaught exception in the Deno handler (the runtime returns a 500 and logs the stack).
+- A handler that explicitly returns a 4xx or 5xx `Response` (counted as a failure for this card unless you tag it otherwise).
+- A wall-clock timeout: the function exceeded the per-tier execution limit (Free and Pro have a CPU/wall-clock cap; the worker is killed and the invocation is marked failed).
+- A boot/cold-start failure: the function failed to import a module, hit a missing environment secret, or the bundle failed to load.
+- A memory limit breach: the isolate exceeded its memory ceiling and was terminated.
+
+Invocations that complete with a 2xx (or a 3xx redirect you intend) are counted as successes. The denominator is every invocation in the window across all functions in the project, unless you scope the card to a single function slug in the Sensitivity settings. Because the window is rolling and refreshed continuously, a burst of failures lifts the percentage within a minute or two of occurring, then decays out of the window an hour later if the underlying cause is fixed.
+
+Note the denominator effect: a low-traffic function magnifies single failures. One failure out of 10 invocations is 10%; the same single failure against 10,000 invocations is 0.01%. The Sensitivity tab lets you set a minimum-invocation floor so a quiet 3am hour does not trip the alert on one stray timeout.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Supabase project (Pro tier) behind a headless storefront. Their Edge Functions include `stripe-webhook` (payment confirmations), `order-confirmation-email`, `inventory-sync` (pulls stock from an ERP every 5 minutes), and `image-resize`. Snapshot taken on 14 Apr 26 at 09:40 BST, the morning after a Tuesday-night deploy.
+
+| Function slug | Invocations (last 1h) | Failures | Error rate | Dominant failure mode |
+| --- | --- | --- | --- | --- |
+| `stripe-webhook` | 1,420 | 0 | 0.0% | healthy |
+| `order-confirmation-email` | 1,380 | 9 | 0.7% | upstream SMTP 4xx |
+| `inventory-sync` | 12 | 7 | **58.3%** | uncaught exception |
+| `image-resize` | 6,210 | 12 | 0.2% | occasional timeout |
+| **Project total** | **9,022** | **28** | **0.31%** | mixed |
+
+The project-level card reads **0.31%**, comfortably green. But the team had pinned a per-function panel for `inventory-sync`, and that one reads **58.3%**, deep red. The Tuesday deploy renamed an environment secret (`ERP_API_KEY` to `ERP_TOKEN`) but the function still references the old name, so every invocation throws at boot. Because `inventory-sync` is low traffic (12 runs/hour), its failures are invisible at the project level.
+
+```text
+Why the project-level number hid the problem:
+  - inventory-sync failures:        7
+  - total project invocations:      9,022
+  - inventory-sync contribution:    7 / 9,022 = 0.08% to the project rate
+  - the project card stayed green while inventory ran 35 minutes stale
+
+What it actually cost:
+  - inventory-sync down since 02:10 (last successful run)
+  - stock not refreshed for ~7.5 hours
+  - 3 oversold SKUs by 09:40, manual order cancellations required
+```
+
+Three takeaways:
+
+1. **Watch per-function, not just project-level.** A noisy headline can be dominated by one high-traffic healthy function while a critical low-traffic worker burns. Pin a separate panel for every revenue-path function.
+2. **Boot failures are the silent killer.** A renamed secret, a missing import, or a bad bundle fails every invocation instantly. These show as a near-100% rate on the affected slug but barely move the aggregate.
+3. **Pair with the backlog, not just the rate.** A failing webhook handler means events are queued upstream (Stripe retries for up to 3 days). Once you fix the function, expect a replay surge; size your pool and rate limits for it.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Edge Function Error Rate | What the combination tells you |
+| --- | --- | --- |
+| [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) | The other API surface. Edge Functions often call PostgREST internally. | If both spike together, the database layer is the root cause; if only Edge Functions spike, the fault is in your function code or an external dependency. |
+| [Database Query Error Rate %](/nerve-centre/kpi-cards/supabase/database-query-error-rate) | Functions that hit Postgres directly surface DB errors here. | A function failing on query errors links the two; fix the query, the function recovers. |
+| [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) | Edge Functions open pooled connections. | A saturated pool makes functions time out waiting for a connection, inflating the error rate without any code bug. |
+| [Auth Sign-In Error Rate %](/nerve-centre/kpi-cards/supabase/auth-sign-in-error-rate) | Auth-gated functions fail when token verification fails. | Both red together points at an Auth/JWT misconfiguration rather than function logic. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite that takes error rates as inputs. | A red Edge Function rate drags the composite; use the score for the executive headline. |
+| [Memory Usage %](/nerve-centre/kpi-cards/supabase/memory-usage) | Memory pressure on the instance can starve functions calling the DB. | High memory plus rising function errors equals a capacity problem, not a code problem. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase's own tooling:**
+
+> **Project Dashboard → Edge Functions → Logs** for the per-invocation log stream with status, execution time, and the Deno console output. Filter by function slug and by status to isolate failures.
+> **Project Dashboard → Edge Functions → (function) → Metrics/Invocations** for the invocation count and error count charts the card aggregates.
+> **Logs Explorer** with the `function_edge_logs` source and a SQL filter (for example `where metadata.response.status_code >= 400`) for an exact count over an arbitrary window.
+
+**Why our number may legitimately differ from the Supabase UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window boundary** | Variable | Vortex IQ uses a rolling 1-hour window; the Supabase chart you are looking at may be set to 24h or a fixed range. Match the range before comparing. |
+| **What counts as a failure** | Vortex IQ may read higher | We count handler-returned 4xx as failures by default; the Supabase invocation chart may class only 5xx and runtime errors as errors. Adjust the failure definition in Sensitivity if you only care about 5xx. |
+| **Minimum-invocation floor** | Vortex IQ may read lower | If the floor is set, a quiet window with too few invocations is suppressed to avoid a one-off failure tripping a false alert. |
+| **Log ingestion latency** | Brief lag | Edge logs land in the Logs pipeline within seconds, but a heavy burst can delay aggregation by a minute, so a freshly-started incident may read slightly low for the first poll. |
+| **Function scope** | Variable | The project-level card sums all functions; a Supabase chart filtered to one slug will differ from the aggregate. |
+
+**Cross-connector reconciliation:** if a Stripe webhook handler is the failing function, pair this card with your Stripe connector's webhook delivery metrics. A rising Edge Function error rate on `stripe-webhook` should correspond to climbing webhook retry counts on the Stripe side; if Stripe shows retries but Supabase shows no invocations, the events are not reaching your function at all (a routing or URL problem, not a code problem).
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My project-level rate is green but a specific user flow keeps failing. Why?**
+A high-traffic healthy function dilutes the aggregate. Pin a per-function panel for each revenue-path function (webhooks, emailers, sync workers) so a low-traffic worker failing at 50% does not hide behind a 0.3% project headline. The per-function view is where you catch boot failures and dependency outages.
+
+**The rate jumped to nearly 100% on one function right after a deploy. What happened?**
+Almost always a boot-time failure: a renamed or missing environment secret, a failed module import, or a bad bundle. Every invocation throws before your logic runs. Check the Edge Function logs for the first failed invocation after the deploy timestamp; the stack trace names the missing import or variable. Roll back or fix the secret in Project Settings → Edge Functions → Secrets.
+
+**Do timeouts count as failures?**
+Yes. If a function exceeds the per-tier wall-clock/CPU limit, the worker is killed and the invocation is marked failed. A rising error rate driven by timeouts (rather than exceptions) usually means an upstream call is slow, or you are doing too much work per invocation. Split the work, add a timeout to your own outbound calls, or move heavy jobs to a queue.
+
+**Why is my error rate spiky overnight when traffic is low?**
+The denominator effect. One failure against ten invocations is 10%. Set a minimum-invocation floor in the Sensitivity tab so quiet hours do not trip the alert on a single stray timeout. The floor only suppresses the alert; the raw count is still recorded.
+
+**A function returns a deliberate 404 for missing records. Is that counted as an error?**
+By default the card counts handler-returned 4xx as failures, so an intentional 404 inflates the rate. If a function returns 4xx as normal business logic (a lookup that legitimately misses), exclude that slug's 4xx in the Sensitivity settings, or have the handler return 200 with an empty body and let the caller interpret it.
+
+**The card shows zero invocations. Is the function broken?**
+Zero invocations means the function is not being called, which is different from failing. Check that the calling code points at the right function URL, that the function is deployed (not just present in your repo), and that any cron schedule or webhook routing is configured. A function with zero traffic shows no rate at all rather than 0%.
+
+**Does this card cover the Postgres errors my function triggers?**
+Only indirectly. If your function calls the database and the query errors, the function catches it (or throws) and that surfaces here as a function failure. The underlying query error also appears on the [Database Query Error Rate %](/nerve-centre/kpi-cards/supabase/database-query-error-rate) card. Read both: this card tells you the function failed; the query-error card tells you why.
+
+**Free-tier functions behave differently. Anything to watch?**
+Free and Pro tiers have tighter execution and memory limits, so timeouts and memory-kill failures are more likely under load. If you see the rate climb only during traffic peaks (and the failures are timeouts/OOM rather than exceptions), it is a capacity ceiling, not a bug. Lighten the per-invocation workload or move to a higher tier.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Edge Function Error Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

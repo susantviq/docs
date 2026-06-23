@@ -1,0 +1,151 @@
+---
+title: "Binlog Backlog (MB) on Primary, MySQL"
+sidebarTitle: "Binlog Backlog (MB) on Primary"
+description: "Binlog Backlog (MB) on Primary for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The total size, in megabytes, of binary-log data that the primary has written but the slowest replica has not yet consumed. It measures replication backlog by *volume* rather than by *time*: how much data is queued waiting to ship to and be applied by replicas. A small, stable backlog is healthy. A backlog that keeps growing means a replica is falling behind faster than it can catch up, and beyond a point the primary risks purging binlogs the replica still needs, which breaks replication outright.
+
+| | |
+| --- | --- |
+| **Status source** | Computed from `SHOW BINARY LOGS` (file names and sizes on the primary) and the slowest replica's read position. The backlog is the sum of binlog bytes ahead of that replica's `Read_Source_Log_Pos` across the relevant files. |
+| **Metric basis** | Bytes of binlog written but not yet read by the slowest replica, converted to MB. This is a volume measure, complementary to the time measure `Seconds_Behind_Source`. |
+| **Aggregation window** | Real-time, evaluated on each sample against the current set of replicas. |
+| **Alert threshold** | `> 1GB` (1024 MB) of un-consumed binlog. Above this the engine raises the card to amber in the sensitivity feed. |
+| **What counts** | Binlog bytes between the slowest replica's read position and the current write position on the primary, across all binlog files in that range. |
+| **What does NOT count** | (1) Binlog already read by every replica (the backlog is measured against the *slowest* one); (2) binlog files already purged; (3) relay-log data already applied on the replica; (4) data still in the primary's in-memory binlog cache before flush. |
+| **Common causes** | A write burst on the primary outpacing a single-threaded apply on the replica; a replica with a stopped thread (backlog grows without bound); a slow network link between primary and replica; an under-provisioned replica that cannot apply as fast as the primary writes. |
+| **Time zone** | Volume is time-zone independent; chart axes render in the merchant display time zone set in the Vortex IQ profile. |
+| **Time window** | `RT` (real-time). |
+| **Alert trigger** | `> 1GB` of binlog backlog. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine takes two readings each sample. From the primary, `SHOW BINARY LOGS` returns every binlog file and its size, and `SHOW MASTER STATUS` (or `SHOW BINARY LOG STATUS` on 8.4+) gives the current write file and position. From each replica's `SHOW REPLICA STATUS` it reads `Source_Log_File` and `Read_Source_Log_Pos` (the IO thread's fetch position). The backlog against a given replica is:
+
+```text
+backlog_bytes(replica) =
+    bytes from (replica.Source_Log_File, replica.Read_Source_Log_Pos)
+    up to (primary.current_file, primary.current_position)
+    summed across all intervening binlog files
+
+binlog_backlog_mb = max over all replicas of backlog_bytes / 1024 / 1024
+```
+
+The card reports the *maximum* across replicas, because the worst-behind replica is the one that gates safe binlog purging and is the failover risk. It uses the IO thread's read position rather than the SQL thread's apply position because that is what governs whether the primary can safely purge a file (a file no replica has *read* must never be purged). Where GTIDs are in use, the engine cross-checks the GTID gap to confirm the byte-based figure. A growing trend matters more than any single reading: the slope tells you whether the replica is catching up, holding steady, or losing ground.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a primary on MySQL 8.0 with two replicas, one of which (Replica B) is under-provisioned and applies single-threaded. A bulk catalogue re-import kicks off at 22:00 on 11 Jun 26, writing heavily for an hour. Snapshot series:
+
+| Sample time | Primary write rate | Replica B read pos vs primary | Backlog (MB) |
+| --- | --- | --- | --- |
+| 21:55 | 8 MB/min | 12 MB behind | 12 |
+| 22:05 | 95 MB/min | 240 MB behind | 240 |
+| 22:20 | 95 MB/min | 690 MB behind | 690 |
+| 22:35 | 95 MB/min | 1,180 MB behind | 1,180 |
+| 22:50 | 95 MB/min | 1,610 MB behind | 1,610 |
+
+The sensitivity card crosses its `> 1GB` threshold around 22:35 and reads **1,610 MB backlog on Replica B** by 22:50, amber and climbing. Replica A (multi-threaded, well-provisioned) stays under 50 MB throughout, so the card reports B's figure because B is the worst case.
+
+The DBA's read:
+
+1. **The backlog is growing, not just large.** A steady 1,610 MB would be a tolerated batch artefact. A backlog rising ~430 MB every 15 minutes means B is consuming binlog slower than the primary produces it: it is losing ground and will keep losing ground until the write burst ends or B speeds up.
+2. **The real danger is binlog retention.** If `binlog_expire_logs_seconds` is set low, the primary may purge a binlog file *before* B has read it. The instant that happens, B's IO thread errors with 1236 ("could not find first log file") and replication breaks, requiring a full re-clone. Backlog growth is the early warning for this.
+3. **Two levers, short and long.** Short term: ensure the primary retains binlogs long enough to cover the catch-up (raise `binlog_expire_logs_seconds`, and do not let disk pressure force an early purge). Long term: enable multi-threaded apply on B (`replica_parallel_workers`) or right-size the instance so a write burst like this drains in minutes, not hours.
+
+```text
+Why backlog volume matters alongside lag time:
+  - Seconds_Behind_Source says "B is N seconds behind" (time).
+  - Backlog MB says "B has N MB still to fetch/apply" (volume).
+  - Volume is what governs purge safety: a file no replica has read must not be purged.
+  - A growing backlog predicts a 1236 break before Seconds_Behind_Source looks alarming.
+```
+
+Three takeaways:
+
+1. **Volume and time are different lenses on the same lag.** Time (`Seconds_Behind_Source`) tells you how stale the replica's data is; volume (backlog MB) tells you how much work is queued and, crucially, how close you are to a purge-induced break. Watch both.
+2. **The slope is the signal.** A large but flat backlog during a known batch is tolerable. A backlog with a positive slope is a replica losing the race, and it will not fix itself until the write rate drops or apply speed rises.
+3. **Backlog is the leading indicator of a 1236 break.** The most damaging replication failure (binlog purged before the replica read it) is preceded by exactly this growth. Acting on the amber here prevents a re-clone later.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Binlog Backlog | What the combination tells you |
+| --- | --- | --- |
+| [Replication Lag (Seconds_Behind_Source)](/nerve-centre/kpi-cards/mysql/replication-lag-seconds-behind-source) | The time-based view of the same lag. | Volume rising with time confirms genuine fall-behind; volume rising while time looks flat warns of an impending purge break. |
+| [Replication Threads Stopped or Lag Exceeds Threshold](/nerve-centre/kpi-cards/mysql/replication-threads-stopped-or-lag-exceeds-threshold) | The hero alert for thread health. | A stopped thread makes backlog grow without bound; this card quantifies how far behind the frozen replica has fallen. |
+| [Replication Thread Health (IO/SQL)](/nerve-centre/kpi-cards/mysql/replication-thread-health-iosql) | Distinguishes fetch lag from apply lag. | IO ahead of SQL means the data is fetched but not applied; backlog measured at the IO position shows fetch-side queue. |
+| [Active Replicas](/nerve-centre/kpi-cards/mysql/active-replicas) | The set the backlog is measured against. | The card reports the worst replica; this confirms how many replicas exist and which is lagging. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mysql/database-disk-usage) | Binlog retention competes for disk. | High disk usage can force early binlog purge, which is what turns backlog growth into a 1236 break. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | The write pressure feeding the backlog. | A QPS/write burst explains backlog growth and predicts when it will drain. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/mysql/last-successful-backup-hours-ago) | The fallback if a replica must be re-cloned. | If backlog leads to a break, backup freshness sets the cost of rebuilding the replica. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL itself:**
+
+> On the primary: `SHOW BINARY LOGS;` for every binlog file and its size, and `SHOW MASTER STATUS;` (or `SHOW BINARY LOG STATUS;` on 8.4+) for the current write file and position.
+> On each replica: `SHOW REPLICA STATUS\G` for `Source_Log_File` and `Read_Source_Log_Pos` (the fetch position the backlog is measured against).
+> `SELECT * FROM performance_schema.replication_connection_status\G` for the modern view of the IO thread's progress.
+> `SHOW VARIABLES LIKE 'binlog_expire_logs_seconds';` and `SHOW VARIABLES LIKE 'max_binlog_size';` to understand retention and file rollover.
+
+To compute the byte gap by hand, sum the sizes of the binlog files between the replica's `Source_Log_File`/`Read_Source_Log_Pos` and the primary's current file/position.
+
+**Why our number may legitimately differ from a manual calculation:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Read vs apply position** | Card uses read pos | The card measures against the IO thread's read position (purge safety); a calculation using the SQL apply position would show a larger gap. |
+| **Worst-replica selection** | Card = max | The card reports the slowest replica; a check against a faster replica will show less backlog. |
+| **In-flight binlog cache** | Card may lag a hair | Data still in the primary's binlog cache before flush is not yet in `SHOW BINARY LOGS` sizes. |
+| **Sampling moment** | Marginal | During a heavy write burst the figure moves between samples; the card shows the value at sample time. |
+
+**Managed-service note:** Amazon RDS and Aurora do not expose a direct "binlog backlog MB" metric; use `ReplicaLag`/`AuroraReplicaLag` (time-based) plus the binlog retention setting (`call mysql.rds_set_configuration('binlog retention hours', N)` on RDS) as the proxy. On Google Cloud SQL, replication is monitored via `seconds_behind_master`; binlog volume is inferred from binary-log storage growth. On all managed services the purge-safety concern still applies: ensure binlog retention exceeds your worst replica's catch-up time.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why measure backlog in MB when I already have Seconds_Behind_Source?**
+They answer different questions. `Seconds_Behind_Source` tells you how *stale* the replica's data is in time. Backlog MB tells you how much binlog *volume* is queued, which is what governs purge safety. A replica can be only a few seconds behind in time yet have hundreds of MB queued during a write burst, and it is the volume, not the seconds, that determines whether the primary can safely purge a binlog file. Reading both gives you the complete picture.
+
+**The backlog is large but flat. Is that a problem?**
+Usually not. A large, stable backlog during a known heavy-write window (a batch import, a bulk update) is the replica working through a queue at a steady rate. The dangerous shape is a *growing* backlog, which means the replica is consuming slower than the primary produces and will keep falling behind. Watch the slope, not just the height.
+
+**How does a growing backlog actually break replication?**
+If the backlog grows large enough that the primary purges a binlog file the replica has not yet read, often because `binlog_expire_logs_seconds` is too low or disk pressure forces an early purge, the replica's IO thread errors with 1236 ("could not find first log file"). Replication then stops dead and the replica must be re-cloned. Backlog growth is the early warning; raising binlog retention and speeding up apply prevents the break.
+
+**Why does the card report the worst replica rather than an average?**
+Because the slowest replica is the one that matters for both risk concerns: it gates how aggressively the primary can purge binlogs (you must retain anything the slowest replica has not read), and it is the worst failover candidate. An average would hide a single badly lagging replica behind several healthy ones. The card surfaces the worst case so you act on the real risk.
+
+**Can I reduce backlog by speeding up the replica?**
+Yes, that is the primary long-term lever. Enable multi-threaded apply with `replica_parallel_workers` (and `replica_parallel_type = LOGICAL_CLOCK`) so the replica applies independent transactions in parallel instead of single-threaded. Right-sizing the replica's CPU and IO, and ensuring it is not also serving heavy read traffic during write bursts, also help. On the primary side, breaking very large transactions into smaller batches reduces the apply stalls that let backlog build.
+
+**Does a stopped replica thread show up here?**
+Yes, and dramatically. If a replica's IO or SQL thread stops, it stops consuming binlog entirely, so the backlog against it grows without bound until someone intervenes. This card will climb steadily; cross-reference [Replication Threads Stopped or Lag Exceeds Threshold](/nerve-centre/kpi-cards/mysql/replication-threads-stopped-or-lag-exceeds-threshold), which fires the hero alert on the stopped thread itself.
+
+**Can I change the 1GB threshold?**
+Yes, it is configurable per profile in the Sensitivity tab. Instances that routinely run large overnight batches may have a higher healthy backlog and want the threshold raised so the card only fires on genuine fall-behind. Set it above your normal batch peak but well below the point where binlog retention would risk a purge break.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Binlog Backlog (MB) on Primary* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

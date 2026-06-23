@@ -1,0 +1,153 @@
+---
+title: "Database Disk Usage %, ClickHouse"
+sidebarTitle: "Database Disk Usage %"
+description: "Database Disk Usage % for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Database Disk Usage %** is the proportion of the data disk that ClickHouse has consumed: used space divided by total space, expressed as a percentage. It is the single most consequential capacity metric on the cluster because ClickHouse does not degrade gracefully when disk fills. When free space runs out, inserts and merges fail outright and the server can stop accepting writes. The card exists to give a DBA the runway to act (drop a partition, add a TTL, expand the volume) long before the disk hits the wall. The `> 90%` alert is the "act now" line.
+
+| | |
+| --- | --- |
+| **What it tracks** | Database Disk Usage % for the selected period: used bytes as a percentage of total volume capacity on the disk(s) holding ClickHouse data. |
+| **Data source** | `system.disks` (`free_space`, `total_space`) for the live percentage; `system.parts` (`bytes_on_disk`) for the per-table attribution behind the headline. |
+| **Time window** | `RT`: real-time, read on the live poll, because disk can fill fast during a backfill. |
+| **Alert trigger** | `> 90%`. Above 90% the remaining runway is short and merges (which temporarily need extra space) start to risk failure; this is the threshold to add capacity or shed data. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+The headline is computed directly from `system.disks`:
+
+```text
+disk_usage_pct = (total_space - free_space) / total_space * 100
+```
+
+ClickHouse reports `free_space` and `total_space` per disk in bytes. On a single-disk default install there is one row (`default`); on a tiered storage setup (hot SSD plus cold object storage) there are multiple disks and the card reports the most pressured data disk, since that is the one that halts writes. The per-table attribution shown when you drill in comes from `SELECT table, sum(bytes_on_disk) FROM system.parts WHERE active GROUP BY table`, which tells you which table is eating the volume. Note the distinction: `bytes_on_disk` is the compressed on-disk size (what fills the volume), not the uncompressed logical data size.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A telemetry platform stores raw device events in ClickHouse on a 2 TB SSD volume. On 22 Mar 26 a new customer is onboarded and their backfill begins. At 14:00 the disk gauge reads a comfortable 64%; by 17:20 it has climbed to **91%** and the `> 90%` alert fires.
+
+The on-call DBA drills into the per-table attribution:
+
+| Table | Compressed size on disk | Share of used space | Note |
+| --- | --- | --- | --- |
+| `events_raw` | 1.31 TB | 71% | the backfill target, growing fast |
+| `events_rollup_1h` | 280 GB | 15% | aggregated, stable |
+| `device_registry` | 92 GB | 5% | reference data |
+| everything else | 168 GB | 9% | logs, system, temp |
+
+```text
+Runway calculation at the moment of alert:
+  Total volume:        2,000 GB
+  Used (91%):          1,820 GB
+  Free:                  180 GB
+  events_raw growth:    ~60 GB/hour during backfill
+  Time to 100%:          180 / 60 = ~3 hours
+  Merge headroom needed: merges can need 1x the largest part free;
+                         at <100 GB free, large merges start to fail first
+```
+
+The runway is roughly three hours to a hard stop, but merges on `events_raw` will begin failing before that because a merge of a large part needs temporary free space to write the merged output. The DBA has three levers:
+
+1. **Shed data with a partition drop.** `events_raw` is partitioned by day. Dropping partitions older than the retention window with `ALTER TABLE events_raw DROP PARTITION '...'` reclaims space instantly (a partition drop is a metadata operation, not a slow delete). This is the fastest relief.
+2. **Add a TTL** so the problem does not recur: `ALTER TABLE events_raw MODIFY TTL event_date + INTERVAL 30 DAY`. This is the durable fix, not the firefight.
+3. **Expand the volume.** On self-managed, grow the underlying block device and let the filesystem extend. On ClickHouse Cloud, storage auto-scales, so this card behaves differently (see FAQs).
+
+Three takeaways for the DBA:
+
+1. **90% on ClickHouse is closer to the edge than 90% on a typical app database.** Merges need transient free space, so the effective ceiling is below 100%. Treat 90% as "act now", not "still have 10% to play with".
+2. **The headline percentage is useless without the per-table attribution.** "91% full" does not tell you what to do; "events_raw is 71% of the disk" tells you exactly which partition to drop or which TTL to add.
+3. **A partition drop is instant; a row-level delete is not.** Reaching for `DELETE FROM` to reclaim space under pressure is the wrong move on ClickHouse; it is a mutation that rewrites parts and can make the space problem worse before it gets better. Drop partitions.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Database Disk Usage % | What the combination tells you |
+| --- | --- | --- |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | Disk is a 15% component of the composite. | Health Score down with disk high equals capacity is the dominant problem. |
+| [Active Parts (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) | A parts backlog often coincides with fast disk growth. | Disk climbing plus parts climbing equals a heavy ingest the merges cannot keep up with. |
+| [Partition Count (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/partition-count-top-10-tables) | Identifies which partitions to drop for relief. | Many old partitions on the biggest table equals an easy TTL or drop win. |
+| [Inserts per Second (live)](/nerve-centre/kpi-cards/clickhouse/inserts-per-second-live) | The rate driving disk growth. | High insert rate plus high disk equals a backfill or traffic surge eating the volume. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/clickhouse/last-successful-backup-hours-ago) | Before you drop partitions, confirm they are backed up. | Stale backup plus an urgent partition drop equals risk; back up first if the data matters. |
+| [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) | The other capacity ceiling that halts work. | Both high equals the instance is undersized for current load, not just storage-bound. |
+| [Too Many Parts Errors (24h)](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h) | The failure mode disk pressure can trigger via failed merges. | Disk high plus parts errors equals merges are failing for lack of space. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Confirm the live percentage** against the server with:
+
+```sql
+SELECT
+  name,
+  total_space,
+  free_space,
+  round((total_space - free_space) / total_space * 100, 1) AS used_pct
+FROM system.disks;
+```
+
+**Confirm the per-table attribution** with:
+
+```sql
+SELECT table, formatReadableSize(sum(bytes_on_disk)) AS size
+FROM system.parts
+WHERE active
+GROUP BY table
+ORDER BY sum(bytes_on_disk) DESC
+LIMIT 10;
+```
+
+At the OS level, `df -h` on the data path should agree closely with `system.disks`. **On ClickHouse Cloud**, storage is decoupled and elastic: the service Monitoring tab shows stored bytes but there is no fixed "total volume" to divide against in the same way, because storage auto-scales. On Cloud, read this card as a growth-and-cost signal (how much am I storing and how fast is it climbing) rather than a "runway to a halt" signal; the hard write-stop behaviour of a full local disk does not apply.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| Tiered storage | Variable | The card reports the most pressured disk; `df` on a single mount may show a different volume. |
+| Sampling instant | Marginal | A backfill moves the number minute to minute; a hand-run query and the live poll sample different instants. |
+| Compressed vs logical size | Our number reflects on-disk | `bytes_on_disk` is compressed; do not compare it to uncompressed dataset sizes. |
+| Detached parts and temp files | Our number may read higher | Detached parts and in-flight merge temp files occupy space the per-table `active` query does not show. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**We are on ClickHouse Cloud. Why is my disk usage not climbing toward a ceiling?**
+ClickHouse Cloud separates compute from storage and auto-scales storage, so there is no fixed local volume to fill. On Cloud, treat this card as a stored-data growth and cost signal, not a runway-to-halt warning. The `> 90%` write-stop behaviour described here applies to self-managed instances with a fixed data volume.
+
+**The disk is at 88% and rising during a backfill. Should I wait or act now?**
+Act now. Merges need transient free space, so failures begin before 100%. Drop the oldest partitions on the biggest table (instant relief) or pause the backfill. Do not wait for the 90% alert if you can already see the growth rate will cross it within your response time.
+
+**Why should I drop partitions instead of running DELETE to free space?**
+A partition drop is a metadata operation that frees the space immediately. A `DELETE` (lightweight or mutation) rewrites parts and, for a mutation, temporarily needs more disk to write the new parts, which makes a space crisis worse. Under disk pressure, always drop partitions.
+
+**The percentage looks high but my dataset is small. Where did the space go?**
+Three usual suspects: detached parts (`SELECT * FROM system.detached_parts`), in-flight merge temporary files during a large merge, and uncleaned `tmp` directories after a crash. Also check that another process is not sharing the volume. The per-table `active` parts query will not show detached or temp space.
+
+**Does this include the disk used by `system` tables and logs?**
+Yes. The headline is whole-volume usage from `system.disks`, which includes `system.query_log`, `system.part_log`, and other internal tables. On a busy cluster these logs can grow large; set a TTL on them (for example `system.query_log` TTL) if they are a meaningful share of the per-table attribution.
+
+**Tiered storage: which disk does the card show?**
+The most pressured data disk, because that is the one that halts writes when full. If your hot SSD tier is at 94% while the cold object tier is at 30%, the card shows 94% and alerts, because new inserts land on the hot tier first. Configure storage policies and TTL-to-disk moves so hot data ages down to the cold tier before the SSD fills.
+
+**Can I set a different alert threshold than 90%?**
+Yes, in the Sensitivity tab. Clusters with slow, predictable growth and fast volume-expansion tooling may run a higher threshold; clusters with spiky backfills and slow procurement should alert earlier, at 80 to 85%, to buy response time.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Database Disk Usage %* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

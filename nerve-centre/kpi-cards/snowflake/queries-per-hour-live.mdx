@@ -1,0 +1,149 @@
+---
+title: "Queries per Hour (live), Snowflake"
+sidebarTitle: "Queries per Hour (live)"
+description: "Queries per Hour (live) for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The rate at which queries are hitting your account right now, expressed as queries per hour. It is the heartbeat of the warehouse: a live measure of how much work is flowing through Snowflake at this moment. On its own it carries no judgement (more queries is neither good nor bad), but it is the denominator for almost every efficiency and cost question you will ask. When it spikes, something changed: a new dashboard rolled out, a scheduled job mis-fired, a bot started hammering an API, or genuine business demand surged. For a platform team it is the first number you glance at to know whether the account is busy, idle, or behaving unusually.
+
+| | |
+| --- | --- |
+| **What it tracks** | The number of queries executed across the account per hour, computed live for the selected period. It counts all query types (SELECT, DML, DDL, and metadata/utility statements) unless filtered. |
+| **Data source** | Derived from `SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY` (and live query monitoring for the real-time edge), counting query starts within the rolling window and projecting to an hourly rate. |
+| **Time window** | `RT`. Real-time, refreshed on the standard live cadence and expressed as a per-hour rate. |
+| **Alert trigger** | None (`-`). This is a context/heartbeat metric, not a threshold card. Anomalies on this signal are caught by the dedicated alert cards (error-rate spike, credit-burn anomaly, queue depth) rather than a fixed QPH limit. |
+| **Units** | Queries per hour (account-wide; per-warehouse breakdown on drill-in). |
+| **Latency** | `QUERY_HISTORY` in `ACCOUNT_USAGE` can trail by minutes; the live edge of the card uses fresher monitoring, so the most recent minutes are best-effort. |
+| **Roles** | owner, platform, dba, finops |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card counts query starts in a recent window and normalises to an hourly rate so the number is comparable regardless of how often it samples:
+
+```text
+window_minutes  = sampling window (e.g. last 5 minutes for the live edge)
+queries_in_win  = count of QUERY_HISTORY rows with START_TIME in the window
+queries_per_hour = queries_in_win * (60 / window_minutes)
+
+# per-warehouse drill-in
+qph[warehouse]   = count(START_TIME in window WHERE WAREHOUSE_NAME = w) * (60 / window_minutes)
+```
+
+Two notes. First, "query" here means any statement Snowflake records in `QUERY_HISTORY`, including cheap metadata operations (`SHOW`, `DESCRIBE`, result-cache hits) and the queries Snowsight itself runs to render dashboards. That is why an idle-looking account can still show a non-trivial QPH. Second, because the value is a rate projected from a short window, a single burst within that window scales up proportionally, which is exactly what makes the live card responsive to spikes. For a stable hourly count rather than a projected rate, use a longer reporting period.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs Snowflake behind a BigCommerce store's data stack. On a normal weekday the account hums along at roughly 1,800 queries per hour. Snapshot at 11 Jun 26, 14:00 UTC.
+
+| Time | Queries per hour | What was happening |
+| --- | --- | --- |
+| 13:00 | 1,750 | Baseline: dbt model runs, BI refreshes, ad-hoc analyst queries. |
+| 13:30 | 1,820 | Baseline, normal afternoon. |
+| 13:55 | **9,400** | Sudden 5x jump. |
+| 14:00 | 9,600 | Still elevated. |
+
+The heartbeat jumped from ~1,800 to ~9,600 QPH in five minutes. The card itself has no alert (it is context), but the spike is the cue to investigate. The platform team drills into the per-warehouse breakdown:
+
+| Warehouse | Baseline QPH | Now | Note |
+| --- | --- | --- | --- |
+| `TRANSFORM_WH` | 400 | 410 | Normal. |
+| `BI_WH` | 1,100 | 1,150 | Normal. |
+| `INGEST_WH` | 250 | 250 | Normal. |
+| `ADHOC_WH` | 50 | **7,790** | The entire spike is here. |
+
+The whole surge is on `ADHOC_WH`. A quick look at `QUERY_HISTORY` filtered to that warehouse shows thousands of near-identical lightweight `SELECT 1`-style statements from a single service account: a misconfigured connection-pool health check that started firing in a tight loop after a deploy. No business value, pure noise, and it was driving `ADHOC_WH` toward saturation.
+
+```text
+Diagnosis path from a QPH spike:
+  1. QPH jumps 5x        -> something changed
+  2. Drill per-warehouse -> ADHOC_WH owns the spike
+  3. Drill QUERY_HISTORY -> one service account, repeated trivial query
+  4. Cross-check business: Snowflake QPS Spike vs Ecom Order Rate flat
+                           -> not real demand, it is a loop / bot
+  5. Action: fix the health-check interval; QPH returns to ~1,800
+```
+
+Three takeaways:
+
+1. **QPH is the heartbeat, not the diagnosis.** The number tells you the rhythm changed; the per-warehouse and `QUERY_HISTORY` drill-ins tell you why.
+2. **A spike with no matching business demand is the tell.** If queries surge while orders stay flat (see the cross-channel card), it is almost always a loop, a bot, or a dashboard storm, not growth.
+3. **Read it as a denominator.** Every cost-per-query and efficiency question divides by this number. When QPH moves, expect [Avg Cost per Query ($)](/nerve-centre/kpi-cards/snowflake/avg-cost-per-query) and saturation to move with it.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Queries per Hour | What the combination tells you |
+| --- | --- | --- |
+| [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) | QPH is the load; saturation is whether that load fills the warehouse. | A QPH spike plus rising saturation pinpoints concurrency pressure. |
+| [Avg Cost per Query ($)](/nerve-centre/kpi-cards/snowflake/avg-cost-per-query) | QPH is the denominator of cost-per-query. | Flat cost-per-query during a QPH spike means cheap queries; rising means heavy ones. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/snowflake/query-error-rate) | A spike of failing queries can inflate QPH with no useful work. | High QPH plus high error rate equals a retry storm or broken job hammering the account. |
+| [Snowflake QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/snowflake/snowflake-qps-spike-vs-ecom-order-rate) | The cross-channel sanity check on whether a query surge maps to real demand. | Query spike with flat orders equals a dashboard storm or bot, not growth. |
+| [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) | More queries usually means more compute, hence more credits. | A QPH surge that does not move credits means the queries are trivial (cache hits, metadata). |
+| [Active Warehouses](/nerve-centre/kpi-cards/snowflake/active-warehouses) | How many warehouses are awake to serve the load. | Rising QPH on a shrinking warehouse count concentrates pressure on fewer warehouses. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake:**
+
+> **Snowsight → Monitoring → Query History** for the live and recent query feed, filterable by warehouse, user, and status.
+> Query `SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY` and `COUNT(*)` over a `START_TIME` range to reproduce the rate by hand.
+> The `INFORMATION_SCHEMA.QUERY_HISTORY()` table function gives lower-latency recent results for the live edge.
+> **Snowsight → Admin → Warehouses** shows per-warehouse running query counts in real time.
+
+**Why our number may legitimately differ from Snowflake's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Rate vs count** | Variable | We project a short window to a per-hour rate; Snowsight shows raw counts over the period you select. A 5-minute burst reads higher as a projected rate. |
+| **`ACCOUNT_USAGE` latency** | Recent minutes lower | `QUERY_HISTORY` in `ACCOUNT_USAGE` can trail by minutes; the freshest data uses `INFORMATION_SCHEMA`, so the two sources can disagree at the live edge. |
+| **What counts as a query** | Variable | We count all `QUERY_HISTORY` rows including metadata/utility statements; if you filter Snowsight to only `SELECT`/DML, your count is lower. |
+| **Time zone** | Window edges shift | Snowsight defaults to account time zone; Vortex IQ windows on UTC and renders in your profile time zone. |
+| **Result-cache hits** | Variable | Cache-served queries still appear in `QUERY_HISTORY`; if you exclude them in Snowsight, the counts diverge. |
+
+**Cross-connector reconciliation:** to tell a genuine demand surge from noise, line QPH up against [Snowflake QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/snowflake/snowflake-qps-spike-vs-ecom-order-rate). Queries up with orders up is growth; queries up with orders flat is a storm to investigate.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does this card have no alert?**
+QPH is a context metric, the heartbeat, not a pass/fail threshold. A high QPH can be perfectly healthy (busy business day) or a problem (retry storm). Rather than a blunt QPH limit, the meaningful anomalies are caught by purpose-built alert cards: [Query Error Rate Spike (>1% in 1h)](/nerve-centre/kpi-cards/snowflake/query-error-rate-spike-1-in-1h), [Credit Burn +50% Week-over-Week](/nerve-centre/kpi-cards/snowflake/credit-burn-50-week-over-week), and [Warehouse Queueing Sustained (>5 queries queued)](/nerve-centre/kpi-cards/snowflake/warehouse-queueing-sustained-5-queries-queued).
+
+**My account shows hundreds of QPH but nobody is running anything. Why?**
+Because "query" includes a lot of background activity: BI tools polling for freshness, Snowsight rendering its own panels, metadata statements (`SHOW`, `DESCRIBE`), result-cache hits, and connection health checks. An "idle" account is rarely at zero QPH. Drill into `QUERY_HISTORY` by user to see what is generating the baseline.
+
+**Is QPH the same as Snowflake's QPS?**
+It is the same signal at a different scale: queries per second times 3,600. We report per-hour because warehouse workloads are spikier than web traffic and an hourly rate reads more naturally for capacity and cost conversations. The cross-channel card uses "QPS" in its name for the ecom-traffic comparison, but the underlying count is identical.
+
+**Why does the live number jump around so much minute to minute?**
+Because it is a rate projected from a short window. A burst of queries in the sampling window scales up proportionally to an hourly figure, which makes the live card responsive but jumpy. For a steadier read, select a longer period so the rate averages over more data.
+
+**Does a higher QPH cost more money?**
+Not directly. Cost is driven by warehouse credits (compute time), not query count. A thousand trivial cache-hit queries can cost almost nothing, while ten heavy table scans burn real credits. Read QPH alongside [Credits Burned (24h)](/nerve-centre/kpi-cards/snowflake/credits-burned-24h) and [Avg Cost per Query ($)](/nerve-centre/kpi-cards/snowflake/avg-cost-per-query) to connect volume to spend.
+
+**Can I see which user or warehouse is driving the QPH?**
+Yes, drill into the card for a per-warehouse breakdown, then reconcile against `QUERY_HISTORY` grouped by `USER_NAME` or `WAREHOUSE_NAME` in Snowsight to attribute the load. This is the standard path when a spike appears.
+
+**Does QPH include queued queries or only running ones?**
+It counts query *starts* (admitted and executing), not queries waiting in the queue. A warehouse can show steady QPH while a queue builds behind it; for the waiting side, read [Avg Query Queue Depth per Warehouse](/nerve-centre/kpi-cards/snowflake/avg-query-queue-depth-per-warehouse).
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Queries per Hour (live)* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

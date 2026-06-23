@@ -1,0 +1,145 @@
+---
+title: "SQL Query Latency p99 (ms), Databricks"
+sidebarTitle: "SQL Query Latency p99 (ms)"
+description: "SQL Query Latency p99 (ms) for Databricks lakehouses. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **SQL Query Latency p99 (ms)** is the 99th-percentile completion time for SQL statements on your Databricks SQL warehouses: 99% of queries finish faster than this, and the worst 1% take longer. This is the extreme-tail card. It catches the pathological queries that p95 smooths over: a join exploding on data skew, a scan with no partition pruning, a query stuck behind a giant one in a saturated queue. When p99 alone spikes while p50 and p95 stay calm, you have a small number of specific, fixable offenders rather than a system-wide slowdown.
+
+| | |
+| --- | --- |
+| **What it tracks** | The 99th-percentile total query duration on your Databricks SQL warehouses over the window: the slowest 1% of statements. |
+| **Data source** | Databricks SQL query history (`system.query.history` / Query History API), durations aggregated to the 99th percentile. |
+| **Time window** | `RT/5m` (real-time, evaluated over a rolling 5-minute window) |
+| **Alert trigger** | `> 30000ms`. When the trailing-window p99 exceeds 30 seconds, the worst 1% of queries have entered timeout-risk territory and the on-call data engineer is notified. |
+| **Roles** | owner, engineering |
+| **Card class** | Hero and Sensitivity card: it drives the Performance health signal and is configurable in the Sensitivity tab. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Vortex IQ reads completed statements from your Databricks SQL warehouse query history over the rolling 5-minute window and computes the 99th percentile of total query duration. As with the other latency percentiles, "total duration" is full wall-clock time: queue wait plus compilation/planning plus execution plus result fetch. The value is reported in milliseconds, so 32,000 means 32 seconds.
+
+The 99th percentile is deliberately sensitive to outliers. It answers "how bad is a near-worst-case query right now?" and is the percentile most likely to expose individual broken queries. A useful mental model: if p99 is roughly in line with p95, your tail is uniform and load-driven; if p99 is many times p95 (for example p95 = 4s but p99 = 32s), a small set of specific queries is behaving very differently from the rest and should be hunted down by name in [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries).
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A subscriptions business runs a `Pro Large` SQL warehouse that serves both finance reporting and an hourly Delta job that aggregates order events into a churn-risk table. Snapshot taken on 02 May 26 at 14:10 BST.
+
+| Reading | Value |
+| --- | --- |
+| p50 latency | 520ms |
+| p95 latency | 3,900ms (healthy, below 5,000ms) |
+| **p99 latency** | **34,500ms** (alert: above 30,000ms) |
+| Warehouse saturation | 41% |
+| Slow-query rate | 1.3% |
+
+The p99 card turns red at 34.5 seconds, but p50, p95, saturation, and slow-query rate are all healthy. This pattern is unambiguous: the warehouse is not under load. A tiny number of queries (the worst 1%) are running enormously slower than everything else.
+
+1. **It is a query problem, not a capacity problem.** With saturation at 41% there is plenty of headroom, so scaling the warehouse would waste money and fix nothing. The cause lives inside specific statements.
+2. **Drilling into the named offenders finds the culprit.** [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries) shows the churn-risk aggregation joining a 2-billion-row events table to a customer dimension without a partition filter, forcing a full-table scan every run. The query plan confirms no file pruning.
+3. **The fix is targeted.** Add a date-partition predicate so the job scans only the last 24 hours of events, and run `OPTIMIZE ... ZORDER BY (customer_id)` on the events table so the join key is co-located. After the change, the same job's duration falls from 34s to under 3s and p99 settles back near p95.
+
+```text
+Why scaling would have been the wrong call:
+  - Saturation 41%  -> warehouse has spare capacity
+  - p50 520ms, p95 3.9s -> 99% of queries are fine
+  - Only the worst 1% are pathological
+  -> The lever is query/table layout (partition predicate + Z-ORDER),
+     not a bigger or multi-cluster warehouse.
+```
+
+Three takeaways:
+
+1. **p99 isolated from p50/p95 means "find the offender", not "scale".** The shape of the percentile spread tells you whether to fix queries or add capacity.
+2. **The 30,000ms threshold is a timeout early-warning.** Many BI tools and JDBC clients default to a 30 to 60 second statement timeout. A p99 above 30 seconds means your worst queries are about to start failing outright, which would show up next in [SQL Query Error Rate %](/nerve-centre/kpi-cards/databricks/sql-query-error-rate).
+3. **Recurring scheduled jobs are common p99 culprits.** Because they run on a fixed cadence, a single badly-written hourly job can spike p99 like clockwork. Correlate p99 spikes with your job schedule using [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with p99 Latency | What the combination tells you |
+| --- | --- | --- |
+| [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) | The broad tail. | p99 close to p95 equals load-driven tail; p99 far above p95 equals specific offenders. |
+| [SQL Query Latency p50 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p50-ms) | The median baseline. | Low p50 with extreme p99 confirms the system is healthy and a few queries are pathological. |
+| [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries) | The named offenders. | Pinpoints exactly which statements are sitting in the worst 1%. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/databricks/slow-query-rate) | The count of slow queries. | Low slow-query rate plus high p99 equals a handful of very slow queries, not a broad problem. |
+| [SQL Query Error Rate %](/nerve-centre/kpi-cards/databricks/sql-query-error-rate) | The failure peer. | A high p99 often precedes errors as the worst queries cross client timeouts. |
+| [SQL Warehouse Saturation %](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation) | The capacity peer. | Low saturation plus high p99 confirms it is a query problem, not a load problem. |
+| [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) | The scheduled-job view. | Correlates clockwork p99 spikes with a specific recurring job. |
+| [Slow SQL Queries During Checkout Window](/nerve-centre/kpi-cards/databricks/slow-sql-queries-during-checkout-window) | The revenue cross-channel view. | Tells you whether the worst queries land during live checkout traffic. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **Query History** in the Databricks SQL workspace, sorted by duration descending, surfaces the exact slow-tail statements behind a p99 spike, including their query plans.
+> **`system.query.history`** (Unity Catalog system tables) lets you reproduce the percentile and join to statement text.
+> **Query Profile** (click into any slow statement) shows the execution stages, spill, and skew that explain why a query landed in the worst 1%.
+
+To match the card precisely:
+
+```sql
+SELECT percentile(total_duration_ms, 0.99) AS p99_ms
+FROM system.query.history
+WHERE warehouse_id = '<your_warehouse_id>'
+  AND start_time >= current_timestamp() - INTERVAL 5 MINUTES;
+```
+
+**Why our number may legitimately differ from the Databricks UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Small sample sensitivity** | Can swing | Over a 5-minute window with few queries, p99 is computed from a handful of statements and can move sharply; the UI over a longer range smooths it. |
+| **Duration definition** | Vortex IQ may read higher | We use total duration including queue wait; some UI columns show execution time only. |
+| **System-table latency** | Brief lag | `system.query.history` can lag completion by a few seconds. |
+| **Time zone / window edges** | Marginal | Vortex IQ aligns the 5-minute window to your reporting time zone. |
+| **Cancelled / failed statements** | Slight | A cancelled long-running query may or may not appear depending on filter; this affects the extreme tail most. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | A p99 spike rarely affects revenue directly because it is only 1% of queries, unless one of those queries feeds a synchronous storefront feature. | Revenue impact during a p99 spike means a customer-facing query is in the worst 1%; investigate via the checkout cross-channel card. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My p99 jumps around far more than p95. Is that a bug?**
+No. p99 is computed from the worst 1% of queries, so over a short 5-minute window it can be derived from just a few statements and will naturally be noisier than p95 or p50. Treat sustained p99 elevation as the signal; a single transient spike from one heavy ad-hoc query is usually safe to ignore.
+
+**p99 breached 30 seconds but no query has actually failed. Should I worry?**
+Yes, treat it as an early warning. The 30,000ms threshold sits just below the default statement timeout of many JDBC/ODBC clients and BI tools. A p99 above 30 seconds means your worst queries are close to timing out; if it keeps climbing, expect [SQL Query Error Rate %](/nerve-centre/kpi-cards/databricks/sql-query-error-rate) to rise next as clients abandon queries.
+
+**How do I find which query is responsible?**
+Open [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries) or sort Query History by duration descending, then open the Query Profile for the offender. Look for full-table scans (no partition pruning), large shuffles, spill to disk, or skew warnings. These are the usual causes of a query in the worst 1%.
+
+**Should I scale my warehouse to fix a p99 spike?**
+Almost never, if p50/p95 and saturation are healthy. A clean p50/p95 with a high p99 is a query problem, and scaling adds cost without fixing it. Fix the offending query: add partition predicates, run OPTIMIZE / Z-ORDER, broadcast small dimension tables, or split the work. Scale only when p95 and saturation are also high.
+
+**Does the p99 threshold need tuning per warehouse?**
+Often yes. A warehouse dedicated to heavy nightly transformations may legitimately have a p99 above 30 seconds; alerting on it would be noise. Set the Sensitivity threshold to reflect each warehouse's real worst-case workload, and consider a higher threshold (or stacking the card per warehouse) for ETL-only warehouses.
+
+**Why might p99 be lower than I expect during a known-slow period?**
+If very slow queries are being cancelled by client timeouts before they complete, they may drop out of the completed-statement percentile and instead surface as errors. A suspiciously calm p99 alongside a rising error rate is a sign that queries are failing rather than finishing slowly. Always read p99 next to [SQL Query Error Rate %](/nerve-centre/kpi-cards/databricks/sql-query-error-rate).
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*SQL Query Latency p99 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

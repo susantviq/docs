@@ -1,0 +1,139 @@
+---
+title: "PgBouncer Pool Saturation vs Traffic Burst, PostgreSQL"
+sidebarTitle: "PgBouncer Pool Saturation vs Traffic Burst"
+description: "PgBouncer Pool Saturation vs Traffic Burst for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Cross-Channel](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **PgBouncer Pool Saturation vs Traffic Burst** overlays connection-pool saturation against the storefront traffic curve, row by row over a rolling 15-minute window. It answers the question that matters during a sale: "when the front-end sends a wave of shoppers, does the database connection pool have room to serve them, or is it about to start queuing?" A pool sitting at 95% during a traffic burst is the precise moment checkout and product pages begin to stall, so this card pairs an infrastructure signal (PgBouncer / pgpool pool usage) with a demand signal (sessions or requests from the ecommerce connector) to show revenue at risk before it is lost.
+{/* /HUMAN_AUTHORED:tldr */}
+
+| | |
+| --- | --- |
+| **PostgreSQL side** | Pool saturation from PgBouncer's `SHOW POOLS` / `SHOW STATS` admin console (`cl_active`, `cl_waiting`, `sv_active`, `sv_idle`) or pgpool's equivalent, expressed as a percentage of configured `pool_size`. Falls back to `pg_stat_activity` saturation against `max_connections` when no external pooler is present. |
+| **Ecom side** | A traffic-burst signal from the connected storefront: live sessions or request rate from the Shopify, BigCommerce, or Adobe Commerce connector, windowed to the same 15-minute buckets. |
+| **What the card shows** | A table, one row per 15-minute bucket, putting pool saturation next to the traffic level so you can see whether saturation is tracking demand (capacity problem) or spiking on its own (leak / runaway query problem). |
+| **Aggregation window** | 15-minute rolling window, refreshed every cycle. Short enough to catch a flash-sale spike, long enough to smooth single-request noise. |
+| **Time window** | `15m` (rolling). |
+| **Alert trigger** | `> 90%` pool saturation **during a traffic burst**. The conjunction is the point: 90% saturation at 03:00 with no traffic is a leak; 90% during a peak-hour burst is imminent revenue loss. |
+| **Roles** | DBA, platform engineering, SRE, ecommerce operations. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calc */}
+For the PostgreSQL side, the engine reads PgBouncer's admin console. `SHOW POOLS` returns per-database, per-user pools with `cl_active` (client connections doing work), `cl_waiting` (clients queued for a server connection), `sv_active`, and `sv_idle`. Saturation is computed as the server connections in use against the configured `pool_size`:
+
+```text
+pool_saturation_pct = (sv_active) / pool_size * 100
+queue_pressure      = cl_waiting        (clients waiting for a free server connection)
+```
+
+A pool at 100% with `cl_waiting > 0` is the queuing state: every backend connection is busy and new client requests are stacking up behind them. Where no external pooler exists, the engine falls back to `pg_stat_activity` (active + idle-in-transaction backends against `max_connections`), the same basis as the [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) card.
+
+For the ecom side, the traffic-burst signal is the storefront session or request rate over the same 15-minute buckets, drawn from whichever ecommerce connector is linked. The card aligns both series on the same time axis and flags any bucket where pool saturation exceeds 90% while traffic is elevated above its rolling baseline. The cross-channel insight is in the correlation, not either number alone: saturation that rises and falls with traffic is a pure capacity ceiling you can raise; saturation that climbs while traffic is flat is a connection leak or a long-held transaction, which more pool size will not fix.
+{/* /HUMAN_AUTHORED:calc */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team supports a storefront on BigCommerce backed by an application that talks to PostgreSQL through PgBouncer in transaction-pooling mode, `pool_size = 50`. A flash sale opens at 12:00 BST on 22 Apr 26. Snapshot of the 15-minute table around the spike:
+
+| Bucket (BST) | Storefront sessions | sv_active / pool_size | Pool saturation | cl_waiting |
+| --- | --- | --- | --- | --- |
+| 11:30 | 1,200 | 22 / 50 | 44% | 0 |
+| 11:45 | 1,500 | 28 / 50 | 56% | 0 |
+| 12:00 | 6,800 | 48 / 50 | 96% | 31 |
+| 12:15 | 7,100 | 50 / 50 | 100% | 184 |
+
+The card headline flags **96% saturation during a traffic burst** at 12:00 and escalates as the 12:15 bucket hits 100% with 184 clients queued. The story the table tells:
+
+1. **Saturation is tracking demand, not leaking.** At 11:30 to 11:45 the pool sat comfortably under 60% with no waiters. The jump to 96% lands exactly on the sessions jump from 1,500 to 6,800. This is a capacity ceiling reached by genuine traffic, not a runaway query.
+2. **The pool is now the bottleneck, not PostgreSQL.** With `cl_waiting` at 184, requests are queuing inside PgBouncer before they ever reach the database. Page renders that need a query are waiting milliseconds-to-seconds for a free server connection. This is where storefront latency and checkout abandonment begin.
+
+```text
+Sizing the revenue exposure for the 12:15 bucket:
+  - 184 clients waiting, average wait observed: 1.8s for a free connection
+  - Checkout pages affected during the 15-min bucket: ~620
+  - Baseline checkout conversion: 3.1%; observed during saturation: 1.9%
+  - Lost conversions in the bucket: ~620 x (3.1% - 1.9%) = ~7 orders
+  - Average order value: GBP 58 -> ~GBP 406 at risk in 15 minutes, recurring while saturated
+```
+
+The action is immediate and has two horizons. Right now: raise PgBouncer `pool_size` (and confirm PostgreSQL `max_connections` has headroom for the larger pool) or shed non-critical background workers off the same pool. Structurally: this sale revealed that `pool_size = 50` cannot serve peak demand, so the team raises the ceiling before the next campaign and adds the saturation alert to the pre-sale runbook.
+
+Three takeaways:
+
+1. **The conjunction is the signal.** 90% saturation alone is ambiguous. 90% saturation *during a burst* is a near-certain revenue event, which is why the alert requires both conditions.
+2. **`cl_waiting` is the line between "busy" and "broken".** A pool at 100% with zero waiters is fully utilised but coping. The same pool with hundreds of waiters is actively shedding requests. Read the waiter count, not just the percentage.
+3. **More pool size only helps a capacity ceiling.** If saturation tracks traffic, raise the pool. If saturation climbs while traffic is flat, the fix is upstream (a connection leak or a stuck transaction), and a bigger pool just delays the wall. Pair with [Idle-in-Transaction Backends](/nerve-centre/kpi-cards/postgresql/idle-in-transaction-backends) to tell them apart.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this card | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) | The single-instance saturation gauge without the traffic overlay. | This card adds the demand context that explains *why* saturation moved. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/postgresql/connection-pool-at-90-saturation) | The alert-list escalation when saturation crosses threshold. | When the burst pushes saturation past 90%, this is where the page fires. |
+| [Idle-in-Transaction Backends](/nerve-centre/kpi-cards/postgresql/idle-in-transaction-backends) | The leak diagnosis: backends holding connections without doing work. | Saturation high with many idle-in-tx backends equals a leak, not a capacity ceiling. |
+| [Connections In Use](/nerve-centre/kpi-cards/postgresql/connections-in-use) | The raw backend count behind the percentage. | Confirms whether the absolute connection count is near `max_connections`. |
+| [PostgreSQL QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/postgresql/postgresql-qps-spike-vs-ecom-order-rate) | The query-volume sibling of the same demand correlation. | Saturation plus a QPS spike with no order spike points at bot traffic loading the pool. |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/postgresql/slow-queries-during-checkout-window-5m) | The latency view of the same checkout impact. | A saturated pool and slow checkout queries together explain checkout abandonment. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The executive composite that weights pool headroom. | Sustained burst saturation drags the composite down during peak hours. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look directly:**
+
+> Connect to the PgBouncer admin console (`psql -p 6432 pgbouncer`) and run `SHOW POOLS;` for live `cl_active`, `cl_waiting`, `sv_active`, `sv_idle` per pool, and `SHOW STATS;` for request rates. `SHOW CONFIG;` confirms the configured `pool_size` and `max_client_conn`.
+> Without an external pooler, `SELECT count(*) FROM pg_stat_activity WHERE state IN ('active','idle in transaction');` against `SHOW max_connections;` gives the fallback saturation.
+> For the traffic side, reconcile against the storefront analytics in the linked ecommerce connector (Shopify, BigCommerce, or Adobe Commerce) for the same 15-minute window.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Pooling mode** | Variable | In transaction-pooling mode `sv_active` reflects connections mid-transaction; in session mode it reflects whole client sessions. The percentage means different things per mode; the card reports the mode in the row detail. |
+| **Multiple pools** | Higher headline | A PgBouncer instance has one pool per database/user pair. The card headlines the most saturated pool; a single-pool `SHOW POOLS` query you run by hand shows only that pool. |
+| **Sample alignment** | Marginal | The ecom traffic signal and the pool sample are aligned to 15-minute buckets; a manual `SHOW POOLS` at an arbitrary second sees an instantaneous value that may sit above or below the bucket average. |
+| **Fallback basis** | Variable | Where no pooler exists, the card uses `pg_stat_activity` against `max_connections`, which is a coarser ceiling than a PgBouncer `pool_size`. |
+
+**On managed services:** RDS Proxy and Aurora expose pinning and connection metrics through CloudWatch (`DatabaseConnections`, `MaxDatabaseConnectionsAllowed`, and RDS Proxy's `ClientConnections` / `DatabaseConnections`); Cloud SQL's built-in connection metrics appear in Cloud Monitoring. Where a managed pooler replaces PgBouncer, reconcile against the provider's connection metrics rather than the PgBouncer admin console.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The pool shows 100% but PostgreSQL `max_connections` is nowhere near full. How?**
+That is exactly what a connection pooler is for. PgBouncer multiplexes many client connections onto a small set of server connections. The pool can be 100% saturated (every server connection busy) while PostgreSQL itself sees only `pool_size` backends, far below `max_connections`. The bottleneck is the pool, and the fix is to raise `pool_size`, provided PostgreSQL has the headroom for the extra backends.
+
+**Saturation spiked but storefront traffic was flat. What does that mean?**
+A leak or a stuck transaction, not a capacity problem. Backends are holding server connections without doing useful work, often clients that opened a transaction and stalled (see [Idle-in-Transaction Backends](/nerve-centre/kpi-cards/postgresql/idle-in-transaction-backends)). Raising `pool_size` only postpones the wall. Find the code path holding connections open and fix `idle_in_transaction_session_timeout`.
+
+**Why require a traffic burst for the alert? 90% saturation sounds bad on its own.**
+Because the same percentage means very different things at different times. Ninety percent during a 03:00 batch window with no shoppers is an operational note; ninety percent during a peak-hour burst is live revenue loss. Requiring both conditions keeps the alert tied to actual customer impact rather than paging on overnight maintenance.
+
+**We do not run PgBouncer. Does this card still work?**
+Yes, with a coarser basis. The engine falls back to `pg_stat_activity` saturation against `max_connections`, the same data as the [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) card. You lose the `cl_waiting` queue-depth signal, which is PgBouncer-specific, but you keep the saturation-versus-traffic correlation.
+
+**The two series are not perfectly aligned in time. Why?**
+The PostgreSQL pool sample and the ecommerce traffic signal come from different systems with different collection latencies, then get bucketed to the same 15-minute grid. A small phase offset between the curves is normal. Read the correlation across several buckets rather than demanding a per-second match.
+
+**Can I tell bot traffic from real demand here?**
+Partly. If pool saturation spikes with traffic but the linked [PostgreSQL QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/postgresql/postgresql-qps-spike-vs-ecom-order-rate) card shows query volume rising with no matching order rise, the burst loading your pool is likely scrapers or bots rather than buyers. Read the two cross-channel cards together during any unexplained spike.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*PgBouncer Pool Saturation vs Traffic Burst* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

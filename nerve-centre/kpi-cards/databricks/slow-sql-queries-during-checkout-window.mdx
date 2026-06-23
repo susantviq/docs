@@ -1,0 +1,177 @@
+---
+title: "Slow SQL Queries During Checkout Window, Databricks"
+sidebarTitle: "Slow SQL Queries During Checkout Window"
+description: "Slow SQL Queries During Checkout Window for Databricks stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A row-level table of Databricks SQL queries that ran slow (above the warehouse latency threshold) during the active checkout window, correlated against a live drop in storefront orders. For a platform team, this answers one question: "is my data layer the reason checkout is stuttering right now?" Each row is one slow statement: the warehouse it ran on, the user or service principal that issued it, the elapsed time, and whether it overlapped a checkout conversion dip. When five or more slow queries co-occur with a measurable checkout drop in the same five-minute window, the card fires. This is the card you open at 14:00 on a flash-sale day when the orders graph wobbles and nobody knows why.
+
+| | |
+| --- | --- |
+| **Data source** | Databricks `system.query.history` (Unity Catalog system table) joined to the SQL Statement Execution and Query History APIs. Rows are filtered to statements whose `total_duration_ms` exceeds the warehouse slow-query threshold and whose `start_time` falls inside the active checkout window. The ecom side is the storefront order rate from the connected Shopify, BigCommerce or Adobe Commerce connector. |
+| **Metric basis** | Per-statement execution records, NOT aggregate warehouse metrics. A row exists for every individual slow query, so the count is the number of distinct slow statements, not a rolled-up average. The "checkout drop" half is the order-per-minute delta against the same weekday-and-hour baseline. |
+| **Aggregation window** | `5m` rolling, refreshed every 60 seconds. Each evaluation re-reads the trailing five minutes of `system.query.history` and the trailing five minutes of storefront orders. |
+| **Slow threshold** | A query is "slow" when `total_duration_ms` exceeds the configured warehouse threshold (default 5,000 ms, matching the [SQL Query Latency p95](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) alert). The threshold is per warehouse so a heavy analytics warehouse and a light serving warehouse can carry different bars. |
+| **Co-occurrence rule** | The card surfaces slow queries at all times, but the alert only fires when slow queries AND a checkout drop happen together. A slow query during a healthy checkout window is logged but does not page; a checkout drop with no slow queries points the finger elsewhere (storefront, payment gateway, CDN). |
+| **What counts as a row** | Any statement in `system.query.history` with `statement_type IN (SELECT, INSERT, UPDATE, MERGE, ...)`, `total_duration_ms` over threshold, and `start_time` inside the five-minute checkout window. Both interactive (BI tool) and serving (storefront-facing) queries are included. |
+| **What does NOT count** | (1) Queries that finished under threshold; (2) queries outside the five-minute window; (3) `CANCELLED` statements that never executed; (4) metadata or warehouse-housekeeping statements (`USE CATALOG`, `SET`); (5) queries on warehouses not tagged as serving the storefront, if a warehouse scope is configured. |
+| **Filtered warehouses** | All SQL warehouses by default. Teams that run a separate analytics warehouse can scope the card to the serving warehouse only, so a slow BI dashboard does not raise a false checkout alarm. |
+| **Time zone** | Workspace timezone for table axes; UTC for cross-connector windowing so the Databricks window and the ecom order window line up exactly. |
+| **Time window** | `5m` (rolling, refreshed every 60 seconds) |
+| **Alert trigger** | `>5 slow queries co-occur with checkout drop`, five or more slow statements in the same five-minute window as a measurable storefront order dip pages the on-call. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card is computed in three stages, all over the same trailing five-minute window.
+
+1. **Pull slow statements.** The engine queries `system.query.history` (or the Query History API where the system table is not enabled) for the last five minutes, keeping rows where `total_duration_ms` is greater than the warehouse slow threshold. Each surviving row becomes a table entry: statement id, warehouse, executing identity, `total_duration_ms`, `rows_produced`, and the `start_time` to `end_time` span.
+
+2. **Read the checkout signal.** In parallel, the connected storefront connector reports orders per minute for the same window. Vortex IQ compares that figure to the same-weekday, same-hour baseline (a rolling four-week median). A "checkout drop" is recorded when current order rate falls a configurable percentage below baseline (default 20%).
+
+3. **Correlate and count.** The two streams are joined on the shared UTC window. The headline count is the number of slow statements; the alert state is `slow_query_count > 5 AND checkout_drop = true`. The detail (`Slow SQL Queries During Checkout Window, broken down by row`) drives the per-row table so an engineer can jump straight from "checkout dipped" to "these are the five statements that were blocking the warehouse when it dipped".
+
+The card does not claim causation on its own. It establishes co-occurrence in a tight five-minute window, which is the strongest correlation signal you can get without distributed tracing, and hands the engineer the exact statements to inspect.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A UK homeware brand on Shopify runs its storefront personalisation and stock-availability lookups against a Databricks SQL serving warehouse (`wh-serving-prod`, a Small auto-scaling warehouse). A separate Large warehouse (`wh-analytics`) is used by the merchandising team for BI. Snapshot taken on 14 Apr 26 at 13:05 BST, ten minutes into a payday promotion.
+
+The orders-per-minute graph, normally tracking around 38/min for a 13:00 weekday slot, has just fallen to 27/min. The platform engineer opens this card.
+
+| Statement id | Warehouse | Identity | Duration | Rows | Window overlap |
+| --- | --- | --- | --- | --- | --- |
+| 01ef9c...a1 | wh-serving-prod | storefront-sp | 8,420 ms | 1 | yes |
+| 01ef9c...b3 | wh-serving-prod | storefront-sp | 9,110 ms | 1 | yes |
+| 01ef9c...c7 | wh-serving-prod | storefront-sp | 11,300 ms | 1 | yes |
+| 01ef9c...d2 | wh-serving-prod | storefront-sp | 7,950 ms | 1 | yes |
+| 01ef9c...e9 | wh-serving-prod | storefront-sp | 10,640 ms | 1 | yes |
+| 01ef9c...f4 | wh-analytics | merch-analyst | 14,200 ms | 38,901 | yes |
+
+The Vortex IQ headline reads **6 slow queries during a checkout drop** and the card is outlined in red because the count is above the threshold of five and a checkout drop is live. The engineer reads three things straight away:
+
+1. **Five of the six slow statements are storefront serving queries on `wh-serving-prod`, all single-row lookups taking 8 to 11 seconds.** A single-row lookup should return in tens of milliseconds. Eight seconds means the warehouse is queueing, not computing. The serving warehouse is saturated. Cross-check with [SQL Warehouse Saturation %](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation), which reads 96%.
+
+2. **The sixth row is the smoking gun.** A merchandising analyst kicked off a 14-second, 38,901-row scan on `wh-analytics`, but the workspace had a shared cluster pool and `wh-serving-prod` had been configured to burst into the same pool. The analytics query starved the serving warehouse of slots. This is a noisy-neighbour incident, not a code regression.
+
+3. **The checkout drop is real and it is costing money.** Orders fell from 38/min to 27/min, an 11/min shortfall. At an average order value of £62, that is roughly £680 of orders per minute not landing while the warehouse is jammed.
+
+```text
+Cost framing while the warehouse is saturated:
+  - Baseline orders/min: 38   Current: 27   Shortfall: 11/min
+  - Average order value: £62
+  - Revenue shortfall/min: 11 × £62 = £682
+  - Window so far: 5 minutes  ->  ~£3,410 of delayed/lost orders
+  - If it runs another 15 minutes before mitigation: a further ~£10,230
+```
+
+The mitigation is immediate and does not require a code deploy: detach `wh-serving-prod` from the shared analytics pool (or move the analyst's workload to an isolated warehouse), and bump the serving warehouse to scale-out so it stops queueing. Within two minutes the serving lookups drop back under 100 ms, saturation falls to 41%, and orders/min recovers to 37. The post-incident action is a guardrail: serving and analytics warehouses must never share a pool during promotional windows.
+
+Three takeaways for the platform team:
+
+1. **Single-row lookups taking seconds is the tell.** When the duration is high but `rows_produced` is tiny, the warehouse is queueing, not crunching. That points at saturation or a noisy neighbour, not query SQL.
+2. **The cross-channel join is what makes this actionable.** Five slow queries with healthy checkout is a yawn; five slow queries with a live order dip is a revenue incident. The card only pages on the combination.
+3. **Isolate serving from analytics.** The most common cause of this card firing is a heavy BI or pipeline query stealing slots from the storefront-serving warehouse. Pair with [DBU by Cluster (7d)](/nerve-centre/kpi-cards/databricks/dbu-by-cluster-7d) to confirm which workloads share compute.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow SQL Queries During Checkout Window | What the combination tells you |
+| --- | --- | --- |
+| [SQL Warehouse Saturation %](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation) | The capacity view of the warehouse running the slow queries. | Slow queries plus saturation above 90% equals a queueing warehouse: scale out, do not debug SQL. |
+| [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) | The aggregate latency that the per-row slow list rolls up into. | If p95 is fine but this table is full, the slowness is concentrated in a few statements, not systemic. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/databricks/slow-query-rate) | The proportion of all queries breaching threshold. | A spiking slow-query rate during the checkout window confirms the table is a symptom of a broad slowdown, not a handful of outliers. |
+| [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries) | The 24-hour view of the worst statements. | If today's checkout-window offenders are also your daily worst queries, they need optimisation, not just isolation. |
+| [SQL Queries per Hour (live)](/nerve-centre/kpi-cards/databricks/sql-queries-per-hour-live) | The volume context: are slow queries a load problem? | A query-volume spike alongside slow queries points at unexpected demand on the serving warehouse. |
+| [Databricks SQL Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/databricks/databricks-sql-spike-vs-ecom-order-rate) | The volume-side cross-channel peer. | Query spike with no order spike plus slow queries equals a runaway or rogue workload, not real shopper demand. |
+| [Pipeline Lag vs Ecom Order Flow](/nerve-centre/kpi-cards/databricks/pipeline-lag-vs-ecom-order-flow) | The pipeline-side cross-channel peer. | Stalled pipeline plus slow serving queries can be the same root compute contention surfacing in two places. |
+| [Shopify Total Revenue](/nerve-centre/kpi-cards/shopify/total-revenue) | The downstream financial impact during the slow window. | Always size the cost of a checkout dip in revenue/min, not just orders/min. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **Query History** (in the SQL workspace, Query History tab) for the per-statement list with duration, status, and the user who ran it. Filter by warehouse and time range to match the five-minute window.
+> **`system.query.history`** (Unity Catalog system table) to run the same filter as SQL: `SELECT statement_id, compute.warehouse_id, executed_by, total_duration_ms FROM system.query.history WHERE start_time >= now() - INTERVAL 5 MINUTES AND total_duration_ms > 5000 ORDER BY total_duration_ms DESC`.
+> **SQL Warehouse monitoring** (the warehouse's Monitoring tab) for queued vs running query counts, which confirm whether slowness is queueing or execution.
+
+**Why our number may legitimately differ from Databricks's own UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **System table latency** | Brief gaps | `system.query.history` can lag live execution by up to a few minutes; the Query History UI is closer to real time. Within the same five-minute window the two should converge, but a query that just finished may appear in the UI before the system table. |
+| **Threshold definition** | Vortex IQ count may be lower | Vortex IQ uses the configured per-warehouse slow threshold (default 5,000 ms). The Databricks UI shows all queries; filter the UI to the same duration to match. |
+| **Warehouse scope** | Vortex IQ count may be lower | If the card is scoped to serving warehouses only, analytics-warehouse slow queries are excluded from the count even though they appear in the workspace Query History. |
+| **Time zone** | Window boundaries shift | The Databricks UI renders in workspace timezone; Vortex IQ aligns the window to UTC so it lines up with the ecom order feed. Set both to the same zone before comparing row-for-row. |
+| **Statement-type filter** | Vortex IQ count may be lower | Metadata statements (`USE`, `SET`) and `CANCELLED` rows are excluded by Vortex IQ; the raw system table includes them. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes the divergence |
+| --- | --- | --- |
+| [`shopify.total_orders`](/nerve-centre/kpi-cards/shopify/total-orders) / [`bigcommerce.total_orders`](/nerve-centre/kpi-cards/bigcommerce/total-orders) / [`adobe_commerce.total_orders`](/nerve-centre/kpi-cards/adobe-commerce/total-orders) | The checkout-drop half of the card should mirror a dip in the storefront order rate. | Slow queries with no order dip equals a slow internal warehouse not in the serving path; an order dip with no slow queries means the cause is storefront or payment, not Databricks. |
+| [`databricks.sql_warehouse_saturation`](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation) | Slow queries during checkout usually coincide with high saturation. | Slow queries with low saturation point at a single heavy statement or a remote dependency, not capacity. |
+| Payment gateway status (Stripe / PayPal connector) | An order dip with healthy warehouses but a degraded gateway means the cause is payment, not data. | Confirms the slow queries are coincidental, not causal, before you reroute compute. |
+
+<details>
+<summary><em>Documentation cross-reference (same-concept peer)</em></summary>
+
+The "slow query during a business-critical window" pattern exists on every analytics warehouse, with the same definition but different native tooling. These references exist only so a team running clients across multiple warehouses can cross-link the same concept; your Databricks workspace does not have a parallel Snowflake or BigQuery instance to reconcile against.
+
+- Snowflake equivalent: long-running statements in `SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY` with high `TOTAL_ELAPSED_TIME` and high `QUEUED_PROVISIONING_TIME`.
+- BigQuery equivalent: jobs in `INFORMATION_SCHEMA.JOBS_BY_PROJECT` with high `total_slot_ms` and elapsed time.
+- Redshift equivalent: queries in `SVL_QUERY_REPORT` / `STL_WLM_QUERY` with high queue wait.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows slow queries but checkout looks fine. Why is it not red?**
+By design. The card lists slow statements at all times for visibility, but it only pages when slow queries co-occur with a measurable checkout drop. Slow queries during a healthy checkout window are logged so you can tune later, but they are not an incident. If you want to chase slow queries regardless of checkout state, use [Slow-Query Rate %](/nerve-centre/kpi-cards/databricks/slow-query-rate) or [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries) instead.
+
+**Checkout dropped but this card shows zero slow queries. Where do I look?**
+That is a useful negative result: it rules out the data layer. The cause is most likely storefront, CDN, or payment gateway. Check the storefront connector's order and conversion cards, the payment connector status, and your CDN dashboard. Databricks is not the bottleneck this time.
+
+**Does this card prove the slow queries caused the checkout drop?**
+No, it proves co-occurrence in a tight five-minute window, which is the strongest correlation signal available without end-to-end tracing. The single-row-but-slow pattern (high duration, tiny `rows_produced`) is a strong indicator of warehouse queueing in the serving path, but always confirm with [SQL Warehouse Saturation %](/nerve-centre/kpi-cards/databricks/sql-warehouse-saturation) before acting.
+
+**My slow queries are all on the analytics warehouse, not the serving one. Should I care?**
+Only if that warehouse shares a compute pool with the serving warehouse, which is the classic noisy-neighbour cause. If they are fully isolated, an analytics slowdown cannot affect checkout, and you can scope this card to serving warehouses only so analytics noise stops triggering false alarms. Set the warehouse scope in the connector settings.
+
+**Why does a single-row lookup take eight seconds?**
+Almost never the SQL. It is queueing: the warehouse has no free slots, so the statement waits before it runs. The execution itself is milliseconds. The fixes are to scale the warehouse out (more clusters), isolate it from competing workloads, or enable serverless so it scales faster under burst. Check the warehouse Monitoring tab for queued-query counts to confirm.
+
+**Does `system.query.history` capture every query?**
+It captures SQL warehouse query history once Unity Catalog system tables are enabled and the `query` schema is granted. Queries run on all-purpose or job compute (notebooks, jobs) are not in `system.query.history`; those surface through the Jobs and clusters APIs instead. If your storefront serving path runs on a cluster rather than a SQL warehouse, point the card at the relevant cluster source and expect a slightly different latency basis.
+
+**How current is the data given the system table lag?**
+The card re-evaluates every 60 seconds over a five-minute window. `system.query.history` can lag by up to a few minutes, so a query that finished seconds ago may not appear immediately. For genuinely real-time triage during a live incident, cross-check the Query History UI in the SQL workspace, which is closer to live, and treat this card as the correlated, persisted record.
+
+**Can I change the slow threshold or the checkout-drop percentage?**
+Yes. Both are configurable per profile in the Sensitivity tab: the slow threshold (default 5,000 ms, set per warehouse) and the checkout-drop percentage (default 20% below the rolling four-week weekday baseline). Tune the slow threshold to your warehouse class and the drop percentage to how noisy your order rate normally is, so the card pages on real incidents, not normal variance.
+
+**The merchandising team complains the card blames their BI queries. Is that fair?**
+It is fair when their warehouse shares a pool with the serving warehouse, because their large scans then steal slots from storefront lookups. The fix is isolation, not blame: give serving and analytics separate warehouses (or separate pools) so a heavy BI query can never degrade checkout. Once isolated, this card will stop attributing checkout dips to their workload.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow SQL Queries During Checkout Window* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

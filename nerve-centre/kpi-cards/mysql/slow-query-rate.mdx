@@ -1,0 +1,160 @@
+---
+title: "Slow-Query Rate %, MySQL"
+sidebarTitle: "Slow-Query Rate %"
+description: "Slow-Query Rate % for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Slow-Query Rate %** is the share of statements that exceeded `long_query_time` and were logged as slow, expressed as a percentage of all statements run. It answers "what proportion of my workload is slow?" in a single number. A low percentile-latency reading can still hide a creeping slow-query rate, and vice versa: this card is the volume view of slowness, where the latency percentiles are the severity view. A rising rate is the earliest sign that a missing index, a stale plan, or a saturated buffer pool is starting to bite across real traffic.
+
+| | |
+| --- | --- |
+| **What it tracks** | The percentage of executed statements classified as slow over the trailing window. Computed as the change in `Slow_queries` divided by the change in `Questions`, both from `SHOW GLOBAL STATUS`. |
+| **Data source** | `SHOW GLOBAL STATUS` counters on the MySQL instance: `Slow_queries` (statements over `long_query_time`) and `Questions` (statements run, excluding certain internal commands). The engine takes deltas between samples. |
+| **Time window** | `15m` (the rate is computed over a trailing 15-minute window). |
+| **Alert trigger** | `> 5%`. When the trailing slow-query rate exceeds 5% the card turns red and a Nerve Centre alert is raised. |
+| **Why it matters** | A high slow-query rate means a large fraction of your traffic is running over the slow threshold, holding connections longer, fattening the latency tail, and pushing toward [connection pool saturation](/nerve-centre/kpi-cards/mysql/connection-pool-saturation). It is a leading indicator of a broad performance regression. |
+| **Reading the value** | Read alongside [Query Latency p95](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) and [p99](/nerve-centre/kpi-cards/mysql/query-latency-p99-ms). A high rate with a fat tail equals many statements are genuinely slow; a high rate with healthy percentiles usually means `long_query_time` is set too low. |
+| **Sentiment key** | `mysql_slow_query_pct` |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The rate is a ratio of two delta counters from `SHOW GLOBAL STATUS`, sampled at the start and end of the trailing window.
+
+```text
+slow_delta      = Slow_queries(now)  - Slow_queries(15m ago)
+questions_delta = Questions(now)     - Questions(15m ago)
+
+slow_query_rate_pct = (slow_delta / questions_delta) * 100
+```
+
+Three points govern accuracy:
+
+1. **Deltas, not absolutes.** Both counters are cumulative since server start. Reading them once gives the all-time rate, which is meaningless for "right now". The engine differences two samples so the number reflects the trailing 15 minutes only.
+2. **The threshold is `long_query_time`.** A statement is "slow" only relative to the server's `long_query_time` setting (default 10 seconds, often tuned down to 1 or 2 seconds in production). If `long_query_time` is set very low, almost everything counts as slow and the rate inflates; if it is high, real problems hide. The rate is only as meaningful as the threshold behind it.
+3. **`Questions` vs `Queries`.** The engine uses `Questions` (client-issued statements) as the denominator, not `Queries` (which also counts statements executed inside stored programs). This keeps the rate aligned with the workload your application actually sends.
+
+The card renders as a gauge, with the 5% alert band coloured red so a breach is visible at a glance.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MySQL 8.0 primary behind an order-management API with `long_query_time = 1`. Snapshot taken on 16 Apr 26 at 17:20 BST during the early-evening order peak.
+
+| Counter | Value at 17:05 | Value at 17:20 | Delta over 15m |
+| --- | --- | --- | --- |
+| `Slow_queries` | 1,204,500 | 1,219,800 | 15,300 |
+| `Questions` | 48,210,000 | 48,440,000 | 230,000 |
+
+```text
+slow_query_rate_pct = (15,300 / 230,000) * 100 = 6.65%
+```
+
+The gauge reads **6.65%**, over the 5% line, and a Nerve Centre alert fires. The team works it:
+
+1. **6.65% means roughly one statement in fifteen is running over a second.** That is a lot of long-held connections during the evening peak, exactly when [connection pool saturation](/nerve-centre/kpi-cards/mysql/connection-pool-saturation) is already tightest.
+2. **They open [Top 10 Slowest Queries](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest).** Two digests dominate the slow log: an order-history lookup joining `orders` to `order_items` without a covering index, and a reporting query an internal dashboard runs on a tight loop.
+3. **They confirm against latency.** [p95](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) has risen to 240ms and [p99](/nerve-centre/kpi-cards/mysql/query-latency-p99-ms) to 1.4s, so the slow rate is real, not an artefact of a too-low `long_query_time`. The slowness is genuinely spread across many executions of those two digests.
+
+```text
+Connection-pressure framing during the peak:
+  - Statements in window: 230,000
+  - Slow statements (>1s): 15,300
+  - Each slow statement holds its connection ~10x longer than a fast one
+  - Effective extra connection-seconds consumed: large enough to push the pool toward 90%
+```
+
+The fix is a covering index on `order_items (order_id, sku, qty)` and moving the dashboard query to a read replica. After both ship, the rate drops to 1.1% and the gauge clears. The follow-up is to confirm `long_query_time` is set sensibly (1 second here is reasonable for an OLTP order API).
+
+Three takeaways:
+
+1. **Rate and latency answer different questions.** Rate is "how much of my traffic is slow"; the percentiles are "how slow is the slow part". A red rate with healthy percentiles usually means `long_query_time` is too aggressive; a red rate with a fat tail is a real regression.
+2. **A high slow rate is a connection-pressure multiplier.** Slow statements hold connections, so a rising rate quietly pushes you toward pool exhaustion well before the pool card turns red. Treat the two as linked.
+3. **Two digests usually explain most of it.** Slowness is rarely uniform; a handful of digests dominate the slow log. [Top 10 Slowest Queries](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest) almost always names the fix.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow-Query Rate | What the combination tells you |
+| --- | --- | --- |
+| [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest) | Names the digests behind the rate. | Tells you which two or three queries to index or move. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p95-ms) | The severity view of the upper band. | High rate plus high p95 equals a real, broad slowdown. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p99-ms) | The tail view. | High rate plus a fat p99 confirms the slow part is genuinely slow, not a low threshold. |
+| [Query Latency p50 (ms)](/nerve-centre/kpi-cards/mysql/query-latency-p50-ms) | The median baseline. | A healthy p50 with a high rate means slowness is concentrated, not universal. |
+| [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) | A cold cache turns fast queries slow. | A falling hit rate driving a rising slow rate equals memory pressure, not bad indexes. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mysql/connection-pool-saturation) | Slow statements hold connections longer. | Rising slow rate plus rising saturation equals the slowness is consuming pool capacity. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | The volume context for the rate. | A high rate at low QPS is less urgent than a high rate at peak QPS. |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/mysql/slow-queries-during-checkout-window-5m) | The revenue-path slice of the slow rate. | Confirms whether the slow statements are hitting the checkout path. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL's own tooling:**
+
+> **`SHOW GLOBAL STATUS`** for the raw counters this card differences:
+> ```sql
+> SHOW GLOBAL STATUS WHERE Variable_name IN ('Slow_queries', 'Questions');
+> ```
+> **`long_query_time`** to confirm the threshold the rate is measured against:
+> ```sql
+> SHOW VARIABLES LIKE 'long_query_time';
+> ```
+> **The slow query log** for the actual slow statements (enable with `slow_query_log = ON` and a sensible `long_query_time`).
+> **`pt-query-digest`** (Percona Toolkit) to aggregate the slow log into ranked digests.
+> **Managed-service consoles:** Amazon RDS / Aurora **Performance Insights** and the slow-query-log export to CloudWatch Logs give the same statements; RDS publishes a `Questions` metric you can cross-check.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **`long_query_time` value** | Large | The rate is entirely relative to this setting. A 1-second threshold reports far more slow queries than a 10-second threshold on the same workload. Confirm the threshold before comparing. |
+| **Window boundary** | Variable | The card uses a trailing 15-minute delta; a manual `SHOW GLOBAL STATUS` shows the all-time rate since server start. |
+| **`Questions` vs `Queries`** | Marginal | The engine uses `Questions` as the denominator; computing the rate against `Queries` (which counts stored-program statements) gives a slightly different figure. |
+| **`log_queries_not_using_indexes`** | Higher | If enabled, fast statements that skip an index are also logged as slow, inflating `Slow_queries` beyond pure time-based slowness. |
+| **Counter reset** | Spike then settle | A `FLUSH STATUS` or server restart resets the counters; the first delta after a reset can read oddly. |
+
+**Cross-connector reconciliation:** pair with your APM connector's throughput and error metrics. A rising slow rate that lines up with a dip in an ecommerce conversion or order-rate card (for example [Slow Queries During Checkout Window](/nerve-centre/kpi-cards/mysql/slow-queries-during-checkout-window-5m)) is the strongest evidence that database slowness is costing revenue, not just CPU.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My slow-query rate is red but the latency percentiles look healthy. What is going on?**
+Almost certainly `long_query_time` is set too low for your workload. If the threshold is 100ms on an analytics database where 300ms queries are normal and harmless, a large share of statements will be logged as slow even though nothing is actually wrong. Confirm `long_query_time` matches what "slow" really means for this database before treating the rate as a problem.
+
+**Why does the rate use deltas instead of the raw counter?**
+`Slow_queries` and `Questions` are cumulative since server start, so dividing them gives the all-time average, which can be days or weeks old and tells you nothing about now. Differencing two samples over 15 minutes gives the current rate, which is what you actually need during an incident.
+
+**The card reads zero. Is slow-query tracking even on?**
+The counters increment regardless of whether the slow query *log* is written, so the rate works even with `slow_query_log = OFF`. A genuine zero means no statements crossed `long_query_time` in the window, which is good. If you also want to *see* the offending statements, enable the slow query log; the rate and the log are independent.
+
+**Does `log_queries_not_using_indexes` affect this number?**
+Yes. With that option on, statements that do not use an index are counted as slow even if they were fast, which inflates `Slow_queries` and the rate. That can be useful for catching missing indexes, but be aware the rate then mixes "slow by time" with "slow by plan". Disable it if you want the rate to mean purely time-based slowness.
+
+**Can I change the 5% alert threshold?**
+Yes, per profile in the Sensitivity tab. A reporting database may tolerate a higher rate; a latency-sensitive checkout database may want it tighter, for example 2%. Set it relative to your normal busy-hour rate so it only fires on genuine regressions.
+
+**Is a high slow-query rate at low traffic something to worry about?**
+Less than at peak, but not nothing. At low QPS, a 10% slow rate might be a handful of statements and easy to ignore; the same 10% at peak is thousands of long-held connections. Read the rate next to [Queries per Second](/nerve-centre/kpi-cards/mysql/queries-per-second-live) to judge urgency, and remember that the same regression will hurt far more once traffic ramps.
+
+**The rate jumped right after a deploy. Coincidence?**
+Usually not. The two most common post-deploy causes are a new query that lacks an index and an ORM change that turned one efficient query into an N+1 pattern. Open [Top 10 Slowest Queries](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest) and look for a digest that did not exist before the deploy; that is your regression.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow-Query Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

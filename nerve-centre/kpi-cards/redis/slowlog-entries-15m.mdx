@@ -1,0 +1,158 @@
+---
+title: "SLOWLOG Entries (15m), kpi"
+sidebarTitle: "SLOWLOG Entries (15m)"
+description: "SLOWLOG Entries (15m) for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of commands in the last 15 minutes that took longer than the `slowlog-log-slower-than` threshold (10,000 microseconds, or 10 ms, by default) to execute *inside Redis*. Redis runs commands on a single thread, so one slow command does not just cost itself: it blocks every other client until it finishes. A handful of slow commands in 15 minutes is the early warning that something pathological is happening, an `O(n)` command on a huge key, an unindexed `KEYS` scan, a slow Lua script, or memory pressure forcing swap. More than ten in 15 minutes means real users are feeling the stalls.
+
+| | |
+| --- | --- |
+| **What it tracks** | The count of new SLOWLOG entries Redis recorded in the trailing 15 minutes. Each entry is one command that exceeded the slow-log threshold. |
+| **Data source** | Redis `SLOWLOG GET` / `SLOWLOG LEN`: the in-memory slow-command log. An entry is created for any command whose execution time exceeds `slowlog-log-slower-than`. The detail line: `Commands exceeding slowlog-log-slower-than threshold (default 10ms).` |
+| **Time window** | `15m` (count of entries with a timestamp inside the trailing 15-minute window). |
+| **Alert trigger** | `> 10`. More than ten slow commands in 15 minutes flags the instance: single-threaded stalls are now frequent enough to degrade every client. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Redis maintains an in-memory ring buffer of slow commands, the SLOWLOG. Whenever a command's execution time (the time spent running the command itself, *excluding* network I/O and time waiting for the client) exceeds `slowlog-log-slower-than` microseconds, Redis appends an entry: a unique ID, a Unix timestamp, the duration in microseconds, the command and its arguments, and the client address and name.
+
+The card reads the log with `SLOWLOG GET` and counts entries whose timestamp falls inside the trailing 15 minutes:
+
+```text
+slowlog_15m = count(entries where entry.timestamp >= now - 15min)
+```
+
+Redis-specific points the engine accounts for:
+
+- **The threshold is configurable and matters.** `slowlog-log-slower-than` defaults to 10,000 microseconds (10 ms). If an operator has lowered it (to catch 1 ms commands) the count rises; if raised or set to a negative number (which disables the log) the count falls or goes to zero. The card reports against whatever threshold the instance is configured with, so always read the count alongside the configured threshold.
+- **The log has a fixed capacity.** `slowlog-max-len` (default 128) bounds the ring buffer. On a very busy instance with many slow commands, older entries are evicted; if more than `slowlog-max-len` slow commands occur in the window, the true count is undercounted by the buffer size. A count pinned at the buffer ceiling is itself a signal to raise `slowlog-max-len`.
+- **Execution time excludes network.** A command logged at 40 ms spent 40 ms *running*, not waiting on a slow client. This is what makes the slow log so diagnostic: it isolates Redis-side cost from client-side or network-side delay.
+- **`SLOWLOG RESET` clears the buffer.** If someone resets it inside the window, recent entries vanish; the engine handles a shrinking log gracefully.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs Redis 7.0 as a cache and queue behind a storefront. `slowlog-log-slower-than` is at the default 10,000 microseconds; `slowlog-max-len` is 128. Snapshot taken on 19 Apr 26 at 14:25 BST.
+
+| Reading | Value |
+| --- | --- |
+| SLOWLOG entries (15m) | **17** |
+| Configured threshold | 10,000 us (10 ms) |
+| `slowlog-max-len` | 128 |
+
+The card shows **17** in red. The engineer runs `SLOWLOG GET 17` and sees the pattern:
+
+| Count | Command | Typical duration |
+| --- | --- | --- |
+| 11 | `KEYS session:*` | 38 to 52 ms |
+| 4 | `HGETALL cart:large:*` | 14 to 19 ms |
+| 2 | `EVALSHA <reindex script>` | 60 to 95 ms |
+
+The diagnosis is immediate:
+
+1. **`KEYS session:*` is the dominant offender.** `KEYS` is `O(n)` over the entire keyspace and blocks the single thread for the full scan. With hundreds of thousands of session keys, each call stalls every other client for 40+ ms. This should never run in production; it belongs in a Lua-free `SCAN` cursor loop.
+2. **`HGETALL` on large hashes** is `O(n)` in field count. A few oversized cart hashes (thousands of fields) are crossing the threshold.
+3. **The Lua reindex script** at 60 to 95 ms is the worst per-call but rare; it blocks the thread for nearly 100 ms each time it runs.
+
+```text
+Impact framing:
+  - 17 slow commands in 15 min, dominated by KEYS session:*
+  - Each KEYS call blocks the single thread ~45 ms
+  - 11 calls = ~500 ms of cumulative thread-block in 15 min
+  - During each block, p95 command latency spikes and every client waits
+  - User effect: intermittent ~50 ms stalls on cache reads during the window
+
+Fix sequence:
+  1. Replace KEYS session:* with SCAN MATCH session:* COUNT 100 (cursor loop)
+  2. Cap cart hash size or split oversized carts
+  3. Move the Lua reindex to an off-peak window or a replica
+  4. Watch this card and Command Latency p95 fall back toward 0
+```
+
+Three takeaways:
+
+1. **One slow command taxes everyone.** Redis is single-threaded for command execution. A 45 ms `KEYS` does not just cost that caller; it freezes the whole instance for 45 ms. The slow log is the single best place to find these.
+2. **Read the count with the threshold.** 17 against a 10 ms threshold is serious. The same 17 against a 1 ms threshold (someone tuned it down to hunt micro-stalls) would be far less alarming. The threshold is the unit.
+3. **The command, not just the count, is the fix.** This card gives the count; pair it with [Top 10 SLOWLOG Commands](/nerve-centre/kpi-cards/redis/top-10-slowlog-commands) to see *which* commands so you know exactly what to refactor.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with SLOWLOG Entries | What the combination tells you |
+| --- | --- | --- |
+| [Top 10 SLOWLOG Commands](/nerve-centre/kpi-cards/redis/top-10-slowlog-commands) | The breakdown of which commands are slow. | This card is the count; that one names the offenders so you know what to refactor. |
+| [Command Latency p95 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p95-ms) | The latency distribution the slow log explains. | Slow-log spikes line up with p95 spikes; the slow log says which commands caused them. |
+| [Command Latency p99 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p99-ms) | The tail latency a single slow command inflates. | One 95 ms Lua script shows up in p99 long before it moves p50. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live) | Throughput context for the slow commands. | Slow commands during a high-ops window hurt far more clients than during a quiet one. |
+| [Memory Fragmentation Ratio](/nerve-centre/kpi-cards/redis/memory-fragmentation-ratio) | Swap (ratio under 1) is a classic slow-command cause. | Slow log full plus fragmentation under 1 equals the instance is swapping to disk. |
+| [Slow Commands During Checkout Window (5m)](/nerve-centre/kpi-cards/redis/slow-commands-during-checkout-window-5m) | The cross-channel view tying slow commands to checkout drops. | Confirms whether the stalls coincided with revenue-impacting moments. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The composite that weights slow-command frequency. | A sustained slow-log count drags the health score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis's own tooling:**
+
+> `redis-cli SLOWLOG GET 25` dumps the most recent 25 entries with ID, timestamp, duration (microseconds), the full command, and the client. This is the raw log the card counts.
+> `redis-cli SLOWLOG LEN` returns the current number of entries in the buffer (bounded by `slowlog-max-len`).
+> `redis-cli CONFIG GET slowlog-log-slower-than` returns the threshold in microseconds. Confirm it matches your expectation, a lowered threshold inflates the count, a negative value disables logging entirely.
+> `redis-cli CONFIG GET slowlog-max-len` returns the buffer capacity. If the count is pinned at this number, you are losing entries to eviction.
+> `redis-cli SLOWLOG RESET` clears the buffer (use with care; it deletes evidence).
+
+For managed services:
+
+> **ElastiCache / MemoryDB:** the SLOWLOG commands work over the standard Redis protocol; the slow log is also surfaced in the engine log exports. CloudWatch `EngineCPUUtilization` spiking alongside slow-log entries confirms single-thread blocking.
+> **Azure Cache for Redis:** SLOWLOG is accessible on Standard and Premium tiers via the console's "Redis Console" or a client; some commands are restricted on lower tiers.
+> **Redis Cloud (Redis Enterprise):** the slow log is available per database through the admin console and the standard `SLOWLOG` commands.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Threshold mismatch** | Variable | We count against the instance's configured `slowlog-log-slower-than`; a manual `SLOWLOG GET` at a different threshold tells a different story. |
+| **Buffer eviction** | Ours could undercount | If more than `slowlog-max-len` slow commands occur in the window, older ones are evicted before we read them. |
+| **`SLOWLOG RESET`** | Ours lower | A reset inside the window deletes entries we would otherwise count. |
+| **Polling instant** | Marginal | We read on a cadence; a burst between reads is captured on the next poll within the 15-minute window. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The slow log is empty but my clients report Redis is slow. Why?**
+The slow log records *command execution* time inside Redis, not network round-trip or client-side delay. If your slowness is network latency, a saturated client connection pool, or DNS, the slow log will be clean while clients still feel pain. Confirm with [Command Latency p95 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p95-ms): if p95 is high but the slow log is empty, the bottleneck is outside Redis's execution path.
+
+**My count is pinned at exactly 128. Is that the true number of slow commands?**
+No, 128 is the default `slowlog-max-len`, the ring-buffer capacity. A count at the ceiling means the buffer overflowed and you are seeing the most recent 128, not all of them. Raise `slowlog-max-len` (for example to 1,000) to capture the full picture during a storm, and treat a pinned count as a signal in its own right.
+
+**Should I lower `slowlog-log-slower-than` to catch more?**
+For investigation, yes, temporarily. Lowering it to 1,000 microseconds (1 ms) surfaces commands the default would miss. But it also inflates this card's count and the buffer fills faster, so revert it after the investigation. The card always reflects the live threshold, so document the value when you read the number.
+
+**Which commands most commonly show up here?**
+The usual suspects are `O(n)` commands run carelessly: `KEYS` (full keyspace scan, never use in production, use `SCAN`), `HGETALL` / `SMEMBERS` / `LRANGE 0 -1` on huge collections, `SORT` without `LIMIT`, large `MGET`/`MSET` batches, slow Lua scripts (`EVAL`/`EVALSHA`), and `DEL` of a single very large key (use `UNLINK` for async deletion). [Top 10 SLOWLOG Commands](/nerve-centre/kpi-cards/redis/top-10-slowlog-commands) names yours.
+
+**Can memory pressure cause slow commands even on fast commands?**
+Yes. If Redis is near `maxmemory` and the OS starts swapping its memory to disk, every command, even a trivial `GET`, can stall for tens of milliseconds because the data page must be read back from disk. A slow log full of normally-instant commands is a strong swap signal; cross-check [Memory Fragmentation Ratio](/nerve-centre/kpi-cards/redis/memory-fragmentation-ratio) (a ratio under 1 means swapping).
+
+**Does the slow log slow Redis down itself?**
+Negligibly. Recording an entry is a cheap append to an in-memory ring buffer. The cost is bounded by `slowlog-max-len`. The only practical caution is setting `slowlog-log-slower-than` to 0, which logs *every* command and floods the buffer; never do that on a busy production instance.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*SLOWLOG Entries (15m)* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

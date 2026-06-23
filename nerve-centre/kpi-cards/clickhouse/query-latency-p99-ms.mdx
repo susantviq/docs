@@ -1,0 +1,165 @@
+---
+title: "Query Latency p99 (ms), ClickHouse"
+sidebarTitle: "Query Latency p99 (ms)"
+description: "Query Latency p99 (ms) for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The 99th-percentile query duration over the recent window: the time below which 99 of every 100 queries complete, expressed in milliseconds. p99 is the tail-latency metric. The median (p50) tells you how the typical query behaves, but p99 tells you how your worst-served queries behave, which is where dashboards time out, ETL jobs stall, and downstream API calls breach their own SLAs. On ClickHouse, a healthy analytical p99 sits well under half a second for point and small-aggregate queries; a p99 above 500ms means the slowest 1% of queries are crossing into user-visible delay. This card flags amber at that threshold so a DBA sees tail regression before users start complaining.
+
+| | |
+| --- | --- |
+| **Data source** | Percentile aggregation over `system.query_log`: `SELECT quantile(0.99)(query_duration_ms) FROM system.query_log WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 5 MINUTE`. Only finished queries are sampled. |
+| **What it tracks** | The tail of the query-duration distribution for completed queries in the rolling window, not the average. One slow query in a hundred drives this number, which is the point. |
+| **Metric basis** | `query_duration_ms` from the query log, the server-measured wall-clock duration of each query from parse to result. It excludes client-side network time but includes all server execution. |
+| **Why >500ms matters** | At p99 above 500ms, the slowest 1% of queries are no longer instant. For an interactive dashboard issuing dozens of queries per page load, a p99 of 500ms means roughly every other page load contains at least one visibly slow panel. Tail latency compounds across fan-out workloads. |
+| **Time window** | `RT/5m` (real-time, computed over the trailing five minutes and refreshed each dashboard cycle). |
+| **Alert trigger** | `>500ms`. A p99 above 500ms sustained over the window flags the card amber and pages the on-call DBA. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine computes the 99th percentile of query duration directly from `system.query_log`, the table ClickHouse populates with one row per executed query:
+
+```sql
+SELECT
+    quantile(0.99)(query_duration_ms) AS p99_ms,
+    quantile(0.50)(query_duration_ms) AS p50_ms,
+    count()                           AS sampled_queries
+FROM system.query_log
+WHERE type = 'QueryFinish'
+  AND event_time > now() - INTERVAL 5 MINUTE
+```
+
+Two filters are load-bearing. `type = 'QueryFinish'` selects only queries that completed successfully; the log also holds `QueryStart`, `ExceptionBeforeStart`, and `ExceptionWhileProcessing` rows, and including those would either double-count or pollute the duration distribution with failed-query timings. The five-minute window keeps the percentile responsive to current conditions rather than smoothing over an hour of history.
+
+ClickHouse's `quantile` function uses reservoir sampling by default, which is fast and accurate enough for monitoring. For an exact tail you would use `quantileExact(0.99)`, but at monitoring cadence the approximate quantile is the right trade-off: it costs a fraction of the memory on a high-QPS instance and the tail estimate is stable to within a few milliseconds.
+
+The 500ms threshold is a deliberate tail-latency line, not a median line. A p50 of 500ms would be alarming; a p99 of 500ms is the point at which the worst-served queries start to be felt. Read this card alongside [Query Latency p50 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p50-ms) and [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) to see the full shape of the distribution.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a self-managed ClickHouse cluster serving an internal analytics product. Snapshot taken on 14 Apr 26 at 14:20 BST, shortly after a new dashboard shipped.
+
+| Percentile | Value | Reading |
+| --- | --- | --- |
+| p50 | 38 ms | Typical query is fast; the median is healthy. |
+| p95 | 210 ms | The 95th percentile is at the p95 card's own threshold (200ms): borderline. |
+| **p99** | **840 ms** | **Amber.** The slowest 1% of queries are crossing 800ms. |
+
+The Nerve Centre headline reads **p99 840ms**, outlined amber against the 500ms threshold. The contrast between p50 (38ms) and p99 (840ms) is the diagnosis: the typical query is fine, but a specific slice of queries is slow. The DBA reads three things:
+
+1. **The median is healthy, so this is not a cluster-wide slowdown.** If the whole instance were starved (CPU, memory, disk I/O) the p50 would have risen too. It did not, so the cause is a subset of queries, not global pressure.
+2. **The gap between p95 and p99 is large.** p95 at 210ms but p99 at 840ms means the tail is fat: a small number of queries are far slower than the rest. This is the signature of a few expensive queries, not a uniform regression.
+3. **The new dashboard is the prime suspect.** It shipped just before the regression. Tail latency that appears alongside a deploy almost always traces to a new query pattern: a missing index condition, a full-scan filter, or an aggregate over an unpartitioned range.
+
+```text
+Triage path from a p99 spike:
+  1. Find the slow queries:
+     SELECT query_duration_ms, read_rows, read_bytes, query
+     FROM system.query_log
+     WHERE type = 'QueryFinish'
+       AND event_time > now() - INTERVAL 5 MINUTE
+       AND query_duration_ms > 500
+     ORDER BY query_duration_ms DESC
+     LIMIT 20
+  2. Look at read_rows: a slow query reading billions of rows is doing a full scan.
+  3. Check the WHERE clause against the table's ORDER BY (primary) key:
+     a filter that does not align with the sort key cannot use the sparse index.
+  4. Fix at the query: add a primary-key-aligned predicate, or add a projection /
+     materialised view for the access pattern the dashboard needs.
+```
+
+In this case the new dashboard's "revenue by hour, last 90 days" panel filtered on a non-key column, forcing a full scan of the events table on every load. Adding a partition-pruning date predicate and a projection aligned to the access pattern dropped the p99 back to 120ms. The right fix was at the query and schema, not at the cluster.
+
+Three takeaways:
+
+1. **p99 is the tail, and the tail is where users feel pain.** A great median hides slow outliers. Always watch p99 for interactive workloads; the median alone will lull you.
+2. **A wide p50-to-p99 gap means a few bad queries, not global pressure.** If the whole distribution rises together, suspect resource saturation. If only the tail rises, hunt for the specific slow query.
+3. **Tail spikes that coincide with a deploy are almost always a new query pattern.** Check `system.query_log` for the slowest queries in the window and align their filters to the table's sort key.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Latency p99 | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) | The next percentile in. | A wide p95-to-p99 gap means a fat tail (a few very slow queries); a narrow gap means a uniform shift. |
+| [Query Latency p50 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p50-ms) | The median, the other end of the distribution. | p50 flat with p99 rising equals a few bad queries; p50 and p99 rising together equals global pressure. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/clickhouse/slow-query-rate) | The count-based view of slowness (queries over 1s). | High p99 plus high slow-query rate confirms the tail is widening, not just one outlier. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/clickhouse/top-10-slowest-queries) | The drill-down: which exact queries make up the tail. | The slow queries here are the ones driving the p99. |
+| [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h) | Slow queries often precede timeouts and exceptions. | Rising p99 then rising failures equals queries crossing their timeout ceiling. |
+| [Memory Usage %](/nerve-centre/kpi-cards/clickhouse/memory-usage) | Heavy aggregates that blow the tail also pressure memory. | High p99 plus high memory equals expensive aggregates; consider spilling settings or query limits. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that weights tail latency. | A sustained p99 breach pulls the composite down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> Run the same percentile query against `system.query_log` from `clickhouse-client`:
+> ```sql
+> SELECT quantile(0.99)(query_duration_ms)
+> FROM system.query_log
+> WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 5 MINUTE
+> ```
+> Inspect individual slow queries with the full-row form (add `read_rows`, `memory_usage`, and `query` to the select). For currently running queries use `SELECT elapsed, query FROM system.processes ORDER BY elapsed DESC`.
+> On **ClickHouse Cloud**, the same `system.query_log` query works in the SQL console, and the managed service surfaces a query-latency panel in its monitoring view.
+
+**Why our number may legitimately differ from a manual query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window boundary** | Slightly higher or lower | The card uses a trailing five minutes from the refresh instant; a manual query run a minute later samples a different set of finished queries. |
+| **Approximate quantile** | Within a few ms | `quantile` uses reservoir sampling; `quantileExact` would give the precise tail but costs more memory. The card uses the approximate form. |
+| **Replica scope** | Card may differ | On a cluster the card reads the configured node's `query_log`; a manual query on another replica sees that replica's queries only. Use `clusterAllReplicas('cluster', system.query_log)` to aggregate. |
+| **Query-log sampling** | Card lower if sampling on | If `log_queries_probability` is below 1, the log holds a sample of queries and the percentile is estimated from that sample. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Slow Analytics Queries During Checkout Window](/nerve-centre/kpi-cards/clickhouse/slow-analytics-queries-during-checkout-window) | A p99 spike during a checkout window can correlate with storefront slowness if the same instance serves both. | p99 spikes with no checkout impact means the slow queries are on an internal-only path. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why watch p99 instead of the average?**
+The average is dragged around by outliers and hides the shape of the distribution. A handful of multi-second queries can lift the average while most queries are fast, or a uniformly slow set can raise it the same amount: the average cannot tell the two apart. p99 answers a precise question ("how slow are my worst-served queries?") that directly maps to user experience on fan-out workloads where one slow query stalls a whole page.
+
+**My p50 is tiny but p99 is huge. Is something broken?**
+Not necessarily broken, but worth investigating. A small p50 with a large p99 means most queries are fast and a small slice is slow. That slice is usually a specific access pattern: a query whose filter does not align with the table's sort key, an aggregate over an unpartitioned range, or a `JOIN` against a large unindexed dimension. Find them with a `query_duration_ms > 500` filter on `system.query_log` and align their predicates to the primary key.
+
+**The number jumps every refresh. Why is it unstable?**
+p99 is a tail statistic over a five-minute window, so it is sensitive to a single slow query entering or leaving the window. On a low-QPS instance with few queries per window, one outlier moves it noticeably. Read the trend over several refreshes rather than any single value; a p99 that is consistently elevated is the real signal.
+
+**Does this include failed or cancelled queries?**
+No. The card filters on `type = 'QueryFinish'`, which is successful completion only. Failed queries (`ExceptionWhileProcessing`) and queries that errored before starting are excluded so their timings do not distort the duration distribution. Track failures separately on [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h).
+
+**How do I bring a high p99 down quickly?**
+Fastest first: identify the slow queries from `system.query_log`, and for each, check whether the `WHERE` clause uses the table's `ORDER BY` (primary) key so the sparse index can prune. If it does not, that is the cause. Durable fixes are query-side (rewrite to use the key, add a date/partition predicate) and schema-side (add a projection or materialised view for the hot access pattern). Raising hardware helps global pressure but rarely fixes a single full-scan query.
+
+**Is 500ms the right threshold for my workload?**
+It is a sensible default for interactive analytical queries. Heavy batch or reporting workloads legitimately run for seconds and would trip this constantly, so for those profiles raise the threshold in the Sensitivity tab. The aim is to catch tail regression relative to your own baseline, not to enforce a universal number.
+
+**On ClickHouse Cloud, is p99 measured the same way?**
+Yes. The card reads `system.query_log` exactly as on a self-managed instance, and that table behaves identically on ClickHouse Cloud. The managed service also shows a query-latency view in its console, which should track this card closely once you match the window and node scope.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Latency p99 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

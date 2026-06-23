@@ -1,0 +1,146 @@
+---
+title: "Circuit Breaker Trips (24h), Elasticsearch"
+sidebarTitle: "Circuit Breaker Trips (24h)"
+description: "Circuit Breaker Trips (24h) for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The count of circuit breaker trips across the cluster over the last 24 hours. A circuit breaker is Elasticsearch's memory safety valve: before it accepts an operation that would allocate a lot of heap (loading field data, building aggregation buckets, holding a large request body), it estimates the memory cost and, if that would push the node past a limit, it rejects the request rather than risk an out-of-memory crash. A trip is therefore a request that was refused to keep the node alive. Any value above zero means the cluster is hitting its memory ceiling and refusing real work, so the card surfaces every trip.
+
+| | |
+| --- | --- |
+| **What it tracks** | The total number of circuit breaker trips across all nodes and all breaker types in the trailing 24-hour window. |
+| **Data source** | The `tripped` counter on each breaker from `GET /_nodes/stats/breaker` (parent, fielddata, request, in_flight_requests, accounting). Detail: "From breakers tripped count. Requests rejected to prevent OOM." |
+| **Time window** | `24h`. The card reports the delta of the tripped counters over the trailing 24 hours. |
+| **Alert trigger** | `> 0`. A healthy, well-sized cluster should rarely trip a breaker, so any trip is flagged for review. |
+| **Breaker types counted** | `parent` (overall, default 95% of heap), `fielddata` (field data on text fields), `request` (per-request data structures such as aggregation buckets), `in_flight_requests` (HTTP request bodies in flight), and `accounting` (memory held by Lucene segments). |
+| **What does NOT count** | Document-level indexing errors (mapping or version conflicts), search-pool or write-pool rejections (those are queue-full rejections, a different mechanism), and slow-but-successful queries. |
+| **Roles** | platform, SRE, DBA |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card reads the `tripped` field for each breaker on each node from `GET /_nodes/stats/breaker` and sums them. Each `tripped` counter is monotonic (lifetime cumulative), so the card reports the delta over the trailing 24-hour window rather than the raw lifetime total.
+
+```text
+circuit_breaker_trips_24h = sum over nodes, over breakers of
+                            ( breaker.<type>.tripped[now] - breaker.<type>.tripped[24h ago] )
+```
+
+What each breaker guards:
+
+- **parent:** the overall accountant. Trips when the combined estimated memory of all breakers exceeds the parent limit (95% of heap by default). A parent trip without a child trip usually means the cluster is collectively near its memory ceiling.
+- **fielddata:** trips when loading field data for sorting or aggregating on an analysed `text` field would exceed its limit. The classic cause is aggregating on a `text` field instead of its `keyword` sub-field.
+- **request:** trips when a single request's in-memory data structures (large aggregation bucket trees, for example) would exceed the limit.
+- **in_flight_requests:** trips when the bytes of HTTP request bodies currently in flight exceed the limit, typically oversized bulk or search bodies arriving concurrently.
+- **accounting:** trips when memory held by open Lucene segments exceeds the limit, usually a sign of too many shards or segments per node.
+
+A trip is the safe outcome: the request is rejected with a `CircuitBreakingException` (HTTP 429) and the node survives. The alternative, accepting the request and running out of heap, would crash the node and take its shards with it. The card surfaces every trip because each one is both a rejected piece of real work and an early warning that the cluster is operating close to its memory limit.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+An SRE team runs a 5-node Elasticsearch cluster (each with 24 GB heap) backing search and an internal analytics tool. Snapshot taken on 18 Apr 26 at 16:30 BST. The 24h breakdown by breaker type:
+
+| Breaker | Trips (24h) | Dominant node | Likely cause |
+| --- | --- | --- | --- |
+| fielddata | 41 | es-data-02 | Aggregation on a `text` field |
+| request | 6 | es-data-02 | Large terms aggregation buckets |
+| parent | 2 | es-data-02 | Cumulative pressure pushing past 95% heap |
+| in_flight_requests | 0 | | |
+| accounting | 0 | | |
+| **Total** | **49** | | |
+
+The Nerve Centre headline reads **49 circuit breaker trips in 24h** against an alert line of >0, flagged for review, and the SRE on rotation investigates. The card points straight at the cause:
+
+1. **Field data is the dominant breaker.** 41 of 49 trips are the fielddata breaker, almost all on es-data-02. That is the textbook signature of an aggregation running against an analysed `text` field, which forces Elasticsearch to load the entire field's terms into heap. The fix is to aggregate on the `keyword` sub-field instead (which uses doc-values on disk, not heap) or to stop sorting/aggregating on the text field altogether.
+2. **The trips cluster on one node.** es-data-02 takes the brunt because the index whose `text` field is being aggregated has a hot shard there. Pair with [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used), which will show es-data-02 running hotter than its peers, and with [Shard Size Skew %](/nerve-centre/kpi-cards/elasticsearch/shard-size-skew) for the hot shard.
+3. **The trips are protecting the cluster, not breaking it.** Each of the 49 trips was a query rejected so the node would not OOM. The analyst running the dashboard saw 49 failed queries; the cluster saw 49 avoided crashes. The wrong response is to raise the fielddata breaker limit to make the errors stop; that removes the safety net. The right response is to fix the query.
+
+```text
+Triage by which breaker dominates:
+  fielddata high  -> aggregating/sorting on a text field -> use keyword sub-field / doc-values
+  request high    -> aggregation buckets too large       -> bound cardinality, add filters
+  parent only     -> collective memory pressure          -> reduce concurrency or add heap
+  in_flight high  -> request bodies too big              -> split bulk/search requests
+  accounting high -> too many shards/segments per node   -> reduce shard count, force-merge
+This cluster: fielddata dominates -> a query/mapping fix, not a capacity fix.
+```
+
+The actionable lesson: circuit breaker trips are a near-miss log. Every trip is a crash that did not happen, but a non-zero count means you are flying close to the memory ceiling and refusing real work. The breaker-type breakdown tells you whether the cause is a bad query, an oversized request, or genuine under-provisioning.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Circuit Breaker Trips | What the combination tells you |
+| --- | --- | --- |
+| [JVM Heap >85% Sustained or Circuit Breaker Tripped](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-85-sustained-or-circuit-breaker-tripped) | The live alert that pages on the first trip. | This card is the 24h trend; the alert is the real-time page. |
+| [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) | Trips happen when heap is under pressure. | High heap plus trips means the node is genuinely near its memory ceiling. |
+| [GC Pause Time (5m total ms)](/nerve-centre/kpi-cards/elasticsearch/gc-pause-time-5m-total-ms) | Memory pressure forces constant GC. | Long GC pauses alongside trips confirm sustained heap strain, not a one-off query. |
+| [Search Error Rate %](/nerve-centre/kpi-cards/elasticsearch/search-error-rate) | Trips surface to clients as 429 errors. | An error spike that coincides with trips means rejections are reaching users. |
+| [Bulk Rejections (24h)](/nerve-centre/kpi-cards/elasticsearch/bulk-rejections-24h) | Heavy writes also push heap toward the breakers. | Trips plus bulk rejections means the write load is stressing memory as well as the queue. |
+| [Shard Size Skew %](/nerve-centre/kpi-cards/elasticsearch/shard-size-skew) | A hot shard concentrates memory pressure on one node. | Trips clustering on one node plus high skew points to an unbalanced shard layout. |
+| [Elasticsearch Health Score](/nerve-centre/kpi-cards/elasticsearch/elasticsearch-health-score) | The composite reflects memory-safety state. | Recurring trips drag the composite down even while the cluster stays green. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> `GET /_nodes/stats/breaker` returns `tripped`, `limit_size_in_bytes`, `estimated_size_in_bytes`, and `overhead` for every breaker on every node, the exact source for this card.
+> `GET /_cat/nodes?v&h=name,heap.percent` shows which nodes are under heap pressure, where trips tend to concentrate.
+> The node logs record `CircuitBreakingException` entries naming the breaker, the limit, and the estimated size of the rejected request, the quickest way to see what was rejected.
+> Cluster settings (`GET /_cluster/settings?include_defaults=true`) show the configured breaker limits if you suspect they have been tuned away from defaults.
+
+On a managed service, AWS OpenSearch Service / managed offerings expose breaker-related metrics and `JVMMemoryPressure` in CloudWatch, and Elastic Cloud surfaces breaker activity in the deployment monitoring view. There is no separate "console" to compare against beyond these metrics; the breaker stats API is authoritative.
+
+**Why our number may legitimately differ from a manual stats call:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Counter vs window** | Card shows the delta | The `tripped` field is a lifetime cumulative counter per breaker per node; the card reports the increase over the trailing 24 hours, so a raw API read shows a larger absolute total. |
+| **Node restarts** | Card may read lower | The counters reset to zero on node restart; trips before a restart inside the window are not in the delta. |
+| **Per-node-per-breaker sum** | Card shows the total | A single API row is one breaker on one node; the card sums every breaker on every node into one figure. |
+| **Tuned limits** | Card may read lower than expected | If breaker limits were raised away from defaults, fewer trips occur (the safety net was loosened), which lowers the count without lowering the underlying risk. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Is a circuit breaker trip a bad thing?**
+It is a mixed signal. The trip itself is the good outcome: a request that would have crashed the node was rejected instead. But a non-zero count is a warning that the cluster is operating close to its memory ceiling and is refusing real work. So the trip protected you, and the count tells you that you cannot keep running this workload without either fixing the queries or adding capacity. Zero trips is the goal; trips happening is the cluster doing its job under strain.
+
+**The fielddata breaker keeps tripping. What is the usual cause?**
+Almost always an aggregation or sort against an analysed `text` field. Aggregating on `text` forces Elasticsearch to load field data (the full set of terms) into heap, which is expensive and exactly what the fielddata breaker guards. The fix is to aggregate on the `keyword` sub-field instead, which uses doc-values stored on disk rather than heap. If you control the mapping, add a `keyword` sub-field; if you cannot change queries, `eager_global_ordinals` can help, but switching to `keyword` is the real fix.
+
+**Should I raise the breaker limits to stop the trips?**
+No, except as a deliberate, temporary measure with eyes open. Raising a breaker limit moves the line at which Elasticsearch protects itself, trading controlled rejections for a higher risk of an actual OOM crash. An OOM kills the whole node and unallocates its shards, which is far worse than a few rejected queries. Fix the cause (bad query, oversized request, too many shards) rather than loosening the safety net.
+
+**What is the difference between a circuit breaker trip and a thread-pool rejection?**
+Different mechanisms with different causes. A circuit breaker trip is a memory-protection refusal: the request was rejected because serving it would use too much heap. A thread-pool rejection (search or write) is a capacity refusal: the queue was full so the request was rejected. A trip says "this would use too much memory"; a rejection says "I am too busy right now". They can co-occur under heavy load, but you fix them differently, breaker trips by reducing memory cost, pool rejections by adding capacity or backoff.
+
+**The parent breaker tripped but no child breaker did. What does that mean?**
+The parent breaker accounts for the combined memory of all breakers and trips at 95% of heap by default. A parent trip with no child trip means no single category blew its own limit, but together they pushed the node past the overall ceiling. This usually points to genuine memory pressure: too much concurrent load, undersized heap, or too many shards per node, rather than one pathological query. Check [JVM Heap Used %](/nerve-centre/kpi-cards/elasticsearch/jvm-heap-used) and reduce concurrency or shard count.
+
+**Trips only happen on one node. Why?**
+Memory pressure concentrates where the load concentrates. A hot shard, a skewed query routing pattern, or an index whose primaries cluster on one node will all push that node's heap higher and trip its breakers first. Check [Shard Size Skew %](/nerve-centre/kpi-cards/elasticsearch/shard-size-skew) and the shard allocation for the index involved. Rebalancing usually spreads the memory pressure and clears single-node trips.
+
+**This is a Sensitivity card. Can I tune when it flags?**
+Yes. The default surfaces any trip (>0), which suits most clusters because a healthy, well-sized cluster should rarely trip. If your workload legitimately runs near the memory ceiling and a small number of trips a day is expected and harmless for you, raise the threshold for your profile in the Sensitivity tab so the card flags only abnormal trip volumes rather than every single one.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Circuit Breaker Trips (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

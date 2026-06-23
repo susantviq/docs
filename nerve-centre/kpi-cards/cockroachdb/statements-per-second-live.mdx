@@ -1,0 +1,122 @@
+---
+title: "Statements per Second (live), CockroachDB"
+sidebarTitle: "Statements per Second (live)"
+description: "Statements per Second (live) for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Statements per Second (live)** is the cluster-wide SQL throughput: how many statements (SELECT, INSERT, UPDATE, DELETE, plus DDL and transaction control) CockroachDB is executing each second right now. It is the database's heartbeat. Read on its own it tells you how hard the cluster is working; read against a baseline it tells you whether traffic is normal, surging, or has fallen off a cliff. A sudden drop to near zero usually means something upstream stopped sending work (an application outage, a network break); a sudden spike usually means a traffic event or a runaway loop. This card has no alert of its own because "high" and "low" are both context-dependent; it is the reference signal you read every other card against.
+
+| | |
+| --- | --- |
+| **What it tracks** | Statements per Second (live) for the selected period: the rate of SQL statements executed across the whole cluster, summed across nodes. |
+| **Data source** | The `sql.query.count` time-series metric (the count of executed SQL statements) differentiated to a per-second rate. The DB Console SQL dashboard shows the same as Statements per second / SQL queries per second. |
+| **Time window** | `RT` (real-time, refreshed on each poll). Throughput is the fastest-moving signal on the cluster and is always read live. |
+| **Alert trigger** | None. Throughput is a reference signal: a healthy value for one cluster is a crisis for another, so there is no universal threshold. Anomalies are caught by pairing it with the cross-channel and error cards. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card reads the cumulative executed-statement counter (`sql.query.count`) and differentiates it into a per-second rate, summed across all nodes to give a single cluster figure. It counts statements of every kind: reads, writes, DDL, and transaction-control statements (BEGIN, COMMIT, ROLLBACK). Because it is a rate over a short live interval, it responds to load changes within the poll interval, which is what makes it useful as a heartbeat.
+
+A few nuances shape how to read it. First, retries inflate the count: CockroachDB transparently retries some transactions under contention, and each retry is another statement execution, so a contention storm can raise the rate without any extra real work being done (cross-reference [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) to separate genuine load from retry churn). Second, the number is statements, not transactions: one transaction can contain many statements, so this is not an order count or a business-event count. Third, it is the gross cluster rate, not per-node, so an uneven distribution is invisible here and must be read from the per-node SQL view. The value of the card is direction and magnitude against your own baseline, not an absolute target.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 6-node CockroachDB cluster backing the storefront, order, and inventory services. Their normal weekday daytime baseline is roughly 4,000 statements/sec, rising to about 9,000 during evening peak. Three readings, taken across 11 Jun 26:
+
+| Time | Statements/sec | vs baseline | Reading |
+| --- | --- | --- | --- |
+| 14:00 BST | 4,100 | normal | healthy daytime steady state |
+| 20:30 BST | **18,400** | ~2x evening peak | spike, investigate the driver |
+| 21:05 BST | **120** | ~3% of baseline | collapse, traffic has stopped arriving |
+
+**The 20:30 spike.** Throughput is double the usual evening peak. The DBA's job is to find the driver, not to panic, a spike can be good (a successful marketing push) or bad (a runaway job or retry storm). They check [CRDB Statements Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/cockroachdb/crdb-statements-spike-vs-ecom-order-rate): order rate has risen proportionally, so this is real customer traffic, not a loop. They then watch capacity, [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation) and [Memory Usage %](/nerve-centre/kpi-cards/cockroachdb/memory-usage), to confirm the cluster has headroom for the surge. It does; the spike is healthy revenue and nothing needs doing except watching.
+
+**The 21:05 collapse.** Twenty-five minutes later throughput falls to 120/sec, near zero. This is the more alarming reading precisely because it is silent: the database is not erroring, it is simply receiving almost no work.
+
+```text
+What a throughput collapse usually means:
+  - The application tier is down or has lost its DB connection
+  - A load balancer or DNS change is routing traffic away
+  - A deploy failed and the storefront is returning cached/error pages
+  - The database itself is fine: low CPU, low memory, no errors
+=> The problem is upstream; the database is the messenger, not the cause.
+```
+
+The DBA confirms the cluster is healthy (no node loss, no unavailable ranges, error rate near zero) and escalates upstream: the 21:00 deploy of the order service failed health checks and the application instances are not connecting. The database throughput card was the fastest signal that customer traffic had stopped, faster than the application's own dashboards in this case. Three takeaways:
+
+1. **A drop is often scarier than a spike.** A spike with proportional order growth is revenue; a collapse to near zero means work has stopped arriving, which is almost always an upstream outage the database surfaces first.
+2. **Always read a spike against orders.** Throughput up *with* orders up is healthy load; throughput up with orders flat is a retry storm or a runaway job, very different remediation.
+3. **There is no "good" absolute number.** 18,000/sec is wonderful for one cluster and a sign of trouble for another. Read it against your own baseline and the paired cards, never against a fixed threshold.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Statements per Second | What the combination tells you |
+| --- | --- | --- |
+| [CRDB Statements Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/cockroachdb/crdb-statements-spike-vs-ecom-order-rate) | The cross-channel sanity check. | Statements up with orders up is real load; statements up with orders flat is retries or a runaway job. |
+| [Statement Error Rate %](/nerve-centre/kpi-cards/cockroachdb/statement-error-rate) | Quality alongside quantity. | High throughput with a rising error rate equals load outpacing capacity; the cluster is straining. |
+| [Statement Latency p95 (ms)](/nerve-centre/kpi-cards/cockroachdb/statement-latency-p95-ms) | The latency cost of throughput. | Throughput up with p95 up equals approaching a capacity limit; latency flat means healthy headroom. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/cockroachdb/connection-pool-saturation) | The capacity gate for a surge. | A throughput surge with saturation climbing equals a looming connection-refusal risk. |
+| [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) | Distinguishes real work from retry churn. | A throughput rise tracking retries equals contention inflating the count, not new business. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/cockroachdb/slow-query-rate) | Whether throughput is healthy or slow. | Rising throughput with a rising slow-query rate equals queries degrading under load. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The executive composite. | Throughput is context for every other signal that feeds the score. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+To confirm the figure natively, open the DB Console **SQL** dashboard and read the **Statements** (queries per second) chart, or query `crdb_internal.node_metrics` for `sql.query.count` and differentiate it yourself. The DB Console **SQL Activity → Statements** page also breaks throughput down by statement fingerprint, useful for finding which query is driving a spike. On CockroachDB Cloud the QPS chart appears on the cluster **Metrics** page.
+
+| Reason our number may differ | Direction | Why |
+| --- | --- | --- |
+| **Counter scope.** Some native views split reads, writes, and DDL into separate series. | Variable | The card sums all statement types; a chart showing only SELECTs reads lower. |
+| **Retry inclusion.** Transparently retried statements each increment the counter. | Both higher | The card reflects executions including retries, matching the raw metric; a "logical query" view excludes them. |
+| **Rate window.** The card differentiates over the live poll interval. | Marginal | A chart smoothed over a longer resolution flattens short spikes the live card catches. |
+| **Time zone.** Chart axes render in the cluster locale. | Cosmetic | Axis labels shift; the rate does not. |
+
+For divergence investigations use Vortex Mind to attribute a spike to a specific statement fingerprint or upstream service.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does this card have no alert threshold?**
+Because there is no universal "too high" or "too low". A value that is a quiet night for one cluster is an overload for another. Throughput is a reference signal you read against your own baseline and against the paired cards (orders, errors, latency), not against a fixed number. The anomaly alerts live on those companion cards.
+
+**My throughput doubled. Should I be worried?**
+It depends on whether real work doubled. Check [CRDB Statements Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/cockroachdb/crdb-statements-spike-vs-ecom-order-rate). If orders rose in step, it is healthy traffic and you only need to confirm capacity headroom. If orders are flat, the extra statements are retries or a runaway loop, which is a problem to chase down at the source.
+
+**Throughput dropped to almost zero but the database looks healthy. Where do I look?**
+Upstream. A near-zero rate with a healthy cluster (no node loss, no errors) means work has stopped arriving, the application tier, a load balancer, DNS, or a failed deploy. The database is the messenger here, not the cause; start with the service that feeds it queries.
+
+**Is one statement the same as one transaction?**
+No. A transaction can contain many statements, and this card counts statements. It is therefore not an order count or a business-event count; do not equate statements/sec with orders/sec. Use the cross-channel order card for the business view.
+
+**Do retried transactions inflate this number?**
+Yes. CockroachDB transparently retries some transactions under contention, and each retry is another statement execution. A contention storm can lift the rate without any extra real work. Pair with [Transaction Retries (24h)](/nerve-centre/kpi-cards/cockroachdb/transaction-retries-24h) to tell genuine load from retry churn.
+
+**Can I see which query is driving a spike?**
+Not from this headline, which is a single cluster rate. Use the DB Console **SQL Activity → Statements** page, which ranks statement fingerprints by execution count and time, or ask Vortex Mind to attribute the spike. The headline tells you *that* throughput moved; the fingerprint view tells you *what* moved it.
+
+**Does the number include internal/system queries?**
+It reflects the SQL statement counter, which is dominated by application queries but can include some internal SQL. For attributing a change to your workload, the fingerprint breakdown in SQL Activity filters out the noise; the headline is intentionally the gross rate.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Statements per Second (live)* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

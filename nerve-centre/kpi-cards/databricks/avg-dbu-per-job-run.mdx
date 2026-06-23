@@ -1,0 +1,131 @@
+---
+title: "Avg DBU per Job Run, Databricks"
+sidebarTitle: "Avg DBU per Job Run"
+description: "Avg DBU per Job Run for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [DBU Burn](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The average Databricks Units consumed per job run over the trailing 7 days, compared against the prior 7-day period. Where [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) tells you the total spend, this card tells you the unit economics: how expensive a single job run has become. It is the efficiency metric FinOps and data engineering watch together, because a rising cost-per-run is the early warning that pipelines are growing heavier (bigger data, worse plans, larger clusters) before the total bill makes it obvious.
+
+| | |
+| --- | --- |
+| **Data source** | Billable usage API joined to the Jobs Runs API (`GET /api/2.1/jobs/runs/list`). DBU consumption per run is taken from the billing-usage records; the run count comes from completed runs in the window. Where enabled, `system.billing.usage` plus `system.workflow.jobs` provide the same join for historical reconciliation. |
+| **Metric basis** | `total job-run DBU in window / number of completed job runs in window`. A simple mean across runs, not weighted by run duration. |
+| **Aggregation window** | Trailing 7 days, compared against the prior 7 days (`7d vsP`). |
+| **Comparison** | Week-over-week. The card surfaces the percentage change against the matching prior period. |
+| **What counts** | Completed job runs (success, failed, and timed-out) and the DBU billed against their compute. |
+| **What does NOT count** | Interactive (all-purpose) cluster usage outside of jobs, SQL warehouse DBU (those have their own cards), and runs still in progress at the window edge. |
+| **Time window** | `7d vsP` (trailing 7 days vs prior 7 days) |
+| **Alert trigger** | `+25% WoW` (cost per run rising week-over-week, investigate before the total bill follows) |
+| **Roles** | FinOps, data engineering, platform engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine sums the DBU billed against job compute over the trailing 7 days and divides by the number of completed job runs in the same window:
+
+```text
+avg_dbu_per_run = total_job_run_DBU (7d) / completed_job_runs (7d)
+wow_change%     = (avg_dbu_per_run_this_week - avg_dbu_per_run_last_week)
+                  / avg_dbu_per_run_last_week × 100
+```
+
+Two things make this metric sharp. First, it is a per-run mean, so it isolates the cost of doing one unit of work from the volume of work. If you ran twice as many jobs this week but each cost the same, this card stays flat while total burn doubles, exactly the separation you want. Second, the week-over-week comparison normalises out the weekly cadence of most pipelines (nightly loads, weekend batch windows), so the `+25% WoW` alert fires on genuine efficiency regressions rather than on the normal Monday-vs-Sunday shape of a workload. A breach means each run is consuming materially more DBU than it did last week: usually larger input data, a regressed query plan, a cluster that was sized up, or autoscaling that is overshooting.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team reviews the card on 21 Apr 26. The headline shows a week-over-week jump that trips the alert.
+
+| Window | Total job-run DBU | Completed runs | Avg DBU/run |
+| --- | --- | --- | --- |
+| Prior 7d (07 to 13 Apr) | 4,200 | 1,400 | 3.0 |
+| This 7d (14 to 20 Apr) | 5,880 | 1,400 | 4.2 |
+
+```text
+wow_change% = (4.2 - 3.0) / 3.0 × 100 = +40%
+```
+
+Run count is identical at 1,400, yet average DBU per run climbed from 3.0 to 4.2, a **+40% WoW** rise that clears the +25% threshold. Because the volume did not change, this is purely an efficiency regression: the same jobs got more expensive. The team works the drill-down:
+
+1. **[DBU by Cluster (7d)](/nerve-centre/kpi-cards/databricks/dbu-by-cluster-7d) isolates the culprit cluster.** It shows the `prod-etl-nightly` cluster jumped from a fixed 8 nodes to autoscaling up to 16 mid-week, after a new upstream feed roughly doubled the input volume on one table.
+2. **The fix is a plan change, not a node change.** The new feed landed as thousands of small files; the nightly load was reading them all on every run. Compacting them with a scheduled `OPTIMIZE` (tracked by [Last Delta Lake Vacuum / Optimize](/nerve-centre/kpi-cards/databricks/last-delta-lake-vacuum-optimize)) cut the read cost and pulled avg DBU/run back toward 3.2 the following week.
+3. **Confirm no run-time regression came with it.** [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) stayed flat, so the extra DBU was scale-out cost, not jobs hanging.
+
+The lesson: this card is most valuable when run count is stable. A +40% per-run rise with flat volume is unambiguous (something made each run heavier), whereas a per-run change alongside a big swing in run count needs the volume context before you read it as a regression.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Avg DBU per Job Run | What the combination tells you |
+| --- | --- | --- |
+| [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) | The total-spend headline this per-run figure feeds. | Rising total with flat per-run equals more runs; rising per-run with flat total equals fewer but heavier runs. |
+| [DBU by Cluster (7d)](/nerve-centre/kpi-cards/databricks/dbu-by-cluster-7d) | Localises which cluster drove the per-run change. | The cluster topping the DBU table is where the efficiency regression lives. |
+| [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h) | Separates useful per-run cost from idle waste. | High per-run plus high idle waste means the cost is partly clusters sitting open between runs. |
+| [Avg Cluster CPU Utilisation %](/nerve-centre/kpi-cards/databricks/avg-cluster-cpu-utilisation) | The utilisation behind the cost. | Per-run cost up with utilisation down means over-provisioned nodes; up with utilisation up means genuinely heavier work. |
+| [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) | Run duration is a direct DBU multiplier. | A per-run cost rise tracking longer runs points to a plan or data-volume regression. |
+| [Job Success Rate (24h)](/nerve-centre/kpi-cards/databricks/job-success-rate-24h) | Failed and retried runs still burn DBU. | Falling success rate inflates per-run cost through wasted retries. |
+| [Last Delta Lake Vacuum / Optimize](/nerve-centre/kpi-cards/databricks/last-delta-lake-vacuum-optimize) | Table maintenance is a common per-run cost lever. | Stale OPTIMIZE plus rising per-run cost equals small-file overhead on reads. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **Settings → Usage** (the account-level usage dashboard) for total job-compute DBU over a custom range.
+> **`system.billing.usage`** joined to **`system.workflow.jobs`** for the per-run DBU series if system tables are enabled.
+> **Workflows → Jobs → Runs** for the completed-run count over the same window.
+
+**Why our number may legitimately differ from the Databricks UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Mean vs duration-weighted** | Variable | Vortex IQ reports a simple per-run mean; a usage dashboard that totals DBU and lets you eyeball it against run count will not weight the two the same way you might by hand. |
+| **Window boundary** | Variable | We use a rolling trailing-7-day window vs prior 7 days; usage dashboards default to calendar periods, so the run set differs at the edges. |
+| **Billing lag** | Vortex IQ slightly lower near the edge | Billable usage records can lag the run by a short interval, so the most recent runs may not yet carry their full DBU at read time. |
+| **In-progress runs** | Vortex IQ excludes | Runs still executing at the window edge are not counted; the usage dashboard may show partial DBU for them. |
+| **Time zone** | Window alignment | Native dashboards use the account time zone; Vortex IQ stores UTC and renders in your profile time zone. |
+
+**Cross-connector reconciliation:** pair with [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume). If per-run cost is climbing while order volume is flat, the pipelines are getting less efficient per unit of business value, the clearest signal that the rise is waste rather than growth.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My per-run cost jumped but I did not change anything. What happened?**
+The usual cause is upstream data growth. The same job reading more rows, more partitions, or more small files costs more DBU per run even with identical code and cluster config. Check the input volume of the heaviest job in [DBU by Cluster (7d)](/nerve-centre/kpi-cards/databricks/dbu-by-cluster-7d), and if small files are the issue, schedule a regular `OPTIMIZE`.
+
+**Why a mean rather than a duration-weighted average?**
+A simple per-run mean is the metric a budget owner reasons about: "what does one run of our pipeline cost on average?" Duration-weighting would let a handful of very long runs dominate and obscure the typical case. For the long-tail view, read [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) alongside it.
+
+**Failed runs are dragging my average up. Is that correct?**
+Yes, and it is intentional. A failed or timed-out run still consumed compute before it died, so it still cost DBU. Counting it keeps the average honest about money spent. If failures are inflating the figure, the fix is to raise [Job Success Rate (24h)](/nerve-centre/kpi-cards/databricks/job-success-rate-24h), not to exclude the cost.
+
+**Does this include interactive notebook usage?**
+No. This card covers job-cluster runs only. Ad-hoc work on all-purpose clusters and SQL warehouse queries are billed and tracked separately. If your engineers run heavy exploratory work interactively, it will not appear here even though it shows in the total bill.
+
+**The +25% alert fired but my total bill is flat. Should I care?**
+Yes, this is the early-warning case the card exists for. Flat total with rising per-run means run volume fell while each run got heavier. The total has not moved yet only because fewer runs masked it; when volume returns to normal, the bill will jump. Investigate now.
+
+**Can I change the +25% threshold?**
+Yes. The week-over-week sensitivity is configurable per profile in the Sensitivity tab. Teams with deliberately variable workloads (seasonal loads, backfills) often widen it to avoid firing on expected swings, while cost-sensitive teams tighten it.
+
+**Why is my per-run figure lower than expected right after midnight?**
+Billing-usage records lag completed runs slightly, so runs that finished in the last few minutes may not yet carry their full DBU. The figure settles as the billing data catches up; reconcile against `system.billing.usage` after the lag clears rather than at the window edge.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Avg DBU per Job Run* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

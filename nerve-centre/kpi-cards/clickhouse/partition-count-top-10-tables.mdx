@@ -1,0 +1,184 @@
+---
+title: "Partition Count (Top 10 Tables), ClickHouse"
+sidebarTitle: "Partition Count (Top 10 Tables)"
+description: "Partition Count (Top 10 Tables) for ClickHouse deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ingest & Merges](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A ranked table of your ten tables with the most partitions, where a partition is a logical slice of a MergeTree table defined by its `PARTITION BY` expression (commonly one per month, or one per day). Partition count is a design-health signal, not a real-time load signal. A table with hundreds or thousands of partitions almost always has a *too-granular* partition key (partitioning by hour or by a high-cardinality column instead of by month), which fragments data, inflates part counts, slows merges and queries, and pushes the table toward the `Too Many Parts` cliff. This card is how you catch a partitioning mistake before it becomes an ingest outage.
+
+| | |
+| --- | --- |
+| **Data source** | `system.parts`, aggregated: `SELECT table, uniqExact(partition_id) AS partitions FROM system.parts WHERE active GROUP BY table ORDER BY partitions DESC LIMIT 10`. The count is distinct partition IDs among active parts. |
+| **Metric basis** | Distinct *partitions*, not parts. Many parts can belong to one partition; this card counts the partitions, which reflects the partition-key design. Pair with [Active Parts (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) for the parts view. |
+| **Why partitions matter** | Each partition is merged independently; ClickHouse never merges parts across partition boundaries. Too many partitions means more, smaller merge units, more files on disk, slower partition pruning, and a faster climb toward the per-table parts cap. |
+| **Aggregation window** | Real-time. Recomputed from `system.parts` on each refresh. |
+| **Alert threshold** | `> 1000 partitions on any table`. A table breaching 1,000 partitions is a near-certain sign of an over-granular `PARTITION BY` and warrants a redesign before it destabilises ingest. |
+| **What does NOT count** | (1) Inactive parts (the query filters `WHERE active`, so parts pending cleanup after a merge are excluded); (2) detached partitions (those are not active); (3) the parts-within-a-partition count (that is the Active Parts card); (4) tables outside the top 10. |
+| **Healthy shape** | Monthly partitioning over a few years is tens of partitions. Daily partitioning over a year or two is hundreds and is often acceptable but worth watching. Anything in the thousands signals a key chosen at too fine a grain. |
+| **Sensitivity note** | This is a Sensitivity card: the `> 1000` default surfaces an over-partitioned table early, while it is still a tuning problem and not yet an outage. |
+| **Time window** | `RT` (real-time, recomputed on each refresh) |
+| **Alert trigger** | `> 1000 partitions` on any single table. |
+| **Roles** | owner, platform, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine groups active parts by table and counts distinct partitions:
+
+```sql
+SELECT
+    table,
+    uniqExact(partition_id)            AS partitions,
+    count()                            AS active_parts,
+    formatReadableSize(sum(bytes_on_disk)) AS size
+FROM system.parts
+WHERE active
+GROUP BY table
+ORDER BY partitions DESC
+LIMIT 10;
+```
+
+`partition_id` is the internal identifier for the slice a part belongs to, derived from the table's `PARTITION BY` expression. Counting `uniqExact(partition_id)` over `active` parts gives the number of live partitions per table. The card surfaces `partitions` as the ranked headline and carries `active_parts` and `size` as context columns, because the relationship between partitions and parts is what diagnoses the problem: a table with 1,200 partitions and 1,300 parts has ~1 part per partition (heavy granularity, light data per slice), which is the classic over-partitioning signature.
+
+On a cluster, the card aggregates across nodes so a table's total partition footprint is visible rather than one node's slice. The `> 1000` alert evaluates per table: any single table in the result set breaching the threshold turns the card red and names that table.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs ClickHouse for a clickstream pipeline. A new `page_events` table was created two weeks ago. Snapshot taken on 17 Apr 26 at 10:05 UTC.
+
+The card shows:
+
+| Rank | Table | Partitions | Active parts | Size |
+| --- | --- | --- | --- | --- |
+| 1 | `page_events` | **1,247** | 1,389 | 04 GB |
+| 2 | `order_events` | 36 | 412 | 88 GB |
+| 3 | `session_summary` | 24 | 190 | 31 GB |
+| 4 | `user_profiles` | 1 | 22 | 9 GB |
+| ... | | | | |
+
+`page_events` is red: 1,247 partitions on a table only two weeks old and just 04 GB in size. Compare it to `order_events`, which is far bigger (88 GB) but has only 36 partitions. The team checks the DDL:
+
+```sql
+-- the offending table
+CREATE TABLE page_events (...)
+ENGINE = MergeTree
+PARTITION BY toYYYYMMDD(event_time)   -- DAILY partitioning, plus a high-cardinality twist
+ORDER BY (event_time, user_id);
+-- worse: an earlier version used PARTITION BY (toDate(event_time), site_id)
+-- with ~40 site_ids, multiplying partitions ~40x
+```
+
+What the team reads:
+
+1. **This is a design fault, not load.** 1,247 partitions in two weeks is impossible from daily partitioning alone (that would be ~14). The `site_id` in the partition key multiplied the slices: ~14 days x ~40 sites plus historical backfill produced ~1,200 partitions. The fix is the `PARTITION BY`, not more hardware.
+2. **The parts-to-partitions ratio confirms it.** 1,389 parts across 1,247 partitions is ~1.1 parts per partition. ClickHouse cannot merge across partitions, so each tiny slice is stuck as its own near-unmergeable unit. That fragments the 04 GB across ~1,400 files and pushes the table toward the `Too Many Parts` cap even though the data volume is trivial.
+3. **It will become an outage if ignored.** As ingest continues, parts climb. Pair with [Too Many Parts Errors (24h)](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h): once a single partition's part count breaches the cap, inserts to `page_events` start failing with code 252 and the pipeline stalls.
+
+```text
+Why this is over-partitioned:
+  - Table age:                    14 days
+  - Partitions:                   1,247  (impossible from date alone -> key includes site_id)
+  - Active parts:                 1,389
+  - Parts per partition:          ~1.1   (each slice is its own near-unmergeable unit)
+  - Data size:                    04 GB  (tiny, the problem is fragmentation, not volume)
+  => Redesign PARTITION BY to monthly (toYYYYMM(event_time)) and drop site_id from
+     the partition key (move it into ORDER BY instead). Expected result: ~1 partition.
+```
+
+The remediation: change `PARTITION BY` to a coarse, low-cardinality expression (monthly, `toYYYYMM(event_time)`), and move `site_id` into the `ORDER BY` / primary key where it belongs for filtering. Because you cannot alter `PARTITION BY` on an existing table in place, the standard path is to create a correctly partitioned table and `INSERT INTO ... SELECT` the data across, then swap names. After the migration the partition count for `page_events` drops to single digits and the parts backlog clears as merges consolidate freely within the larger partitions.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards platform teams should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Partition Count | What the combination tells you |
+| --- | --- | --- |
+| [Active Parts (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) | Parts are the other half of the fragmentation story. | High partitions plus high parts with a ~1:1 ratio is the over-partitioning signature; high parts within few partitions is a merge-throughput problem instead. |
+| [Too Many Parts Errors (24h)](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h) | The outage an over-partitioned table eventually causes. | A table topping this card today is the prime suspect when code-252 errors start tomorrow. |
+| [Merges In Progress](/nerve-centre/kpi-cards/clickhouse/merges-in-progress) | More partitions means more, smaller merge units. | Many partitions plus a high merge count means the scheduler is thrashing on tiny per-partition merges. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/clickhouse/database-disk-usage) | Fragmentation wastes space and inodes. | An over-partitioned table inflates file count and disk overhead out of proportion to its data. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) | Too many partitions slows partition pruning and reads. | Latency creeping up on a specific table that also tops this card points straight at the partition key. |
+| [Inserts per Second (live)](/nerve-centre/kpi-cards/clickhouse/inserts-per-second-live) | Insert pattern shapes partition/part growth. | Frequent small inserts into an over-partitioned table is the fastest route to a parts cliff. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that weights ingest health. | A table over the partition threshold drags the score down ahead of any visible failure. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse itself:**
+
+> **`system.parts`** for the authoritative count: `SELECT table, uniqExact(partition_id) AS partitions, count() AS parts FROM system.parts WHERE active GROUP BY table ORDER BY partitions DESC`. This is exactly what the card runs.
+> **`system.parts` per partition** to see the offender's shape: `SELECT partition, count() AS parts, sum(rows) FROM system.parts WHERE active AND table = 'page_events' GROUP BY partition ORDER BY parts DESC`.
+> **`SHOW CREATE TABLE <name>`** to read the `PARTITION BY` expression that produced the partitions, the root-cause artefact.
+> **`system.tables`** for `partition_key` and engine metadata across tables.
+> **ClickHouse Cloud:** the same `system.parts` reads apply; the Cloud console also surfaces table-level part and partition statistics per service.
+
+**Why our number may legitimately differ from a manual read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Active-only filter** | Vortex IQ lower | The card counts `WHERE active`. A manual count without that filter includes inactive parts pending cleanup and over-reports. |
+| **Distinct partitions vs parts** | Different numbers | This card counts distinct `partition_id`; a naive `count()` on `system.parts` counts parts, which is a larger and different number. Match the aggregation. |
+| **Sampling instant** | Marginal | During heavy ingest, partitions/parts churn between the card's sample and a hand-run query, especially right after a backfill. |
+| **Cluster aggregation** | Vortex IQ higher | The card aggregates across nodes; a single-node query sees only that node's partitions. |
+| **Detached partitions** | Vortex IQ lower | Detached partitions are not `active` and are excluded; if you `ATTACH` them, the count rises. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`clickhouse.active-parts-top-10-tables`](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) | A table high here is usually high there too. | A high parts count concentrated in *few* partitions means a merge-throughput issue, not a partition-key issue; the two cards disagree by design in that case. |
+| [`clickhouse.too-many-parts-errors-24h`](/nerve-centre/kpi-cards/clickhouse/too-many-parts-errors-24h) | The over-partitioned table is the likely source of future code-252 errors. | If errors appear on a table *not* topping this card, the cause is insert frequency, not partition granularity. |
+
+<details>
+<summary><em>Same-concept peer on other database connectors</em></summary>
+
+The "too many partitions / over-fragmented table" concept exists on partitioned engines elsewhere, though ClickHouse's MergeTree partitioning is distinctive. These are not a reconciliation against your ClickHouse data; they exist so a mixed-estate platform team can cross-link the idea across docs.
+
+- PostgreSQL equivalent: an excessive number of declarative or inheritance partitions on a partitioned table, which inflates planning time.
+- MySQL equivalent: too many `PARTITION` definitions on a partitioned InnoDB table.
+- BigQuery equivalent: hitting the per-table partition limit on date/integer-range partitioned tables.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What is the difference between a partition and a part?**
+A *partition* is a logical slice defined by your `PARTITION BY` expression (for example, all rows for one month). A *part* is a physical immutable directory of data on disk; many parts can belong to one partition, and ClickHouse merges parts *within* a partition over time but never *across* partitions. This card counts partitions (a design-health signal). The [Active Parts (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) card counts parts (a merge-throughput signal). You usually need both to diagnose a table.
+
+**Why is 1,000 partitions the threshold? My table has 800 and seems fine.**
+Healthy partitioning is coarse: monthly over a few years is tens, daily over a couple of years is hundreds. By the time a table reaches the high hundreds it is almost always partitioned at too fine a grain or by a high-cardinality column, and the cost (slower pruning, fragmented merges, file-count overhead) is already being paid even if nothing has failed yet. The `> 1000` default is the point where a redesign is clearly warranted. This is a Sensitivity card, so lower the threshold per profile if you want earlier warning.
+
+**Can I just `ALTER TABLE` to change the partition key?**
+No. ClickHouse does not allow changing `PARTITION BY` on an existing table in place. The standard remedy is to create a new table with the correct (coarser) partition key, copy the data across with `INSERT INTO new_table SELECT * FROM old_table`, validate row counts, then `RENAME` to swap them. Plan this as a migration; it is the price of getting the partition key right after the fact, which is why catching an over-partitioned table early (when it is small) matters so much.
+
+**My table has thousands of partitions but they are all tiny. Is that really a problem?**
+Yes, often the worst kind. Tiny partitions mean each one holds very few parts and rows, and because merges never cross partition boundaries, ClickHouse cannot consolidate them into efficient larger units. You end up with thousands of near-unmergeable slices, a huge file count, slow partition pruning, and a fast climb toward the per-table parts cap, all for a trivial amount of data. The fragmentation, not the data volume, is the problem.
+
+**Should I partition by day to make `DROP PARTITION` retention easy?**
+Daily partitioning is a reasonable trade-off *only* if your data spans a bounded window (so the partition count stays in the low hundreds) and you genuinely use `DROP PARTITION` for retention. For longer-lived tables, prefer monthly partitioning and use TTL (`TTL event_time + INTERVAL 90 DAY`) for retention instead, which deletes at the part level without needing a fine partition grain. Partitioning purely for delete-convenience is the most common cause of over-partitioning.
+
+**Does a high-cardinality column in the partition key cause this?**
+Almost always, and it is the classic mistake. Partitioning by `(date, site_id)`, `(date, customer_id)`, or any column with many distinct values multiplies the partition count by that cardinality. The partition key should be low-cardinality and coarse (typically just a time bucket). High-cardinality columns belong in the `ORDER BY` / primary key, where they help query filtering without exploding the partition count. If a table tops this card, check `SHOW CREATE TABLE` for a multi-column or high-cardinality `PARTITION BY` first.
+
+**The card only shows 10 tables. What if my over-partitioned table is number 11?**
+The card ranks the top 10 by partition count, so the worst offenders surface first; an over-partitioned table is, by definition, near the top. If you suspect a table outside the top 10, run the `system.parts` aggregation manually without the `LIMIT 10` to see the full ranking. In practice, any table serious enough to risk an outage is in the top few, which is what the alert (`> 1000 on any table`) is tuned to catch.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Partition Count (Top 10 Tables)* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

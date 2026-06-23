@@ -1,0 +1,138 @@
+---
+title: "Slow-Query Rate %, MariaDB"
+sidebarTitle: "Slow-Query Rate %"
+description: "Slow-Query Rate % for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The proportion of statements that ran slower than `long_query_time`, expressed as a percentage of total queries over a 15-minute window. It is the `Slow_queries` status counter divided by total queries (`Questions` / `Queries`), differenced over the window. A gauge, not a latency number: it tells you *how much* of the workload is slow, not *how slow* the slow ones are. For a DBA, the slow-query rate is the volume signal that complements the latency percentiles. p95 and p99 tell you the tail is bad; the slow-query rate tells you what fraction of the workload is in that tail. When it crosses 5% the card turns amber, because at that point one query in twenty is breaching the slow threshold and the slow query log is filling.
+
+| | |
+| --- | --- |
+| **What it tracks** | Slow-Query Rate %: slow queries as a percentage of total queries over the trailing 15 minutes. The detail line is *Slow-Query Rate % for the selected period.* |
+| **Data source** | MariaDB global status counters `Slow_queries` and `Questions` (or `Queries`) from `SHOW GLOBAL STATUS`, differenced across the window. "Slow" means execution time exceeded `long_query_time` (the slow-query log threshold). |
+| **Time window** | `15m`: a rolling 15-minute window, recomputed each poll. |
+| **Alert trigger** | `> 5%`. Above this the card turns amber and surfaces in the Sensitivity feed. |
+| **Reads as** | A gauge from 0% to 100%. The headline is the share of the workload that breached `long_query_time`. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The rate is a ratio of two monotonic counters, both differenced over the 15-minute window so the gauge reflects the recent workload rather than the cumulative history since startup.
+
+```text
+slow_query_rate_% = ( ΔSlow_queries / ΔQuestions ) × 100   over the trailing 15m
+
+where  ΔSlow_queries = Slow_queries(now) - Slow_queries(now - 15m)
+       ΔQuestions    = Questions(now)    - Questions(now - 15m)
+```
+
+`Slow_queries` increments whenever a statement's execution time exceeds `long_query_time` (default 10 seconds, but most production instances set it far lower, often 0.5 to 2 seconds, to capture meaningful offenders). Crucially, the rate is only interpretable alongside the configured `long_query_time`: a server with `long_query_time = 0.1` will show a much higher rate than one set to `10`, for the identical workload. The card reads the live `long_query_time` and presents it next to the rate so the figure is never read in a vacuum. If the server restarts inside the window the counters reset to zero; the engine clamps the negative delta and recomputes from the restart point. Where `Questions` is unavailable the engine uses `Queries` (which also counts statements executed inside stored programs) and notes the basis in the source line.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MariaDB 10.6 primary with `long_query_time = 1` (one second). Snapshot taken on 21 Mar 26 at 10:15 GMT, shortly after a release.
+
+| Reading | Value |
+| --- | --- |
+| `Slow_queries` delta (15m) | 4,100 |
+| `Questions` delta (15m) | 58,000 |
+| **Slow-Query Rate %** | **7.1%** |
+| Gauge state | Amber (threshold `> 5%`) |
+
+7.1% means roughly one query in fourteen is taking longer than a second, and the rate jumped right after a release, which is the most useful clue: a deploy changed something. The DBA pulls the slow query log and the digest table to see which statements are now slow:
+
+```sql
+SELECT DIGEST_TEXT,
+       COUNT_STAR,
+       ROUND(AVG_TIMER_WAIT/1e9, 0) AS avg_ms,
+       SUM_ROWS_EXAMINED / NULLIF(COUNT_STAR,0) AS rows_per_call
+FROM   performance_schema.events_statements_summary_by_digest
+WHERE  AVG_TIMER_WAIT/1e9 > 1000          -- over long_query_time
+ORDER BY COUNT_STAR DESC
+LIMIT 5;
+```
+
+The top statement is a new `SELECT` introduced by the release that joins `orders` to a `customer_segments` table with no index on the join column. It runs thousands of times and examines the whole segments table each call, dominating the slow count. The fix is an index on `customer_segments(customer_id)` plus an `ANALYZE TABLE`. After deploying, the rate falls to 0.4% on the next window.
+
+Three takeaways:
+
+1. **Read the rate next to the latency percentiles.** The rate is volume (how many are slow); p95/p99 are severity (how slow). A high rate with a modest p99 means lots of mildly-slow queries; a low rate with a huge p99 means a few catastrophic ones. The pair tells you whether to optimise broadly or surgically.
+2. **The rate is meaningless without `long_query_time`.** A rate of 7% at `long_query_time = 0.1` is very different from 7% at `long_query_time = 2`. Always read the configured threshold (the card shows it) before reacting.
+3. **Spikes after a release point at a query change.** A rate that jumps at a deploy boundary is almost always a new or changed statement with a missing index. The digest table, filtered by `COUNT_STAR`, names the offender by volume.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow-Query Rate | What the combination tells you |
+| --- | --- | --- |
+| [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mariadb/top-10-slowest-queries-digest) | The named statements behind the slow count. | The rate says "5% are slow"; this card says "and here are the five digests responsible". |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p95-ms) | The severity of the body of the tail. | High rate plus high p95 means the slow queries are a real, broad volume, not one outlier. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p99-ms) | The severity of the extreme tail. | Low rate plus high p99 means rare but catastrophic queries; high rate plus modest p99 means many mildly-slow ones. |
+| [Query Latency p50 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p50-ms) | The typical-request baseline. | A rising rate with a flat p50 confirms the median is healthy and the problem is purely the tail. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mariadb/queries-per-second-live) | The throughput context. | A rate spike at steady QPS is a query/index change; a rate spike with a QPS surge may be load-driven. |
+| [InnoDB / XtraDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mariadb/innodb-xtradb-buffer-pool-hit-rate) | Cold-cache disk reads that make queries slow. | A hit-rate dip that coincides with a rate spike means the slow queries are paying for disk I/O. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite that weights performance. | A sustained slow-query-rate breach pulls the composite down. |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/mariadb/slow-queries-during-checkout-window-5m) | The revenue-at-risk cross-channel view. | A high rate that overlaps checkout traffic is the version that costs conversions. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> `SHOW GLOBAL STATUS LIKE 'Slow_queries';` and `SHOW GLOBAL STATUS LIKE 'Questions';` for the raw counters behind the ratio.
+> `SHOW VARIABLES LIKE 'long_query_time';` to confirm the threshold the rate is measured against (and `log_slow_query_file` / `slow_query_log` to confirm logging is on).
+> The slow query log itself, summarised with `pt-query-digest` (Percona Toolkit), which prints counts and percentiles per digest.
+> `SELECT * FROM performance_schema.events_statements_summary_by_digest WHERE AVG_TIMER_WAIT/1e9 > <long_query_time_ms>;` for the structured equivalent of the slow log.
+
+**Why our number may legitimately differ from a manual ratio:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Windowing** | Variable | A manual `Slow_queries / Questions` from `SHOW STATUS` is cumulative since startup; our card differences over a trailing 15 minutes, so a fresh spike reads higher than the lifetime average. |
+| **`Questions` vs `Queries`** | Slightly different denominator | `Queries` counts statements inside stored programs; `Questions` does not. We use `Questions` where available and note the basis. |
+| **`long_query_time` changed** | Step change | If someone lowered `long_query_time` mid-window, more statements qualify as slow and the rate jumps without the workload changing. |
+| **Restart inside the window** | Ours may read low | Counters reset to zero on restart; we clamp the negative delta and recompute from the restart point. |
+
+**On managed services:** Amazon RDS / Aurora for MariaDB exposes `Slow_queries` via Enhanced Monitoring and publishes the slow query log to CloudWatch Logs (when enabled); SkySQL and Azure Database for MariaDB surface the slow-query counter in their own consoles and offer log export. Confirm the managed service's `long_query_time` parameter-group value matches your expectation before comparing rates.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Q: The rate looks high, but is the database actually slow?**
+Not necessarily. The rate is entirely relative to `long_query_time`. If that threshold is set aggressively low (say 0.1 seconds) a perfectly healthy reporting workload will show a high rate because legitimate analytic queries cross the line. Always read the configured `long_query_time` (the card shows it) first. A high rate at a low threshold may just mean the threshold is tuned for sensitivity, not that anything is broken.
+
+**Q: How does the slow-query rate relate to p95 and p99?**
+They are volume versus severity. The rate tells you what fraction of queries are slow; the percentiles tell you how slow the slow ones are. A high rate with a modest p99 means many mildly-slow queries (optimise broadly, often a missing index on a high-frequency statement). A low rate with a huge p99 means a few catastrophic queries (optimise surgically, often a long transaction or a full scan). Read them together.
+
+**Q: The rate jumped right after a deploy. What should I check?**
+A deploy-boundary spike almost always means a new or changed statement with a missing or unused index. Filter [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mariadb/top-10-slowest-queries-digest) and the digest table by `COUNT_STAR` to find the high-frequency offender, run `EXPLAIN` to confirm the plan, and add the index. Cross-check [Queries per Second (live)](/nerve-centre/kpi-cards/mariadb/queries-per-second-live) to rule out a pure traffic surge.
+
+**Q: Does the rate count queries that hit a cold cache?**
+Yes, indirectly. A query that would be fast against a warm buffer pool can exceed `long_query_time` when it has to read from disk, so it increments `Slow_queries`. If the rate rises alongside a dip in [InnoDB / XtraDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mariadb/innodb-xtradb-buffer-pool-hit-rate), the slowness is I/O-driven (buffer pool too small or recently restarted) rather than a bad plan.
+
+**Q: Should I lower long_query_time to catch more slow queries?**
+Lowering it gives you finer visibility but inflates the rate and grows the slow query log, which itself adds write overhead. A common production setting is 0.5 to 2 seconds: low enough to catch real offenders, high enough to avoid logging routine queries. If you lower it, expect this card's rate to rise as a definitional consequence, not because anything degraded, and re-baseline the Sensitivity threshold accordingly.
+
+**Q: The rate is 0% but my latency percentiles are amber. How?**
+The percentiles measure execution time directly; the rate measures how many queries crossed `long_query_time`. If `long_query_time` is set high (say 10 seconds) but your p95 sits at 250ms, the percentiles flag a real slowdown while the rate stays at zero because nothing crossed the 10-second line. Lower `long_query_time` to bring the rate into a useful range, or trust the percentiles, which do not depend on the threshold.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow-Query Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

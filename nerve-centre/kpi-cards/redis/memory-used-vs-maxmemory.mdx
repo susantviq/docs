@@ -1,0 +1,154 @@
+---
+title: "Memory Used vs Maxmemory %, Redis"
+sidebarTitle: "Memory Used vs Maxmemory %"
+description: "Memory Used vs Maxmemory for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of Redis's configured memory ceiling that the dataset currently occupies: `used_memory` divided by `maxmemory`. For Redis, memory is not just a resource, it is effectively the disk: the entire dataset lives in RAM, and `maxmemory` is the hard wall. As usage approaches that wall, Redis starts evicting keys according to its `maxmemory-policy`, and if the policy is `noeviction` it starts rejecting writes outright. This is the single most important capacity gauge on a Redis board, which is why it sits in the Executive Overview as a Hero card: it tells you, at a glance, how much runway you have before evictions or write failures begin.
+
+| | |
+| --- | --- |
+| **What it tracks** | `used_memory / maxmemory` expressed as a percentage. Redis treats memory as its data store, so this is the percentage of the data ceiling consumed. |
+| **Data source** | `used_memory` from `INFO memory` and `maxmemory` from `CONFIG GET maxmemory` (also exposed in `INFO memory`). |
+| **Time window** | `RT` (real-time, re-evaluated on every Nerve Centre poll, typically every 60 seconds). |
+| **Alert trigger** | `> 90%`. At 90% of `maxmemory` the card turns red because eviction (or write rejection under `noeviction`) is imminent or already happening. |
+| **Chart type** | Gauge, so the headroom is read at a glance. |
+| **If `maxmemory` is 0** | A value of `0` means "no limit" (use all available system RAM). The card then falls back to `used_memory` against total system RAM where the deployment exposes it, because the real ceiling is the OS, not Redis. |
+| **What pushes it up** | Organic dataset growth, missing or too-long TTLs, large values, a key leak (keys created but never expired), and replication / client output buffers. |
+| **Roles** | owner, dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The gauge is a direct ratio:
+
+```text
+memory_used_pct = (used_memory / maxmemory) * 100
+```
+
+- **`used_memory`** is the bytes Redis's allocator has committed for the dataset and internal structures, as reported by `INFO memory`. It is the figure Redis compares against `maxmemory` when deciding whether to evict.
+- **`maxmemory`** is the configured ceiling. Crucially, Redis enforces the policy against `used_memory`, not against the OS-reported RSS, so this card mirrors the exact number Redis uses for its own eviction decisions.
+
+Two behaviours hinge on this percentage:
+
+- **Approaching 100%.** Once `used_memory` reaches `maxmemory`, Redis applies the `maxmemory-policy`. With an eviction policy (for example `allkeys-lru`, `volatile-lru`, `allkeys-lfu`, `volatile-ttl`) Redis removes keys to make room for new writes, so the dataset stays at the ceiling and you see eviction activity. With `noeviction`, Redis stops accepting write commands and returns an out-of-memory error to clients while still serving reads.
+- **The 0 special case.** If `maxmemory` is `0`, there is no Redis-imposed limit; Redis will grow until the OS runs out of RAM and the process is killed (OOM) or swaps. In that mode the meaningful ceiling is total system memory, so the card uses system RAM as the denominator where available, and you should pair it closely with [Memory Fragmentation Ratio](/nerve-centre/kpi-cards/redis/memory-fragmentation-ratio) to catch swap early.
+
+Note that `used_memory` (the eviction-relevant figure) can differ from `used_memory_rss` (what the OS gives the process). Fragmentation lives in that gap; this card deliberately uses `used_memory` because that is what drives eviction.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A DBA runs a Redis 7.2 instance as the cache and session store for an order-processing platform. `maxmemory` is set to 6 GB and `maxmemory-policy` is `volatile-lru`. Snapshot taken on 18 Feb 26 at 20:10 UTC during an evening traffic peak.
+
+| Signal | Value | Source |
+| --- | --- | --- |
+| `used_memory` | 5.64 GB | `INFO memory` |
+| `maxmemory` | 6.00 GB | `CONFIG GET maxmemory` |
+| `maxmemory-policy` | `volatile-lru` | `CONFIG GET maxmemory-policy` |
+| `evicted_keys` (delta last 5m) | 0 | `INFO stats` |
+| Card headline | **94%** | computed |
+
+The card reads **94%**, above the 90% alert, and turns red. The DBA's read:
+
+1. **The instance is on the edge of eviction.** At 94% with `volatile-lru`, the next burst of writes will push usage to the ceiling and Redis will begin evicting the least-recently-used keys that have a TTL set. Right now `evicted_keys` is still flat, so eviction has not started, but there is almost no runway left during a traffic peak.
+2. **The policy choice has a sharp consequence here.** `volatile-lru` only evicts keys that have a TTL. If a large share of memory is held by keys with no TTL (for example permanent config blobs or a leaked namespace), Redis cannot evict them and may run out of evictable candidates, effectively behaving like `noeviction` for the non-expiring keys and starting to reject writes. The DBA should check how much of the dataset is TTL-bearing.
+3. **There are three levers, in order of speed.** Fastest: raise `maxmemory` if the node has spare RAM (`CONFIG SET maxmemory 8gb`), buying immediate headroom. Next: find and fix the growth (audit TTLs, hunt for a key leak with `--bigkeys` and keyspace sampling). Slowest but cleanest: shard or move cold data off the instance. The card buys the time to choose deliberately rather than reacting to a write-rejection incident.
+
+```text
+Capacity decision at 20:10 UTC on 18 Feb 26:
+  - Usage:                 5.64 GB / 6.00 GB = 94%
+  - Runway at this rate:   ~0.36 GB before eviction begins
+  - Policy:                volatile-lru (only TTL-bearing keys evictable)
+  - Risk:                  if non-TTL keys dominate -> writes start failing
+  - Levers:
+      immediate  -> CONFIG SET maxmemory 8gb (if node has RAM)
+      short term -> audit TTLs / hunt key leak (redis-cli --bigkeys)
+      lasting    -> shard cold data off this instance
+```
+
+Three takeaways:
+
+1. **90% is a runway warning, not a failure.** At 90 to 95% you still have time to act before evictions or write rejections start. The whole point of a Hero gauge is to give you that lead time; do not wait for 100%.
+2. **The eviction policy decides what "full" means.** Under an eviction policy, full means keys silently disappear (cache misses rise). Under `noeviction`, full means writes fail loudly. Know your policy before you read this card, because the symptom of "full" is completely different between them.
+3. **Raising `maxmemory` is a tactic, not a fix.** Bumping the ceiling buys headroom but can mask a key leak or missing TTLs that will simply fill the new ceiling too. Pair this card with [Total Keys (db0)](/nerve-centre/kpi-cards/redis/total-keys-db0) and [Evicted Keys / minute](/nerve-centre/kpi-cards/redis/evicted-keys-minute) to tell organic growth apart from a leak.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards DBAs should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Memory Used vs Maxmemory | What the combination tells you |
+| --- | --- | --- |
+| [Evicted Keys / minute](/nerve-centre/kpi-cards/redis/evicted-keys-minute) | Eviction is what happens when this gauge hits 100% under an eviction policy. | Usage at the ceiling plus rising evictions equals the instance is actively shedding data to stay alive. |
+| [Memory Fragmentation Ratio](/nerve-centre/kpi-cards/redis/memory-fragmentation-ratio) | This card uses `used_memory`; fragmentation lives in the RSS gap. | High usage plus high fragmentation means the OS is even closer to physical exhaustion than this % implies. |
+| [Keyspace Hit Rate %](/nerve-centre/kpi-cards/redis/keyspace-hit-rate) | Evictions caused by a full instance show up as falling hit rate. | Usage at the ceiling plus dropping hit rate equals eviction is hurting cache effectiveness. |
+| [Total Keys (db0)](/nerve-centre/kpi-cards/redis/total-keys-db0) | Distinguishes organic growth from a key leak. | Rising memory with flat key count equals values growing; rising memory with rising keys equals a possible leak or missing TTLs. |
+| [Last RDB Save (minutes ago)](/nerve-centre/kpi-cards/redis/last-rdb-save-minutes-ago) | `BGSAVE` forks; a near-full instance can fail to fork. | High usage plus a failing RDB save often equals fork failing for lack of headroom. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The composite folds memory pressure into overall health. | Sustained high usage drags the health score even when latency looks fine. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis's own tooling:**
+
+> **`INFO memory`** for `used_memory`, `used_memory_human`, `maxmemory`, `maxmemory_human`, `maxmemory_policy`, and `used_memory_peak`. The `used_memory` figure here is exactly what this card divides by `maxmemory`.
+> **`CONFIG GET maxmemory`** and **`CONFIG GET maxmemory-policy`** to confirm the ceiling and the eviction behaviour.
+> **`INFO stats`** for `evicted_keys` and `expired_keys` to see whether the ceiling is being hit (evictions climbing).
+> **`MEMORY DOCTOR`** for Redis's own plain-language read on memory health.
+> **ElastiCache / MemoryDB:** the `DatabaseMemoryUsagePercentage` CloudWatch metric and the node group's `maxmemory` reserved-memory settings; AWS reserves some memory for overhead, so the console % can differ slightly from a raw `used_memory / maxmemory`.
+
+**Why our number may legitimately differ from what you see:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **`used_memory` vs RSS** | Different denominator | This card uses `used_memory` (the eviction-relevant figure); OS tools show RSS, which is inflated by fragmentation and forks. |
+| **Reserved memory (managed)** | Vortex IQ may differ from console | ElastiCache reserves a slice of memory for overhead; `DatabaseMemoryUsagePercentage` accounts for it differently than a raw ratio. |
+| **`maxmemory = 0`** | Denominator changes | With no Redis limit, the card uses system RAM as the ceiling where available, which is not what `CONFIG GET maxmemory` returns (0). |
+| **Polling cadence** | Up to ~1 min lag | A fast-filling instance can move several percent between your manual `INFO` and the next Vortex IQ poll. |
+| **Time zone** | Display only | Chart axes render in your profile time zone; the ratio itself is time-zone-independent. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`redis.evicted-keys-minute`](/nerve-centre/kpi-cards/redis/evicted-keys-minute) | Evictions should be ~0 below ~95% and rise as the gauge approaches 100%. | Evictions while well under 100% suggest a much lower effective ceiling (reserved memory) or a misread `maxmemory`. |
+| ElastiCache `DatabaseMemoryUsagePercentage` | Should track this card closely. | Small persistent gaps are usually AWS reserved-memory accounting, not an error. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card reads 94% but performance is fine. Do I need to act?**
+Yes, plan to. At 94% you have very little runway before Redis hits `maxmemory` and either starts evicting keys or rejecting writes, depending on your `maxmemory-policy`. Performance being fine right now just means you have not crossed the wall yet. Use the lead time: confirm your policy, audit TTLs, look for a key leak, and decide whether to raise `maxmemory` (if the node has spare RAM) or shed data. Acting at 94% is calm; acting at 100% is an incident.
+
+**What actually happens when usage hits 100%?**
+It depends entirely on `maxmemory-policy`. Under an eviction policy (`allkeys-lru`, `volatile-lru`, `allkeys-lfu`, `volatile-ttl`, etc.) Redis evicts existing keys to make room, so writes keep succeeding but some cached data silently disappears and cache misses rise. Under `noeviction`, Redis refuses write commands and returns an out-of-memory error to the client while still serving reads. Check `CONFIG GET maxmemory-policy` so you know which symptom to expect.
+
+**My policy is `volatile-lru` and writes are failing even though I have evictable memory. Why?**
+`volatile-lru` (and `volatile-*` policies generally) can only evict keys that have a TTL set. If most of your memory is held by keys with no expiry, Redis runs out of eligible eviction candidates and behaves like `noeviction` for the remainder, rejecting writes. The fix is either to set TTLs on more keys, switch to an `allkeys-*` policy (which can evict any key), or raise `maxmemory`. Audit how much of your dataset is TTL-bearing.
+
+**`maxmemory` is set to 0. What does this card show?**
+`maxmemory = 0` means no Redis-imposed limit: Redis will use all available system RAM. With no ceiling, the meaningful limit is the OS, so the card falls back to measuring `used_memory` against total system RAM where the deployment exposes it. Running with `maxmemory = 0` is risky because there is no eviction safety net, the process can be OOM-killed or start swapping. Setting an explicit `maxmemory` below total RAM is strongly recommended.
+
+**Is it safe to just raise `maxmemory` when this card goes red?**
+Raising `maxmemory` is a valid immediate lever if the underlying node has spare physical RAM, and it instantly buys headroom. But it can mask a real problem: a key leak or missing TTLs will simply fill the new, higher ceiling too. Treat a `maxmemory` bump as time bought, then investigate growth with [Total Keys (db0)](/nerve-centre/kpi-cards/redis/total-keys-db0), `redis-cli --bigkeys`, and a TTL audit. Never raise `maxmemory` above the node's physical RAM, or you invite swap.
+
+**Why does this use `used_memory` instead of the RSS the OS reports?**
+Because Redis makes its eviction decisions against `used_memory`, not against RSS. This card is meant to mirror exactly the number Redis uses to decide when to evict or reject writes, so it uses the same figure. The gap between `used_memory` and `used_memory_rss` is fragmentation, which is a separate concern tracked by [Memory Fragmentation Ratio](/nerve-centre/kpi-cards/redis/memory-fragmentation-ratio). Read the two together for the complete memory picture.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Memory Used vs Maxmemory %* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

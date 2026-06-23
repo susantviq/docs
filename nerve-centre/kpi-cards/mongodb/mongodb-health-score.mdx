@@ -1,0 +1,140 @@
+---
+title: "MongoDB Health Score, MongoDB"
+sidebarTitle: "MongoDB Health Score"
+description: "MongoDB Health Score for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **MongoDB Health Score** is a single 0 to 100 composite that rolls up the deployment's most important reliability signals into one gauge a platform lead can read at a glance. It blends capacity (connection pool headroom), performance (query latency and slow ops), replication health (member state and lag), durability (backup freshness), and error pressure (connection and query errors) into one number. It is the card you put on the wall: green and you sleep, amber and you investigate, red and you page. It does not replace the underlying cards; it tells you which of them to open.
+
+| | |
+| --- | --- |
+| **What it tracks** | A weighted composite health index from 0 (critical) to 100 (healthy) across capacity, performance, replication, durability, and errors. |
+| **Data source** | Derived in Vortex IQ from the underlying MongoDB KPI cards, which in turn read `serverStatus()`, `rs.status()`, the system profiler, and backup metadata (`mongodump` recency, Atlas continuous backup, or snapshot age). It is a composite, not a single native counter. |
+| **Time window** | `RT/7D`. The headline is real-time; the 7-day track shows whether health is trending up, flat, or degrading. |
+| **Alert trigger** | `< 70`. Dropping below 70 escalates to the Nerve Centre alert feed and signals that one or more component domains has degraded materially. |
+| **Why it matters** | One number for a non-specialist audience (owner, on-call lead) that answers "is the database okay right now?" without requiring them to read eight gauges. |
+| **Reading the value** | 90 to 100 healthy, 70 to 89 watch, below 70 act. The score's value is in its direction and its breakdown: a falling score tells you to open the component cards. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The score is a weighted blend of five component domains, each scored 0 to 100 and then combined. The weighting prioritises signals that cause shopper-visible failure over signals that are merely uncomfortable.
+
+| Domain | Approx weight | Drawn from |
+| --- | --- | --- |
+| **Capacity** | 25% | [Connection Pool Saturation %](/nerve-centre/kpi-cards/mongodb/connection-pool-saturation) and [Connections In Use](/nerve-centre/kpi-cards/mongodb/connections-in-use). Saturation past 90% drags this domain hard. |
+| **Performance** | 25% | [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms), [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p99-ms), and [Slow Ops (15m, >100ms)](/nerve-centre/kpi-cards/mongodb/slow-ops-15m-100ms). |
+| **Replication** | 20% | [Replica Lag (seconds)](/nerve-centre/kpi-cards/mongodb/replica-lag-seconds), [Replica Set Members (state)](/nerve-centre/kpi-cards/mongodb/replica-set-members-state), and [Elections (24h)](/nerve-centre/kpi-cards/mongodb/elections-24h). |
+| **Durability** | 15% | [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/mongodb/last-successful-backup-hours-ago) and [Database Disk Usage %](/nerve-centre/kpi-cards/mongodb/database-disk-usage). |
+| **Errors** | 15% | [Connection Errors (24h)](/nerve-centre/kpi-cards/mongodb/connection-errors-24h) and [Query Error Rate %](/nerve-centre/kpi-cards/mongodb/query-error-rate). |
+
+Each domain is normalised against its own healthy band, so a metric sitting comfortably inside its sensitivity range contributes its full share, and a metric breaching its alert line contributes little or nothing. The domains are then combined by weight to produce the 0 to 100 headline.
+
+The blend is intentionally non-linear at the edges. A single domain in critical state (for example, a replica set with a member in `RECOVERING`, or a backup older than 72 hours) caps the overall score so the gauge cannot read "green" while a serious single-domain failure is live. This prevents the classic composite trap where four healthy domains average away one broken one. The alert fires below **70**, which corresponds to at least one domain degraded or two domains soft.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 3-node replica set behind a checkout and inventory service. The MongoDB Health Score has sat at 96 to 98 for weeks. Snapshot taken on 22 May 26 at 09:40 BST: the gauge has dropped to **64**, below the `< 70` alert line, and the on-call DBA opens the breakdown.
+
+| Domain | Score | What moved |
+| --- | --- | --- |
+| Capacity | 88 | Pool saturation 72%, healthy. |
+| Performance | 91 | p95 at 140ms, slow ops 6 in 15m, fine. |
+| Replication | 41 | One secondary in `RECOVERING`, replica lag 240s. |
+| Durability | 95 | Last backup 4h ago. |
+| Errors | 80 | Query error rate 0.3%, slightly raised. |
+
+The composite reads 64 not because the deployment is broadly unhealthy but because the replication domain collapsed and the non-linear cap pulled the headline down. The story is clear without reading every card: a secondary fell behind, entered `RECOVERING`, and replica lag blew past its 10-second line.
+
+```text
+Why 64 and not the raw weighted mean:
+  - weighted mean of the five domains   ~ 79
+  - replication in critical state        -> cap applied
+  - capped composite                     = 64
+  - one domain in critical must not read green
+```
+
+The DBA opens [Replica Set Members (state)](/nerve-centre/kpi-cards/mongodb/replica-set-members-state), confirms the member is resyncing after a disk event, and checks [Elections (24h)](/nerve-centre/kpi-cards/mongodb/elections-24h) to see whether the primary flapped. Once the secondary catches up and rejoins as `SECONDARY`, the replication domain recovers and the headline climbs back toward 96 within the hour.
+
+Two takeaways:
+
+1. **The score is a router, not a diagnosis.** Its job is to tell you which of the five domains to open. A drop to 64 with a healthy four-fifths is far less alarming than a slow grind to 64 across all five, even though the headline is identical. Always read the breakdown.
+2. **A capped score is a feature, not a bug.** The non-linear cap is what stops a single critical failure from being averaged into invisibility. If you ever see the headline well below the apparent weighted mean, that gap is telling you a single domain is in critical state.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with MongoDB Health Score | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mongodb/connection-pool-saturation) | The capacity domain's main driver. | A falling score with high saturation equals a capacity wall. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) | The performance domain's main driver. | Score dip with rising p95 equals a query or index regression. |
+| [Replica Lag (seconds)](/nerve-centre/kpi-cards/mongodb/replica-lag-seconds) | The replication domain's main driver. | Score dip with high lag equals a struggling secondary. |
+| [Elections (24h)](/nerve-centre/kpi-cards/mongodb/elections-24h) | Replication instability signal. | Score dip plus elections equals primary flapping. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/mongodb/last-successful-backup-hours-ago) | The durability domain's main driver. | Score dip with stale backup equals a recovery risk you must fix today. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mongodb/database-disk-usage) | Capacity and durability tail risk. | Disk past 90% caps the score and threatens write availability. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mongodb/connection-errors-24h) | The errors domain's main driver. | Score dip with rising connection errors equals refusals upstream of latency. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | Load context for any score move. | A score dip during a genuine traffic surge reads differently from one at steady load. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MongoDB's own tooling:**
+
+> There is no native single "health score" in MongoDB, so reconcile the composite by checking each component domain at source. **`db.serverStatus()`** covers connections, memory, opcounters, and latencies. **`rs.status()`** covers replica-set member state and lag. **`db.system.profile`** (with profiling enabled) covers slow ops. Backup freshness lives in your `mongodump` schedule, Atlas Cloud Backups, or your snapshot tooling.
+> **Atlas** users have the closest native analogue in the cluster's **Metrics** tab plus the **Alerts** page; a cluster with no firing alerts and all metrics inside their green bands corresponds to a high score here.
+> **`mongostat`** gives a fast terminal snapshot of ops, connections, and replication state for a quick sanity check against the gauge.
+
+**Why our number may legitimately differ from a manual read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Composite, not a counter** | No single native equal | The score is a Vortex IQ blend; there is no `serverStatus` field to compare it to directly. Reconcile component by component. |
+| **Non-linear cap** | Score lower than weighted mean | A single critical domain caps the headline, so the score can sit well below the simple average of its parts. |
+| **Weighting choices** | Emphasis differs from raw metrics | Capacity and performance carry more weight than durability, so an identical-looking deployment can score differently depending on which domain moved. |
+| **Time window** | RT vs 7D divergence | The headline is real-time; the 7-day track smooths transient blips that the live gauge reflects instantly. |
+| **Sentiment thresholds** | Tunable per profile | Domain healthy bands come from your Sensitivity settings, so two deployments with the same raw numbers can score differently if their thresholds differ. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**There is no health score in `mongosh`. What is this actually measuring?**
+It is a Vortex IQ composite, not a native MongoDB metric. The deployment exposes raw signals (`serverStatus`, `rs.status`, the profiler, backup metadata) but no single "health" number. This card blends those raw signals into one 0 to 100 gauge so a non-specialist can read overall state at a glance. To reconcile, check each component domain at source as described above.
+
+**The score dropped below 70 but every individual card I open looks fine. Why?**
+Two common causes. First, several domains may each be soft (none individually alerting) but their combined drag pushes the composite under 70; open the breakdown and look for two or three amber domains rather than one red one. Second, a transient breach may have already recovered: the real-time headline reflects the dip while the cards you open a minute later show the recovered value. Check the 7-day track for the shape.
+
+**Why is the score so much lower than the average of its five domains?**
+That is the non-linear cap doing its job. When any single domain enters critical state (a `RECOVERING` member, a backup older than 72 hours, disk past 90%), the composite is capped so it cannot read green while a serious single failure is live. A large gap between the headline and the apparent weighted mean is a signal that exactly one domain is critical.
+
+**Can I change the weights?**
+The domain weights are fixed to keep the score comparable across deployments and customers, but the healthy bands that feed each domain are tunable per profile in the Sensitivity tab. Tightening or loosening those thresholds is the supported way to make the score match your deployment's normal operating range.
+
+**Does the score account for sharded clusters?**
+Yes. For a sharded cluster the replication and capacity domains aggregate across shards, and shard-specific concerns ([Shard Balance Skew %](/nerve-centre/kpi-cards/mongodb/shard-balance-skew), [Chunks Pending Migration](/nerve-centre/kpi-cards/mongodb/chunks-pending-migration)) feed the relevant domains. A single hot or unbalanced shard will pull the composite down even if the cluster average looks healthy.
+
+**The score is green but a query is slow for one specific user. Should I trust the gauge?**
+The score is a deployment-wide composite; it will not catch a single pathological query or a single tenant's hot collection if the aggregate is healthy. Use it as the top-level "is the database okay" signal, then drop into [Top 10 Slow Operations](/nerve-centre/kpi-cards/mongodb/top-10-slow-operations) and [Slow Ops (15m, >100ms)](/nerve-centre/kpi-cards/mongodb/slow-ops-15m-100ms) for query-level detail. A high score and a slow individual query are not contradictory.
+
+**How quickly does the score recover after I fix the underlying problem?**
+The real-time headline reflects component recovery on the next poll, typically within a minute or two for live signals like connections and latency. Domains backed by slower signals (a secondary resyncing, a backup completing) recover when their underlying card recovers. The 7-day track will continue to show the dip as history, which is intended: it is the record of what happened.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*MongoDB Health Score* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

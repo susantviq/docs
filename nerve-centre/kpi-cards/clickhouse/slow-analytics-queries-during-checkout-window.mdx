@@ -1,0 +1,175 @@
+---
+title: "Slow Analytics Queries During Checkout Window, ClickHouse"
+sidebarTitle: "Slow Analytics Queries During Checkout Window"
+description: "Slow Analytics Queries During Checkout Window for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A table that lists the slow ClickHouse queries running during a live checkout window, so you can see whether heavy analytics work is colliding with the moment shoppers are paying. Many ecommerce stacks run their order database and their analytics warehouse close together: shared instance, shared connection pool, or a checkout flow that reads from ClickHouse for personalisation, fraud scoring, or inventory checks. When a fat analytics query (a month-end report, an ad-hoc BI scan, a backfill job) runs long during a peak checkout minute, it can starve the resources checkout depends on. This card pairs the slow-query list with the storefront checkout rate: when more than five slow queries co-occur with a checkout drop, it flags the collision so the on-call DBA can act before the dip becomes lost revenue.
+
+| | |
+| --- | --- |
+| **Data source** | Slow queries from `system.query_log` (entries with `query_duration_ms` above the slow threshold) over the last few minutes, joined against the storefront checkout/order rate from the connected ecommerce platform (Shopify, BigCommerce, or Adobe Commerce). |
+| **What it tracks** | The overlap, broken down by row: each slow query shown with its duration, user, memory, and the query text, alongside whether checkout was dropping at the same time. |
+| **Why it matters** | Analytics queries and the checkout path often share an instance or a connection pool. A heavy report running during peak checkout competes for connections, memory, and CPU, slowing or refusing the queries checkout needs. This card is where a "why did conversion dip at 12:05?" question gets a database answer. |
+| **Time window** | `5m` (a rolling 5-minute window, tight enough to catch a collision while it is still happening). |
+| **Alert trigger** | `>5 slow queries co-occur with checkout drop`. More than five slow queries inside the window while the checkout rate is falling fires the alert. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card builds two things and looks for their overlap.
+
+**The slow-query list** comes from `system.query_log`, filtered to completed queries whose duration exceeds the slow threshold (1000 ms by default, the same threshold used by [Slow-Query Rate %](/nerve-centre/kpi-cards/clickhouse/slow-query-rate)):
+
+```sql
+SELECT
+    event_time,
+    user,
+    query_duration_ms,
+    formatReadableSize(memory_usage) AS memory,
+    normalizeQuery(query) AS query
+FROM system.query_log
+WHERE type = 'QueryFinish'
+  AND query_duration_ms > 1000
+  AND event_time > now() - INTERVAL 5 MINUTE
+ORDER BY query_duration_ms DESC
+```
+
+**The checkout signal** comes from the connected ecommerce connector: the checkout-initiation or order rate over the same five-minute buckets, compared against its recent normal to detect a drop.
+
+The detector raises the alert when both conditions hold in the window:
+
+```text
+slow_query_count > 5         (more than five slow queries in the 5-minute window)
+AND checkout_rate dropping    (checkout/order rate below its recent normal band)
+```
+
+Five is the floor because one or two slow queries are routine background noise on any busy warehouse; a cluster of more than five at once is a genuine load event. The five-minute window is short on purpose: a checkout collision is an acute, real-time problem, and the value of the card is naming the offending queries while they are still running (or just finished) so they can be killed or throttled, not in a post-mortem an hour later.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs ClickHouse as both the event warehouse and the read store behind a BigCommerce checkout that calls it for real-time inventory and fraud scoring. Snapshot of the table on 14 Apr 26 at 12:05 BST, during the lunchtime checkout peak.
+
+| Started (BST) | User | Duration | Memory | Query (normalised) |
+| --- | --- | --- | --- | --- |
+| 12:04:41 | `bi_reporting` | **18,400 ms** | 9.6 GiB | `SELECT ... FROM orders GROUP BY customer_id, month ...` |
+| 12:04:52 | `bi_reporting` | 12,100 ms | 7.1 GiB | `SELECT ... FROM order_items JOIN products ...` |
+| 12:05:03 | `analyst_adhoc` | 9,800 ms | 4.4 GiB | `SELECT ... FROM events WHERE event_date >= ...` |
+| 12:05:09 | `analyst_adhoc` | 8,200 ms | 3.9 GiB | `SELECT count() FROM events GROUP BY ...` |
+| 12:05:14 | `bi_reporting` | 6,700 ms | 2.8 GiB | `SELECT ... FROM sessions ...` |
+| 12:05:18 | `analyst_adhoc` | 5,100 ms | 2.1 GiB | `SELECT ... FROM funnel ...` |
+
+Checkout rate over the same window dropped from a normal ~40/min to 26/min. The Nerve Centre headline reads **6 slow queries during a checkout drop**, outlined red. The DBA reads it as follows:
+
+1. **The collision is real, not coincidental.** Six slow queries landed inside the same minute that checkout fell by a third. The top two alone held nearly 17 GiB of memory between them. On a shared instance, that is exactly the kind of pressure that slows the small, fast queries checkout's fraud and inventory calls depend on.
+2. **The source is concentrated.** Five of the six rows belong to two users, `bi_reporting` and `analyst_adhoc`. This is not broad organic load, it is a month-end report run plus an analyst exploring ad-hoc, both unluckily timed for the lunch peak.
+3. **The fix is immediate and the prevention is structural.** Right now: throttle or kill the two heaviest `bi_reporting` queries to give checkout its headroom back. Afterwards: schedule heavy reporting outside peak windows, or isolate it onto a separate ClickHouse read replica / resource-group so analytics can never again contend with the checkout path.
+
+```text
+Acting on the collision in the moment:
+  - Find the live offenders (these may still be running):
+      SELECT query_id, user, elapsed, formatReadableSize(memory_usage)
+      FROM system.processes
+      WHERE elapsed > 5 ORDER BY memory_usage DESC
+  - Kill the worst, give checkout its resources back:
+      KILL QUERY WHERE query_id = '<id>'
+  - Confirm checkout recovers on the storefront admin
+  - Prevention: move bi_reporting to a workload/resource group with a
+    memory and concurrency cap, or to a dedicated read replica
+```
+
+Within two minutes of killing the top two queries, checkout recovered to 39/min. The lasting fix was a ClickHouse workload setting capping `bi_reporting` to a memory and concurrency budget so a single report can never again starve the checkout path.
+
+Three takeaways:
+
+1. **Co-occurrence is the signal, not the slow query alone.** Slow analytics queries are normal; slow analytics queries *while checkout is dropping* is a revenue event. The card joins the two so you do not have to correlate by eye across two tools.
+2. **Shared infrastructure is the root cause.** Every one of these collisions traces back to analytics and checkout drawing from the same pool, memory, or CPU. Isolating heavy reporting (resource groups or a dedicated replica) removes the entire class of incident.
+3. **The query text names the owner.** The normalised query and user columns tell you immediately who to throttle and who to talk to. A collision is usually two or three known heavy users, not a mystery.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this card | What the combination tells you |
+| --- | --- | --- |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/clickhouse/slow-query-rate) | The overall proportion of slow queries. | A high slow-query rate that overlaps checkout is what this card isolates row by row. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/clickhouse/top-10-slowest-queries) | The 24-hour worst-offender list. | If the queries colliding with checkout are also your daily slowest, they are chronic and need isolation, not a one-off kill. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) | The latency the whole instance is feeling. | p95 spiking during the collision confirms the slow queries are dragging everything, including checkout's calls. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p99-ms) | The tail latency checkout's fast queries suffer. | A p99 jump in the window is the tail where checkout queries get stuck behind the heavy ones. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/clickhouse/connection-pool-saturation) | The pool both workloads share. | If the heavy queries also saturate the pool, checkout is being refused connections on top of being slowed. |
+| [MEMORY_LIMIT_EXCEEDED (24h)](/nerve-centre/kpi-cards/clickhouse/memory-limit-exceeded-24h) | The memory ceiling heavy queries push toward. | A multi-GiB report during checkout can trip memory limits, killing queries on both sides. |
+| [ClickHouse QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/clickhouse/clickhouse-qps-spike-vs-ecom-order-rate) | The volume-side revenue-at-risk peer. | QPS spikes show phantom load; this card shows heavy load colliding with the moment that matters most. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that absorbs latency and slow-query pressure. | A checkout collision drags the composite as latency, memory, and slow-query signals all move at once. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> Pull the same slow-query list directly from `clickhouse-client`:
+> ```sql
+> SELECT event_time, user, query_duration_ms, memory_usage, normalizeQuery(query)
+> FROM system.query_log
+> WHERE type = 'QueryFinish'
+>   AND query_duration_ms > 1000
+>   AND event_time > now() - INTERVAL 5 MINUTE
+> ORDER BY query_duration_ms DESC;
+> ```
+> For queries still running, `system.processes` (or `SHOW PROCESSLIST`) shows live duration and memory so you can `KILL QUERY` the worst offender. On **ClickHouse Cloud**, the same `system.query_log` and `system.processes` queries run in the SQL console, and the managed query-insights view lists slow queries over time. For the checkout side, reconcile against the ecommerce connector's native admin (Shopify, BigCommerce, or Adobe Commerce order/checkout reports) for the order rate in the same window.
+
+**Why our number may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **query_log flush delay** | Card slightly behind | `system.query_log` is flushed in batches (every ~7.5 seconds by default), so a query that just finished may appear in a manual query a moment before it reaches the card. |
+| **Slow threshold** | Either | The card uses the configured slow threshold (1000 ms by default); a manual query with a different `query_duration_ms` filter will list more or fewer rows. |
+| **Running vs finished** | Card may show fewer | The card lists finished slow queries from `query_log`; a query still running appears in `system.processes` but not yet in `query_log`, so a live `SHOW PROCESSLIST` can show extra in-flight offenders. |
+| **Checkout-source lag** | Checkout line slightly behind | The ecommerce connector polls orders on its own refresh; the checkout-drop signal can trail the storefront admin by a poll cycle. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| Shopify / BigCommerce / Adobe Commerce checkout rate | The checkout-drop signal should match the platform's native order/checkout report for the window. | A mismatch points at the connector's order polling window, not at ClickHouse. |
+| [ClickHouse QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/clickhouse/clickhouse-qps-spike-vs-ecom-order-rate) | Both cards reference the same storefront order data. | If the order context differs, the connector is mid-poll; recheck after a cycle. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Our analytics warehouse is fully separate from the checkout database. Does this card still apply?**
+Less so, and that is fine to know up front. The card is most valuable when analytics and checkout share infrastructure: the same ClickHouse instance, the same connection pool, or a checkout flow that reads from ClickHouse for inventory, fraud, or personalisation. If your checkout path never touches this ClickHouse instance, a slow query here cannot directly slow checkout, so treat the card as a coincidence detector rather than a causal one. It can still surface a *correlated* external cause (a noisy deploy that hit both systems), but the direct-contention story does not apply.
+
+**Why does it need more than five slow queries? One huge query can wreck checkout on its own.**
+True, and a single multi-GiB query can absolutely starve a shared instance. The count of five is a noise filter for the *common* case where the danger is a cluster of heavy work arriving together. If your concern is the single fat query, watch [MEMORY_LIMIT_EXCEEDED (24h)](/nerve-centre/kpi-cards/clickhouse/memory-limit-exceeded-24h) and [Query Latency p99 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p99-ms) alongside this card, and lower the threshold in the Sensitivity tab if your instance is small enough that even two heavy queries are a real risk.
+
+**Checkout dropped but the slow-query list is empty. What now?**
+Then ClickHouse is probably not the cause this time. A checkout drop with no slow queries points elsewhere: the payment gateway, the storefront app, a CDN issue, or genuinely lower shopper intent. The value of this card is precisely that it can clear ClickHouse of blame: an empty list during a checkout dip tells the team to look outside the database. Cross-reference the storefront and payment connectors rather than chasing a database ghost.
+
+**How do I stop heavy reports colliding with checkout for good?**
+Two structural fixes. First, isolate heavy analytics into a ClickHouse workload / resource group with a memory and concurrency cap, so a report physically cannot consume more than its budget no matter when it runs. Second, separate the read paths entirely: point checkout's reads at a dedicated replica and let BI hit a different one. Scheduling reports outside peak hours helps but is fragile, because ad-hoc analyst queries do not respect a schedule. Resource isolation removes the whole class of problem.
+
+**The query text is normalised. How do I find the exact query that ran?**
+The card shows the normalised form (literals stripped) so similar queries group together and the table stays readable. To get the exact statement and its full parameters, look up the `query_id` in `system.query_log` directly: `SELECT query FROM system.query_log WHERE query_id = '<id>'`. The card's user and time columns give you enough to find the precise row.
+
+**Can a slow query that finished just before checkout dropped still be the cause?**
+Yes, and it is worth checking. A query that ran for 18 seconds and finished at 12:04:59 was holding memory and a connection slot through 12:05, which is exactly when checkout fell. The card's five-minute window deliberately includes recently finished queries for this reason: the damage from a heavy query lasts as long as it held resources, not just the instant it completed. Read the `Started` and `Duration` columns together to see what was actually in flight during the dip.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow Analytics Queries During Checkout Window* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

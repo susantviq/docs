@@ -1,0 +1,145 @@
+---
+title: "Last Successful Backup (hours ago), MariaDB"
+sidebarTitle: "Last Successful Backup (hours ago)"
+description: "Last Successful Backup age for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Backup](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How many hours have elapsed since the last successful physical backup completed, where "backup" means a verified `mariabackup` (or Percona XtraBackup) run. This is the simplest, most consequential number a DBA can read: it is the upper bound on how much data you would lose if the cluster were destroyed right now, and how stale your restore point is. A small number means a fresh recovery point; a large number means your last safe copy is ageing and your potential data loss is growing with every hour. A backup that ran but failed verification does not count, only a confirmed, restorable backup resets the clock.
+
+| | |
+| --- | --- |
+| **Source** | The completion timestamp of the most recent successful `mariabackup` / Percona XtraBackup run, reported by the backup job and read by the connector. |
+| **Metric basis** | Age in hours of the last *verified successful* backup, NOT the last *attempted* backup. A failed or aborted run leaves the clock running. |
+| **Aggregation window** | Real-time: the card computes `now - last_success_timestamp` on each poll. |
+| **Healthy value** | Comfortably under your backup interval. For a nightly schedule, a healthy reading stays below roughly 24 to 30 hours; the alert fires well beyond that. |
+| **What resets the clock** | A `mariabackup` (or XtraBackup) run that completes the prepare/apply-log phase and passes verification. Logical `mysqldump`/`mariadb-dump` exports can be counted if the connector is configured to track them. |
+| **What does NOT reset it** | (1) A backup that started but failed; (2) a snapshot taken at the storage layer that the connector is not tracking; (3) binlog archiving alone (that is point-in-time material, not a full base backup); (4) a copy that completed but failed restore verification. |
+| **Time window** | `RT` (real-time age, recomputed each poll) |
+| **Alert trigger** | `>72h`, more than three days without a verified backup is a serious recoverability gap. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card reads the timestamp of the most recent backup that the connector has confirmed as *successful* and subtracts it from the current time:
+
+```text
+age_hours = (now - last_successful_backup_timestamp) / 3600
+
+state = healthy   if age_hours <= backup_interval (e.g. ~24h for nightly)
+        watch     if backup_interval < age_hours <= 72h
+        alert     if age_hours > 72h
+```
+
+The word "successful" carries the weight. A `mariabackup` run is only counted once it has (a) completed the copy phase, (b) completed the `--prepare` (apply-log) phase so the copy is consistent and restorable, and ideally (c) passed a restore-verification check. A run that crashes mid-copy, or one whose prepare step fails, does not move the timestamp, so the age keeps climbing. This is intentional: a backup you cannot restore is not a backup, and the card refuses to let a failed job give you false comfort.
+
+Because the value is an *age*, it grows continuously between backups. On a healthy nightly schedule you will see it sawtooth: rising through the day to roughly 24 hours, then dropping back to near zero when the night's backup completes. A reading that climbs past 72 hours means at least three scheduled backups in a row have failed or not run.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MariaDB Galera cluster with a nightly `mariabackup` job at 01:00 BST, taken from a dedicated donor node so production nodes are undisturbed. The card normally sawtooths between 0 and 24 hours. On 18 May 26 the DBA opens the dashboard and sees a worrying reading.
+
+| Date | Scheduled 01:00 run | Outcome | Card reading next morning |
+| --- | --- | --- | --- |
+| 16 May 26 | ran | success | 8h (healthy) |
+| 17 May 26 | ran | failed: donor disk full mid-copy | 32h (watch) |
+| 18 May 26 | ran | failed: donor disk still full | 56h and climbing |
+
+By 09:00 on 18 May the card reads **56 hours** and is amber, heading for the 72-hour alert. The DBA reads three things:
+
+1. **The clock did not reset because the runs failed.** Two nightly jobs fired but neither produced a restorable backup (the donor node ran out of disk during the copy). The card correctly ignored the attempts and kept counting from the 16 May success. Had it counted attempts, the team would have been falsely reassured.
+2. **Potential data loss equals the age.** If the cluster were lost right now, the team could only restore to the 16 May 01:00 backup plus whatever binary logs survived. That is up to 56 hours of orders, customer records, and inventory changes at risk, which is unacceptable for this business.
+3. **The fix is the backup target, not the database.** The database itself is healthy; the failure is downstream, on the backup donor's storage. The team clears space on the donor volume (or repoints the backup to object storage), reruns `mariabackup` manually, verifies the prepare phase, and the card drops to near zero.
+
+```text
+Recoverability framing at 56h:
+  - Last restorable point: 16 May 26 01:00
+  - Worst-case data loss if cluster lost now: up to 56h (minus surviving binlogs)
+  - Alert boundary: 72h (would breach by ~17:00 on 18 May)
+  - Immediate action: free donor disk, rerun + verify mariabackup, confirm clock resets
+```
+
+After a manual verified run completes at 11:20, the card reads **0h** and returns to green. The team also adds a disk-space pre-check to the backup job and an alert on the donor volume. The lesson the team should carry: a backup *schedule* is not a backup *guarantee*; only a verified, restorable copy resets this clock, and you want to learn about three failed nights from this card, not from a failed restore.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Last Successful Backup | What the combination tells you |
+| --- | --- | --- |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mariadb/database-disk-usage) | A full disk is a top cause of backup failure. | Disk near full plus rising backup age equals backups failing for lack of space. |
+| [Failover Readiness](/nerve-centre/kpi-cards/mariadb/failover-readiness) | Backups and standbys are the two pillars of recoverability. | Stale backup plus no healthy standby equals a severe recoverability gap. |
+| [Async Replication Lag (seconds)](/nerve-centre/kpi-cards/mariadb/async-replication-lag-seconds) | A lagging replica is often the backup source. | High lag on the backup donor can stall or invalidate a backup. |
+| [Galera Cluster Size](/nerve-centre/kpi-cards/mariadb/galera-cluster-size) | Backups are often taken from a donor node. | A node loss can remove your usual backup source, delaying the next run. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite that weights recoverability. | A stale backup drags the composite down even when live metrics look fine. |
+| [Instance Uptime](/nerve-centre/kpi-cards/mariadb/instance-uptime) | Context for whether a restart interrupted a backup. | A restart timestamp aligning with a failed run explains the gap. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mariadb/connection-errors-24h) | Backup tools connect like any client. | Auth/connection errors can be why the backup job could not run. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> Check the `mariabackup` log and the backup directory's `xtrabackup_info` file, which records the backup start/end time and the `--prepare` outcome.
+> List the backup target (filesystem path or object-storage bucket) and read the timestamp of the most recent completed, prepared backup set.
+> If you archive binary logs for point-in-time recovery, check the binlog archive freshness separately; this card tracks the base backup, not the binlog stream.
+> On a managed service, the provider's backup/restore console shows the last successful automated backup time and retention.
+
+**Why our number may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Attempt vs success** | Card older | The card counts only verified successful runs; a filesystem may show a newer but incomplete/failed backup folder whose timestamp you should not trust. |
+| **Verification step** | Card older if verify pending | If the connector waits for a prepare/restore-verify before resetting, the clock resets a little after the raw copy finished. |
+| **Time zone** | Display only | The age is timezone-independent (it is a duration); the underlying timestamp is stored UTC and rendered in your Vortex IQ display timezone. |
+| **Logical vs physical** | Depends on config | If you rely on `mariadb-dump` exports, ensure the connector is configured to count them; otherwise only `mariabackup` runs reset the clock. |
+
+**Cross-source reconciliation:**
+
+| Source | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| `xtrabackup_info` end time | Should match the timestamp the card uses, to the minute. | A divergence usually means the card is tracking a different backup target than the one you are inspecting. |
+| Managed-service backup console | Should agree on the last successful automated backup. | The console may also count provider-side snapshots the connector is not tracking, so it can read fresher. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**A backup ran last night but the card still shows 30 hours. Why did it not reset?**
+Almost certainly the run failed verification: it copied data but the `--prepare` (apply-log) step failed, or the job aborted mid-copy (commonly from a full disk on the backup target). The card only counts a *restorable* backup, so a failed attempt deliberately does not reset the clock. Check the `mariabackup` log and the `xtrabackup_info` file for the last successful, prepared set.
+
+**Does a storage snapshot count as a backup here?**
+Only if the connector is tracking that snapshot mechanism. By default this card watches `mariabackup`/XtraBackup runs. Storage-layer snapshots (LVM, cloud volume snapshots) can be valid backups but require a crash-consistent or quiesced capture to be safely restorable; if you rely on them, configure the connector to track them and verify they restore cleanly.
+
+**Is a backup enough on its own for point-in-time recovery?**
+No. A base backup gives you a restore point as of when it ran. To recover to a point *between* backups you also need the binary logs archived continuously and applied on top of the base backup. This card tracks the base backup age; track your binlog archive freshness separately so you know your true recovery-point objective.
+
+**Why 72 hours as the alert and not 24?**
+The 72-hour threshold is a conservative "something is genuinely wrong" line that tolerates a single missed nightly run plus a weekend gap before paging. If your recovery-point objective is tighter (many ecommerce businesses want under 24 hours), lower the sensitivity threshold for this card so it alerts after one missed run rather than three.
+
+**Should I back up from a Galera node, and does taking one affect the cluster?**
+Take backups from a dedicated donor or a node you can desync, using a non-blocking method (`mariabackup` streams without locking the whole instance). Backing up directly from a serving node can briefly desync it (it shows as `Donor/Desynced`), which is why most teams designate one node as the backup source. Losing that node ([Galera Cluster Size](/nerve-centre/kpi-cards/mariadb/galera-cluster-size) drops) can also be why a backup did not run.
+
+**The card reads 0 hours but I have never tested a restore. Am I safe?**
+A fresh backup is necessary but not sufficient. The only proof a backup works is a successful test restore. This card confirms a backup *completed and prepared*; it cannot guarantee the restored data is usable in your environment. Schedule periodic restore drills (restore to a scratch instance and run integrity checks) so the green reading reflects real recoverability.
+
+**Does this work the same for standalone MariaDB and Galera?**
+Yes. The backup age concept is engine-agnostic; whether you run a single server or a Galera cluster, the card tracks the last successful `mariabackup`/XtraBackup run against the configured target. The only practical difference is *where* you take the backup from (a donor node in a cluster), not how the age is measured.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Last Successful Backup (hours ago)* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

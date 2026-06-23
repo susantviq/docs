@@ -1,0 +1,130 @@
+---
+title: "Query Latency p99 (ms), MongoDB"
+sidebarTitle: "Query Latency p99 (ms)"
+description: "Query Latency p99 (ms) for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Query Latency p99 (ms)** is the 99th-percentile read latency for the MongoDB deployment over a rolling 5-minute window: 99% of reads finish faster than this number, and the slowest 1% finish slower. This is the worst-case line that platform teams care about for SLOs. The slowest 1% of reads are where timeouts, retries, and abandoned requests live, and a single user can hit several of them in one session. The card alerts at 500ms, because a p99 above half a second means real requests are stalling long enough to trip client timeouts and cascade retries upstream.
+
+| | |
+| --- | --- |
+| **What it tracks** | The 99th-percentile read operation latency for the deployment, the far tail of the read-latency distribution. |
+| **Data source** | The `opLatencies.reads` operation-latency histogram from `serverStatus` (same source family as the p50 and p95 cards, read at the 99th-percentile bucket). |
+| **Time window** | `RT/5m` (real-time, rolling 5-minute window). |
+| **Alert trigger** | `> 500ms` sustained. A p99 above 500ms means the slowest 1% of reads are stalling long enough to risk client timeouts and retry storms. |
+| **Calculation basis** | Read-side latency only; the extreme tail, not the typical case. |
+| **Units** | Milliseconds (ms). |
+| **Roles** | platform, engineering, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The p99 is sourced from the same `serverStatus` operation-latency surface as its p50 and p95 siblings, but read at the far end of the distribution. On deployments that expose the latency histogram (`opLatencies` with histogram buckets, surfaced natively on Atlas), the engine reads the 99th-percentile bucket directly for the 5-minute window. The card samples the cumulative `latencies.reads` counters at the window boundaries and works from the delta so the value reflects current behaviour, not the average since process start.
+
+Where the histogram is not available, MongoDB exposes only scalar `latency` and `ops` totals, from which a true 99th percentile cannot be recovered. In that mode the card reports the windowed mean read latency as a conservative floor and labels the reading as an average rather than a percentile, so you are not misled into thinking a 1%-tail figure is available when it is not. The value is converted from microseconds to milliseconds for display, and the 500ms alert is evaluated on the windowed reading so a lone slow query does not trip it.
+
+The p99 is, by construction, noisier than the p95: it summarises far fewer operations, so a small number of pathological reads can move it sharply. That sensitivity is the point. p99 is where you see the rare-but-real stalls that an aggregate average would bury.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a sharded cluster backing the catalogue and cart services for a flash-sale event. Snapshot taken on 22 May 26 at 12:00 BST, ten minutes into a promotion that drove a sudden traffic spike.
+
+| Window (5m) | Reads in window | p50 (ms) | p95 (ms) | p99 (ms) | Note |
+| --- | --- | --- | --- | --- | --- |
+| 11:45 | 380,000 | 4 | 52 | 118 | Pre-sale baseline |
+| 11:50 | 620,000 | 5 | 71 | 190 | Sale opens, traffic spikes |
+| 11:55 | 910,000 | 6 | 144 | 470 | Tail stretching |
+| 12:00 | 940,000 | 8 | 211 | 612 | **Alert fires (p99 > 500ms)** |
+
+The median is still a comfortable 8ms and the p95 has only just crossed its own 200ms threshold, but the p99 has reached 612ms. That 600ms+ far tail is where the damage is: at 940,000 reads in the window, the slowest 1% is roughly 9,400 reads each taking over half a second, enough to trip the cart service's 500ms client timeout and trigger retries, which add still more load.
+
+```text
+Reading the far tail:
+  p99 >> p95 (big gap)        -> a small set of very slow ops; hunt specific queries / hot docs
+  p99 tracking p95 upward     -> the whole tail is stretching; capacity or cache problem
+  p99 spiky, p50/p95 flat     -> intermittent stalls: lock contention, checkpoint, balancer migration
+```
+
+What the team does: the p99-to-p95 gap is wide (612ms vs 211ms), which says a small set of operations is far slower than the rest rather than the whole distribution sliding. They open [Top 10 Slow Operations](/nerve-centre/kpi-cards/mongodb/top-10-slow-operations) and find the culprit is a single catalogue query on a shard that has become a hot shard during the sale. They confirm against [Shard Balance Skew %](/nerve-centre/kpi-cards/mongodb/shard-balance-skew) (now at 31%) and [WiredTiger Cache Hit Rate %](/nerve-centre/kpi-cards/mongodb/wiredtiger-cache-hit-rate). The immediate mitigation is to raise the client timeout slightly to stop the retry storm, then rebalance the hot shard and add the missing compound index the slow query needed.
+
+Three takeaways:
+
+1. **p99 is an SLO line, not a vanity metric.** If your service promises "99% of requests under X ms", this card is the database-layer input to that promise. When it breaches, your SLO is at risk before any average shows it.
+2. **The p99-to-p95 gap is diagnostic.** A wide gap means a few very slow operations (chase those specific queries); a narrow gap that moves with p95 means the whole tail is stretching (chase capacity).
+3. **p99 stalls cause retry storms.** Reads slow enough to hit client timeouts get retried, which adds load, which slows more reads. A breaching p99 can be self-amplifying, so act on it before it compounds.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Latency p99 | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) | The next tail line down. | A wide p99-to-p95 gap means a few very slow ops; a narrow gap means the whole tail is stretching. |
+| [Query Latency p50 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p50-ms) | The median baseline. | p99 high with p50 flat confirms the problem is the far tail, not the typical query. |
+| [Top 10 Slow Operations](/nerve-centre/kpi-cards/mongodb/top-10-slow-operations) | The named list of the worst offenders. | Identifies the exact operations sitting in the 1% tail. |
+| [Slow Ops (15m, >100ms)](/nerve-centre/kpi-cards/mongodb/slow-ops-15m-100ms) | The profiler count behind the tail. | A rising slow-op count timed to the p99 breach confirms which window to investigate. |
+| [Shard Balance Skew %](/nerve-centre/kpi-cards/mongodb/shard-balance-skew) | The hot-shard explanation on sharded clusters. | A skew spike timed to the p99 rise points at one overloaded shard. |
+| [WiredTiger Cache Hit Rate %](/nerve-centre/kpi-cards/mongodb/wiredtiger-cache-hit-rate) | The cache-pressure explanation. | A falling hit rate that tracks the p99 rise confirms disk fetches are stretching the tail. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mongodb/query-error-rate) | The reliability peer. | p99 breach plus rising errors means the slow tail is now timing out and failing. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | The composite roll-up. | Confirms whether the far-tail latency is pulling overall health below its threshold. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MongoDB's own tooling:**
+
+> Run `db.serverStatus().opLatencies` in `mongosh`; on builds with histograms the document includes the distribution buckets used to derive percentiles, while older builds expose only `latency` and `ops` scalars.
+> Use the **database profiler** (`db.setProfilingLevel(1, { slowms: 100 })`) and query `system.profile` sorted by `millis` descending to read the actual slowest operations that occupy the 1% tail.
+> On **MongoDB Atlas**, the Metrics tab plots "Read Latency" with native p99 lines per node; select the node serving the workload and align to the 5-minute window.
+> `mongostat` and `mongotop` give a live, low-overhead view of where read time is being spent by collection.
+
+**Why our number may legitimately differ from MongoDB's native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Tail sampling noise** | Variable | p99 summarises far fewer ops than p95, so two tools sampling at slightly different instants can report meaningfully different far-tail values. |
+| **Cumulative vs windowed** | Native scalar often lower | `opLatencies` is cumulative since process start; the card windows it to 5 minutes, sharpening recent spikes. |
+| **Percentile vs mean fallback** | Native (Atlas) higher | Without a histogram the card reports a windowed mean as a floor; Atlas reports a true 99th percentile, which is always at or above the mean. |
+| **Per-node scope** | Variable | We read the targeted node; on a sharded or secondary-reading workload the cluster-wide tail can be worse than any single node shows. |
+
+**Cross-connector reconciliation:** pair with [Slow Ops During Checkout Window (5m)](/nerve-centre/kpi-cards/mongodb/slow-ops-during-checkout-window-5m) and [MongoDB OPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mongodb/mongodb-ops-spike-vs-ecom-order-rate) to connect a far-tail breach to the revenue-bearing path. For divergence investigations, use Vortex Mind.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is the alert at 500ms here but 200ms on the p95 card?**
+The two cards measure different slices of the distribution. p95 at 200ms says a noticeable fraction of reads is slow; p99 at 500ms says the worst 1% has reached the point of tripping client timeouts and retries. The higher absolute threshold reflects that the far tail is naturally slower; a 200ms p99 would be excellent, so alerting there would be noise.
+
+**My p99 is very spiky compared to p95. Is the card broken?**
+No, that volatility is inherent to the 99th percentile. It is computed from far fewer operations than p95, so a handful of pathological reads can move it sharply window to window. Treat sustained breaches, not single-window spikes, as actionable; the alert evaluates the windowed value to filter out lone slow queries.
+
+**p99 alerted but p50 and p95 look fine. Where do I even start?**
+A clean p50 and p95 with a breaching p99 is the classic "a few very slow operations" pattern. Go straight to [Top 10 Slow Operations](/nerve-centre/kpi-cards/mongodb/top-10-slow-operations) and the profiler (`system.profile`) sorted by `millis`. The cause is usually one query: a missing index, a COLLSCAN on a large collection, a hot document under contention, or a lookup against a hot shard.
+
+**The card reports an average, not a true p99. Why?**
+Deployments that do not expose the operation-latency histogram cannot produce a real 99th percentile from `serverStatus` alone, so the card falls back to a windowed mean as a conservative floor and labels it as such. To get a genuine p99, run a build with latency histograms enabled or read the percentile directly from the Atlas Metrics view.
+
+**Should I tune the 500ms threshold for my workload?**
+Yes, if your SLO demands it. A latency-critical service may want to alert at 300ms; a batch or analytics workload may tolerate seconds. The sensitivity threshold is configurable per profile in the Sensitivity tab. Set it to the latency budget your application actually promises rather than the generic default.
+
+**Does a p99 breach mean queries are failing?**
+Not by itself; it means they are slow. But slow reads that exceed the client's timeout will be cancelled and retried, which can turn a latency problem into an error problem. Watch [Query Error Rate %](/nerve-centre/kpi-cards/mongodb/query-error-rate) alongside this card: if errors rise in step with the p99, your timeouts are firing and a retry storm may be building.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Latency p99 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

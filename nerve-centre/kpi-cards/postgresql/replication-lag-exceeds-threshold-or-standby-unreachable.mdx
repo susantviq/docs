@@ -1,0 +1,154 @@
+---
+title: "Replication Lag Exceeds Threshold or Standby Unreachable, PostgreSQL"
+sidebarTitle: "Replication Lag Exceeds Threshold or Standby Unreachable"
+description: "Replication Lag Exceeds Threshold or Standby Unreachable for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This alert fires when a streaming replica falls more than ten seconds behind the primary, or when the standby stops responding altogether and its replication state goes to BROKEN. Both conditions attack the same thing: your ability to survive losing the primary. A standby that is ten seconds behind will lose ten seconds of committed writes if you fail over to it right now; a standby that is unreachable gives you no failover target at all. For a DBA or SRE this is a high-availability alarm. The primary may be perfectly healthy when it fires, which is exactly why it is dangerous: the safety net has a hole in it and nothing else on the dashboard will tell you.
+
+| | |
+| --- | --- |
+| **What it tracks** | Replay lag on each streaming standby (seconds behind the primary) and the standby's reachability/state. Fires on lag breach or on a broken/disconnected standby. |
+| **Data source** | `pg_stat_replication` on the primary (one row per connected standby, with `write_lag`, `flush_lag`, `replay_lag`, `state`, and LSN columns) plus `pg_stat_wal_receiver` / `pg_last_wal_replay_lsn()` on the standby. Reachability is inferred from the row disappearing or `state` leaving `streaming`. See the continuous siblings [Replication Lag (seconds)](/nerve-centre/kpi-cards/postgresql/replication-lag-seconds) and [WAL Lag Bytes (primary -> standby)](/nerve-centre/kpi-cards/postgresql/wal-lag-bytes-primary-standby). |
+| **Time window** | `RT` (real-time, evaluated on each poll, roughly every 60 seconds). |
+| **Alert trigger** | `lag >10s OR state=BROKEN`. Either condition is sufficient: ten seconds of replay lag, or any standby that has stopped streaming (disconnected, in error, or absent from `pg_stat_replication`). |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card evaluates two independent conditions and fires if either is true:
+
+```text
+condition A (lag):     replay_lag_seconds > 10   on any standby
+condition B (broken):  standby state != 'streaming'
+                       OR standby absent from pg_stat_replication
+                       OR walreceiver not running on the standby
+fire when: A OR B
+```
+
+**Lag** is measured as time, not bytes, because time is what you lose on failover. On the primary, `pg_stat_replication.replay_lag` gives the interval between a transaction committing on the primary and being replayed on the standby. Where that column is null (an idle standby that has fully caught up reports null, not zero), the engine falls back to comparing LSN positions and the standby's `pg_last_xact_replay_timestamp()`.
+
+The byte view is a useful companion but a different question: `pg_wal_lsn_diff(sent_lsn, replay_lsn)` tells you how much WAL is still in flight. A big byte backlog with low time lag means a burst is being caught up; a growing byte backlog with growing time lag means the standby cannot keep pace. That distinction lives in [WAL Lag Bytes (primary -> standby)](/nerve-centre/kpi-cards/postgresql/wal-lag-bytes-primary-standby).
+
+**Broken** covers the cases where there is no lag number to read because the standby is not streaming at all: it crashed, the network partitioned, the replication slot was dropped, or the WAL it needs was already recycled on the primary. Any of these means the row either shows a non-`streaming` state or vanishes from `pg_stat_replication` entirely, and the card treats absence as the most severe form of the alert.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a primary PostgreSQL 15 instance with two streaming standbys: `standby-a` in the same region (intended failover target) and `standby-b` in a second region (read scaling and DR). Snapshot taken on 09 May 26 at 02:14 BST during an overnight bulk-import job.
+
+| Standby | state | replay_lag | WAL lag bytes | Reading |
+| --- | --- | --- | --- | --- |
+| standby-a | streaming | 0.4s | 12 MB | healthy |
+| standby-b | streaming | **34s** | **2.1 GB** | **BREACH (lag)** |
+
+The card fires on `standby-b`. The headline reads **Replication Lag 34s on standby-b (BREACH)**. The on-call DBA reads:
+
+1. **The primary is fine and the local failover target is fine.** `standby-a` is at 0.4s; if the primary died right now, failover to `standby-a` would lose well under a second of writes. The HA story for the local region is intact.
+2. **The cross-region DR standby has fallen behind a bulk job.** `standby-b` is 34s and 2.1 GB behind. The overnight import is generating WAL faster than the cross-region link can ship and the remote machine can replay it. This is a capacity/throughput problem on the DR path, not a broken link.
+3. **The risk is DR-only, for now.** Losing the primary in this moment is still survivable via `standby-a`. But if the lag keeps growing, the DR copy drifts further from reality, and a region-loss scenario would lose 34s and climbing.
+
+```text
+Triage:
+  1. Confirm direction: is replay_lag growing or shrinking?
+     SELECT application_name, state, replay_lag,
+            pg_wal_lsn_diff(sent_lsn, replay_lsn) AS bytes_behind
+     FROM pg_stat_replication;
+  2. If it is a transient bulk job, expect it to drain after the job ends.
+  3. If it keeps growing: check standby disk I/O and CPU (replay is single-process),
+     check the network link saturation, check max_standby_streaming_delay.
+  4. Verify the replication slot has enough retained WAL that the standby
+     will not be cut off (see WAL Lag Bytes and slot retention).
+```
+
+Now contrast the other failure mode. Two days later, 11 May 26 at 14:50 BST:
+
+| Standby | state | replay_lag | Reading |
+| --- | --- | --- | --- |
+| standby-a | *absent from pg_stat_replication* | n/a | **BREACH (BROKEN)** |
+| standby-b | streaming | 0.6s | healthy |
+
+This is worse despite the smaller-looking table. `standby-a`, the local failover target, has dropped off entirely. There is no lag number because nothing is streaming. The walreceiver on `standby-a` died, or the slot was dropped, or required WAL was recycled. Until it is rebuilt, a primary failure means failing over cross-region to `standby-b` (higher latency, possibly a different availability zone) or, worst case, no clean target at all.
+
+Three takeaways:
+
+1. **Lag is measured in time because time is what you lose.** "2 GB behind" sounds alarming and "34s behind" sounds modest, but the 34s is the number that matters: it is the data you forfeit on failover. Read the byte view for throughput, the time view for risk.
+2. **A null lag is not zero lag.** A fully caught-up idle standby reports null `replay_lag`. Do not read a missing value as "broken"; the card distinguishes "caught up and quiet" (null, healthy) from "not streaming" (absent/non-streaming, BROKEN).
+3. **The unreachable case is the more urgent one.** Lag usually self-heals when a burst ends; an unreachable standby does not. A BROKEN state means you are running without the safety margin you think you have, and rebuilding a standby takes time you will not have during a real outage.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Replication Lag / Standby Unreachable | What the combination tells you |
+| --- | --- | --- |
+| [Replication Lag (seconds)](/nerve-centre/kpi-cards/postgresql/replication-lag-seconds) | The continuous time-lag gauge this alert is built on. | The gauge shows the trend; this card marks the breach. |
+| [WAL Lag Bytes (primary -> standby)](/nerve-centre/kpi-cards/postgresql/wal-lag-bytes-primary-standby) | The byte-backlog companion. | Bytes high with time low equals catching up; both growing equals falling behind. |
+| [Active Streaming Replicas](/nerve-centre/kpi-cards/postgresql/active-streaming-replicas) | The count of standbys currently streaming. | A drop in this count is the same event as a BROKEN standby here. |
+| [Failover Readiness](/nerve-centre/kpi-cards/postgresql/failover-readiness) | The "do I have a safe target right now?" verdict. | This alert is the input; Failover Readiness is the conclusion. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/postgresql/last-successful-backup-hours-ago) | The other half of your recovery story. | If replication is broken AND backups are stale, you have no recovery path at all. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/postgresql/database-disk-usage) | Retained WAL for a lagging slot consumes primary disk. | A lagging standby plus rising primary disk equals WAL piling up behind a slow slot. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The composite that includes replication health as a factor. | A BROKEN standby pulls the composite down even when the primary is green. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL's own tooling:**
+
+> On the primary, run `SELECT application_name, client_addr, state, sent_lsn, replay_lsn, write_lag, flush_lag, replay_lag FROM pg_stat_replication;`. One row per connected standby; a missing row is the BROKEN case.
+> On the standby, run `SELECT status, last_msg_receipt_time, latest_end_lsn FROM pg_stat_wal_receiver;` and `SELECT now() - pg_last_xact_replay_timestamp() AS replay_lag;`.
+> Check replication slots with `SELECT slot_name, active, restart_lsn, pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) AS retained_bytes FROM pg_replication_slots;` to confirm the primary is retaining enough WAL.
+> On a managed service, the provider exposes this as a metric: `ReplicaLag` (RDS / Aurora), `replication.replica_lag` (Cloud SQL), or the replica's lag chart (Azure). The provider also handles failover itself, so the console is the authority on whether a managed replica is healthy.
+
+**Why our number may legitimately differ from PostgreSQL's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Idle standby null lag** | Card reads healthy, raw column reads null | A caught-up idle standby reports null `replay_lag`; the card treats null-with-streaming as 0, not as missing data. |
+| **Poll timing** | Brief skew | The card polls roughly every 60s; a hand-run `pg_stat_replication` query is instantaneous and can catch a momentary spike the card misses, or vice versa. |
+| **Time vs byte lag** | Looks contradictory | The card alerts on seconds; the provider console may headline bytes. A big byte number with small time lag is a burst being absorbed, not a breach. |
+| **Managed-service failover** | Card may briefly show BROKEN during a planned failover | When RDS/Cloud SQL promotes a replica, the old topology tears down momentarily; the card can flag BROKEN during the handover before the new topology settles. |
+| **Cascading replicas** | Card measures against the primary | A standby fed by another standby shows lag relative to its immediate upstream in `pg_stat_replication`; end-to-end lag from the true primary is the sum of the chain. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My standby shows null replay_lag. Is replication broken?**
+No, the opposite. A standby that has fully caught up and has no new WAL to replay reports null, not zero, for `replay_lag`. The card reads "streaming + null lag" as healthy (zero lag). BROKEN is reserved for a standby that is not streaming at all: absent from `pg_stat_replication`, in a non-`streaming` state, or with a dead walreceiver.
+
+**The lag spikes every night during our bulk import, then clears. Should I tune the threshold?**
+If the spike is a predictable, self-clearing consequence of a known batch window and never threatens your failover target, you can raise the lag threshold for that instance during that window in the Sensitivity tab. But first confirm the byte backlog is actually draining ([WAL Lag Bytes](/nerve-centre/kpi-cards/postgresql/wal-lag-bytes-primary-standby) trending down after the job). A "transient" lag that grows a little more each night is a capacity problem in disguise.
+
+**Why ten seconds? My replicas usually run under one second.**
+Ten seconds is a deliberately conservative default that catches a meaningful loss of recovery margin without paging on normal WAL-shipping jitter. If your replicas genuinely run sub-second and you want tighter detection (synchronous-replication-grade expectations), lower the threshold for that instance. If you run cross-region async replicas where multi-second lag is normal, raise it for those.
+
+**A standby disappeared from the list but the primary is healthy. Why is this a page?**
+Because the safety net just lost a strand. Your primary being healthy is precisely why this is easy to miss, nothing customer-facing changes when a standby dies. But if the primary fails before you rebuild that standby, you have fewer (or zero) safe failover targets. An unreachable standby is the more urgent of the two breach conditions for exactly this reason.
+
+**Can a replication slot cause the primary to run out of disk?**
+Yes, and it is a classic incident. A physical replication slot guarantees the primary retains WAL until the standby has consumed it. If the standby is down or far behind and the slot is still active, the primary keeps every WAL segment the standby has not replayed, and that pile grows until the primary disk fills. Watch this card alongside [Database Disk Usage %](/nerve-centre/kpi-cards/postgresql/database-disk-usage); a lagging slot is one of the few ways a healthy primary fills its own disk.
+
+**Does this work on logical replication, or only physical streaming?**
+The primary signal is physical streaming replication via `pg_stat_replication`, which is what most HA setups use. Logical replication exposes lag differently (through `pg_replication_slots` and subscriber-side `pg_stat_subscription`); the card reads physical replicas as the failover-relevant case. If your DR depends on logical replication, treat this card as covering your physical standbys and monitor logical subscriptions separately.
+
+**On a managed service the provider handles failover. Do I still need this card?**
+Yes, for visibility. The provider promotes a replica for you, but you still want to know your replica lag before a failover (it sets how much data the automatic failover will lose) and you want independent confirmation that your read replicas are healthy. The card gives you the lag-and-state view the provider uses to make its own decision, in the same place as the rest of your database signals.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Replication Lag Exceeds Threshold or Standby Unreachable* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

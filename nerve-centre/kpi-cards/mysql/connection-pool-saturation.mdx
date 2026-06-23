@@ -1,0 +1,173 @@
+---
+title: "Connection Pool Saturation %, MySQL"
+sidebarTitle: "Connection Pool Saturation %"
+description: "Connection Pool Saturation % for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Connection Pool Saturation %** is the share of the instance's connection ceiling that is currently in use: `Threads_connected / max_connections`. It answers a single operational question for the on-call DBA: how close is this server to refusing new connections? At 100% MySQL returns `ERROR 1040 (HY000): Too many connections` and every new client (application worker, cron job, read replica health check) is rejected until a slot frees up. That failure mode is abrupt, not gradual, so this card is treated as a Hero capacity signal and watched in real time.
+
+| | |
+| --- | --- |
+| **What it tracks** | Live connection-slot utilisation expressed as a percentage. `Threads_connected` is the count of currently open connections (active plus sleeping); `max_connections` is the hard ceiling configured for the instance. |
+| **Data source** | `Threads_connected` from `SHOW GLOBAL STATUS`, divided by the `max_connections` system variable from `SHOW GLOBAL VARIABLES`. Both are read on every poll so a runtime change to `max_connections` is picked up automatically. |
+| **Time window** | `RT/1m` (real-time gauge, sampled continuously and evaluated against the alert threshold on a sustained 1-minute basis). |
+| **Alert trigger** | `> 90%`. A sustained reading above 90% means roughly one connection storm away from `Too many connections` rejections. |
+| **Aggregation** | Point-in-time gauge. The headline shows the latest sample; the sparkline shows the trailing window so a slow climb is distinguishable from a momentary spike. |
+| **Units** | Percentage (0 to 100). The card also exposes the raw `Threads_connected` and `max_connections` numbers on hover so you can see the absolute headroom, not just the ratio. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card computes a straight ratio on each poll:
+
+```text
+Connection Pool Saturation % = (Threads_connected / max_connections) * 100
+```
+
+Both inputs come from the live instance, not from a cache:
+
+- `Threads_connected` is a global status counter (`SHOW GLOBAL STATUS LIKE 'Threads_connected'`). It includes connections that are actively running a query and connections that are idle in the `Sleep` command state. It does NOT include the small number of internal background threads (purge, IO, page cleaner), so it maps cleanly onto application-facing capacity.
+- `max_connections` is a server variable (`SHOW GLOBAL VARIABLES LIKE 'max_connections'`). On a managed service such as Amazon RDS or Aurora it is frequently set by a formula in the parameter group (for example `LEAST({DBInstanceClassMemory/12582880}, 5000)`), so the effective ceiling moves with the instance class.
+
+One subtlety the card accounts for: MySQL reserves one extra connection slot above `max_connections` for an account holding the `SUPER` (or `CONNECTION_ADMIN`) privilege, so a `root` session can still get in to investigate at 100%. The card reports saturation against the published `max_connections` ceiling, which is the number that matters for ordinary application traffic.
+
+The `RT/1m` window means the alert does not fire on a single transient sample. The threshold is evaluated against a sustained 1-minute reading, which filters out the brief spikes that occur normally during deploys, connection-pool warm-up, or a batch job opening connections in a burst.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a primary MySQL 8.0 instance on an `db.r6g.2xlarge` RDS class backing the order and catalogue services for a mid-size retailer. The parameter group resolves `max_connections` to **2,000**. Snapshot taken on 14 Apr 26 at 19:42 BST, during an evening promotional push.
+
+| Sample time | Threads_connected | max_connections | Saturation % | State |
+| --- | --- | --- | --- | --- |
+| 19:38 | 980 | 2,000 | 49% | Healthy |
+| 19:40 | 1,510 | 2,000 | 76% | Climbing |
+| 19:42 | 1,844 | 2,000 | **92%** | **Alert** |
+| 19:43 | 1,961 | 2,000 | 98% | Critical |
+
+At 19:42 the gauge crosses 90% and the card turns red. The DBA opens the instance and runs `SHOW PROCESSLIST` to see where the connections are going:
+
+```text
+Breakdown at 19:42 (1,844 connections):
+  - 1,420 in 'Sleep' state (idle, held open by the app connection pool)
+  - 310 actively running queries
+  - 114 in 'Sending data' on a single un-indexed report query
+```
+
+The signal here is not raw traffic: only 310 connections are doing work. The other 1,420 are idle connections held open by the application's pool, and a single slow report query is causing workers to pile up waiting their turn. Three corrective levers, in order of safety:
+
+1. **Reclaim idle connections.** `wait_timeout` is set to the default 28,800 seconds (8 hours), so idle pool connections never get reaped. Lowering it to 600 seconds and lowering the application pool's max-idle setting frees hundreds of slots without touching live traffic.
+2. **Kill the offending query, not the pool.** The 114 connections stacked on the un-indexed report query are the immediate accelerant. Identify it via [Top 10 Slowest Queries (digest)](/nerve-centre/kpi-cards/mysql/top-10-slowest-queries-digest), `KILL` the runaway, and route the report to a read replica.
+3. **Raise the ceiling only as a last resort.** `SET GLOBAL max_connections = 2500` buys headroom instantly, but each connection costs memory (per-thread buffers), so raising it on a memory-constrained instance trades a connection error for an out-of-memory kill. Check [Memory Usage %](/nerve-centre/kpi-cards/mysql/memory-usage) before turning this dial.
+
+```text
+Why 90% is the line, not 100%:
+  - At 92% there are 156 free slots.
+  - The app pool can open a 200-connection burst on a single deploy or a retry storm.
+  - 156 < 200, so a routine event would tip the instance into ERROR 1040.
+  - 90% gives the team a minute or two to act before rejections start.
+```
+
+Three takeaways:
+
+1. **Saturation is about headroom, not load.** A server at 92% saturation with 1,420 idle connections is not busy, it is leaking slots. Read this card alongside [Connections In Use](/nerve-centre/kpi-cards/mysql/connections-in-use) and `SHOW PROCESSLIST` to separate "working hard" from "holding slots".
+2. **The cure is usually the application pool, not the database.** Most saturation events trace back to an oversized or mis-tuned client-side pool (HikariCP, PgBouncer-style proxies, PHP persistent connections) rather than genuine demand.
+3. **Raising `max_connections` is a sedative, not a fix.** It removes the symptom and adds memory pressure. Treat it as a bridge while you fix the real cause.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Connection Pool Saturation % | What the combination tells you |
+| --- | --- | --- |
+| [Connections In Use](/nerve-centre/kpi-cards/mysql/connections-in-use) | The raw `Threads_connected` number behind the ratio. | High saturation with low active connections equals idle-connection leak, not real demand. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/mysql/connection-pool-at-90-saturation) | The alert-list card that fires off this exact metric. | The gauge shows the level; the alert card shows when and for how long it breached. |
+| [Aborted Connects (24h)](/nerve-centre/kpi-cards/mysql/aborted-connects-24h) | Counts connections that failed to establish. | Saturation at 100% drives `Aborted_connects` up as new clients are rejected. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mysql/connection-errors-24h) | The error-side view of refused connections. | A spike here during a saturation event confirms `Too many connections` is hitting the app. |
+| [Memory Usage %](/nerve-centre/kpi-cards/mysql/memory-usage) | Each connection consumes per-thread memory. | Check before raising `max_connections`; high memory plus high saturation is a trap. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | Distinguishes genuine traffic from idle-slot hoarding. | Saturation rising while QPS is flat means the pool is leaking, not the workload growing. |
+| [MySQL Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/mysql/mysql-pool-saturation-vs-traffic-burst) | The cross-channel revenue framing. | Ties a saturation breach to a live traffic burst and the revenue at risk if connections start failing. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite that weights saturation as an input. | A single sustained saturation breach pulls the health score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look on the instance:**
+
+> `SHOW GLOBAL STATUS LIKE 'Threads_connected';` for the live numerator.
+> `SHOW GLOBAL VARIABLES LIKE 'max_connections';` for the denominator.
+> `SHOW STATUS LIKE 'Max_used_connections';` for the high-water mark since the last restart, which tells you the worst saturation the instance has seen.
+> `SELECT * FROM performance_schema.threads;` or `SHOW PROCESSLIST;` to see what each connection is actually doing.
+
+To reproduce the card's exact number at the prompt:
+
+```sql
+SELECT
+  ROUND(
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status
+       WHERE VARIABLE_NAME = 'Threads_connected')
+    /
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_variables
+       WHERE VARIABLE_NAME = 'max_connections') * 100, 1
+  ) AS connection_pool_saturation_pct;
+```
+
+**On a managed service:**
+
+| Service | Where to confirm |
+| --- | --- |
+| Amazon RDS / Aurora | The `DatabaseConnections` CloudWatch metric is the numerator; the parameter group holds the `max_connections` formula. The RDS Performance Insights "DB Load" view shows connection waits. |
+| Google Cloud SQL | The `database/mysql/connections` Cloud Monitoring metric; `max_connections` is in the instance flags. |
+| Azure Database for MySQL | The `active_connections` metric in Azure Monitor; the connection limit is tied to the pricing tier and vCore count. |
+
+**Why our number may legitimately differ from a native reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sampling moment** | Either way | The gauge is a point-in-time read; `SHOW PROCESSLIST` run a second later catches a different instant. Connection counts move fast during bursts. |
+| **`max_connections` changed at runtime** | Either way | `SET GLOBAL max_connections` takes effect immediately. The card re-reads the variable each poll, but a managed-service console may cache the parameter-group value and lag. |
+| **CloudWatch granularity** | Smoother | RDS `DatabaseConnections` is a 1-minute average by default; a sub-minute spike the card catches will be flattened in CloudWatch. |
+| **Reserved SUPER slot** | Marginal | MySQL allows one connection above `max_connections` for a SUPER user. The card reports against the published ceiling, so a `root` session at the ceiling can read 100%+ briefly. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card shows 92% but the server feels fine. Is this a false alarm?**
+Not a false alarm, an early warning. Saturation measures headroom, not load. A server can sit at 92% with most connections idle and respond instantly to the queries that are running. The risk is not current slowness; it is that the next connection burst (a deploy, a retry storm, a cron fan-out) has nowhere to land and starts getting `ERROR 1040`. Investigate now while it is cheap, using `SHOW PROCESSLIST` to see how many connections are in `Sleep`.
+
+**Most of my connections are idle (`Sleep` state). Should they count?**
+Yes, because they occupy a slot. An idle connection still consumes a `max_connections` slot and per-thread memory; it just is not running a query. This is the single most common cause of saturation: an application connection pool that opens connections it never closes. The fix is on the client side (lower the pool's max-idle and max-lifetime) plus a shorter server-side `wait_timeout` to reap abandoned connections.
+
+**Can I just raise `max_connections` to make the alert go away?**
+You can, and sometimes you should as a bridge, but it is not free. Each connection reserves per-thread buffers (`read_buffer_size`, `sort_buffer_size`, `join_buffer_size`, and others). On a memory-constrained instance, doubling `max_connections` can push the instance into swap or trigger the OOM killer, which is a far worse failure than a connection error. Always check [Memory Usage %](/nerve-centre/kpi-cards/mysql/memory-usage) first, and prefer fixing the client pool.
+
+**Does `Threads_connected` include the replica IO threads?**
+The connections a replica opens to its source do appear in the source's `Threads_connected` (each replica holds one connection for the binlog dump). On the replica side, the internal SQL and IO threads are background threads and are not application connections. For a server with many replicas, account for one source-side slot per replica when sizing `max_connections`.
+
+**What is the difference between this card and `Max_used_connections`?**
+This card is live saturation right now. `Max_used_connections` is the high-water mark since the last restart: the most connections ever held at once. They answer different questions. Use this card for "are we about to run out?" and `Max_used_connections` for "how close have we ever come?". If `Max_used_connections` is at or near `max_connections`, you have already hit the ceiling at least once and likely dropped connections.
+
+**On RDS, the console connection graph does not match the card. Why?**
+RDS `DatabaseConnections` in CloudWatch is, by default, a 1-minute average. The card samples in real time. A 15-second spike to 98% that the card catches and alerts on will appear as a much lower average in CloudWatch. For matching, switch the CloudWatch statistic to Maximum over a 1-minute period; that will line up far better with the card's peak readings.
+
+**Will the alert fire on a brief deploy-time spike?**
+No, that is what the `1m` in the `RT/1m` window prevents. A single transient sample above 90% (common when a fresh app instance warms its pool) does not trip the alert. The threshold is evaluated against a sustained 1-minute reading, so only a genuine, persistent breach pages the on-call.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Connection Pool Saturation %* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

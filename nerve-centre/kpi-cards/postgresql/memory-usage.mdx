@@ -1,0 +1,169 @@
+---
+title: "Memory Usage %, gauge"
+sidebarTitle: "Memory Usage %"
+description: "Memory Usage % for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of the host's (or instance's) RAM currently in use by the PostgreSQL workload: shared buffers, per-backend working memory, the operating-system page cache serving the data files, and connection overhead. Memory is what keeps PostgreSQL fast. When there is enough, hot data lives in cache and queries fly; when it runs short, the database spills sorts to disk, the page cache thrashes, and on a self-managed host the OOM killer can terminate the postmaster outright. This gauge is the early-warning line between a database that is comfortably resident in memory and one about to start swapping.
+
+| | |
+| --- | --- |
+| **What it tracks** | Used RAM divided by total RAM, as a percentage. "Memory Usage % for the selected period." Covers PostgreSQL's `shared_buffers`, the sum of per-backend `work_mem` / `maintenance_work_mem` in flight, and the OS page cache that PostgreSQL relies on for file reads. |
+| **Data source** | Self-managed: host memory stats (`/proc/meminfo` or equivalent) for total / used / available, cross-referenced with PostgreSQL's configured `shared_buffers` and live backend count. RDS / Aurora: the CloudWatch `FreeableMemory` metric against instance class RAM. Cloud SQL: `database/memory/usage` against `database/memory/total_usage` quota. |
+| **Time window** | `RT` (real-time, refreshed on the live polling cycle). |
+| **Alert trigger** | `> 85%`. Crossing 85% pages the on-call DBA. The threshold sits below 100% deliberately: PostgreSQL performance degrades well before memory is fully exhausted, and on self-managed hosts you want warning before the OOM killer engages. |
+| **Threshold basis** | Percentage of total instance / host RAM. Amber approaching the line, red at breach. |
+| **What does NOT count** | Memory used by co-located services that do not belong to the database, swap usage (tracked separately; any swapping is already a red flag), and memory on read replicas (each instance is gauged independently). |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The gauge is `used_memory / total_memory * 100`, sampled in real time. The subtlety in PostgreSQL is what "used" honestly means, because of how the operating-system page cache works.
+
+On a healthy self-managed PostgreSQL host, most of RAM is "used" by the OS page cache holding data-file blocks. That is good: it is the cache that makes reads fast. Linux reports this cache as used memory, but it is reclaimable: the kernel will hand it back to a process that needs it. So a naive "used = total - free" reads near 100% on every healthy database and is useless as an alarm.
+
+The engine therefore tracks the figure that actually predicts trouble:
+
+`used = total - available`
+
+where `available` (from `MemAvailable` in `/proc/meminfo`) is the kernel's own estimate of how much memory could be made available to a new allocation without swapping, accounting for reclaimable cache. A gauge built on `available` stays comfortably mid-range on a healthy database and climbs only when genuine, non-reclaimable demand (backend working memory, anonymous allocations) starts to crowd out the reclaimable cache. That is exactly the condition that precedes spilling and swapping.
+
+PostgreSQL's own memory has two main consumers the drill-down attributes:
+
+1. **`shared_buffers`** is a fixed shared allocation set at startup (commonly 25% of RAM). It does not grow with load; it is a constant baseline.
+2. **Per-backend memory** is the variable part. Each connection can use up to `work_mem` per sort / hash operation (and a single query can run several), plus `maintenance_work_mem` for vacuum / index builds. With many connections running memory-heavy queries, this is what drives the gauge up, and it scales with both connection count and query complexity.
+
+On managed services the provider abstracts the host, so the engine uses `FreeableMemory` (RDS, conceptually the available figure) or the Cloud SQL usage / quota metrics. The interpretation is the same: the gauge reflects pressure on genuinely allocatable memory, not the benign page cache.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a self-managed PostgreSQL 16 primary on a host with 64 GB RAM, `shared_buffers` set to 16 GB, `work_mem` set to 64 MB, serving an OLTP order workload plus an analytics read path. Snapshot taken on 28 May 26 at 20:15 BST during an evening reporting peak, after the card paged at 20:08.
+
+| Consumer | Memory | Notes |
+| --- | --- | --- |
+| `shared_buffers` (fixed) | 16 GB | Constant baseline |
+| OS page cache (reclaimable) | 21 GB | Healthy; serving data-file reads |
+| Per-backend `work_mem` in flight | 18 GB | 140 active backends, many running multi-sort analytics |
+| Other processes + kernel | 3 GB | |
+| **Available (`MemAvailable`)** | **6 GB** | |
+| **Gauge (used = total - available)** | **90.6%** | Red, over threshold |
+
+The gauge reads **90.6%** and has paged. The drill-down makes the cause obvious: per-backend `work_mem` is consuming 18 GB, which is wildly out of proportion. Working it through:
+
+```text
+Why per-backend memory exploded:
+  - work_mem = 64 MB is the limit PER SORT/HASH NODE, not per query.
+  - The evening analytics queries each have several sort and hash-join nodes.
+    A single query with 5 such nodes can use up to 5 x 64 MB = 320 MB.
+  - 140 backends are active, and ~50 of them are heavy analytics queries.
+  - 50 heavy queries x ~320 MB each = ~16 GB, plus the OLTP backends = ~18 GB.
+
+The trap: work_mem looks small (64 MB) but multiplies by
+  (number of memory nodes) x (number of concurrent backends).
+At high concurrency it is the single fastest way to exhaust RAM.
+```
+
+The DBA has two levers and uses both:
+
+1. **Immediate relief.** The analytics read path does not need 64 MB of `work_mem` per node. Set a lower value just for that workload (per-role or per-session): `ALTER ROLE analytics_reader SET work_mem = '16 MB';`. This quarters the per-backend appetite for the reporting queries without touching OLTP latency. The gauge falls to **78%** within minutes as the next batch of analytics queries runs under the new limit.
+2. **Structural fix.** The analytics workload should not share the primary's memory budget with order processing at all. The team plans to route reporting to the read replica, isolating the two so a reporting peak can never again threaten the OLTP primary's memory.
+
+Three lessons platform teams should carry:
+
+1. **`work_mem` is a per-operation, per-backend limit, and it multiplies.** The headline value looks harmless, but real usage is `work_mem x sort/hash nodes x concurrent backends`. Tuning it blindly upward to speed up one query can OOM the host under concurrency. Set it conservatively globally and raise it only for specific roles or sessions that need it.
+2. **High page-cache usage is not a problem.** A healthy PostgreSQL host shows most RAM "used" by reclaimable page cache, and that is exactly what you want: it is the cache serving fast reads. The gauge is built on available memory precisely so it does not cry wolf at benign cache. Worry when available memory shrinks, not when "free" is low.
+3. **Mixing OLTP and analytics on one instance is a memory-pressure factory.** Order processing wants many small fast transactions; analytics wants a few large memory-hungry ones. Sharing one memory budget means the second can starve the first. Route heavy reads to a replica.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Memory Usage % | What the combination tells you |
+| --- | --- | --- |
+| [Buffer Cache Hit Rate %](/nerve-centre/kpi-cards/postgresql/buffer-cache-hit-rate) | The payoff of memory: data served from cache, not disk. | Memory pressure plus falling cache-hit rate equals the working set no longer fits in RAM. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/postgresql/database-disk-usage) | Insufficient `work_mem` forces sorts to spill to disk as temp files. | Memory high plus disk temp-file growth equals queries spilling because RAM ran short. |
+| [Connections In Use](/nerve-centre/kpi-cards/postgresql/connections-in-use) | Each connection carries per-backend memory cost. | Connection count and memory rising together points to per-backend `work_mem` as the driver. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/postgresql/connection-pool-saturation) | More backends means more concurrent `work_mem` allocations. | Saturation plus memory pressure equals too many heavy backends at once. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/postgresql/slow-query-rate) | Queries spilling to disk for want of memory run slow. | Slow-query rate climbing with memory pressure equals spill-induced slowdowns. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p95-ms) | Memory pressure shows up as latency at the tail. | p95 rising alongside memory points to cache misses and disk spill. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The composite that folds capacity pressure into one number. | Sustained memory pressure drags the score even when errors look fine. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL and the host:**
+
+> **Host memory truth (self-managed):** `free -h` or `cat /proc/meminfo` shows total, used, free, and crucially `MemAvailable`, the figure the gauge is built on. Watch the `Swap` line too: any active swapping is already a red flag.
+> **Configured allocations:** `SHOW shared_buffers;`, `SHOW work_mem;`, `SHOW maintenance_work_mem;` confirm the baseline and per-operation limits.
+> **Live backend pressure:** `SELECT count(*), state FROM pg_stat_activity GROUP BY state;` shows how many backends are active and could be holding `work_mem`.
+> **Cache effectiveness (the related signal):** `SELECT sum(blks_hit) * 100.0 / nullif(sum(blks_hit) + sum(blks_read), 0) AS cache_hit_pct FROM pg_stat_database;`
+> **Managed services:** the RDS / Aurora console CloudWatch tab shows `FreeableMemory` and `SwapUsage`; Cloud SQL shows memory usage on the instance overview.
+
+**Why our number may legitimately differ from the native tooling:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Available vs free** | Vortex IQ reads lower than naive "used" | We base the gauge on `MemAvailable` (reclaimable cache counted as available); a tool reporting `used = total - free` shows near-100% on every healthy host. |
+| **Page cache treatment** | Vortex IQ lower | Reclaimable OS page cache is not counted as pressure; some monitoring counts it as used and alarms falsely. |
+| **CloudWatch sampling lag** | Brief lag on RDS | `FreeableMemory` publishes at one-minute granularity; a fast `work_mem` surge can lead the published value briefly. |
+| **Shared memory accounting** | Possible double-count | `shared_buffers` is shared across backends; per-process tools that sum RSS across backends double-count it. The gauge avoids this by reading host-level totals. |
+| **Co-located services** | Either way | On a host running more than PostgreSQL, other processes count toward host memory; isolate the database for a clean read. |
+
+**Cross-source reconciliation:**
+
+| Source | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| `free -h` / `MemAvailable` | Should match the gauge closely | Per-process RSS sums double-count shared memory; trust the host-level available figure. |
+| RDS `FreeableMemory` | `100 - (freeable / class_ram)` should match | One-minute publish lag; brief surges lead the published value. |
+| `SwapUsage` (any source) | Should be near zero on a healthy instance | Non-zero swap means memory pressure has already crossed into harmful territory. |
+
+<details>
+<summary><em>Swap is the line you never want to cross</em></summary>
+
+For a database, swapping is almost always worse than running slightly hot on memory. When PostgreSQL's pages get swapped to disk, query latency becomes wildly unpredictable, because what should be a memory access becomes a disk read. On many production deployments swap is disabled or set very low on purpose, so that under genuine memory exhaustion the OOM killer acts decisively rather than letting the host limp along swapping. Either way, the appearance of any sustained swap usage is a sign the gauge crossed into real danger some time ago. Treat non-zero swap as a separate, urgent signal alongside this gauge.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My host shows 95% memory used in `top` but this gauge says 70%. Which is right?**
+Both, measuring different things. `top` and naive "used = total - free" count the reclaimable OS page cache as used, which is near-100% on every healthy database because PostgreSQL deliberately fills RAM with cached data blocks. The gauge is built on `MemAvailable`, the kernel's estimate of memory that could be allocated without swapping, which is the figure that actually predicts trouble. The gauge is the one to alert on; the `top` figure is the page cache doing its job.
+
+**Why is the alert at 85% and not higher?**
+Because PostgreSQL performance degrades well before memory is fully exhausted. As available memory shrinks, the page cache shrinks with it, cache-hit rate falls, queries start hitting disk, and sorts spill to temp files, all before you reach 100%. On a self-managed host you also want warning before the OOM killer engages and terminates the postmaster. 85% buys time to act while the database is still healthy.
+
+**Raising `work_mem` made one report faster but the host started OOMing. Why?**
+Because `work_mem` is the limit per sort or hash operation, per backend, not per query or per server. A single query can have several memory-using nodes, and dozens of backends can run concurrently. Real peak usage is roughly `work_mem x nodes per query x concurrent backends`, which at high concurrency dwarfs the host's RAM. Set `work_mem` conservatively as the global default and raise it only for specific roles or sessions (`ALTER ROLE ... SET work_mem`) that genuinely need it.
+
+**What should `shared_buffers` be set to?**
+A common starting point is 25% of host RAM, with the remainder left for the OS page cache (which PostgreSQL also relies on heavily) and per-backend memory. Pushing `shared_buffers` much higher often does not help and can hurt, because it steals RAM from the page cache and per-backend memory. It is a fixed allocation set at startup, so it shows as a constant baseline on this gauge, not a variable. Tune it with the [Buffer Cache Hit Rate %](/nerve-centre/kpi-cards/postgresql/buffer-cache-hit-rate) card, not in isolation.
+
+**On RDS / Aurora I cannot get a shell. How is memory measured?**
+Through the provider metric: RDS and Aurora publish `FreeableMemory`, which is conceptually the available figure (free plus reclaimable), and the gauge computes used against the instance class RAM. You also get `SwapUsage` in CloudWatch, which should stay near zero. You cannot run `free -h`, but the metric is reliable for alerting. If the instance class is undersized for the workload, the answer is to scale up the class or offload reads to a replica.
+
+**Memory climbs steadily all day then resets after a restart. Is that a leak?**
+PostgreSQL itself rarely leaks memory in the classic sense, but a few patterns mimic one: a very high connection count where many backends each hold cached relation metadata, prepared statements accumulating on long-lived connections, or extensions with their own per-backend caches. A gradual climb that resets on restart usually points to long-lived connections accumulating per-backend state; cycling connections through a pooler with a connection lifetime, or using PgBouncer, typically flattens it. Sudden jumps, by contrast, are almost always `work_mem` under concurrency.
+
+**Should I run analytics queries on the same instance as my transactional workload?**
+Ideally not, especially under memory pressure. OLTP wants many small fast transactions; analytics wants a few large, memory-hungry, long-running queries. Sharing one memory budget means a reporting peak can starve order processing of `work_mem` and page cache, exactly the scenario in the worked example. Route heavy reads to a read replica so the two workloads have separate memory budgets. This is one of the highest-leverage capacity decisions you can make.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Memory Usage %* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

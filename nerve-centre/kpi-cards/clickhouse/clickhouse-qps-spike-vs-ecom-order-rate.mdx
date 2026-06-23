@@ -1,0 +1,167 @@
+---
+title: "ClickHouse QPS Spike vs Ecom Order Rate, ClickHouse"
+sidebarTitle: "ClickHouse QPS Spike vs Ecom Order Rate"
+description: "ClickHouse QPS Spike vs Ecom Order Rate for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A dual-axis view that overlays ClickHouse query throughput (queries per second) against the storefront order rate over the same window. In a healthy analytics stack the two lines move together: more shoppers means more events to query, more dashboards refreshed, more order rows scanned. The card exists to catch the moment they diverge. A query-per-second spike with no matching order spike means something is hammering the database that is not real demand: a runaway dashboard auto-refresh, a bot scraping reports, a retry storm, or a misconfigured BI tool polling every few seconds. That phantom load consumes the same connection pool, memory, and merge capacity your real analytics need, so it puts revenue-supporting queries at risk without any revenue to show for it.
+
+| | |
+| --- | --- |
+| **Data source** | ClickHouse QPS from the `Query` counter in `system.events` (delta per second), plotted against the storefront order rate pulled from the connected ecommerce platform (Shopify, BigCommerce, or Adobe Commerce orders per minute). Both series are aligned to the same wall-clock buckets. |
+| **What it tracks** | The *relationship* between database query volume and order volume, not either number alone. The headline signal is divergence: QPS climbing while orders stay flat. |
+| **Why it matters** | Every query consumes a connection-pool slot, memory, and CPU. When QPS spikes for a non-revenue reason (dashboard storm, bot, retry loop), it competes with the queries that genuinely support the storefront and finance teams. The order line is the reference that tells you whether a QPS spike is earning its keep or just burning capacity. |
+| **Time window** | `15m` (a rolling 15-minute window, fine enough to catch a sudden spike and its order-rate context). |
+| **Alert trigger** | `qps spike with no order spike (= dashboard storm / bot)`. When QPS jumps sharply but the order rate does not follow, the card flags a probable phantom-load event. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Two series are computed and overlaid on a shared time axis.
+
+**ClickHouse QPS** is the per-second delta of the cumulative `Query` event counter:
+
+```sql
+SELECT value FROM system.events WHERE event = 'Query'
+```
+
+The counter is monotonic since server start, so the card samples it on a fixed cadence and divides the difference by the elapsed seconds:
+
+```text
+qps = (Query_now - Query_prev) / (t_now - t_prev)
+```
+
+**Order rate** comes from the connected ecommerce connector, expressed as orders per minute over the same buckets. For divergence detection the two series are normalised to a common baseline (each line indexed against its own rolling 15-minute median) so a spike is measured as a multiple of normal rather than an absolute count. The detector raises the alert when:
+
+```text
+qps_ratio  > spike_threshold      (QPS well above its own recent normal)
+AND order_ratio ≈ 1               (order rate within normal band)
+```
+
+In plain terms: the database got much busier, the storefront did not. The 15-minute window is deliberately short. Real shopper-driven analytics load and order flow rise and fall together over minutes, so a window this size keeps the two lines tightly comparable and surfaces a sudden, order-less QPS jump quickly rather than smearing it across an hour.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs ClickHouse as the analytics warehouse behind a Shopify storefront. Marketing dashboards, a finance reporting tool, and an internal "live orders" wallboard all query it. Snapshot of the dual-axis card on 14 Apr 26.
+
+| Time (BST) | ClickHouse QPS | Orders / min | Reading |
+| --- | --- | --- | --- |
+| 09:00 | 240 | 18 | Normal morning baseline, lines tracking |
+| 09:15 | 310 | 24 | Both rising together, healthy demand |
+| 09:30 | **1,950** | 23 | QPS jumped 6x, orders flat: divergence |
+| 09:45 | **2,010** | 22 | Sustained phantom load |
+| 10:00 | 295 | 21 | Resolved after the rogue client was stopped |
+
+The Nerve Centre headline reads **QPS spike with no order spike, 6x normal**, outlined red. The DBA reads it as follows:
+
+1. **Orders are completely unaffected.** The order line never left its 18 to 24 band. Whatever drove QPS from 310 to 1,950 sold nothing. That immediately rules out a genuine traffic surge and points at an internal source.
+2. **The shape says "machine, not human".** Human-driven load ramps and decays; this jumped to 1,950 in one bucket and held flat at ~2,000. A perfectly flat plateau is the signature of an automated client polling on a fixed interval: a dashboard stuck in an auto-refresh loop, a BI tool retrying a failed query, or a bot.
+3. **The cost is real even though the revenue is not.** During the spike, [Connection Pool Saturation %](/nerve-centre/kpi-cards/clickhouse/connection-pool-saturation) climbed toward 90% and [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) doubled. The finance team's legitimate month-end report ran slow because a phantom client was eating the pool.
+
+```text
+Finding the source during the spike:
+  - Identify the loudest client right now:
+      SELECT client_name, user, count() AS active
+      FROM system.processes
+      GROUP BY client_name, user
+      ORDER BY active DESC
+  - Confirm what it is running:
+      SELECT query, count() FROM system.query_log
+      WHERE event_time > now() - INTERVAL 15 MINUTE
+      GROUP BY query ORDER BY count() DESC LIMIT 10
+  - A single normalised query repeated thousands of times = a poll/retry loop
+  - Short-term: kill the runaway session, then fix the client's refresh interval
+```
+
+In this case the culprit was the live-orders wallboard: a recent change set its refresh to every two seconds and removed result caching, so each tick re-scanned the full orders table. Restoring a 30-second cache-backed refresh dropped its contribution back to a handful of QPS.
+
+Three takeaways:
+
+1. **QPS alone is not a health signal.** A high number can be glorious (genuine demand) or wasteful (a bot). The order line is what tells the two apart. Never read QPS without its revenue context.
+2. **Flat plateaus mean automation.** Humans create ragged curves; machines create flat lines and clean step changes. The *shape* of the divergence often names the cause before you open `system.processes`.
+3. **Phantom load steals from real load.** The connection pool, memory, and merge capacity a dashboard storm consumes are the same resources your finance and merchandising queries need. An order-less QPS spike is not free, it is revenue-supporting capacity spent on nothing.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this card | What the combination tells you |
+| --- | --- | --- |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/clickhouse/queries-per-second-live) | The raw QPS line without the order reference. | Confirms the absolute spike magnitude that this card normalises and contextualises. |
+| [ClickHouse Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/clickhouse/clickhouse-event-ingest-vs-ecom-orders) | The write-side twin: ingest vs orders rather than queries vs orders. | A read spike without orders is a dashboard/bot problem; an ingest stall with orders flowing is a pipeline problem. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/clickhouse/connection-pool-saturation) | The pool the spike consumes. | A QPS spike that pushes saturation past 90% is the moment phantom load starts refusing real clients. |
+| [ClickHouse Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/clickhouse/clickhouse-pool-saturation-vs-traffic-burst) | The other side of the divergence question, framed around traffic. | Saturation with a traffic burst is demand; saturation without one (this card) is internal load. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) | The latency real queries suffer during the spike. | Latency rising in lockstep with an order-less QPS spike quantifies the cost of the phantom load. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/clickhouse/slow-query-rate) | The proportion of queries breaching one second. | A spike of repeated heavy queries (uncached dashboard) shows up here as a slow-query surge. |
+| [Slow Analytics Queries During Checkout Window](/nerve-centre/kpi-cards/clickhouse/slow-analytics-queries-during-checkout-window) | The checkout-specific revenue-at-risk peer. | If the phantom spike overlaps checkout, this card sizes the direct storefront exposure. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that absorbs latency and saturation. | A sustained order-less spike drags the composite as latency and pool pressure climb. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> Read the live `Query` counter and derive QPS yourself in `clickhouse-client`:
+> ```sql
+> SELECT value FROM system.events WHERE event = 'Query';
+> -- sample twice a second or two apart, then divide the delta
+> ```
+> See who is generating the load right now in `system.processes`, grouped by `client_name` or `user`, and confirm the actual statements in `system.query_log` over the last 15 minutes. ClickHouse's built-in `SHOW PROCESSLIST` gives the same live view in a single command.
+> On **ClickHouse Cloud**, the same `system.events` and `system.query_log` queries run in the SQL console, and the managed monitoring view plots queries per second over time so you can confirm the spike against the platform's own chart. For the order side, reconcile against the ecommerce connector's native admin (Shopify Analytics, BigCommerce Analytics, or Adobe Commerce reports) for orders in the same window.
+
+**Why our number may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sampling cadence** | Either | The card derives QPS from counter deltas on its own cadence; a manual two-sample check a few seconds apart can land on a higher or lower instantaneous rate than the smoothed line. |
+| **Normalisation** | Card shows a ratio, not a raw count | The divergence signal compares each line to its own rolling median; a raw QPS number from `system.events` will not match the indexed value on the chart axis. |
+| **Order-source lag** | Order line slightly behind | The ecommerce connector polls orders on its own refresh; a brand-new order may appear on the storefront admin a minute before it reaches the card's order series. |
+| **Counter reset** | Card resets to baseline | `system.events` counters reset to zero on server restart; a restart inside the window produces a one-off discontinuity the card smooths over. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ClickHouse Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/clickhouse/clickhouse-event-ingest-vs-ecom-orders) | Both cards share the same order reference line. | If orders look different across the two cards, the ecommerce connector refresh is mid-poll; give it a cycle and recheck. |
+| Shopify / BigCommerce / Adobe Commerce orders | The order series should match the platform's native orders-per-minute. | A mismatch points at the connector's order polling window, not at ClickHouse. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**QPS spiked but orders also spiked. Is that an alert?**
+No, and that is the whole point of the card. When both lines rise together it is genuine, revenue-supporting demand: more shoppers, more events, more dashboards being read about real activity. The card only flags the case where QPS jumps and the order line stays flat. A matched spike is healthy load and should not fire.
+
+**Why use a 15-minute window? My traffic patterns are slower than that.**
+Fifteen minutes is short enough to catch a sudden phantom spike while still giving the order line meaningful context. Real shopper-driven query and order load track each other over minutes, so a tight window keeps the comparison honest. A longer window would average a sharp two-minute bot burst into the surrounding hour and hide it. If your analytics genuinely move on a slower rhythm, the window is configurable in the Sensitivity tab.
+
+**Our database serves analytics that have nothing to do with orders. Won't this card always look divergent?**
+It can, and that is worth knowing before you rely on it. The card assumes query load is broadly correlated with storefront activity, which holds for most ecommerce analytics stacks. If a large share of your QPS comes from order-independent workloads (log analytics, product telemetry, ML feature pipelines), expect a noisier baseline and tune the spike threshold accordingly, or lean on [Queries per Second (live)](/nerve-centre/kpi-cards/clickhouse/queries-per-second-live) and [Connection Pool Saturation %](/nerve-centre/kpi-cards/clickhouse/connection-pool-saturation) for capacity signals that do not depend on the order reference.
+
+**How do I tell a dashboard storm from a bot from a retry loop?**
+Look at `system.query_log` for the spike window. A *dashboard storm* shows many different queries from many BI client names arriving at once (everyone opening their dashboard). A *bot or scraper* shows one client name repeating a small set of queries on a fixed interval. A *retry loop* shows the same single query repeated rapidly, often a query that is also appearing in your error or slow-query logs. The query mix usually names the cause before you do anything else.
+
+**Can a real flash sale look like a phantom spike?**
+Briefly, if the order connector lags. During a flash sale, marketing and ops dashboards refresh aggressively to watch it, so QPS can jump a beat before the order series catches up through its polling cycle. The card may flag for one bucket and then clear as orders arrive. A genuine flash sale resolves itself within a cycle; a true phantom spike stays divergent. If in doubt, check whether orders are climbing on the storefront admin even if the card's order line has not refreshed yet.
+
+**The card cleared on its own. Should I still investigate?**
+Yes, if it recurs. A one-off self-clearing spike (someone left a report open, then closed it) is low priority. A spike that returns at the same time each day, or every time a particular service deploys, is a pattern: an automated client with a bad refresh interval or a leaking poll. Recurring order-less spikes waste capacity continuously even though each one looks harmless in isolation. Cross-reference [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/clickhouse/connection-pool-at-90-saturation) to see whether the recurring spike is also pushing the pool to its limit.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*ClickHouse QPS Spike vs Ecom Order Rate* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

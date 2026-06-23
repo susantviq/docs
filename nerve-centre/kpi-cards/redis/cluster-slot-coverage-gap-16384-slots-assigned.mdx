@@ -1,0 +1,156 @@
+---
+title: "Cluster Slot Coverage Gap (<16384 slots assigned), Redis"
+sidebarTitle: "Cluster Slot Coverage Gap (<16384 slots assigned)"
+description: "Cluster Slot Coverage Gap for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A Redis Cluster spreads the keyspace across exactly 16384 hash slots. Every slot must be owned by a primary that is currently reachable, or any command touching a key in an unowned slot fails with `CLUSTERDOWN Hash slot not served`. This card watches for the moment that `cluster_slots_ok` drops below 16384, which means part of your keyspace has gone dark. For a platform or SRE team this is the single most important cluster alert: it is the difference between "a node is slow" and "a chunk of customer-facing reads and writes are now returning errors".
+
+| | |
+| --- | --- |
+| **Data source** | `CLUSTER INFO` over the Redis wire protocol, specifically the `cluster_slots_ok`, `cluster_slots_pfail`, `cluster_slots_fail` and `cluster_state` fields. Vortex IQ polls every cluster node and takes the authoritative view. |
+| **Metric basis** | Slot-ownership state, not key count or memory. A gap means one or more of the 16384 slots has no reachable owning primary (the primary is down and no replica has been promoted). |
+| **What "gap" means** | Redis-distinctive: a slot coverage gap = some keys unreachable, commands on those slots fail. Clients hashing to an unserved slot receive `CLUSTERDOWN` (or, with `cluster-require-full-coverage no`, only that slot's keys error while the rest serve). |
+| **Aggregation window** | `RT` (real-time). The card re-reads `CLUSTER INFO` on every poll cycle and raises the alert the moment coverage drops. |
+| **Alert trigger** | `cluster_slots_ok < 16384`. Any value below full coverage fires. The headline shows the count of missing slots and, where the topology is known, the failed primary and its slot range. |
+| **What does NOT count** | (1) A single replica lagging while its primary still serves the slot, that is healthy coverage; (2) a manual `CLUSTER SETSLOT` resharding in progress where slots are in `MIGRATING`/`IMPORTING` but still served; (3) a standalone (non-cluster) instance, where this card is not applicable and reads `n/a`. |
+| **Topology scope** | All shards in the cluster the connector is pointed at. On a managed service (AWS ElastiCache cluster mode, Azure Cache for Redis Enterprise, Redis Cloud) the same `CLUSTER INFO` view is read through the configured endpoint. |
+| **Time window** | `RT` (real-time, re-evaluated on every poll) |
+| **Alert trigger** | `cluster_slots_ok < 16384` |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calc */}
+The card issues `CLUSTER INFO` and reads the integer reported on the `cluster_slots_ok` line. That field is Redis's own count of slots that are assigned to a primary and that primary is in an `ok` (reachable) state. The coverage gap is:
+
+```text
+coverage_gap = 16384 - cluster_slots_ok
+```
+
+A healthy cluster always reports `cluster_slots_ok:16384` and `cluster_state:ok`. The card fires when `coverage_gap > 0`. Two supporting fields refine the picture: `cluster_slots_pfail` (slots whose owner is suspected dead by at least one node but not yet agreed) and `cluster_slots_fail` (slots whose owner has been agreed dead by the cluster majority). A non-zero `pfail` is an early warning; a non-zero `fail` means a failover is needed and has not completed.
+
+Because `CLUSTER INFO` is reported per node and a partitioned node can hold a stale view, Vortex IQ reads from every reachable node and takes the lowest `cluster_slots_ok` it sees, so a split-brain minority cannot mask a real gap with an optimistic local reading.
+{/* /HUMAN_AUTHORED:calc */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a six-node Redis Cluster (three primaries, three replicas) backing session storage and a read-through product cache for a high-traffic storefront. Slots are split evenly: primary A owns 0 to 5460, primary B owns 5461 to 10922, primary C owns 10923 to 16383. Snapshot taken on 14 Apr 26 at 02:11 BST during an overnight host-maintenance window.
+
+| Node | Role | Slot range | State |
+| --- | --- | --- | --- |
+| A (10.0.1.11) | primary | 0 to 5460 | ok |
+| A-rep (10.0.2.11) | replica of A | (mirrors 0 to 5460) | ok |
+| B (10.0.1.12) | **primary** | **5461 to 10922** | **down (host rebooted)** |
+| B-rep (10.0.2.12) | replica of B | (mirrors 5461 to 10922) | **also down, same rack** |
+| C (10.0.1.13) | primary | 10923 to 16383 | ok |
+| C-rep (10.0.2.13) | replica of C | (mirrors 10923 to 16383) | ok |
+
+Both nodes serving shard B went down together because they were placed in the same rack (an anti-affinity mistake). With no replica to promote, the 5462 slots in range 5461 to 10922 have no reachable owner.
+
+```text
+CLUSTER INFO (read from node A):
+  cluster_state:fail
+  cluster_slots_assigned:16384
+  cluster_slots_ok:10922
+  cluster_slots_pfail:0
+  cluster_slots_fail:5462
+
+coverage_gap = 16384 - 10922 = 5462 slots dark (~33% of the keyspace)
+```
+
+The Vortex IQ headline reads **5462 slots unreachable, cluster_state: fail** outlined in red, with the failed range and the suspected node (B / B-rep) named. What this means in practice:
+
+1. **Roughly one in three keys now errors.** Any `GET`, `SET`, or session lookup that hashes into 5461 to 10922 returns `CLUSTERDOWN Hash slot not served`. With `cluster-require-full-coverage yes` (the default) Redis would refuse those commands cluster-wide for that slot range. About a third of logged-in shoppers cannot read or write their session; their carts appear empty.
+2. **The other two shards are fine.** Slots 0 to 5460 and 10923 to 16383 still serve normally, so the failure is partial, not total. That is why the count of missing slots matters more than a simple up/down.
+3. **The fix is a failover that cannot happen automatically.** Because both B and B-rep are down, there is no replica to promote. The team must bring back at least one node in shard B (or, in an emergency, `CLUSTER ADDSLOTS` the orphaned range onto a healthy primary, accepting the data loss for those slots).
+
+```text
+Impact framing while the gap is open:
+  - Keyspace dark: 5462 / 16384 slots = 33.3%
+  - Session reads/writes failing for ~1/3 of active users
+  - Time to recover = time to reboot host B + replica catch-up (target < 3 min)
+  - Anti-affinity fix queued so B and B-rep never share a rack again
+```
+
+Three takeaways for the on-call DBA:
+
+1. **A gap is binary in customer terms but graded in size.** "Cluster is down" sounds total; this card tells you it is 33% down, which changes the mitigation from "full outage page" to "degraded for a subset".
+2. **No replica means no automatic recovery.** A coverage gap that persists for more than a failover timeout (default `cluster-node-timeout`, often 15s) usually means the dead primary had no healthy replica to promote. Pair with [Connected Replicas](/nerve-centre/kpi-cards/redis/connected-replicas) to confirm replica coverage before the next maintenance window.
+3. **Rack/zone placement is the root cause more often than Redis itself.** Two nodes of the same shard in the same failure domain turns a survivable single-host reboot into a coverage gap. This card surfaces the symptom; the cure is topology hygiene.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside this one
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Cluster Slot Coverage Gap | What the combination tells you |
+| --- | --- | --- |
+| [Cluster Slots Assigned (of 16384)](/nerve-centre/kpi-cards/redis/cluster-slots-assigned-of-16384) | The continuous gauge behind this alert. | Assigned reads the same `cluster_slots_ok`; this card is its threshold alarm. Watch them together for the live count plus the page. |
+| [Connected Replicas](/nerve-centre/kpi-cards/redis/connected-replicas) | Tells you whether a dead primary had anything to promote. | Zero replicas on a shard plus a coverage gap equals manual recovery only, no auto-failover. |
+| [Replica Lag (seconds)](/nerve-centre/kpi-cards/redis/replica-lag-seconds) | A laggy replica may be promoted but with stale data. | High lag at failover means the promoted replica serves the slot but with recent writes lost. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The executive composite that this alert dominates. | A coverage gap alone collapses the health score; this card is the why. |
+| [Instance Uptime](/nerve-centre/kpi-cards/redis/instance-uptime) | A reset uptime on a shard node explains the gap. | Recent restart on the failed primary equals the host bounce that opened the gap. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live) | Throughput drops the instant a shard goes dark. | A step-down in OPS proportional to the missing slot fraction confirms client-side errors. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis itself:**
+
+> **`CLUSTER INFO`** is the authority. Confirm `cluster_state` and `cluster_slots_ok` directly: `redis-cli -c CLUSTER INFO`.
+> **`CLUSTER SHARDS`** (Redis 7+) or **`CLUSTER NODES`** maps each slot range to its owning node so you can identify exactly which primary went dark.
+> **`CLUSTER SLOTS`** returns the slot-to-node assignment as a structured list; the missing range will simply be absent.
+> **`redis-cli --cluster check <host>:<port>`** runs Redis's own coverage audit and prints "[OK] All 16384 slots covered" or names the uncovered slots.
+
+**Why our number may legitimately differ from a single node's view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Per-node staleness** | Vortex IQ may show a gap a beat earlier or later | A partitioned node reports its own `cluster_slots_ok`; we read all nodes and take the lowest, so we can flag a gap a node in the majority has not yet agreed. |
+| **Failover in flight** | Transient gap then self-clears | During the seconds between primary death and replica promotion, `cluster_slots_ok` dips then recovers. We surface the dip; `redis-cli --cluster check` run after recovery shows full coverage. |
+| **Reshard in progress** | No gap, but `CLUSTER NODES` shows MIGRATING | Slots in `MIGRATING`/`IMPORTING` are still served; coverage stays 16384 even though `CLUSTER NODES` looks busy. |
+| **require-full-coverage off** | Cluster stays "up" with a gap | With `cluster-require-full-coverage no`, `cluster_state` can read `ok` while a slot is unserved; we still count the missing slot from `cluster_slots_ok`. |
+
+**Managed-service note:** AWS ElastiCache (cluster mode enabled), Azure Cache for Redis (Enterprise/clustered), and Redis Cloud all expose `CLUSTER INFO` through the configured endpoint, and most also surface a "shards healthy" or "primary node count" metric in their own console. Reconcile our missing-slot count against the console's unhealthy-shard count: one dead shard of three on a 16384-slot cluster corresponds to roughly 5461 missing slots.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My instance is a single standalone Redis, not a cluster. Why does this card say n/a?**
+Hash slots only exist in Redis Cluster mode. A standalone primary (with or without replicas via Sentinel) owns the entire keyspace implicitly and never reports `cluster_slots_ok`. The card reads `n/a` and does not alert. If you want availability monitoring for a standalone setup, watch [Connected Replicas](/nerve-centre/kpi-cards/redis/connected-replicas) and [Instance Uptime](/nerve-centre/kpi-cards/redis/instance-uptime) instead.
+
+**The card fired for two seconds during a failover and then cleared. Was that a false alarm?**
+No, it was real but self-healed. When a primary dies, there is a genuine window (bounded by `cluster-node-timeout`) where its slots are unserved before a replica is promoted. The gap was true; Redis recovered it automatically. A momentary flap is normal during a planned failover; a gap that stays open past the failover timeout means no replica was available to promote.
+
+**What is the difference between `cluster_slots_pfail` and `cluster_slots_fail`?**
+`pfail` (possible fail) means at least one node suspects the owning primary is down but the cluster has not yet reached agreement. `fail` means a majority of primaries have agreed the owner is dead, which triggers failover. A rising `pfail` with `cluster_slots_ok` still at 16384 is an early warning, not yet an outage; a non-zero `fail` is an active gap.
+
+**Can keys be lost when a coverage gap is recovered by promoting a lagging replica?**
+Yes. If the dead primary had unreplicated writes (the replica was behind), promoting that replica restores coverage but loses the writes that never reached it. That is why this card should be read with [Replica Lag (seconds)](/nerve-centre/kpi-cards/redis/replica-lag-seconds): low lag at failover means near-zero loss, high lag means recent writes for those slots are gone.
+
+**We run with `cluster-require-full-coverage no`. Does the card still detect gaps?**
+Yes. That setting changes Redis's behaviour (it keeps serving the slots it still owns instead of refusing all commands) but it does not change `cluster_slots_ok`. We read the slot count directly, so a gap is detected whether or not the cluster as a whole reports `fail`.
+
+**During a planned reshard `CLUSTER NODES` shows slots MIGRATING. Why no alert?**
+Migrating and importing slots are still served by their current owner throughout the move; clients are redirected with `ASK`/`MOVED` but never get `CLUSTERDOWN`. Coverage stays at 16384 for the whole reshard, so the card correctly stays green. A gap during a reshard would indicate the operation broke, which is rare.
+
+**On ElastiCache the console says the cluster is healthy but Vortex IQ flagged a gap. Which is right?**
+Check the timing. Managed-service health dashboards often poll on a 60-second cadence and smooth transient states, while we read `CLUSTER INFO` in real time and take the most pessimistic node view. A short gap during an ElastiCache node replacement can be invisible in the console but real on the wire. Run `redis-cli --cluster check` against the endpoint to settle it: it queries every node and reports actual coverage.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Cluster Slot Coverage Gap* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

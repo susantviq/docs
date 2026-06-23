@@ -1,0 +1,150 @@
+---
+title: "Query Latency p95 (ms), ClickHouse"
+sidebarTitle: "Query Latency p95 (ms)"
+description: "Query Latency p95 (ms) for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Query Latency p95 (ms) is the duration below which 95% of queries complete, in milliseconds, over a rolling window. For a platform team this is the honest tail-latency signal: the median ([p50](/nerve-centre/kpi-cards/clickhouse/query-latency-p50-ms)) tells you how a typical query feels, but p95 tells you how the slow 1-in-20 feels, and that is the experience that makes a dashboard feel sluggish or a checkout call time out. ClickHouse is built for sub-second analytics, so a p95 above 200ms on a tuned OLTP-style workload is a warning that queries are scanning too much, contending for resources, or queuing behind heavier work.
+
+| | |
+| --- | --- |
+| **What it tracks** | The 95th-percentile query duration in milliseconds, computed via percentile aggregation over `query_duration_ms` in `system.query_log`. |
+| **Data source** | From `system.query_log` percentile aggregation: `quantile(0.95)(query_duration_ms)` over completed queries in the rolling window. |
+| **Metric basis** | Completed-query duration, server-side. Measures wall-clock time the server spent on each query, not network round-trip or client render time. |
+| **Aggregation window** | Real-time gauge over a rolling 5-minute window (`RT/5m`). The headline shows the latest p95; the sparkline shows the recent trend. |
+| **Time window** | `RT/5m` (real-time, rolling 5-minute window) |
+| **Alert trigger** | `> 200ms`, p95 above 200ms over the window pages the platform on-call because tail latency is degrading user-facing responsiveness. |
+| **What counts** | All completed queries with a recorded duration: SELECTs, INSERTs, and DDL, across native, HTTP, and wire-protocol interfaces. |
+| **What does NOT count** | Queries that failed before completing (no clean duration), cancelled queries, and time spent in the client or network. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine runs a percentile aggregation over `query_duration_ms` in `system.query_log` for completed queries in the rolling window:
+
+```sql
+SELECT round(quantile(0.95)(query_duration_ms)) AS p95_ms
+FROM system.query_log
+WHERE type = 'QueryFinish'
+  AND event_time >= now() - INTERVAL 5 MINUTE;
+```
+
+`type = 'QueryFinish'` restricts the sample to queries that completed (failed queries have no meaningful duration). `query_duration_ms` is the server-side wall-clock time for each query. `quantile(0.95)` returns the value below which 95% of those durations fall. ClickHouse offers `quantile` (approximate, fast) and `quantileExact` (slower, exact); the card uses the approximate form, which is accurate to within a fraction of a percent and far cheaper at high volume. The window slides continuously. See the At a glance summary for what the metric tracks and the worked example below for a typical reading.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs ClickHouse behind a customer-facing analytics dashboard. The product SLA promises panels render in under a quarter of a second, so 200ms p95 is the line. Baseline p95 sits around 60ms. Snapshot sequence taken on 14 Apr 26:
+
+| Time (BST) | p50 | p95 | p99 | What was happening |
+| --- | --- | --- | --- | --- |
+| 09:00 | 18ms | 58ms | 140ms | Healthy baseline |
+| 11:30 | 22ms | 240ms | 1,100ms | p95 breaches; p50 barely moved |
+| 12:10 | 19ms | 61ms | 150ms | Recovered |
+
+The 11:30 reading is the interesting one: p50 stayed at 22ms (typical queries fine) but p95 jumped to 240ms and p99 to over a second. The card goes red and the alert fires.
+
+Three readings the team should take:
+
+1. **A p95 breach with a healthy p50 means the problem is in the tail, not the typical query.** Most queries are still fast; a minority got slow. That pattern almost always means resource contention (a heavy query or merge competing for CPU and disk) or a subset of queries hitting a cold cache. Compare with [Query Latency p50 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p50-ms): if p50 had also jumped, the whole instance would be slow (load or a global stall), which is a different diagnosis.
+
+2. **The tail is where SLAs break.** At p50 of 22ms the dashboard feels instant for most refreshes, but 1 in 20 panel loads now takes 240ms and 1 in 100 takes over a second. Customers notice the slow ones, not the fast ones. p95 is the metric the SLA is written against because it captures the experience of the unlucky requests. Pair with [Slow-Query Rate %](/nerve-centre/kpi-cards/clickhouse/slow-query-rate) to see how many queries crossed the 1-second slow threshold.
+
+3. **Hunt the tail in `system.query_log`, ordered by duration.** The fix starts with finding the slow queries: `SELECT query_duration_ms, normalized_query_hash, read_rows, memory_usage FROM system.query_log WHERE type = 'QueryFinish' AND event_time >= now() - 600 ORDER BY query_duration_ms DESC LIMIT 20`. If the top queries all share a `normalized_query_hash`, one query pattern is the culprit (often a missing filter causing a full scan). If they are varied but `read_rows` is uniformly huge, the instance is under merge or cache pressure. Cross-check [Merges In Progress](/nerve-centre/kpi-cards/clickhouse/merges-in-progress) and [UncompressedCache Hit Rate %](/nerve-centre/kpi-cards/clickhouse/uncompressedcache-hit-rate).
+
+```text
+Diagnosing the 11:30 breach:
+  - p50 held:        18ms -> 22ms   (typical query fine)
+  - p95 jumped:      58ms -> 240ms  (tail degraded)
+  - p99 jumped:      140ms -> 1,100ms
+  - Pattern:         tail-only -> contention or cold cache, not global load
+  - Next step:       order query_log by duration; check merges + cache hit rate
+```
+
+The correct response depends on the shape. Tail-only degradation (p50 flat, p95/p99 up) points at contention or a slow query subset: find and fix the offending pattern or shed the competing background work. Whole-distribution degradation (p50 up too) points at global load or a stall: check QPS, connection saturation, and memory.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards platform teams should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Latency p95 | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p50 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p50-ms) | The median, contrasted against the tail. | p95 up with p50 flat equals a tail/contention problem; both up equals global slowdown. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p99-ms) | The far tail, the worst 1 in 100. | The gap between p95 and p99 shows how heavy the worst outliers are. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/clickhouse/slow-query-rate) | Counts queries over the 1-second slow line. | Confirms how much of the tail has crossed into genuinely slow territory. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/clickhouse/top-10-slowest-queries) | The named offenders behind the tail. | Identifies the specific query patterns dragging p95 up. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/clickhouse/queries-per-second-live) | Load context for the latency. | p95 rising with QPS equals queuing under load; p95 rising with flat QPS equals a slow query, not load. |
+| [Merges In Progress](/nerve-centre/kpi-cards/clickhouse/merges-in-progress) | Background merges contend for the same CPU and disk. | High merge activity often explains a transient p95 spike. |
+| [UncompressedCache Hit Rate %](/nerve-centre/kpi-cards/clickhouse/uncompressedcache-hit-rate) | A cold cache forces disk reads and inflates the tail. | A dip in cache hit rate alongside a p95 spike confirms cache pressure. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that weights latency. | A sustained p95 breach drags the overall health score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> **`system.query_log`** is the authoritative source. Reproduce the headline with:
+> `SELECT quantile(0.95)(query_duration_ms) FROM system.query_log WHERE type = 'QueryFinish' AND event_time >= now() - 300`.
+> For an exact (slower) figure use `quantileExact(0.95)(query_duration_ms)`.
+> Order by duration to find the offenders: `... ORDER BY query_duration_ms DESC LIMIT 20`.
+> **`system.metrics`** for live concurrency context (queries running now), which explains queuing-driven latency.
+> **ClickHouse Cloud console** (managed service): the Metrics tab plots query latency percentiles per service over time.
+
+**Why our number may legitimately differ from a direct query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Approximate vs exact quantile** | Marginal | The card uses `quantile` (approximate) for speed; `quantileExact` may differ by a fraction of a percent. The approximate value is correct for trending and alerting. |
+| **Log sampling** | Variable | If `log_queries_probability` is below 1, the percentile is computed over a sample. Set probability to 1 for the most faithful figure. |
+| **Window boundary** | Variable | The card uses a continuously sliding 5-minute window; a fixed `now() - 300` query covers a slightly different slice. |
+| **Query-type mix** | Variable | The card includes all `QueryFinish` rows (SELECT, INSERT, DDL). Filtering to SELECTs only will usually lower the p95 because INSERTs and DDL can be slower. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Slow Analytics Queries During Checkout Window](/nerve-centre/kpi-cards/clickhouse/slow-analytics-queries-during-checkout-window) | A p95 spike during a checkout window is higher impact. | Tail latency confined to off-peak windows is lower priority than the same spike during a revenue-critical period. |
+| Storefront page-speed / conversion cards | A database p95 spike can ripple into storefront response times if queries sit on the request path. | Storefront fine while p95 is high means the slow queries are off the shopper path (internal BI). |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why p95 and not just average latency?**
+Averages hide the tail. One slow query can be drowned out by thousands of fast ones, leaving the average looking healthy while a meaningful fraction of users wait. p95 reports the experience of the slow 1-in-20, which is where SLAs are written and where users actually feel pain. Read p50, p95, and p99 together: the shape of the distribution is more informative than any single number.
+
+**My p50 is flat but p95 breached. What does that mean?**
+The typical query is fine; a minority got slow. That tail-only pattern almost always means resource contention (a heavy query or a merge competing for CPU and disk) or a subset of queries hitting a cold cache. It is a different diagnosis from a whole-instance slowdown (where p50 also rises). Hunt the slow queries in `system.query_log` ordered by `query_duration_ms`.
+
+**Does this measure network and client time too?**
+No. `query_duration_ms` is server-side wall-clock time only: the time ClickHouse spent on the query. Network round-trip, TLS handshake, and client-side rendering are not included. If users report slowness but server p95 is fine, the bottleneck is outside the database (network, client, or a proxy).
+
+**Why is the approximate quantile used instead of the exact one?**
+`quantileExact` sorts all values and is accurate but memory- and CPU-heavy at high query volume. `quantile` uses a reservoir estimate that is accurate to within a fraction of a percent and far cheaper. For a live dashboard and alerting, the approximate value is the right trade-off. If you need the exact figure for a post-incident report, run `quantileExact(0.95)` by hand.
+
+**The alert fired at 210ms then cleared in two minutes. Should I investigate?**
+A brief breach that self-clears is often a transient: a one-off heavy query, a merge wave, or a cold-cache moment after a restart. Use the trend, not the single sample. If p95 breaches repeatedly or stays above 200ms, that is structural and worth investigating via [Top 10 Slowest Queries](/nerve-centre/kpi-cards/clickhouse/top-10-slowest-queries). A single self-clearing spike usually does not warrant action.
+
+**How do I lower p95 once I find the slow queries?**
+The usual levers: add a `WHERE` filter so the query reads fewer parts (ClickHouse prunes by primary key and partition), select fewer columns (columnar storage means unread columns cost nothing), pre-aggregate with a materialised view, or move heavy ad-hoc reporting off the customer-facing instance. Raising hardware rarely fixes a tail caused by a full scan; fixing the query does.
+
+**Does log TTL affect the live p95?**
+No. The live 5-minute p95 only needs the most recent five minutes of `system.query_log`, which are always present regardless of TTL. A short TTL only affects historical or 24-hour latency views, not this real-time card.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Latency p95 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

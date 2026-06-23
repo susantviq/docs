@@ -1,0 +1,160 @@
+---
+title: "ES Product Index Doc Count vs Ecom Catalog, kpi"
+sidebarTitle: "ES Product Index Doc Count vs Ecom Catalog"
+description: "ES Product Index Doc Count vs Ecom Catalog for Elasticsearch stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This card compares the number of product documents in your Elasticsearch search index against the number of active, sellable products in your ecommerce catalogue. When the two numbers drift apart, your product-sync pipeline into search has broken: shoppers can no longer find SKUs that exist in the store, or the index is serving stale products that no longer sell. For a platform team, this is the single clearest signal that "search is lying to customers about what we sell". A drift of more than 100 documents trips the alert because at that scale the gap is structural (a failed reindex, a stuck connector, a mapping rejection) rather than the normal few-second lag of a healthy near-real-time index.
+
+| | |
+| --- | --- |
+| **What it tracks** | The signed difference between (a) the live document count of the product search index in Elasticsearch and (b) the count of active/published products in the connected ecommerce platform (Shopify, BigCommerce, Adobe Commerce). Drift = ES doc count minus ecom catalogue count. |
+| **Data source** | Elasticsearch side: `GET /<product-index>/_count` (or `GET /_cat/indices/<product-index>?h=docs.count`). Ecom side: the platform connector's product count (active/published only). The card joins both at read time. The `detail` for this card is explicit: drift means the product-sync to search is broken and merchants miss SKUs in search results. |
+| **Time window** | `RT/24h`. The headline drift is real-time (recomputed on each refresh); the trend strip shows the last 24 hours so you can see when the gap opened. |
+| **Alert trigger** | `> 100 docs drift` (absolute value). A sustained gap above 100 documents in either direction pages the platform/search on-call. |
+| **Cross-channel join** | This is an Elasticsearch-distinctive cross-channel card: it only has meaning when an ecom connector is also configured, because the comparison number comes from the storefront, not from Elasticsearch. |
+| **Direction matters** | Negative drift (ES has fewer docs than the catalogue) = missing SKUs, shoppers cannot find live products. Positive drift (ES has more docs than the catalogue) = stale/zombie products, shoppers find items that are discontinued or unpublished. |
+| **What does NOT count** | Draft, archived, or unpublished products on the ecom side; deleted documents in Elasticsearch that have not yet been merged out of segments (these inflate `_cat/indices` but not `_count`, which is why the card prefers `_count`). |
+| **Roles** | owner, engineering, operations, merchandising |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card computes a two-sided comparison:
+
+```text
+es_doc_count      = GET /<product-index>/_count  -> .count
+ecom_catalog_count = connector active-product count (published + sellable)
+
+drift             = es_doc_count - ecom_catalog_count
+drift_pct         = drift / ecom_catalog_count * 100   (shown for context)
+```
+
+`_count` is preferred over `_cat/indices ... docs.count` deliberately. The `_cat` figure includes deleted documents that are still present in Lucene segments but not yet merged away, so it overstates the live, queryable population. `_count` returns only live documents, which is exactly the set a shopper's search can return.
+
+The alert fires on the absolute value: `abs(drift) > 100`. The card holds both the raw counts and the signed drift so the headline can show direction (for example "ES is short by 412 docs" versus "ES has 412 stale docs"). The 24-hour strip is sampled on each refresh so a step change pinpoints the moment a sync job failed.
+
+If the product index is aliased (a common pattern where `products` is an alias pointing at `products-v7`), the card reads the count through the alias so a blue/green reindex swap does not register as spurious drift while both indices briefly co-exist.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A homewares retailer runs Adobe Commerce as the catalogue of record and an Elasticsearch cluster (managed, 3 data nodes) as the storefront search backend. A nightly connector reindexes the `catalog_product` index from Magento into the `products` alias in Elasticsearch. Snapshot taken on 14 Apr 26 at 08:10 BST, shortly after the overnight job ran.
+
+| Source | Count | Notes |
+| --- | --- | --- |
+| Adobe Commerce active products | 48,930 | `status = enabled`, `visibility != not-visible-individually` |
+| Elasticsearch `products` `_count` | 48,512 | live documents queryable by shoppers |
+| **Drift** | **-418** | ES is short by 418 documents |
+
+The Vortex IQ headline shows **-418 drift** in red because it exceeds the 100-document threshold. Reading the 24-hour strip, the gap was zero at 02:00 (before the job) and stepped to -418 at 03:47, exactly when the reindex connector logged a batch failure. The platform team investigates in this order:
+
+1. **Confirm the direction.** Negative drift means missing SKUs, the worse of the two cases, because 418 live products cannot be found in storefront search at all. That is direct lost revenue, not a cosmetic issue.
+2. **Find the failing batch.** The connector log shows a bulk request rejected partway through with `mapper_parsing_exception` on a new `colour_family` attribute that Adobe added but the Elasticsearch mapping does not know about. Every document in that batch (and every batch after the failure, if the job aborts) never landed.
+3. **Quantify the exposure.** 418 of 48,930 products is 0.85% of the catalogue. If those products were a random slice they would carry roughly 0.85% of search-driven revenue, but in practice the missing batch is often a contiguous range (a newly imported supplier feed), so it can be disproportionately the newest, most-promoted products. The team cross-checks merchandising to see whether any are in an active campaign.
+
+```text
+Revenue framing (illustrative):
+  - Search-attributed revenue/day across catalogue: ~£62,000
+  - Missing share if uniform: 0.85% -> ~£527/day at risk
+  - Missing share if the batch is a promoted new range: materially higher
+  - The fix (correct the mapping + replay the failed batch) is minutes;
+    the cost is the hours the gap stays open undetected.
+```
+
+Three takeaways for the platform team:
+
+1. **A drift card is an early-warning system for sync failures that produce no error on the storefront.** The site does not 500; search simply returns fewer results. Without this comparison the gap is invisible until a merchandiser or customer notices a specific product is "missing".
+2. **Positive drift is just as actionable as negative.** If the next night the catalogue drops 600 discontinued lines but the delete-by-query never ran, ES would show +600 stale documents. Shoppers then find and click products that are out of catalogue, leading to dead PDPs and wasted ad spend.
+3. **Resolve the root cause, not just the count.** Replaying the failed batch fixes today's drift, but the underlying mapping mismatch will recur on the next attribute Adobe adds. The durable fix is dynamic-mapping templates or a schema-change check in the connector.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this card | What the combination tells you |
+| --- | --- | --- |
+| [Indexing Rate (docs/sec)](/nerve-centre/kpi-cards/elasticsearch/indexing-rate-docssec) | The throughput view of the sync that feeds this index. | Drift opening while indexing rate is zero confirms the sync job stalled, not just slowed. |
+| [Bulk Rejections (24h)](/nerve-centre/kpi-cards/elasticsearch/bulk-rejections-24h) | The mechanism by which documents silently fail to land. | Non-zero bulk rejections plus negative drift equals "the reindex tried but Elasticsearch pushed back". |
+| [Avg Index Refresh Time (ms)](/nerve-centre/kpi-cards/elasticsearch/avg-index-refresh-time-ms) | Refresh lag is the benign cause of small, transient drift. | Climbing refresh time explains a sub-100 drift that self-heals; it does not explain a sustained 400+ gap. |
+| [Cluster Status (green / yellow / red)](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) | A red cluster can make documents unavailable to `_count`. | Drift plus a non-green cluster means the gap may be unallocated shards, not a sync failure. |
+| [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) | Unassigned product shards remove their documents from the live count. | Negative drift exactly matching a shard's document share points at allocation, not sync. |
+| [Search Error Rate %](/nerve-centre/kpi-cards/elasticsearch/search-error-rate) | The shopper-facing consequence if queries also start failing. | Drift with a clean error rate means search "works" but returns an incomplete catalogue, the quietest failure mode. |
+| [Search QPS Spike vs Ecom Traffic](/nerve-centre/kpi-cards/elasticsearch/search-qps-spike-vs-ecom-traffic) | Another cross-channel card joining search to storefront. | Read together to separate "search is incomplete" from "search is being hammered". |
+| [ES Search Pool Saturation vs Ecom Burst](/nerve-centre/kpi-cards/elasticsearch/es-search-pool-saturation-vs-ecom-burst) | The capacity-side cross-channel peer. | Drift is a correctness problem; pool saturation is a capacity problem, distinct but often confused. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch and the storefront:**
+
+> **`GET /<product-index>/_count`** is the authoritative live document count; this is the number the card uses on the Elasticsearch side. Run it through the alias if you use one.
+> **`GET /_cat/indices/<product-index>?v&h=index,docs.count,docs.deleted`** shows live and deleted documents side by side; the difference explains why `_cat` and `_count` disagree.
+> **`GET /<product-index>/_stats/docs`** gives the same live count plus per-shard breakdown, useful when drift maps to one shard.
+> On the ecom side, reconcile against the platform's own product count: Adobe Commerce admin product grid filtered to enabled/visible, BigCommerce **Products** count, or the Shopify products list filtered to active.
+
+**Why our number may legitimately differ from a raw `_cat/indices` read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Deleted-but-not-merged docs** | `_cat` higher than the card | `_cat/indices` includes `docs.deleted` still in segments; the card uses `_count`, which is live only. |
+| **Near-real-time refresh lag** | small transient drift | A just-indexed document is not counted until the next refresh (default 1s); healthy clusters self-heal within seconds. |
+| **Alias spanning two indices** | apparent spike during reindex | During a blue/green swap both `products-v7` and `products-v8` may briefly answer the alias; the card reads the alias to avoid double counting once the swap completes. |
+| **Ecom-side filter scope** | variable | The catalogue figure counts active/published only; if your storefront indexes a different scope (for example includes "out of stock but visible"), align the filter before comparing. |
+| **Time zone of the trend strip** | axis shift only | Elasticsearch stat timestamps are UTC; the card renders the 24h strip in your Vortex IQ display time zone. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_products`](/nerve-centre/kpi-cards/shopify/total-revenue) / BigCommerce / Adobe product counts | The ecom catalogue figure should match the platform's own active-product total. | If they disagree, the connector's product filter (status, visibility) differs from your storefront's definition of "sellable". |
+| [Indexing Rate (docs/sec)](/nerve-centre/kpi-cards/elasticsearch/indexing-rate-docssec) | A healthy reindex shows a burst of indexing that closes drift to near zero. | Flat indexing rate with open drift means the job never ran or aborted at the start. |
+
+<details>
+<summary><em>Cross-engine note (same concept on other search backends)</em></summary>
+
+The "index document count versus source-of-truth catalogue" comparison is engine-agnostic. If you also run OpenSearch, the same `_count` API applies. On Algolia the equivalent is the index "Records" count in the dashboard versus your catalogue; on Solr it is `numDocs` from the core stats. These are listed only so a team running search on more than one engine can find the equivalent metric; the Vortex IQ card reconciles against your actual Elasticsearch cluster.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does the card use `_count` instead of the number I see in `_cat/indices`?**
+`_cat/indices` reports `docs.count` including deleted documents still sitting in Lucene segments that have not been merged away yet. Those documents cannot be returned to a shopper, so counting them would understate real drift. `_count` returns only live, queryable documents, which is the population that matters for "can a customer find this product".
+
+**A small drift appears and disappears within seconds. Is that a problem?**
+No. Elasticsearch is near-real-time: a newly indexed document is searchable and counted only after the next refresh (default once per second). During a steady-state sync you will see drift bounce by a handful of documents and self-correct. The alert is set at 100 precisely so this normal jitter never pages anyone. Investigate only sustained gaps.
+
+**The drift is positive (ES has more docs than the catalogue). What does that mean?**
+Stale or zombie products. Items were unpublished, archived, or deleted on the ecom side but the corresponding delete (or delete-by-query) never reached Elasticsearch. Shoppers can find and click these, landing on dead or misleading product pages. Fix the delete path in your sync, then run a one-off delete-by-query or full reindex to clear the backlog.
+
+**We use an alias for blue/green reindexing. Does that confuse the card?**
+No, the card reads the count through the alias. During a swap, where both the old and new index briefly serve the alias, Elasticsearch de-duplicates at the alias level for `_count`, so you will not see a spurious doubling. If you read the underlying indices directly you would, which is another reason the card prefers the alias.
+
+**Our catalogue legitimately differs from the index because we exclude some products from search. How do we stop false alerts?**
+Align the ecom-side count filter with what you actually index. If your storefront search deliberately omits, say, gift cards or B2B-only SKUs, configure the connector's product scope to exclude the same set. Drift should be measured against the products you intend to make searchable, not the entire catalogue.
+
+**Can a non-green cluster cause apparent drift?**
+Yes. If a product shard is unassigned (red cluster) its documents drop out of the live `_count`, producing negative drift that is really an allocation problem, not a sync problem. Always check [Cluster Status](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) and [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) before assuming the sync failed.
+
+**How fast should we react to a sustained negative drift?**
+Treat it like a partial outage of discoverability. The site is up, but a slice of the catalogue is invisible to search and therefore unsellable through that path. The cost grows linearly with time-open, and the fix (replay the failed batch, correct a mapping) is usually minutes once located. Sustained negative drift above the threshold warrants same-shift action.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*ES Product Index Doc Count vs Ecom Catalog* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

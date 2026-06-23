@@ -1,0 +1,148 @@
+---
+title: "SQL Warehouse Saturation %, Databricks"
+sidebarTitle: "SQL Warehouse Saturation %"
+description: "SQL Warehouse Saturation % for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How close your Databricks SQL warehouse is to its concurrency ceiling, expressed as a percentage. A SQL warehouse can serve a finite number of concurrent queries before new ones start queuing; saturation measures how full that pipe is right now. At 40% there is plenty of headroom; at 90% queries are about to queue, and once they queue, latency rises sharply and dashboards feel slow. For a platform team this is the gauge that tells you whether to scale out (add clusters to the warehouse), and the alert at 90% is the line where action becomes urgent rather than optional.
+
+| | |
+| --- | --- |
+| **What it tracks** | The ratio of in-use query slots to total available slots across the warehouse's active clusters, as `dbx_pool_saturation`, rendered as a gauge from 0 to 100%. |
+| **Data source** | The SQL Warehouses API monitoring endpoint (`GET /api/2.0/sql/warehouses/{id}` and the warehouse monitoring stats) plus `system.compute.warehouse_events` and query-history concurrency, where the system schema is enabled. Saturation is active concurrency divided by the warehouse's max concurrency for its current cluster count. |
+| **Why it matters** | Saturation is the leading indicator of query queuing. Latency and queue-time both stay flat until saturation nears 100%, then rise non-linearly. Catching the climb to 90% lets you scale before users feel it. |
+| **Time window** | `RT/1m`: real-time gauge sampled on a one-minute cadence. |
+| **Alert trigger** | `> 90%`. Sustained saturation above 90% means the warehouse is at its concurrency ceiling and queries are queuing or about to. |
+| **Sentiment** | Lower is healthier for headroom, but very low sustained values (under 10%) suggest the warehouse is over-provisioned for its load. |
+| **Roles** | owner, engineering, operations (DBA / platform / SRE) |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+A Databricks SQL warehouse runs one or more clusters, and each cluster admits a bounded number of concurrent queries (the platform targets roughly ten running queries per cluster before it considers scaling). Saturation is the live occupancy of that capacity:
+
+```text
+total_slots   = clusters_active * slots_per_cluster
+in_use_slots  = queries_currently_running
+saturation_%  = (in_use_slots / total_slots) * 100
+```
+
+Vortex IQ reads active concurrency from the warehouse monitoring stats and the count of running queries from query history, then divides by the slot capacity implied by the warehouse's current cluster count and size. Because warehouses autoscale, the denominator moves: when the warehouse adds a cluster, total slots rise and saturation drops even if load is unchanged. The gauge therefore reflects *occupancy relative to current capacity*, which is exactly what you want, a warehouse that is at max clusters and still 95% saturated has a genuine capacity problem, whereas one at 95% with room to add clusters will self-heal in seconds.
+
+The one-minute sampling smooths out sub-second bursts. A momentary spike to 100% as a heavy query lands is normal; the alert is built around *sustained* saturation, so a single sample over 90% that drops back at the next reading does not page.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a SQL warehouse (size Medium, autoscaling 1 to 4 clusters) that powers internal BI dashboards plus an embedded analytics layer on a storefront. Snapshot taken on 18 Apr 26 between 09:00 and 09:30 UTC, the morning reporting peak.
+
+| Time (UTC) | Clusters | Running queries | Total slots | Saturation % | Note |
+| --- | --- | --- | --- | --- | --- |
+| 09:02 | 1 | 7 | 10 | 70 | Warming up |
+| 09:08 | 1 | 10 | 10 | 100 | At ceiling, queuing begins |
+| 09:09 | 2 | 11 | 20 | 55 | Autoscale added a cluster |
+| 09:21 | 2 | 19 | 20 | 95 | **Alert: sustained > 90%** |
+| 09:24 | 3 | 21 | 30 | 70 | Scaled again, recovered |
+
+The gauge flags red at 09:21 when saturation holds at 95% across several samples while the warehouse is on 2 of its 4 allowed clusters. The platform engineer drills in.
+
+```text
+What is happening at 09:21:
+  - 19 queries running, 20 slots; ~4 queries queued and waiting
+  - Queue time on new queries: jumped from 0.1s to 6.8s
+  - Embedded storefront analytics widget load time: up from 0.9s to 7s+
+  - Warehouse has 2 more clusters of headroom but scale-up lag is ~30-60s
+```
+
+The decisions:
+
+1. **Confirm autoscaling is doing its job.** It is, by 09:24 a third cluster is up and saturation falls to 70%. The 95% window was the autoscaler's reaction lag, not a hard ceiling. The user-visible pain lasted about three minutes.
+2. **Reduce the reaction lag.** Raising the warehouse's minimum cluster count from 1 to 2 during business hours means the morning peak starts with more headroom and the first burst does not hit 100%. This trades a small steady-state cost for smoother peaks.
+3. **Check whether the load is queries or one heavy query.** Here it was many concurrent dashboard refreshes, a true concurrency problem that scaling out solves. If it had been one giant query holding a slot, scaling out would not have helped, and the fix would live in [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries) instead.
+
+Two takeaways:
+
+1. **Saturation is the cause; latency is the effect.** The latency rise on [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) at 09:21 and this gauge hitting 95% are the same event. Watch saturation to act before latency degrades.
+2. **A warehouse pinned at max clusters and still saturated is a different problem.** When there is no headroom left to autoscale into, sustained high saturation means the warehouse is genuinely too small for its peak, and the answer is a larger warehouse size or a higher max-cluster ceiling, not patience.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with SQL Warehouse Saturation | What the combination tells you |
+| --- | --- | --- |
+| [Active SQL Sessions](/nerve-centre/kpi-cards/databricks/active-sql-sessions) | Sessions drive concurrency; more sessions push saturation up. | A session surge with rising saturation equals a genuine demand peak. |
+| [SQL Query Latency p95 (ms)](/nerve-centre/kpi-cards/databricks/sql-query-latency-p95-ms) | Latency is the user-visible effect of saturation. | p95 climbing as saturation passes 90% confirms queuing, not slow queries. |
+| [SQL Queries per Hour (live)](/nerve-centre/kpi-cards/databricks/sql-queries-per-hour-live) | The throughput driving the gauge. | High QPH plus high saturation equals scale out; low QPH plus high saturation equals heavy queries. |
+| [Active SQL Warehouses](/nerve-centre/kpi-cards/databricks/active-sql-warehouses) | Tells you how many warehouses exist to spread load. | One saturated warehouse among many idle ones equals a routing/sizing imbalance. |
+| [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries) | Distinguishes concurrency pressure from one slot-hogging query. | A single slow query holding a slot saturates a small warehouse on its own. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/databricks/slow-query-rate) | Slow queries occupy slots longer, inflating saturation. | Rising slow-query rate plus saturation equals queries holding slots too long. |
+| [Avg Cluster CPU Utilisation %](/nerve-centre/kpi-cards/databricks/avg-cluster-cpu-utilisation) | Confirms whether the warehouse hardware is also hot. | High saturation with low CPU means slots are full but compute is idle (queries waiting, not working). |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> Open **SQL → SQL Warehouses → (your warehouse) → Monitoring**. The live charts show **Running queries**, **Queued queries**, and **Cluster count** over time; saturation is running queries against slot capacity.
+> Query `SELECT * FROM system.compute.warehouse_events WHERE warehouse_id = '...'` (where the system schema is enabled) for scale-up / scale-down events that change the denominator.
+> The **Query History** view, filtered to the warehouse, shows per-query queue time, the direct symptom of saturation.
+
+**Why our number may legitimately differ from the Databricks UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Denominator timing** | Brief mismatch | Saturation depends on current cluster count; during an autoscale event the UI and our poll can briefly disagree on the slot total. |
+| **Sampling cadence** | Smoothing | Vortex IQ samples on a one-minute cadence; the UI's live chart can show sub-minute spikes we average out. |
+| **Slots-per-cluster model** | Variable | The exact concurrency a cluster admits depends on query weight; we use the platform's nominal target, so our percentage is an estimate of occupancy, not an exact slot count. |
+| **Queued vs running** | Definition | Our gauge measures running occupancy; a warehouse can be 100% saturated with a long queue behind it, which the UI shows as a separate "queued" series. |
+| **Time zone** | Display only | Chart axes render in workspace time in the UI and profile time in Vortex IQ; the percentages are identical. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Databricks SQL Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/databricks/databricks-sql-spike-vs-ecom-order-rate) | A storefront traffic spike drives query volume and saturation. | Saturation rising with no order/traffic spike points at internal BI, not the storefront. |
+| [Slow SQL Queries During Checkout Window](/nerve-centre/kpi-cards/databricks/slow-sql-queries-during-checkout-window) | Saturation during peak checkout slows embedded analytics. | High saturation off-peak is a reporting job, not a customer-facing risk. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Saturation hit 100% but no one complained. Was it a false alarm?**
+Probably not a false alarm, more likely the autoscaler caught up fast. A brief 100% sample as a burst lands, followed by a new cluster coming online within 30 to 60 seconds, produces a short spike that users may not notice. The alert is built around *sustained* high saturation precisely to avoid paging on these self-healing blips. If the spike held above 90% for several minutes, it was real and worth investigating even if no one filed a ticket.
+
+**My warehouse is at max clusters and still 95% saturated. What now?**
+This is the case where autoscaling cannot help: there is no headroom left to add. Your options are (1) increase the warehouse's max-cluster ceiling, (2) move to a larger warehouse size (more slots per cluster), or (3) split workloads so heavy reporting and interactive dashboards run on separate warehouses. Pinning at max clusters and high saturation is the clearest signal the warehouse is undersized for its peak.
+
+**Why is the gauge a percentage rather than a query count?**
+Because the meaningful question is "how full am I relative to what I have", not the raw number. Twenty running queries is fine on a large warehouse and overloaded on a small one. The percentage normalises across warehouse sizes and autoscaling, so 90% always means the same thing: nearly out of headroom.
+
+**Saturation is high but CPU utilisation is low. How?**
+Slots can be full of queries that are waiting rather than computing: blocked on I/O, waiting on a remote source, or serialising on a contended table. The slot is occupied (so saturation is high) but the CPU is idle (so utilisation is low). Scaling out adds slots but will not speed up the waiting queries; investigate what they are blocked on instead.
+
+**Does serverless SQL change how this card behaves?**
+The concept is the same but the mechanics differ. Serverless warehouses scale far more quickly and elastically, so sustained high saturation is rarer and recovery is faster. The card still reports occupancy against current capacity; you will simply see fewer prolonged 90%+ windows because the platform reacts in seconds rather than tens of seconds.
+
+**Can one runaway query saturate the whole warehouse?**
+On a small (single-cluster) warehouse, a single very heavy query can occupy a large share of the slots or starve others of resources, pushing effective saturation high. The fix there is not scaling out (the warehouse is not concurrency-bound, it is one-query-bound) but finding and optimising that query via [Top 10 Slowest SQL Queries](/nerve-centre/kpi-cards/databricks/top-10-slowest-sql-queries).
+
+**Should I just set min clusters high enough to never saturate?**
+That eliminates queuing but means paying for idle capacity off-peak. The better pattern is a modest minimum during business hours (so the first burst has headroom) and aggressive autoscaling for the peaks. Watch this card against [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h) to find the balance between smooth peaks and wasted spend.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*SQL Warehouse Saturation %* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

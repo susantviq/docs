@@ -1,0 +1,145 @@
+---
+title: "Query Error Rate %, MariaDB"
+sidebarTitle: "Query Error Rate %"
+description: "Query Error Rate % for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Errors](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Query Error Rate %** is the share of statements that the server rejected or failed to complete, expressed as a percentage of total statements over the window. It is the database's "are queries actually succeeding?" signal, the counterpart to throughput. A healthy production instance runs at a near-zero error rate; even a fraction of a percent of failing queries usually means real customer-facing breakage, because application code rarely sends statements it expects to fail. A sudden climb points to a specific, findable cause: a bad deploy with malformed SQL, a lock-timeout storm, a permissions change, a full disk rejecting writes, or a schema migration colliding with live traffic. As a hero and sensitivity card it pages the on-call team the moment errors cross the line, because error rate moving is almost always a symptom of something that just changed.
+
+| | |
+| --- | --- |
+| **What it tracks** | The percentage of statements that errored versus total statements executed. Query Error Rate % for the selected period. |
+| **Data source** | The ratio of error-counting status variables (such as the aborted-statement and access-denied counters, and where available `performance_schema.events_statements_summary_*` error totals) against total `Questions` over the window. On managed services the figure is read from the provider's error metric. |
+| **Time window** | `5m` (the error count and the statement total are both summed over a rolling five-minute window). |
+| **Alert trigger** | `> 1%`. Sustained error rate above 1% over the window means a meaningful slice of queries are failing; treat as a live incident. |
+| **Metric basis** | Failed statements as a fraction of all statements, NOT a raw error count. Five failures in a million queries is healthy; five failures in fifty queries is a fire. |
+| **What does NOT count** | (1) Slow-but-successful queries (those belong to [Slow-Query Rate %](/nerve-centre/kpi-cards/mariadb/slow-query-rate)); (2) connection-level failures before a statement is sent (those belong to [Connection Errors (24h)](/nerve-centre/kpi-cards/mariadb/connection-errors-24h)); (3) warnings, which do not fail the statement. |
+| **Sentiment key** | `maria_query_error_rate` |
+| **Roles** | dba, platform, sre, engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card divides failed statements by total statements over the window:
+
+```text
+Query Error Rate % = (errored statements in window / total statements in window) × 100
+```
+
+The denominator is the increase in `Questions` (client statements) across the five-minute window. The numerator is the increase in the statements that ended in an error: SQL that failed to parse or execute, statements rejected by access control, statements aborted by a lock-wait timeout or deadlock victim selection, and writes rejected because a constraint, a read-only state, or a full disk blocked them. Where `performance_schema` statement instrumentation is enabled, the engine reads the per-digest error totals for an accurate count; where it is not, it approximates from the relevant global status counters.
+
+Two properties define how to read the number:
+
+1. **It is a ratio, so volume matters in both directions.** During a traffic trough, a single failing health-check query can read as a high percentage simply because the denominator is tiny. During peak traffic, the same one failure per second disappears into a near-zero rate. The five-minute window smooths the worst of this, but always sanity-check the absolute error count alongside the percentage at low traffic.
+2. **It captures rejection, not slowness.** A query that takes 30 seconds but returns rows is a success here; it is the slow-query cards' job, not this one's. This card fires only when statements actually fail.
+
+The `5m` window means both counters are summed over the trailing five minutes, so a brief blip of errors during a deploy does not trip the alert unless it persists, while a genuine error storm crosses 1% and pages.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+An engineering team ships a release to a service backed by MariaDB 10.6. Snapshot taken on 17 Feb 26 around the deploy at 14:30 GMT.
+
+| Time (GMT) | Total statements (5m) | Errored (5m) | Error rate | State |
+| --- | --- | --- | --- | --- |
+| 14:25 | 540,000 | 12 | 0.002% | Healthy baseline. |
+| 14:30 | 535,000 | 11 | 0.002% | Deploy begins. |
+| 14:33 | 528,000 | 9,500 | **1.80%** | Alert fires. |
+| 14:38 | 531,000 | 9,800 | **1.85%** | Sustained. |
+
+The card jumps from a near-zero baseline to **1.8%** and the sensitivity alert fires at 14:33, three minutes after the deploy. The on-call engineer reads three things:
+
+1. **The timing fingers the deploy.** The error rate was flat for hours and stepped up within minutes of the 14:30 release. This is not a slow-building capacity problem; something the deploy changed is rejecting queries. The first move is to look at what changed, not at the server's resources.
+2. **The error class names the cause.** Grouping the failing statements by error code (via `performance_schema` digests or the application's own logs) shows they are all `ER_BAD_FIELD_ERROR`, "Unknown column `customer_uuid`". The release referenced a column that a migration had not yet added. The application is sending SQL the schema cannot satisfy.
+3. **Rollback beats forward-fix here.** Because the failing queries are deterministic (every call to the affected endpoint fails), every customer hitting that path sees an error. Rolling back the release restores the previous SQL immediately and drops the error rate back to baseline, buying time to ship the migration and the code together. The team rolls back at 14:41; the card returns to 0.002% by 14:46.
+
+```text
+Incident shape:
+  Baseline error rate   ~0.002%
+  Peak error rate        1.85%   (alert at >1%)
+  Dominant error         ER_BAD_FIELD_ERROR (unknown column customer_uuid)
+  Correlation            stepped up within 3m of the 14:30 deploy
+Diagnosis: code shipped ahead of its migration.
+Action: roll back release; re-ship migration first, code second.
+        Error rate back to baseline 5m after rollback.
+```
+
+The takeaway: error rate is the deploy team's smoke detector. When it moves, look first at what changed in the last few minutes, then group the failures by error code to name the cause before touching the server.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Query Error Rate % | What the combination tells you |
+| --- | --- | --- |
+| [Query Error Rate Spike (>1% in 5m)](/nerve-centre/kpi-cards/mariadb/query-error-rate-spike-1-in-5m) | The dedicated alert feed for this metric. | The alert list shows exactly when the rate crossed 1% and for how long. |
+| [Connection Errors (24h)](/nerve-centre/kpi-cards/mariadb/connection-errors-24h) | The connection-level failures this card excludes. | Statement errors plus connection errors together separate "queries failing" from "clients cannot connect at all". |
+| [InnoDB Deadlocks (last 5m)](/nerve-centre/kpi-cards/mariadb/innodb-deadlocks-last-5m) | A common source of aborted statements. | An error spike that coincides with deadlocks means lock contention, not bad SQL. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mariadb/slow-query-rate) | The slow-but-successful counterpart. | Lock-wait timeouts often show as both slow queries and errors; reading both tells you whether queries are timing out. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mariadb/queries-per-second-live) | The denominator context. | A high error percentage at very low QPS may be one failing health check, not a real incident. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mariadb/database-disk-usage) | A full disk rejects every write. | Error rate spiking with disk near 100% means writes are failing for lack of space, not bad code. |
+| [Galera Cluster Status](/nerve-centre/kpi-cards/mariadb/galera-cluster-status) | A non-Primary node refuses writes. | Write errors across the cluster with a non-Primary status equals quorum loss, not application error. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite that weights error rate heavily. | Any sustained error rate above 1% pulls the health score down sharply. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> **`SHOW GLOBAL STATUS LIKE 'Aborted%'`** and the access-denied counters for the raw error-side totals.
+> **`SELECT DIGEST_TEXT, SUM_ERRORS, COUNT_STAR FROM performance_schema.events_statements_summary_by_digest WHERE SUM_ERRORS > 0 ORDER BY SUM_ERRORS DESC`** to see which query shapes are failing and how often (the single most useful query for this card).
+> **`SHOW GLOBAL STATUS LIKE 'Questions'`** for the denominator.
+> **The error log** (`log_error`) and the application's own database error logs for the specific error codes and messages behind a spike.
+
+On a managed service, compare against the provider's error-count or failed-query metric on the managed-database console, and cross-check the provider's slow-query and error logs.
+
+**Why our number may legitimately differ from MariaDB's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window alignment** | Smoothing | The card sums over a rolling five-minute window; a per-second view in a tool catches sharper peaks the average flattens. |
+| **`performance_schema` enabled or not** | Card more or less precise | With statement instrumentation on, the count is exact per digest; without it, the card approximates from global counters and may differ at the margin. |
+| **Error vs warning** | Card lower than a naive log count | Warnings do not fail a statement and are excluded here; a log scrape that counts warnings reads higher. |
+| **Connection vs statement errors** | Card lower | Failures before a statement is sent are excluded from this card (they belong to [Connection Errors (24h)](/nerve-centre/kpi-cards/mariadb/connection-errors-24h)); a combined provider metric may pool both. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The error rate spiked at 03:00 when traffic is almost nothing. Real problem?**
+Check the absolute count, not just the percentage. At low traffic the denominator is tiny, so a single failing health-check or monitoring query can read as several percent. If the raw error count is one or two and they are all the same benign statement, it is noise. If the absolute count is genuinely elevated, it is real regardless of the hour. The five-minute window helps, but always sanity-check the numerator at low traffic.
+
+**How do I find which query is failing?**
+Run the `performance_schema.events_statements_summary_by_digest` query in the reconcile section, ordered by `SUM_ERRORS`. It groups failures by normalised query shape and shows the count per shape, so the worst offender surfaces immediately. Then look up the error code in your application logs or the MariaDB error log to get the exact message. This two-step (digest then code) names almost every error spike in minutes.
+
+**What is the difference between this and Slow-Query Rate?**
+This card counts statements that failed. [Slow-Query Rate %](/nerve-centre/kpi-cards/mariadb/slow-query-rate) counts statements that succeeded but took too long. A query that runs for 40 seconds and returns rows is slow, not an error. The exception is a lock-wait timeout: a statement that waits, then gives up, ends in an error, so it can appear on both cards. Reading them together tells you whether your queries are timing out (slow plus error) or failing outright (error only).
+
+**Does this include deadlock victims?**
+Yes. When InnoDB detects a deadlock it rolls back one transaction as the victim, which surfaces as an error (`ER_LOCK_DEADLOCK`) to the application. So a deadlock storm pushes both this card and [InnoDB Deadlocks (last 5m)](/nerve-centre/kpi-cards/mariadb/innodb-deadlocks-last-5m). If your application retries deadlock victims automatically (the recommended pattern), the user may never notice, but the error still counts here, which is why a low-level deadlock rate can keep this card slightly above zero.
+
+**My disk filled up and the error rate went to 30%. Connected?**
+Directly. When the data or log volume is full, InnoDB cannot write, so every `INSERT`, `UPDATE`, and `DELETE` fails while `SELECT`s may still succeed. The result is a high error rate dominated by write failures. Pair with [Database Disk Usage %](/nerve-centre/kpi-cards/mariadb/database-disk-usage): if it is near 100% at the same time, free space (drop old binlogs, extend the volume) and the error rate recovers as soon as writes can land.
+
+**Why is the threshold 1% and not higher?**
+Because production application code almost never sends queries it expects to fail. A well-behaved service runs at thousandths of a percent. Crossing 1% means roughly one in a hundred statements is failing, which at any real traffic level is thousands of customer-facing errors per minute. 1% is deliberately sensitive so the team is paged while the cause is still fresh and findable, usually a deploy or a change made in the last few minutes.
+
+**Can a permissions change cause this?**
+Yes, and it is a common surprise. Revoking a grant, rotating a credential, or a migration that recreates a user can leave the application sending valid SQL that the server now refuses with an access-denied error. These show up here as a clean error spike with an access-denied code, not as a SQL or lock problem. If the error code points at permissions, look at recent `GRANT`/`REVOKE` activity and credential rotations rather than at the application code.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Query Error Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

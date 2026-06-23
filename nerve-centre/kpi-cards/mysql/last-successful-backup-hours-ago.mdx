@@ -1,0 +1,148 @@
+---
+title: "Last Successful Backup (hours ago), MySQL"
+sidebarTitle: "Last Successful Backup (hours ago)"
+description: "Last Successful Backup age for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Backup](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The age, in hours, of the most recent backup that completed successfully. This is the single clearest answer to the question every platform owner dreads being asked after an incident: "if we lost the database right now, how much data would we lose?" The backup age is a direct proxy for the recovery point objective (RPO). A reading of 3 means your last good backup is 3 hours old, so a total loss now would cost you up to 3 hours of writes (plus whatever binlog-based point-in-time recovery can recover beyond it). The longer this number grows, the larger the unrecoverable window and the higher the risk.
+
+| | |
+| --- | --- |
+| **What it tracks** | Hours elapsed since the completion timestamp of the last backup that finished with a success status. The source can be a logical `mysqldump`, a physical Percona XtraBackup, or a managed snapshot (Amazon RDS / Aurora automated or manual snapshot, Google Cloud SQL backup). |
+| **Data source** | The backup job's success record: XtraBackup's `xtrabackup_info` / completion log, the `mysqldump` job exit status and timestamp, or the snapshot metadata from the managed service (RDS `DescribeDBSnapshots` SnapshotCreateTime with Status `available`, Cloud SQL backupRuns with status `SUCCESSFUL`). Vortex IQ reads the latest success timestamp and subtracts it from now. |
+| **Calculation basis** | `now - last_successful_backup_completed_at`, expressed in hours. A failed or in-progress backup does not reset the clock; only a completed success does. |
+| **Time window** | `RT` (real-time; recomputed continuously against the current time). |
+| **Alert trigger** | `> 72h`. More than three days since a successful backup is a hard escalation: at that point a failure has almost certainly been silently recurring and the RPO has degraded far beyond any reasonable policy. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card subtracts the last successful backup's completion time from the current time:
+
+```text
+backup_age_hours = (now - last_successful_backup_completed_at) / 3600 seconds
+```
+
+Three points that govern how the number behaves:
+
+1. **Only success resets the clock.** A backup that started and then failed, was cancelled, or is still running does not update the timestamp. This is deliberate and is the whole point of the card: a green "backup ran" log line is worthless if the job errored at 90%. The card tracks completion-with-success, which is the only state that actually protects you.
+2. **Age is not the same as RPO, but it bounds it.** If you also stream binary logs (binlog) off-box continuously, point-in-time recovery can roll forward from the last full backup to seconds before the failure, so your effective RPO is much smaller than the backup age. The backup age is the worst-case RPO if binlogs are unavailable or also lost. Pair this card with [Binlog Backlog (MB) on Primary](/nerve-centre/kpi-cards/mysql/binlog-backlog-mb-on-primary) to understand the roll-forward capability.
+3. **Source-agnostic.** Whether the protection is a nightly `mysqldump`, an hourly XtraBackup, or a managed snapshot schedule, the card normalises to a single "hours since last good backup" so the owner does not need to know the underlying mechanism to read the risk.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MySQL 8.0 primary on a managed instance with a documented policy of "daily automated snapshot at 02:00, retained 14 days" plus continuous binlog archiving. The expected steady-state backup age oscillates between 0 (just after 02:00) and 24 (just before the next run). Snapshot of the card taken on 18 Mar 26 at 11:00 GMT.
+
+| Field | Value |
+| --- | --- |
+| Last successful snapshot completion | 15 Mar 26, 02:14 GMT |
+| Current time | 18 Mar 26, 11:00 GMT |
+| Computed age | ~80.8 hours |
+
+```text
+backup_age_hours = 18 Mar 11:00  -  15 Mar 02:14  =  3 days 8h 46m  =  80.8h
+```
+
+The card reads **80.8 hours** and Nerve Centre raises the hero alert because it has crossed the 72h line. The team has a policy of daily backups, so an 80-hour age means the last three nightly runs failed silently. Diagnosis and response:
+
+1. **The schedule is firing but the job is failing.** The most common causes on managed services are: the snapshot window colliding with a long-running migration that holds locks, an out-of-disk condition on the backup target, or an IAM / permissions change that broke the snapshot job. On self-managed XtraBackup, a full backup volume or a changed datadir path are the usual suspects. Check the backup job logs for the last three nights first.
+2. **Quantify the exposure honestly.** If binlogs are intact, point-in-time recovery can still roll forward to near-now, so the practical RPO is small despite the 80-hour figure. If binlogs were also affected (same disk, same retention bug), the true exposure is 80 hours of writes. Confirm binlog availability immediately; this is the difference between "annoying" and "catastrophic".
+3. **Restore-test before declaring victory.** Once the nightly job is fixed and a fresh backup completes (resetting the card to ~0), run an actual restore into a throwaway instance and verify row counts against the primary. A backup that has never been restored is a hypothesis, not a safety net.
+
+```text
+Triage order for an 80h reading:
+  1. Are binlogs intact and shipping off-box?  (determines true RPO)
+  2. Why did the last 3 scheduled runs fail?   (logs / disk / IAM)
+  3. Trigger an immediate manual backup.        (stops the bleeding)
+  4. Restore-test the fresh backup.             (proves it works)
+  5. Add a job-failure alert at source.         (so age never silently grows)
+```
+
+Three takeaways:
+
+1. **Backup age is your RPO in one number.** It answers "how much data could we lose right now" without anyone digging through job logs.
+2. **Silence is the failure mode.** The card crosses 72h precisely because nobody noticed the job had been failing; the whole value of the hero alert is breaking that silence.
+3. **An untested backup is not a backup.** Resetting the card to 0 proves a backup completed, not that it can be restored. Periodic restore tests are the only real proof.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Last Successful Backup | What the combination tells you |
+| --- | --- | --- |
+| [Binlog Backlog (MB) on Primary](/nerve-centre/kpi-cards/mysql/binlog-backlog-mb-on-primary) | Binlogs enable point-in-time roll-forward beyond the last backup. | A large backup age is survivable if binlogs are intact; both stale equals true data loss. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mysql/database-disk-usage) | A full disk is a leading cause of failed backups. | Backup age growing while disk is near 90% points straight at out-of-space failures. |
+| [Replication Lag (Seconds_Behind_Source)](/nerve-centre/kpi-cards/mysql/replication-lag-seconds-behind-source) | A replica is a complementary, not substitute, protection. | Replication protects against host loss; backups protect against logical corruption. You need both. |
+| [Replication Thread Health (IO/SQL)](/nerve-centre/kpi-cards/mysql/replication-thread-health-iosql) | Backups are often taken from a replica. | A stopped replica thread can stall a replica-sourced backup, growing the age silently. |
+| [MySQL Health Score](/nerve-centre/kpi-cards/mysql/mysql-health-score) | The composite that weights backup recency. | A stale backup visibly drags the composite below its healthy band. |
+| [Instance Uptime](/nerve-centre/kpi-cards/mysql/instance-uptime) | A recent restart can disrupt a scheduled backup window. | Backup age jumping after an unplanned restart suggests the post-restart run did not fire. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL's own / native tooling:**
+
+> **Percona XtraBackup:** the `xtrabackup_info` file in the backup target and the job's completion log line ("completed OK!"). The `start_time` / `end_time` fields give the authoritative completion timestamp.
+> **`mysqldump`:** the wrapping job's exit code (0 = success) and the dump file's modification time. A non-zero exit means the dump is incomplete regardless of file presence.
+> **Amazon RDS / Aurora:** the console Snapshots tab or `aws rds describe-db-snapshots`, reading `SnapshotCreateTime` for the latest snapshot with `Status = available`. Automated-backup recency is also shown as the latest restorable time for point-in-time recovery.
+> **Google Cloud SQL:** the Backups tab or `gcloud sql backups list`, reading the latest run with `status = SUCCESSFUL`.
+
+**Why our number may legitimately differ from the console:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Completion vs start time** | Card may read older | The card uses completion time; a console that shows start time will read newer for a long-running backup still finishing. |
+| **Available vs creating status** | Card may read older | A managed snapshot in `creating` / `backing-up` state is not yet a success; the card waits for `available` / `SUCCESSFUL` before resetting. |
+| **Time zone** | Display only | Native tooling shows the account / region time zone; the card computes an age (a duration), which is time-zone independent, but the underlying timestamp display may differ. |
+| **Multiple backup sources** | Card uses the newest | If you run both XtraBackup and a managed snapshot, the card reports the most recent success across all configured sources. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mysql/database-disk-usage) | Backups failing often coincide with high disk usage. | Age growing while disk is comfortable points at permissions / scheduling, not space. |
+| [Binlog Backlog (MB) on Primary](/nerve-centre/kpi-cards/mysql/binlog-backlog-mb-on-primary) | Binlogs determine roll-forward beyond the last backup. | A high backup age with healthy binlog shipping means RPO is still small in practice. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card says 80 hours but my backup schedule is daily. What happened?**
+The schedule is firing but the job has been failing silently for the last three runs, so the success timestamp has not advanced. Check the backup job logs for the failed nights: the usual causes are a full backup target, a lock collision with a long-running operation, or a permissions / IAM change that broke the job. The card crossing 72h is doing exactly its job: surfacing a failure nobody noticed.
+
+**Does a failed or in-progress backup reset the age?**
+No. Only a backup that completes with a success status resets the clock. This is intentional. A job that started and errored at 90%, or one that is still running, gives you no recoverable copy, so it must not be treated as protection. The card deliberately tracks completion-with-success only.
+
+**My backup age is high but I have a replica. Am I covered?**
+Partly, and not for the risk backups address. A replica protects against host or hardware loss, but it faithfully replicates logical corruption: a bad `DELETE` or a botched migration is copied to the replica within seconds. Backups protect against that class of failure because you can restore to a point before the mistake. Replication and backups are complementary; you need both. See [Replication Lag (Seconds_Behind_Source)](/nerve-centre/kpi-cards/mysql/replication-lag-seconds-behind-source).
+
+**How does this relate to point-in-time recovery and RPO?**
+The backup age is the worst-case recovery point objective: the maximum data you could lose if only the backup survives. If you also archive binary logs continuously and off-box, point-in-time recovery rolls forward from the last full backup to seconds before the failure, shrinking your effective RPO far below the backup age. Always read this card together with [Binlog Backlog (MB) on Primary](/nerve-centre/kpi-cards/mysql/binlog-backlog-mb-on-primary) to know your true exposure.
+
+**Should I trust a low age as proof I am safe?**
+A low age proves a backup completed, not that it can be restored. A surprising share of backups fail silently at restore time due to corruption, version mismatch, or missing grants. The only real proof is a periodic restore test into a throwaway instance with a row-count check against the primary. Schedule one at least monthly.
+
+**I run backups from a replica to avoid loading the primary. Does the card still work?**
+Yes. The card reads the latest successful completion regardless of which host produced the backup. Be aware that a replica-sourced backup can stall if the replica's SQL thread stops; pair this card with [Replication Thread Health (IO/SQL)](/nerve-centre/kpi-cards/mysql/replication-thread-health-iosql) so a broken replica does not quietly grow your backup age.
+
+**Why is 72 hours the alert and not 24?**
+72 hours is a deliberately conservative hard-escalation line that survives a single missed daily run plus a weekend without firing on normal variation. It is the "this has clearly been broken for days" threshold. For tighter policies, lower the sensitivity threshold per instance: an instance with an hourly backup target should alert far sooner than 72h.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Last Successful Backup (hours ago)* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

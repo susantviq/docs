@@ -1,0 +1,138 @@
+---
+title: "PostgreSQL Inventory Rows vs Ecom Inventory Count, PostgreSQL"
+sidebarTitle: "PostgreSQL Inventory Rows vs Ecom Inventory Count"
+description: "PostgreSQL Inventory Rows vs Ecom Inventory Count for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Cross-Channel](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **PostgreSQL Inventory Rows vs Ecom Inventory Count** reconciles the stock figures held in your PostgreSQL inventory table against the stock count the storefront is publishing through the ecommerce connector. It is a drift detector: when the database (your system of record) and the storefront (what shoppers see) disagree on how many units of a SKU are available, you are either overselling stock you do not have or hiding stock you could be selling. Both cost money. The card surfaces the SKUs where the two counts have diverged, so a platform team can catch a broken sync job before it turns into cancelled orders or dead inventory.
+{/* /HUMAN_AUTHORED:tldr */}
+
+| | |
+| --- | --- |
+| **PostgreSQL side** | The available-quantity rows in your inventory table (the count, and the per-SKU quantities, of stock the database holds as the source of truth). |
+| **Ecom side** | The published inventory level per SKU from the connected storefront connector (Shopify, BigCommerce, or Adobe Commerce inventory API). |
+| **What the card shows** | The count of SKUs whose PostgreSQL quantity does not match the storefront quantity, with the worst-drifting SKUs listed. A drift of zero means the sync is healthy. |
+| **Aggregation window** | Real-time spot-check plus a rolling 24-hour view (`RT/24h`), so you see both the current divergence and whether drift has been accumulating. |
+| **Time window** | `RT/24h` (live spot-check with a 24-hour trend). |
+| **Alert trigger** | `> 0 SKUs drifting`. Any SKU where the database and storefront disagree is worth surfacing, because a single oversold hero product during a sale is enough to generate cancellations and chargebacks. |
+| **Roles** | DBA, platform engineering, ecommerce operations, merchandising. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calc */}
+The engine takes the per-SKU available quantity from the PostgreSQL inventory table (the system of record) and joins it, by SKU, to the published inventory level returned by the storefront connector's inventory API. For each SKU it computes the difference:
+
+```text
+drift(sku) = pg_available_qty(sku) - storefront_published_qty(sku)
+drifting_skus = count of SKUs where drift != 0
+```
+
+A positive drift means the database holds more stock than the storefront is showing (under-selling: shoppers see "out of stock" or a low number while real inventory exists). A negative drift means the storefront is advertising more than the database actually has (over-selling: the storefront will accept orders the warehouse cannot fulfil). The headline is the count of drifting SKUs; the detail lists the largest absolute drifts first, since those carry the most revenue or fulfilment risk.
+
+The card deliberately treats PostgreSQL as the truth source and the storefront as the published view. The expectation in a healthy pipeline is that a write to the inventory table propagates to the storefront within the sync interval, so transient drift during the seconds of a sync cycle is normal and is smoothed by the 24-hour view. Persistent or growing drift is the failure signature: a stalled sync worker, a failed webhook, a connector rate-limit backoff that never recovered, or a manual storefront edit that bypassed the database.
+{/* /HUMAN_AUTHORED:calc */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs the storefront on Shopify and keeps inventory authoritative in PostgreSQL, pushing updates to Shopify through a sync worker every five minutes. On 18 Apr 26 at 14:20 BST the card flags drift. The detail table:
+
+| SKU | Product | PostgreSQL qty | Storefront qty | Drift | Direction |
+| --- | --- | --- | --- | --- | --- |
+| TR-OAK-180 | Oak dining table | 0 | 14 | -14 | Overselling |
+| CH-LIN-02 | Linen dining chair | 6 | 48 | -42 | Overselling |
+| LMP-BR-09 | Brass floor lamp | 120 | 0 | +120 | Underselling |
+| RUG-WL-240 | Wool rug 240cm | 33 | 31 | +2 | Minor / in-flight |
+
+The card headline reads **4 SKUs drifting** and the `> 0` alert has tripped. The team reads the rows by risk:
+
+1. **Two SKUs are overselling, which is the dangerous direction.** The oak table reads zero in the database but the storefront still advertises 14 units. Every order placed against those phantom 14 will be accepted and then cancelled, producing refunds, chargebacks, and one-star reviews. The linen chair is worse in volume: the storefront is offering 42 units that do not exist.
+2. **One SKU is underselling, which is lost revenue rather than a customer-trust hit.** The brass lamp has 120 units in the database but shows zero on the storefront, so it is invisible to shoppers. No orders, no complaints, just silent missed sales.
+3. **One SKU is in-flight.** The wool rug differs by two units, consistent with an order placed seconds before the sync cycle. The 24-hour view shows it self-correcting on the next sync; it is not a fault.
+
+```text
+Sizing the overselling exposure:
+  - Oak table: 14 phantom units x GBP 480 AOV = GBP 6,720 of orders that will cancel
+  - Linen chair: 42 phantom units x GBP 95 = GBP 3,990 of orders that will cancel
+  - Cancellation handling cost (refund + support + chargeback risk): est. GBP 8 per order
+  - Underselling (brass lamp): 120 units x GBP 140 sitting unsellable until sync restored
+```
+
+The root cause turns out to be a sync worker that crashed at 13:55 and stopped pushing deltas. The fix is to restart the worker and force a full reconciliation push, prioritising the overselling SKUs. The longer-term action is an alert on sync-worker liveness so the next stall pages the team in minutes, not after drift has built up.
+
+Three takeaways:
+
+1. **Direction decides urgency.** Overselling (storefront higher than database) damages customers and trust and must be fixed first. Underselling (database higher than storefront) is lost revenue you can recover once the sync is healthy. Always read the sign of the drift, not just the count.
+2. **Small drift on hot SKUs is normal; persistent drift is a broken sync.** A SKU off by one or two units for one sync cycle is in-flight inventory. The same SKU drifting for an hour, or the drift count climbing across the 24-hour view, means the pipeline has stalled.
+3. **The database is the truth, the storefront is the symptom.** When the two disagree, fix the propagation from PostgreSQL to the storefront rather than editing the storefront directly, which only masks the underlying sync fault and creates a second source of truth.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with this card | What the combination tells you |
+| --- | --- | --- |
+| [PostgreSQL QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/postgresql/postgresql-qps-spike-vs-ecom-order-rate) | The query-volume cross-channel sibling. | Inventory drift alongside an order spike with no QPS rise can mean the write path that updates stock has stalled. |
+| [PgBouncer Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/postgresql/pgbouncer-pool-saturation-vs-traffic-burst) | The capacity cross-channel sibling. | A saturated pool can starve the sync worker of connections, causing the very drift this card detects. |
+| [Slow Queries During Checkout Window (5m)](/nerve-centre/kpi-cards/postgresql/slow-queries-during-checkout-window-5m) | The checkout-latency cross-channel sibling. | Slow inventory queries during checkout can leave stock decrements lagging, feeding drift. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/postgresql/query-error-rate) | The error view of the write path. | A spike in errors on inventory writes is a leading indicator of drift about to appear here. |
+| [Top Tables by Dead Tuples](/nerve-centre/kpi-cards/postgresql/top-tables-by-dead-tuples) | The bloat view of the inventory table. | A heavily updated inventory table accumulating dead tuples can slow the reads the sync depends on. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The executive composite. | Persistent drift is a business-impact signal even when the database's own health looks green. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look directly:**
+
+> On the PostgreSQL side, query the inventory table for the authoritative per-SKU quantity, for example `SELECT sku, available_qty FROM inventory WHERE sku = ANY($1);` for the drifting SKUs the card lists.
+> On the ecom side, read the same SKUs back from the storefront's inventory API: Shopify's InventoryLevel / GraphQL inventory query, BigCommerce's catalogue inventory endpoint, or Adobe Commerce's stock items API.
+> Compare the two numbers per SKU. The difference is the drift the card reports.
+
+**Why our number may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sync window** | Lower over time | A SKU drifting at the instant you check may have synced by the time you query both sides. The 24-hour view distinguishes in-flight drift from a real stall. |
+| **Multi-location stock** | Variable | If the storefront aggregates stock across several locations and the database holds per-location rows, compare the aggregate, not a single location row. The card aligns to the storefront's published total. |
+| **Reserved / committed stock** | Variable | Some pipelines subtract reserved-for-order quantity before publishing. If the database shows on-hand and the storefront shows available-to-sell, a constant offset is expected, not drift. The card uses the available-to-sell basis on both sides where possible. |
+| **API caching** | Marginal | Storefront inventory APIs may serve a cached value for a few seconds; a back-to-back manual query can see a value the card has not yet refreshed. |
+
+**On managed platforms:** the storefront side is reconciled in the merchant admin (Shopify admin Inventory, BigCommerce Products inventory, Adobe Commerce catalogue stock), and the PostgreSQL side against the live table on the primary. There is no managed-service console number for this card; the reconciliation is always database row versus storefront API.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**A SKU shows drift of one or two units and then clears. Is that a fault?**
+Almost never. That is in-flight inventory: an order decremented the database a moment before the storefront sync cycle ran, so the two sides briefly disagree by the order quantity. The 24-hour view smooths this; if the same SKU keeps clearing and re-drifting within sync intervals it is healthy. Persistent drift that does not clear is the fault.
+
+**Why does the alert fire on a single SKU? That seems aggressive.**
+Because one oversold hero product during a campaign is enough to cause real damage: cancelled orders, refunds, chargebacks, and reviews. A drift count of zero is the only safe state for an inventory pipeline, so any non-zero count is surfaced. Tune the sensitivity if your business tolerates a small standing offset (for example a reserved-stock buffer) in the Sensitivity tab.
+
+**Overselling versus underselling: which do I fix first?**
+Overselling, every time. When the storefront advertises more than the database holds, you are accepting orders you cannot fulfil, which costs customer trust and money in cancellations. Underselling (database higher than storefront) is lost revenue, recoverable the moment the sync is restored, but it does not harm anyone. Fix the negative-drift SKUs first.
+
+**The storefront and database use different SKU identifiers. Does the card still match them?**
+The card joins on the SKU mapping configured for the connector. If your storefront uses a variant ID or barcode where the database keys on an internal SKU, the connector mapping must bridge them. An unmapped SKU appears as drift (one side missing) rather than a quantity difference; check the mapping before treating it as a sync fault.
+
+**Can drift be caused by something other than a broken sync?**
+Yes. A manual edit in the storefront admin that bypasses the database is the classic case: someone corrects stock directly on the storefront, the database never hears about it, and the next sync overwrites their edit or the two stay out of step. Other causes are a connector rate-limit backoff that stalled, a failed inventory webhook, or a multi-location aggregation mismatch. Treat any persistent drift as a pipeline investigation, not just a worker restart.
+
+**Does this measure financial value or just unit counts?**
+Unit counts. The card reports how many units each side disagrees by, per SKU. The revenue framing in the worked example is illustrative; to attach value, pair the drifting SKUs with their price from the storefront connector. The point of the card is to catch the disagreement early, before it converts into cancelled-order or dead-stock cost.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*PostgreSQL Inventory Rows vs Ecom Inventory Count* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

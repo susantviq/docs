@@ -1,0 +1,136 @@
+---
+title: "Pool Saturation Across Galera Nodes vs Traffic, MariaDB"
+sidebarTitle: "Pool Saturation Across Galera Nodes vs Traffic"
+description: "Pool Saturation Across Galera Nodes vs Traffic for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Per-node connection pool saturation across every Galera node, laid alongside live storefront traffic so you can see whether a node is filling up because of genuine shopper demand or because of an imbalance, a stuck thread, or a hot node. Each row is one Galera node: its used vs available connections, its saturation percentage, and the share of cluster traffic landing on it. The danger reading is one node above 90% while siblings sit comfortably; that means your load balancer or proxy is hot-spotting, and a single node rejecting connections can stall checkout even though the cluster has spare capacity.
+
+| | |
+| --- | --- |
+| **What it tracks** | Connection pool saturation (`Threads_connected / max_connections`) per Galera node, joined row-by-row against the live traffic share for that node, over a rolling 15-minute window. |
+| **Data source** | Per-node `SHOW GLOBAL STATUS LIKE 'Threads_connected'` and `Max_used_connections` against `@@max_connections`, correlated with storefront sessions/orders from the connected ecommerce platform (Shopify, BigCommerce or Adobe Commerce). |
+| **Time window** | `15m` rolling, refreshed on the live poll. |
+| **Alert trigger** | `>90% sustained during burst`, any node holding above 90% saturation while traffic is spiking. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+For each Galera node `n`, saturation is `Threads_connected(n) / max_connections(n)` expressed as a percentage. The traffic column is that node's share of cluster query volume in the window, or where a storefront link exists, the share of active shopper sessions routed to it. The card overlays the two so the question "is this node busy because customers are busy?" can be answered at a glance. The alert fires only when saturation stays above 90% for the duration of a traffic burst rather than on a momentary spike, because brief peaks during flash-sale onset are expected and self-clear. The grounding signal is the `>90% sustained during burst` rule from the card's alert definition over the 15-minute window: sustained, not instantaneous, and burst-qualified so a quiet-hour blip does not page anyone.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A 3-node Galera cluster backs the Adobe Commerce store of a UK homeware brand. A 20%-off email goes out at 19:00 on 14 Apr 26 and traffic triples within four minutes. Snapshot taken at 19:06 BST, 15-minute window.
+
+| Node | Threads_connected | max_connections | Saturation | Traffic share | Reading |
+| --- | --- | --- | --- | --- | --- |
+| galera-1 | 142 | 500 | 28% | 33% | Healthy, proportional |
+| galera-2 | 138 | 500 | 28% | 32% | Healthy, proportional |
+| galera-3 | **481** | 500 | **96%** | 35% | **Saturated, disproportionate** |
+
+All three nodes carry roughly a third of traffic, but galera-3 sits at 96% saturation while its siblings sit at 28%. The traffic share does not justify the connection count: this is not a demand problem, it is a connection-handling problem on one node. The headline shows **1 of 3 nodes >90%** outlined in red.
+
+The on-call DBA reads it like this:
+
+1. **Capacity is not the issue.** The cluster is holding 761 connections against a combined ceiling of 1,500. There is plenty of headroom in aggregate; the problem is distribution.
+2. **Connections are not closing on galera-3.** Equal traffic but 3.4x the open connections means threads are accumulating: likely a long-running query holding connections open, an application pool that opened persistent connections to galera-3 and never recycled them, or a proxy that pinned sticky sessions to one node.
+3. **The clock is ticking on checkout.** Once galera-3 hits `max_connections` it returns "Too many connections" and every shopper routed there by the proxy fails at the worst moment. Pair with [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/mariadb/connection-pool-at-90-saturation) to see if the alert has already fired.
+
+```text
+Revenue framing while galera-3 is saturated:
+  - Cluster order rate (baseline burst): ~210 orders / 15m
+  - galera-3 traffic share: 35%  => ~74 orders at risk if it starts rejecting
+  - Avg order value: £58
+  - Exposure if galera-3 hits the ceiling: 74 × £58 = £4,292 per 15m window
+```
+
+The fix is operational, not architectural: drain galera-3 at the proxy (MaxScale / ProxySQL) so new connections land on galera-1 and galera-2, kill the long-running statements holding threads open (`SHOW PROCESSLIST` then `KILL`), and confirm the application's connection pool is recycling. Capacity planning comes later; right now it is a hot-node rebalance.
+
+Three takeaways:
+
+1. **Saturation alone lies; saturation versus traffic tells the truth.** A node at 90% during a genuine 3x traffic burst that is shared evenly is fine. A node at 90% while peers sit at 28% is a routing or leak problem, and the difference is invisible without the traffic overlay.
+2. **Aggregate headroom hides per-node danger.** Total cluster utilisation can read 50% while one node is about to reject connections. Always read the per-node rows, not a cluster average.
+3. **In Galera every node serves writes, so a hot node is a checkout risk.** Unlike async primary/replica, there is no read-only node to sacrifice; a saturated Galera node failing connections directly blocks order writes routed to it.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Pool Saturation vs Traffic | What the combination tells you |
+| --- | --- | --- |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation) | The single-instance saturation gauge this card spreads across nodes. | If the aggregate gauge looks fine but this card shows one hot node, you have a distribution problem, not a capacity one. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/mariadb/connection-pool-at-90-saturation) | The real-time alert that fires when a node crosses the line. | This card explains *which* node and *why* (traffic-justified or not) once that alert pages you. |
+| [Galera Cluster Size](/nerve-centre/kpi-cards/mariadb/galera-cluster-size) | Confirms how many nodes *should* be sharing the load. | A node missing from the cluster concentrates traffic onto survivors, driving the remaining nodes toward saturation. |
+| [Galera Cluster Status](/nerve-centre/kpi-cards/mariadb/galera-cluster-status) | Confirms the cluster is in Primary state and accepting writes. | A non-Primary node refuses writes, so the proxy piles load on the rest. |
+| [Galera Flow Control Paused %](/nerve-centre/kpi-cards/mariadb/galera-flow-control-paused) | Detects a slow node throttling the whole cluster. | A node under flow control may hold connections longer, inflating its saturation. |
+| [Aborted Connects (24h)](/nerve-centre/kpi-cards/mariadb/aborted-connects-24h) | Counts connections that failed to establish. | Rising aborts on the saturated node confirm it is rejecting at the ceiling. |
+| [Connections In Use](/nerve-centre/kpi-cards/mariadb/connections-in-use) | The raw open-connection count. | Read together to see whether the percentage is rising from more connections or a lowered `max_connections`. |
+| [MariaDB QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/mariadb/mariadb-qps-spike-vs-ecom-order-rate) | The query-volume twin of this traffic overlay. | If QPS spikes without an order spike, the connection pressure may be bots, not shoppers. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> Per node, run `SHOW GLOBAL STATUS LIKE 'Threads_connected';` and `SHOW GLOBAL STATUS LIKE 'Max_used_connections';` then divide by `SELECT @@max_connections;`.
+> `SHOW STATUS LIKE 'wsrep_%';` shows the Galera node's cluster view; `wsrep_cluster_size` and `wsrep_local_state_comment` confirm which nodes are live.
+> `SHOW PROCESSLIST;` (or `SELECT * FROM information_schema.PROCESSLIST`) reveals what is holding connections open on the hot node.
+> On managed platforms: AWS RDS / Aurora "DatabaseConnections" per-instance CloudWatch metric, or SkySQL / MariaDB Enterprise monitoring per-node panels.
+
+**Why our number may legitimately differ from a manual reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Poll timing** | Snapshot vs sustained | Vortex IQ reports the sustained 15-minute view; a single `SHOW STATUS` is one instant and may catch a trough or a peak. |
+| **Proxy-counted connections** | Our number can be higher | If MaxScale / ProxySQL multiplexes, the proxy's view of pooled connections can differ from the node's raw `Threads_connected`. |
+| **max_connections per node** | Variable | Nodes may have different `max_connections`; the percentage normalises for that, the raw count does not. |
+| **Traffic attribution** | Approximate | Traffic share is inferred from query volume or storefront sessions; sticky-session proxies can skew which node "owns" a shopper. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`shopify.total_revenue`](/nerve-centre/kpi-cards/shopify/total-revenue) / [`bigcommerce.total_revenue`](/nerve-centre/kpi-cards/bigcommerce/total-revenue) / [`adobe_commerce.total_revenue`](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | A saturated node rejecting connections should show as a dip in order rate during the same window. | If revenue holds while a node is saturated, the proxy successfully rerouted away from the hot node. |
+| [`google_analytics.ga_property_health`](/nerve-centre/kpi-cards/google-analytics/ga4-property-health) | Independent demand-side traffic peer. | GA4 sessions spiking confirms a genuine traffic burst, validating that saturation is demand-driven rather than a leak. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**One node is at 95% but the storefront seems fine. Do I still need to act?**
+Yes, treat it as urgent even if shoppers are unaffected yet. "Fine" usually means the proxy is still finding capacity on the healthy nodes. The moment the saturated node hits `max_connections` it returns "Too many connections" and any shopper routed there fails. Drain or rebalance the hot node before it reaches the ceiling, do not wait for the revenue dip.
+
+**Why does one node fill up faster than the others if Galera is multi-primary?**
+Galera replicates writes everywhere, but client connections are distributed by your proxy or load balancer, not by Galera itself. Hot-spotting comes from sticky sessions pinned to one node, a deployment that hard-codes one node's address, persistent application pools that never rebalance, or a long-running query holding threads open on that node. The fix is at the proxy and application layer, not in Galera config.
+
+**The card shows all three nodes near 90% during a sale. Is that the same alert?**
+No. Even saturation that tracks an evenly shared traffic burst is a capacity signal, not a distribution fault. The dangerous pattern this card highlights is *disproportionate* saturation (one node hot, peers cool). If all nodes saturate together under genuine demand, you need more capacity (higher `max_connections`, more RAM per node, or another node), which is a planning decision, not an incident.
+
+**How is "traffic" measured for the overlay?**
+Where the MariaDB connector is linked to a storefront connector, traffic share uses active shopper sessions or order rate routed to each node. Where no storefront link exists, it falls back to per-node query volume. Sticky-session proxies can make session attribution approximate, so treat the traffic column as directional, not exact.
+
+**Can I change the 90% threshold?**
+Yes. The 90% sustained-during-burst trigger is the default; adjust it per profile in the Sensitivity tab. Instances with very high `max_connections` headroom may prefer 85%; tightly provisioned single-node setups may want a lower bar to get earlier warning.
+
+**Does this card work on a single-node MariaDB instance?**
+It renders, but with one row it is effectively [Connection Pool Saturation %](/nerve-centre/kpi-cards/mariadb/connection-pool-saturation) with a traffic overlay. The per-node comparison value only appears with two or more Galera nodes. For async primary/replica topologies use the per-instance saturation card instead.
+
+**A node dropped out of the cluster and the survivors spiked. Is that this card or a Galera card?**
+Both, read together. [Galera Cluster Size](/nerve-centre/kpi-cards/mariadb/galera-cluster-size) tells you a node left; this card shows the consequence (the remaining nodes absorbing its share and climbing toward saturation). Restore the node or add capacity before the survivors hit their ceiling.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Pool Saturation Across Galera Nodes vs Traffic* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

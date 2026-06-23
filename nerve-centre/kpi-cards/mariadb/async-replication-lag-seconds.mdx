@@ -1,0 +1,140 @@
+---
+title: "Async Replication Lag (seconds), MariaDB"
+sidebarTitle: "Async Replication Lag (seconds)"
+description: "Async Replication Lag (seconds) for MariaDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How far behind the primary an asynchronous replica is, measured in seconds. This is the replica's `Seconds_Behind_Master` (now `Seconds_Behind_Source`): the gap between the timestamp of the last event the replica has applied and the current time on the primary. Zero means the replica is caught up; a rising number means the replica's apply thread cannot keep pace with the write rate. For a DBA, lag is the single most important replication signal: lagging replicas serve stale reads, fail their freshness SLOs, and (most dangerously) cannot be promoted cleanly in a failover without losing the un-applied transactions. When lag crosses 10 seconds the card turns amber.
+
+| | |
+| --- | --- |
+| **What it tracks** | Async Replication Lag (seconds): the maximum `Seconds_Behind_Source` across active asynchronous replicas. The detail line is *Async Replication Lag (seconds) for the selected period.* |
+| **Data source** | MariaDB `SHOW REPLICA STATUS` on each replica, reading `Seconds_Behind_Source` (`Seconds_Behind_Master` on older versions). Where GTID is in use, the engine cross-checks `Gtid_IO_Pos` against the primary's `gtid_binlog_pos` for a position-based view. |
+| **Time window** | `RT`: real-time, refreshed on each poll. The headline is the current worst-case lag across replicas. |
+| **Alert trigger** | `> 10s`. Above this the card turns amber and surfaces in the Sensitivity feed. |
+| **Distinct from** | Galera flow-control pause (synchronous cluster), which is a different replication model. This card is for classic async (binlog-based) replication. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The headline is the maximum lag across all active async replicas, so a single straggler sets the number. On each replica, MariaDB reports `Seconds_Behind_Source` from `SHOW REPLICA STATUS`. That value is computed as the difference between the current replica clock and the timestamp recorded in the binary-log event currently being applied, adjusted for the known clock offset between primary and replica.
+
+```text
+lag_seconds(replica) = now_on_replica - timestamp_of_event_being_applied
+card_value           = max(lag_seconds across active replicas)
+```
+
+Two well-known quirks matter. First, `Seconds_Behind_Source` reports `NULL` when the replica is not actually replicating (either thread stopped); the engine treats `NULL` as "replication broken" and surfaces it distinctly from "lag is high", because the two need different responses. Second, the value can read `0` deceptively if the I/O thread itself has stalled: the replica thinks it is caught up to the last event it received, even though it has stopped receiving new ones. To guard against that, where GTID is enabled the engine also compares the replica's applied GTID position against the primary's, which exposes a stalled I/O thread that the seconds-based metric would miss.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MariaDB 10.11 primary with two read replicas behind an application that routes reporting and search reads to the replicas. Snapshot taken on 18 Mar 26 at 16:40 GMT.
+
+| Replica | Seconds_Behind_Source | Note |
+| --- | --- | --- |
+| replica-a | 2 s | healthy, tracking write rate |
+| **replica-b** | **34 s** | **lagging, single apply thread saturated** |
+| **Card value (max)** | **34 s** | **amber (threshold `> 10s`)** |
+
+replica-a is fine, but replica-b has fallen 34 seconds behind, so the card reads 34 and turns amber. Because the card reports the worst case, the DBA knows at least one replica is serving reads that are over half a minute stale. The investigation:
+
+```sql
+-- On replica-b
+SHOW REPLICA STATUS\G
+-- Seconds_Behind_Source: 34
+-- Slave_SQL_Running_State: 'Reading event from the relay log'
+-- Slave_IO_Running: Yes, Slave_SQL_Running: Yes
+
+SHOW PROCESSLIST;   -- look at the replica SQL apply thread
+```
+
+Both threads are running, so replication is not broken; the apply thread simply cannot keep up. The cause: a large `DELETE` on the primary touched two million rows, and the replica is applying it single-threaded while new writes keep arriving. The fixes are well established:
+
+1. **Enable parallel replication.** Set `slave_parallel_threads` (and an appropriate `slave_parallel_mode`) so independent transactions apply concurrently instead of serially. This is the standard remedy for an apply-bound replica.
+2. **Chunk large DML on the primary.** A two-million-row `DELETE` replicates as one serial unit of work; break it into batches so the replica drains them between normal traffic.
+3. **Check replica hardware.** If the replica has slower disks than the primary, its apply thread is I/O-bound and will lag under any sustained write burst. Match replica I/O to the primary for read-replica topologies.
+
+After enabling four parallel apply threads, replica-b drains the backlog and lag returns to 1 to 2 seconds.
+
+Three takeaways:
+
+1. **The card reports the worst replica, not the average.** One lagging straggler is enough to turn it amber, which is correct: a failover to that replica would lose the un-applied transactions.
+2. **Lag is usually an apply-side problem.** The I/O thread (pulling binlog) is rarely the bottleneck; the SQL apply thread is. Parallel replication and chunked DML are the two highest-leverage fixes.
+3. **`NULL` is worse than a big number.** A high lag means the replica is working through a backlog. `NULL` means a thread has stopped and the replica is not replicating at all. Treat the two differently: high lag needs tuning, `NULL` needs `SHOW REPLICA STATUS` to read the `Last_Error` and restart the thread.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Async Replication Lag | What the combination tells you |
+| --- | --- | --- |
+| [Active Async Replicas](/nerve-centre/kpi-cards/mariadb/active-async-replicas) | The count of replicas that should be reporting lag. | If a replica disappears from the count, its lag stops contributing; a dropped replica can mask a lag problem. |
+| [Failover Readiness](/nerve-centre/kpi-cards/mariadb/failover-readiness) | Whether a clean promotion is currently possible. | High lag directly degrades failover readiness: you cannot promote a replica that is 30s behind without data loss. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mariadb/queries-per-second-live) | The write-rate context driving the lag. | Lag that rises with a write-rate spike is load-driven; lag that rises at steady QPS is an apply-thread or hardware problem. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mariadb/query-latency-p99-ms) | Long transactions that replicate as serial work. | A p99 spike from a long transaction on the primary often precedes a lag spike on the replica that must apply it. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mariadb/database-disk-usage) | Relay-log growth while the replica catches up. | A lagging replica accumulates relay logs; sustained lag can fill replica disk. |
+| [Memory Usage %](/nerve-centre/kpi-cards/mariadb/memory-usage) | Buffer-pool pressure on the apply side. | An apply thread paying for disk reads (cold cache) lags more under the same load. |
+| [MariaDB Health Score](/nerve-centre/kpi-cards/mariadb/mariadb-health-score) | The composite that weights replication health. | Sustained lag pulls the composite down even when the primary is serving writes cleanly. |
+| [MariaDB Inventory Rows vs Ecom Inventory Count](/nerve-centre/kpi-cards/mariadb/mariadb-inventory-rows-vs-ecom-inventory-count) | The downstream effect of stale replica reads. | If the storefront reads inventory from a lagging replica, counts diverge from the source of truth. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MariaDB's own tooling:**
+
+> `SHOW REPLICA STATUS\G` on each replica: read `Seconds_Behind_Source`, `Slave_IO_Running`, `Slave_SQL_Running`, and `Last_Error`.
+> For GTID topologies, compare `SELECT @@gtid_slave_pos;` on the replica against `SELECT @@gtid_binlog_pos;` on the primary for a position-based lag view that survives a stalled I/O thread.
+> `SHOW REPLICA HOSTS;` on the primary to confirm which replicas should be reporting.
+> `pt-heartbeat` (Percona Toolkit) writes a heartbeat row on the primary and measures true lag on the replica, immune to the `Seconds_Behind_Source` stalled-I/O quirk.
+
+**Why our number may legitimately differ from a manual `SHOW REPLICA STATUS`:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Max vs single replica** | Ours higher | The card reports the worst replica; reading one healthy replica manually will show less lag than our maximum. |
+| **Stalled I/O thread** | Ours higher (GTID path) | `Seconds_Behind_Source` can read `0` when the I/O thread has stalled; our GTID cross-check exposes the real gap. |
+| **Clock skew** | Marginal | `Seconds_Behind_Source` assumes synchronised clocks; drift between primary and replica adds or removes a second or two. |
+| **`NULL` handling** | Surfaced separately | A stopped thread reports `NULL`; we surface that as broken replication rather than as numeric lag. |
+
+**On managed services:** Amazon RDS / Aurora for MariaDB exposes lag as the `ReplicaLag` CloudWatch metric (in seconds) and in the console replication view; SkySQL and Azure Database for MariaDB report lag in their own metrics consoles. Aurora's storage-level replication behaves differently from classic binlog replication, so its lag metric is typically far lower; align the replication model before comparing.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Q: The card reads zero but I suspect the replica is stale. Can that happen?**
+Yes, and it is the classic `Seconds_Behind_Source` trap. If the replica's I/O thread has stalled, the replica believes it is caught up to the last event it received and reports `0`, even though new events on the primary are not arriving. Where GTID is enabled the engine cross-checks the applied GTID position against the primary and surfaces the real gap. For a definitive check run `pt-heartbeat`, which measures true lag independent of the I/O thread state.
+
+**Q: What is the difference between high lag and NULL?**
+High lag means replication is working but the apply thread is behind: the replica is draining a backlog. `NULL` means a replication thread has stopped (`Slave_IO_Running` or `Slave_SQL_Running` is `No`), so the replica is not replicating at all. Run `SHOW REPLICA STATUS\G`, read `Last_Error`, fix the cause (often a duplicate-key or missing-row error), then `START REPLICA`. The two states need different responses, which is why the card distinguishes them.
+
+**Q: Lag keeps spiking under load. How do I reduce it?**
+The apply thread is almost always the bottleneck. Enable parallel replication (`slave_parallel_threads` with an appropriate `slave_parallel_mode`) so independent transactions apply concurrently. Chunk large DML on the primary so a single big `UPDATE`/`DELETE` does not replicate as one serial unit. Ensure the replica's disk and memory match the primary; an under-provisioned replica is I/O-bound on apply. Check [Queries per Second (live)](/nerve-centre/kpi-cards/mariadb/queries-per-second-live) to confirm the lag tracks write-rate spikes.
+
+**Q: Does this card cover Galera (synchronous) clusters?**
+No. Galera is synchronous multi-primary replication with a different lag model (flow control rather than seconds-behind). For Galera use [Galera Flow Control Paused %](/nerve-centre/kpi-cards/mariadb/galera-flow-control-paused) and [Galera Cluster Status](/nerve-centre/kpi-cards/mariadb/galera-cluster-status). This card is for classic async binlog replication.
+
+**Q: Why does the card sometimes show a higher number than my managed-service console?**
+The card reports the maximum lag across replicas, so it tracks your worst follower. A console that shows the lag for one specific replica (or an average) will read lower. On Aurora the storage-level replication metric is naturally much smaller than classic binlog lag, so align the replication model before treating the gap as an error.
+
+**Q: Is a few seconds of lag a problem?**
+It depends on what reads from the replica. For analytics and reporting, several seconds is harmless. For read-after-write paths (a user updates a record then immediately reads it from a replica) even one second causes visible inconsistency. The `> 10s` default is a generic starting point; if your application routes freshness-sensitive reads to replicas, tighten the threshold in the Sensitivity tab, and consider routing those reads to the primary.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Async Replication Lag (seconds)* is one of hundreds of KPI pulses Vortex IQ tracks across MariaDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

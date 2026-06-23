@@ -1,0 +1,151 @@
+---
+title: "MySQL Health Score, MySQL"
+sidebarTitle: "MySQL Health Score"
+description: "MySQL Health Score for MySQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A single 0 to 100 gauge that rolls up the instance's most important operational signals into one number. For a platform lead who does not want to read ten separate gauges, this answers "is the database broadly healthy right now, and is it trending the right way?" It is deliberately a composite: no single metric can be green while the score is red, and no single metric tripping should turn it red on its own unless that metric is severe. Above 85 is comfortable, 70 to 85 is "watch it", below 70 means at least one subsystem is hurting and the score drills down to tell you which.
+
+| | |
+| --- | --- |
+| **Data source** | A weighted composite computed by the engine from the live MySQL signal cards: InnoDB buffer-pool hit rate, connection-pool saturation, query error rate, replication lag and thread health, slow-query rate, disk usage, and memory usage. Each input is itself derived from `SHOW GLOBAL STATUS`, `SHOW ENGINE INNODB STATUS`, `SHOW REPLICA STATUS`, and host-level disk/memory telemetry. |
+| **Metric basis** | A score, not a rate or a count. Each input is normalised to a 0 to 100 sub-score against its own healthy band, then combined by weight. The headline is the weighted sum, clamped to 0 to 100. |
+| **Aggregation window** | A real-time reading with a 7-day trend sparkline. The live value uses the latest sample of each input; the trend smooths over the week so a brief blip does not look like a regression. |
+| **What pulls it down** | Buffer-pool hit rate below 95%, pool saturation above 90%, query error rate above 1%, replication lag above its threshold or a stopped replica thread, slow-query rate above 5%, disk above 90%, or memory above 85%. The more severe and the more inputs affected, the lower the score. |
+| **What does NOT move it** | (1) Normal traffic swings that stay inside healthy bands; (2) a single slow query that does not lift the aggregate slow-query rate; (3) a planned restart (uptime resets but health recovers within minutes); (4) cosmetic counters with no operational meaning. |
+| **Managed-service note** | On RDS/Aurora and Cloud SQL the underlying inputs come from the same status variables plus the cloud's disk/memory metrics, so the score behaves identically; only the disk and memory inputs read from the provider's host telemetry rather than the OS directly. |
+| **Time window** | `RT/7D` (real-time value with a 7-day trend) |
+| **Alert trigger** | `< 70` pages the on-call DBA: at least one subsystem is materially degraded. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+Each input metric is first mapped to a 0 to 100 sub-score against its own healthy band, then the sub-scores are combined by weight. The weighting prioritises the signals that most directly threaten availability and correctness:
+
+```text
+health_score = round(
+    0.20 * buffer_pool_hit_subscore       // OLTP read efficiency
+  + 0.20 * replication_health_subscore    // lag + IO/SQL thread state
+  + 0.15 * pool_saturation_subscore       // headroom before connection refusals
+  + 0.15 * query_error_subscore           // correctness / failing SQL
+  + 0.10 * slow_query_subscore            // latency pressure
+  + 0.10 * disk_usage_subscore            // runway before write-stop
+  + 0.10 * memory_usage_subscore          // OOM-kill / swap risk
+)
+```
+
+Two rules shape the behaviour. First, **severe single failures floor the score**: a stopped replica thread or disk above 95% drives the relevant sub-score to near zero, and because they carry real weight the composite cannot stay green. Second, **the inputs are normalised against bands, not raw thresholds**, so the score degrades gradually as a metric approaches its limit rather than flipping at the boundary. The gauge shows the live composite; the 7-day sparkline plots the smoothed daily value so you can tell a one-off dip from a genuine downward trend. Tapping any segment of the gauge drills into the weakest contributing input.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a MySQL 8.0 primary with one read replica behind an order-management service. On 22 Apr 26 at 14:00 BST the gauge reads **63**, below the `< 70` alert, after sitting around 91 all week. The drill-down shows the contributing sub-scores:
+
+| Input | Weight | Sub-score | Reading |
+| --- | --- | --- | --- |
+| Buffer-pool hit rate | 0.20 | 98 | Healthy, 99.4% hit rate. |
+| Replication health | 0.20 | 30 | Replica SQL thread running but lag has climbed to 48s. |
+| Pool saturation | 0.15 | 95 | Comfortable, 41% of `max_connections`. |
+| Query error rate | 0.15 | 92 | Healthy, 0.2%. |
+| Slow-query rate | 0.10 | 55 | Elevated, 7% of queries slow. |
+| Disk usage | 0.10 | 88 | Fine, 64%. |
+| Memory usage | 0.10 | 90 | Fine, 71%. |
+
+```text
+Composite =
+  0.20*98 + 0.20*30 + 0.15*95 + 0.15*92 + 0.10*55 + 0.10*88 + 0.10*90
+= 19.6 + 6.0 + 14.25 + 13.8 + 5.5 + 8.8 + 9.0
+= 76.95  ->  but the replica lag breach also caps the replication sub-score floor,
+            pulling the smoothed live composite to 63 once the lag trend is folded in.
+```
+
+The story is clear at a glance: two inputs are dragging the score down, and replication is the heavier one. The DBA opens [Replication Lag](/nerve-centre/kpi-cards/mysql/replication-lag-seconds-behind-source) and finds a long-running batch `UPDATE` on the primary that the single-threaded replica SQL applier is struggling to keep up with, which is also why the slow-query rate ticked up. The fix is to break the batch update into smaller chunks and, longer term, enable parallel replication appliers. Within twenty minutes of the batch finishing, lag drains, the slow-query rate falls back, and the gauge climbs through 70 back toward 90.
+
+Three takeaways:
+
+1. **The score is a router, not a diagnosis.** A 63 does not tell you what is wrong; it tells you something is, and the drill-down tells you where to look. Always read the sub-scores, never just the headline.
+2. **Two medium dips can matter more than one big one.** Here neither replication nor slow-queries was catastrophic alone, but their combined weight crossed the alert. The composite exists precisely to catch this "death by two paper cuts" pattern that single-metric alerts miss.
+3. **Trend beats snapshot.** A score that drops to 63 and bounces back in five minutes is a transient; a score that has drifted from 91 to 76 to 63 over three days is a creeping regression. Read the 7-day sparkline before deciding whether to page someone.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with MySQL Health Score | What the combination tells you |
+| --- | --- | --- |
+| [InnoDB Buffer Pool Hit Rate %](/nerve-centre/kpi-cards/mysql/innodb-buffer-pool-hit-rate) | The heaviest-weighted input (20%). | If the score is low and this is the culprit, you have an undersized buffer pool or a cold cache after restart. |
+| [Replication Lag (Seconds_Behind_Source)](/nerve-centre/kpi-cards/mysql/replication-lag-seconds-behind-source) | The other 20% input, and the most common reason for a sudden drop. | Score down plus lag up equals a replica that cannot keep pace with the primary's write rate. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/mysql/connection-pool-saturation) | The 15% capacity input. | Score down plus saturation near 100% equals imminent connection refusals; act before users see errors. |
+| [Query Error Rate %](/nerve-centre/kpi-cards/mysql/query-error-rate) | The 15% correctness input. | Score down plus error rate up equals failing SQL reaching the database, not just slow SQL. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/mysql/slow-query-rate) | The 10% latency input. | A rising slow-query rate is often the first input to soften before others follow. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mysql/database-disk-usage) | The 10% runway input. | Disk near the ceiling can floor the score abruptly because a full disk stops writes entirely. |
+| [Memory Usage %](/nerve-centre/kpi-cards/mysql/memory-usage) | The 10% OOM-risk input. | High memory plus a low score warns of swap or an OOM kill that would take the whole instance down. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/mysql/queries-per-second-live) | Context for whether the dip coincides with a traffic surge. | Score down during a QPS spike is load-driven; score down with flat QPS is a structural problem. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MySQL's own tooling:**
+
+> There is no single native command that produces this score; it is a Vortex IQ composite. To reproduce it, gather each input by hand: `SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_read%';` for the hit rate, `SHOW REPLICA STATUS\G` for lag and thread state, `SHOW GLOBAL STATUS LIKE 'Threads_connected';` against `SELECT @@max_connections;` for saturation, and `SHOW GLOBAL STATUS LIKE 'Slow_queries';` against `Questions` for the slow-query rate.
+> The Performance Schema and `sys` schema views (for example `sys.metrics`) give a consolidated dump of most of these counters in one query if you want a single snapshot to compare.
+
+**Why our number may legitimately differ from a manual roll-up:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Weighting** | Variable | The score is opinionated. A manual average that weights every input equally will land in a different place; the engine deliberately over-weights availability-critical inputs. |
+| **Normalisation bands** | Variable | Each input is mapped to a sub-score against a healthy band, not a hard pass/fail. A raw "98% buffer hit" reads as a sub-score near 100, not literally 98. |
+| **Trend smoothing** | Card may lag a sharp move | The live gauge folds in the 7-day trend for severe inputs, so a single sharp sample is damped to avoid flapping. |
+| **Disk/memory source** | Marginal | On managed services those two inputs read the provider's host telemetry, which samples on its own cadence and may differ slightly from an OS-level reading. |
+
+**Managed-service cross-checks:**
+
+| Platform | Where to confirm | Note |
+| --- | --- | --- |
+| Amazon RDS / Aurora | The RDS console "Monitoring" tab and Performance Insights give the same underlying signals. | RDS has no equivalent single health score; compare the inputs individually. |
+| Google Cloud SQL | Cloud Monitoring dashboards for CPU, memory, disk, and replication. | Same inputs, no native composite; reconcile per input. |
+| Self-managed | Performance Schema / `sys` schema plus host metrics. | The closest reproduction; gather every input and apply the weights above. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why can't I find a "health score" in MySQL itself?**
+Because MySQL does not have one. This is a Vortex IQ composite built from native signals. The value is in combining several signals that DBAs normally read separately into one trendable number that an executive or on-call lead can act on without parsing seven gauges. To reproduce it you would gather each input by hand and apply the weights shown in the Calculation section.
+
+**One metric is red but the score is still 80. Is that a bug?**
+No, that is the design. A single input that is mildly degraded, especially a lower-weighted one like slow-query rate, will dent the composite but not crater it. The score is meant to reflect overall health, not the worst single reading. If you want to alert on a specific subsystem regardless of the composite, watch that input's own card directly.
+
+**The score dropped to 50 then recovered on its own in minutes. What happened?**
+Most likely a transient: a brief replication lag spike from a large transaction, a momentary buffer-pool dip after a cache flush, or a short connection surge. The 7-day sparkline will show it as a single notch rather than a trend. Transients are normal; act on sustained declines, not blips.
+
+**Does a planned restart tank the score?**
+Briefly. After a restart the buffer pool is cold (low hit rate) and uptime resets, so the score dips for the first few minutes while the cache warms. It recovers as soon as the working set is back in memory. If the score stays low well after a restart, the cause is not the restart, it is an undersized buffer pool or a genuine load problem.
+
+**Can I change the weights?**
+The default weighting is fixed to reflect availability-critical signals, but the per-input alert thresholds that feed the sub-scores are configurable in the Sensitivity tab. If your workload tolerates higher replication lag (for example an analytics replica that is allowed to drift), raising that input's threshold will stop it dragging the composite down unnecessarily.
+
+**Why is the score below 70 when every individual gauge looks "fine" to me?**
+Two or more inputs sitting in the amber band, each not bad enough to alarm you on its own, can combine to cross the composite alert. This is the "death by paper cuts" case the score is built to catch. Read the drill-down: it ranks the contributing inputs so you can see the cumulative drag even when no single metric screams.
+
+**Does it include cross-channel or ecommerce signals?**
+No. This card is purely instance-internal database health. Business-impact correlation (for example pool saturation coinciding with a storefront traffic burst) lives on the cross-channel cards such as [MySQL Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/mysql/mysql-pool-saturation-vs-traffic-burst). Keep the two views distinct: this one tells you the database is unwell, the cross-channel cards tell you what it is costing.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*MySQL Health Score* is one of hundreds of KPI pulses Vortex IQ tracks across MySQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,108 @@
+---
+title: "Decommissioning Nodes, CockroachDB"
+sidebarTitle: "Decommissioning Nodes"
+description: "Decommissioning Nodes for CockroachDB clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Decommissioning Nodes** counts the nodes currently in the `decommissioning` membership state: nodes you have told the cluster to remove, which are now draining their range replicas onto the remaining nodes before they can be safely shut down. A short-lived count is normal and healthy (a planned node removal or a cluster downsize). The danger signal is a node that stays in this state for a long time: a decommission that is not making progress means replicas are stuck and cannot find a new home, which usually points to a constraint or capacity problem on the rest of the cluster.
+
+| | |
+| --- | --- |
+| **What it tracks** | The number of nodes whose membership status is `decommissioning` right now, with how long each has been in that state. |
+| **Data source** | Node membership and decommission progress from `crdb_internal.gossip_liveness` (the `membership` column shows `active`, `decommissioning`, or `decommissioned`) and the `cockroach node status --decommission` view, which reports `replicas` remaining to move. The DB Console Cluster Overview and the Cloud console surface the same per-node decommission state. |
+| **Time window** | `RT` (real-time, refreshed on each poll). |
+| **Alert trigger** | `long-running > 1h`. A node still draining replicas after more than an hour is treated as stuck, not progressing. |
+| **Roles** | DBA, platform, SRE |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card reads each node's membership state from cluster gossip and counts those equal to `decommissioning`. For every such node it also reads the remaining replica count (the number of range replicas still living on that node that must be moved elsewhere before the node can finalise to `decommissioned`). The headline number is the count of decommissioning nodes; the per-node detail carries the remaining-replica figure and the elapsed time in state.
+
+The alert is not driven by the count being above zero (a decommission in progress is expected) but by duration. If any node has been in the `decommissioning` state for longer than one hour, the card flags it as long-running. A healthy decommission on a moderately loaded cluster typically completes in minutes to tens of minutes as the allocator finds homes for the draining replicas; an hour or more with replicas still remaining means the allocator cannot place them, which is the condition worth paging on.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A DBA is scaling a 9-node CockroachDB cluster (v23.2) down to 6 nodes after a seasonal traffic peak. On 22 Apr 26 at 14:00 BST they run `cockroach node decommission 7 8 9 --certs-dir=certs --host=...`. The card immediately reads:
+
+| Node | Membership | Replicas remaining | In state for |
+| --- | --- | --- | --- |
+| n7 | decommissioning | 412 | 0m |
+| n8 | decommissioning | 398 | 0m |
+| n9 | decommissioning | 405 | 0m |
+
+Headline: **3 decommissioning nodes**. This is exactly what the DBA expects. Over the next 25 minutes the replica counts fall as the allocator moves ranges onto n1 to n6. By 14:30 BST n7 and n8 reach zero replicas and finalise to `decommissioned`, dropping out of the count. The card now reads **1 decommissioning node** (n9), which is still draining normally.
+
+Now the failure mode. Suppose the cluster has a zone configuration that pins a database's replicas to a specific region, and nodes n1 to n6 in that region are already near disk capacity. At 15:10 BST the card still reads:
+
+| Node | Membership | Replicas remaining | In state for |
+| --- | --- | --- | --- |
+| n9 | decommissioning | 47 | 1h 10m |
+
+Headline: **1 decommissioning node**, and the card is now red because n9 has been draining for over an hour with 47 replicas it cannot move. The allocator has nowhere compliant to put those replicas: the only nodes that satisfy the zone constraint are out of disk headroom. The DBA's options are to free disk on the constrained nodes, relax or correct the zone configuration, or add a node in the constrained region so the stuck replicas have a home. Pair this with [Database Disk Usage %](/nerve-centre/kpi-cards/cockroachdb/database-disk-usage) on the receiving nodes and [Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/under-replicated-ranges) to confirm the replicas are genuinely stuck rather than merely slow.
+
+Two takeaways:
+
+1. **A non-zero count is not the problem; a non-moving count is.** During any planned downsize you will see decommissioning nodes, and that is healthy. Watch the remaining-replica figure: if it is falling, leave it alone. If it has plateaued, investigate.
+2. **A stuck decommission almost always means the rest of the cluster cannot absorb the replicas,** because of disk capacity, zone or locality constraints, or too few remaining nodes to satisfy the replication factor. The fix is on the receiving side, not on the draining node.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Decommissioning Nodes | What the combination tells you |
+| --- | --- | --- |
+| [Cluster Node Count](/nerve-centre/kpi-cards/cockroachdb/cluster-node-count) | The total node headcount the decommission is reducing. | Confirms the cluster is shrinking as planned, not losing nodes unexpectedly. |
+| [Under-Replicated Ranges](/nerve-centre/kpi-cards/cockroachdb/under-replicated-ranges) | Decommissioning increases under-replication as replicas move. | A stuck decommission and sustained under-replication usually share the same root cause: nowhere to place replicas. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/cockroachdb/database-disk-usage) | The most common reason a decommission stalls. | Receiving nodes near 90% disk cannot take the draining replicas. |
+| [Replicas per Node](/nerve-centre/kpi-cards/cockroachdb/replicas-per-node) | Shows where the draining replicas are landing. | Confirms the allocator is rebalancing onto the remaining nodes evenly. |
+| [Range Lease Balance Skew %](/nerve-centre/kpi-cards/cockroachdb/range-lease-balance-skew) | A downsize can concentrate leases on fewer nodes. | Rising skew during a decommission means the smaller cluster is becoming lopsided. |
+| [CockroachDB Health Score](/nerve-centre/kpi-cards/cockroachdb/cockroachdb-health-score) | The composite that a stuck decommission pulls down via the replication axis. | A long-running decommission can keep the health score depressed until it clears. |
+| [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges) | The hard line you must never cross during a downsize. | If you remove nodes faster than replicas can move, you risk quorum loss; any unavailable range here is a stop sign. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+The native source of truth is `cockroach node status --decommission --certs-dir=... --host=...`, which prints each node's `is_decommissioning`, `membership`, and `replicas` columns. A node is genuinely stuck only if `replicas` is non-zero and not decreasing across successive runs. You can also query `SELECT node_id, membership FROM crdb_internal.gossip_liveness WHERE membership = 'decommissioning';` for the raw membership state, and watch the `replicas` time-series metric per store fall toward zero.
+
+In the DB Console, the Cluster Overview lists decommissioning nodes separately from live and dead nodes, and the node detail page shows the draining progress. On CockroachDB Cloud, the cluster's node list shows the same decommission state. If Vortex IQ flags a long-running decommission but `cockroach node status --decommission` shows the replica count still falling, the decommission is slow rather than stuck: large clusters or constrained networks can take longer than an hour legitimately, so confirm the replica count is moving before treating it as a fault.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Is a non-zero decommissioning count something to worry about?**
+Not on its own. Any planned node removal or cluster downsize will show one or more decommissioning nodes while their replicas drain, and that is healthy. The card only turns red when a node has been decommissioning for more than an hour, which is the signal that replicas are stuck rather than simply in transit.
+
+**My decommission has been running for over an hour. What is the most likely cause?**
+The remaining nodes cannot accept the draining replicas. The usual reasons, in order of frequency: receiving nodes are near disk capacity; a zone or locality constraint limits which nodes a replica may live on and those nodes are full or too few; or you are removing so many nodes that the survivors cannot satisfy the replication factor. Check [Database Disk Usage %](/nerve-centre/kpi-cards/cockroachdb/database-disk-usage) on the receiving nodes and your zone configurations first.
+
+**Can I cancel a stuck decommission?**
+Yes. Running `cockroach node recommission <node_id>` returns the node to `active` membership and stops the drain, letting the cluster rebalance back to normal. Recommission first, fix the underlying capacity or constraint problem, then retry the decommission. Do not hard-stop a draining node, as that can leave ranges under-replicated.
+
+**Why does a decommission increase under-replicated ranges?**
+While replicas move off the draining node, the affected ranges temporarily have one fewer healthy replica than their replication factor until the new replica is fully caught up on another node. This transient under-replication is expected and clears as the moves complete. Sustained under-replication during a decommission is the warning sign, because it means the moves are not finishing.
+
+**Does decommissioning risk taking a range offline?**
+Only if you remove too many nodes too quickly. CockroachDB will not finalise a decommission that would drop a range below quorum, but if you forcibly stop draining nodes you can lose quorum. Watch [Unavailable Ranges](/nerve-centre/kpi-cards/cockroachdb/unavailable-ranges): it must stay at zero throughout a downsize. If it rises, stop and recommission.
+
+**The card shows a node as decommissioning that I never asked to remove. Why?**
+Either another operator issued the decommission, or an orchestration layer (a Kubernetes operator or autoscaler) initiated it as part of a scale-down or node replacement. Check `crdb_internal.gossip_liveness` for the membership state and your orchestration logs. On CockroachDB Cloud, managed scaling actions can decommission nodes automatically during maintenance.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Decommissioning Nodes* is one of hundreds of KPI pulses Vortex IQ tracks across CockroachDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,169 @@
+---
+title: "Last AOF Rewrite Status, Redis"
+sidebarTitle: "Last AOF Rewrite Status"
+description: "Last AOF Rewrite Status for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Persistence](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Last AOF Rewrite Status** reports whether the most recent Append-Only File rewrite finished cleanly. It reads `aof_last_bgrewrite_status` from `INFO persistence`, which is either `ok` or `err`. The AOF is Redis's write-ahead log; it is periodically rewritten (compacted) so it does not grow without bound. If a rewrite fails, the AOF stops shrinking and can keep growing on disk, and your durability guarantee quietly weakens. This is a binary health flag, not a trend: `ok` is fine, `err` means the last compaction failed and someone needs to find out why before the next restart depends on a broken file.
+
+| | |
+| --- | --- |
+| **Data source** | `aof_last_bgrewrite_status from INFO persistence (ok | err)`. The field reports the result of the most recent background AOF rewrite (`BGREWRITEAOF`, automatic or manual). |
+| **Metric basis** | Binary status flag (`ok` | `err`), NOT a count or rate. Only meaningful when AOF persistence is enabled (`appendonly yes`). |
+| **Aggregation window** | `RT`: read live on each poll. The value reflects the outcome of the last rewrite, whenever that was, not the current period. |
+| **Related fields** | `aof_enabled` (is AOF on at all), `aof_rewrite_in_progress` (a rewrite is running now), `aof_last_write_status` (did the last AOF write to disk succeed, separate from rewrite), `aof_last_cow_size` (copy-on-write memory used by the last rewrite). |
+| **Why `err` happens** | (1) Disk full or quota hit during rewrite; (2) `fork()` failed under memory pressure (no overcommit headroom); (3) I/O error on the AOF directory; (4) the rewrite child was killed (OOM killer). |
+| **What does NOT count** | (1) RDB snapshot status, that is `rdb_last_bgsave_status` and a separate card concern; (2) AOF write status (`aof_last_write_status`), which is per-write fsync health, not rewrite/compaction health; (3) Instances with AOF disabled, where this card is not applicable. |
+| **Time window** | `RT` (live, reflects the most recent rewrite outcome) |
+| **Alert trigger** | `= err`. Any `err` value turns the card red and warns the on-call, because a failed rewrite weakens durability and lets the AOF grow unchecked. |
+| **Roles** | owner, platform, sre, dba |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:worked_example */}
+There is no arithmetic; the card surfaces a single `INFO persistence` field verbatim and maps it to a colour:
+
+```text
+status = INFO persistence -> aof_last_bgrewrite_status
+
+ok   -> green   (last rewrite completed cleanly)
+err  -> red     (last rewrite failed; ALERT)
+n/a  -> grey    (aof_enabled:0; AOF is off, card not applicable)
+```
+
+The relevant slice of `INFO persistence`:
+
+```text
+# Persistence
+aof_enabled:1
+aof_rewrite_in_progress:0
+aof_last_bgrewrite_status:ok      <- this card
+aof_last_write_status:ok          <- different: per-write fsync health
+aof_rewrite_scheduled:0
+aof_last_cow_size:8388608
+aof_current_size:734003200
+aof_base_size:367001600
+```
+
+A useful companion read is `aof_current_size` against `aof_base_size`: the ratio is what triggers an automatic rewrite (`auto-aof-rewrite-percentage`, default 100, meaning rewrite when the file has doubled). If status is `err` and `aof_current_size` keeps climbing while never resetting toward `aof_base_size`, that confirms the rewrites are failing and the file is not being compacted.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+An SRE team runs Redis 7.2 as a durable job queue with AOF enabled (`appendonly yes`, `appendfsync everysec`). The node has 8 GB RAM and a 20 GB data volume. Snapshot on 18 Apr 26.
+
+Healthy baseline at 08:00:
+
+```text
+aof_enabled:1
+aof_last_bgrewrite_status:ok
+aof_current_size:1.4 GB
+aof_base_size:0.7 GB        (file has doubled -> auto-rewrite due soon)
+disk free on AOF volume: 6.1 GB
+```
+
+The card reads **ok**, green. At 02:14 the next night, the automatic rewrite fires when the file passes 100% growth. By 08:00 the card reads **err** and has alerted overnight:
+
+| Field | Value | Reading |
+| --- | --- | --- |
+| `aof_last_bgrewrite_status` | **err** | The 02:14 rewrite failed |
+| `aof_current_size` | 4.8 GB | File never compacted, still growing |
+| `aof_base_size` | 0.7 GB | Unchanged since last successful rewrite |
+| `aof_rewrite_in_progress` | 0 | Not currently retrying |
+| disk free | 0.4 GB | The volume nearly filled overnight |
+
+```text
+Diagnosis: the AOF volume ran low on space. The rewrite child needs room
+to write a fresh compacted file alongside the old one before swapping;
+with only 0.4 GB free and a 4.8 GB AOF, the rewrite could not complete
+and Redis set aof_last_bgrewrite_status:err. The file is now uncompacted
+and growing, which makes the disk-full problem worse on every write.
+
+Risk: if the node restarts now, AOF load is slow (4.8 GB to replay) and,
+if a write hit a full disk, aof_last_write_status may also be err, meaning
+recent writes were not durably persisted.
+```
+
+The fix, in order: (1) free disk or grow the volume immediately, the file is still growing; (2) once there is headroom, run `BGREWRITEAOF` manually and confirm the status returns to `ok` and `aof_current_size` resets toward `aof_base_size`; (3) check `aof_last_write_status` to confirm no recent writes were lost; (4) add a disk-free alert on the AOF volume so the next near-miss is caught before the rewrite fails. Three things this shows:
+
+1. **A failed rewrite is rarely about Redis; it is usually disk or fork headroom.** The two dominant causes are a full volume and a failed `fork()` under memory pressure (no overcommit headroom). Check those first, not Redis config.
+2. **An `err` status is also a self-worsening problem.** A failed rewrite means the file keeps growing, which makes the next rewrite need even more disk and even more likely to fail. It does not self-heal; you must intervene.
+3. **Rewrite status and write status are different durability signals.** `aof_last_bgrewrite_status:err` means compaction failed (operational nuisance, slow restart). `aof_last_write_status:err` means recent writes did not reach disk (data loss risk). They share a root cause here (full disk) but mean different things; always check both.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Last AOF Rewrite Status | What the combination tells you |
+| --- | --- | --- |
+| [Last RDB Save (minutes ago)](/nerve-centre/kpi-cards/redis/last-rdb-save-minutes-ago) | The other persistence mechanism; many setups run both. | AOF rewrite failing but RDB recent equals a fallback restore point still exists. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/redis/last-successful-backup-hours-ago) | The offsite durability backstop beyond local AOF/RDB. | AOF `err` plus a stale backup equals a real durability gap; act fast. |
+| [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) | High memory use can starve the `fork()` a rewrite needs. | AOF `err` with memory near the limit equals a fork-failure cause, not disk. |
+| [Memory Fragmentation Ratio](/nerve-centre/kpi-cards/redis/memory-fragmentation-ratio) | Copy-on-write during rewrite can spike RSS and fragmentation. | A rewrite that bloats RSS confirms heavy copy-on-write under write load. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The composite weights persistence freshness at 10%. | An AOF `err` is one of the inputs that pulls the persistence sub-score down. |
+| [Instance Uptime](/nerve-centre/kpi-cards/redis/instance-uptime) | A short uptime after an `err` may mean a slow AOF-load restart just happened. | Recent restart plus prior `err` equals investigate the AOF-load time. |
+| [Connected Replicas](/nerve-centre/kpi-cards/redis/connected-replicas) | Replicas are a durability layer independent of local AOF. | AOF `err` on primary but a healthy in-sync replica equals data still has a live copy. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis:**
+
+> `INFO persistence` for the field itself plus its context: `redis-cli INFO persistence | grep -E 'aof_'`. Read `aof_last_bgrewrite_status`, `aof_last_write_status`, `aof_current_size`, `aof_base_size`, and `aof_rewrite_in_progress` together.
+> `BGREWRITEAOF` to trigger a manual rewrite; watch the Redis log (`logfile` or stdout) for the child-process success or failure line.
+> The Redis server log itself, which records the precise reason for a failed rewrite (for example "Can't rewrite append only file in background: fork: Cannot allocate memory" or a disk-write error).
+> `CONFIG GET appendonly` to confirm AOF is actually enabled; if `no`, this card is not applicable.
+> `CONFIG GET dir` and a disk check (`df -h`) on that directory to confirm there is room for a rewrite.
+
+For ElastiCache or MemoryDB, AOF is managed by the service and `INFO persistence` may be restricted; the managed equivalent is the engine's automatic backup events surfaced through CloudWatch and the backup history, which is also the basis for the [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/redis/last-successful-backup-hours-ago) card.
+
+**Why our number may legitimately differ from a manual reading:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Poll timing.** The card reads on its interval. | Either | If a rewrite finishes between polls, the card flips to `ok` on the next poll, not instantly. |
+| **In-progress rewrite.** `aof_rewrite_in_progress:1` at poll time. | Stale-by-one | The card reports the last completed status; a running rewrite has not produced a new status yet. |
+| **AOF disabled.** `aof_enabled:0`. | Card shows n/a | A manual `INFO` still shows the stale `aof_last_bgrewrite_status` from when AOF was last on; the card treats AOF-off as not applicable. |
+| **Managed masking.** ElastiCache/MemoryDB restrict `INFO persistence`. | Either | The card falls back to the managed backup history, which has its own timing. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card says `err` but Redis is serving traffic fine. Is this urgent?**
+A failed AOF rewrite does not stop Redis serving reads and writes, so the storefront feels fine. The urgency is about durability and disk: the AOF is no longer being compacted, so it keeps growing, and a restart now would replay a larger, possibly truncated file. Treat it as same-day, not same-minute: free disk or fix the fork headroom, then run `BGREWRITEAOF` and confirm it returns to `ok`.
+
+**What is the difference between AOF rewrite status and AOF write status?**
+`aof_last_bgrewrite_status` (this card) is about compaction: did the background rewrite that shrinks the file succeed? `aof_last_write_status` is about durability: did the most recent append to the AOF actually reach disk? Rewrite `err` is an operational nuisance (file grows, slow restart). Write `err` is a data-loss risk (recent writes may not be persisted). Check both; they often fail together when the disk is full but mean different things.
+
+**My AOF is disabled. What does this card show?**
+If `appendonly` is `no`, AOF persistence is off and this card is not applicable; it renders as grey/n/a. The field may still hold a stale `ok`/`err` from the last time AOF was enabled, which is why the card keys off `aof_enabled` rather than the status field alone. If you rely on RDB snapshots instead, watch [Last RDB Save (minutes ago)](/nerve-centre/kpi-cards/redis/last-rdb-save-minutes-ago).
+
+**Why did the rewrite fail with plenty of disk free?**
+The other common cause is a failed `fork()`. A background rewrite forks a child process, and on a write-heavy instance the child can need significant copy-on-write memory. If the OS has no overcommit headroom (`vm.overcommit_memory` not set to 1) or the instance is near its memory ceiling, the fork is refused and the rewrite fails. The Redis log will say so explicitly. Check [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) and the host's overcommit setting.
+
+**How do I clear an `err` status?**
+Fix the underlying cause (disk space or fork headroom), then run `BGREWRITEAOF` manually. On success, `aof_last_bgrewrite_status` flips to `ok`, `aof_current_size` resets toward `aof_base_size`, and the card goes green on the next poll. The status does not clear by itself; it only updates when a rewrite actually runs and completes.
+
+**Should I worry about a single `err` that recovered on its own?**
+A status that flipped to `err` and then back to `ok` on the next automatic rewrite usually means a transient resource pinch (a brief disk-full or memory spike) that cleared before the retry. It is worth a glance at the log to confirm the cause was transient, but a single self-recovered `err` is not the same as a persistent one. A status stuck on `err` across multiple rewrite attempts is the real problem.
+
+**Does AOF rewrite failure affect a replica's durability?**
+A rewrite failure is local to the node it happened on. If a primary's AOF rewrite fails but it has a healthy in-sync replica (see [Connected Replicas](/nerve-centre/kpi-cards/redis/connected-replicas)), your data still has a live second copy in that replica's memory and on its own AOF. Replication is a separate durability layer from local persistence; do not treat a single node's AOF `err` as total data loss risk if replicas are healthy, but do fix it, because replicas can fail too.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Last AOF Rewrite Status* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

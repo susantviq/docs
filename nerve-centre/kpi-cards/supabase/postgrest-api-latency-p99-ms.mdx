@@ -1,0 +1,162 @@
+---
+title: "PostgREST API Latency p99 (ms), Supabase"
+sidebarTitle: "PostgREST API Latency p99 (ms)"
+description: "PostgREST API Latency p99 for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [PostgREST API](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This card reports the 99th-percentile response time of requests served by PostgREST, the auto-generated REST layer in front of your Supabase database. Where p95 describes the experience of the unluckiest 1 in 20 requests, p99 describes the unluckiest 1 in 100: the far tail. It is the metric that catches the rare but severe stalls (a lock wait, a cold-cache scan, a connection that queued for a long time) which p95 smooths over. For a platform or SRE team, p99 is the gauge that exposes the requests your most demanding users and your slowest code paths actually hit. A healthy p95 with a blown-out p99 is one of the most useful diagnostic shapes you can read: most of the API is fine, but a thin slice of requests is hitting a specific, fixable problem.
+
+| | |
+| --- | --- |
+| **What it tracks** | The 99th-percentile end-to-end latency of HTTP requests served by PostgREST (Supabase's auto-generated REST API over Postgres), in milliseconds for the window. |
+| **Data source** | Supabase request logs and edge/PostgREST metrics via the project's Logs & Analytics layer (`api_logs` / Logflare-backed request logs) and the project metrics endpoint. The card reads the per-request duration distribution and computes the p99. |
+| **Time window** | `RT/5m` (a live reading plus a five-minute rolling percentile). |
+| **Alert trigger** | `>500ms`. A sustained p99 above 500ms means roughly 1 in 100 API calls is taking over half a second of server time, which is the point where the worst-case experience becomes visibly bad. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card collects the duration of every PostgREST request in the rolling window, sorts them, and reports the value at the 99th percentile:
+
+```text
+p99 = the latency value at the 99th percentile of all PostgREST
+      request durations in the window
+fire when: p99 > 500ms (sustained)
+```
+
+As with p95, each duration is PostgREST's full server-side time: URL-to-query parsing, acquiring a pooled connection, executing the SQL, serialising to JSON, and writing the response. Network time between the client and the edge is excluded, so a browser always sees this value plus the round trip.
+
+Two things make p99 behave differently from p95, and they matter for reading it:
+
+1. **The far tail is noisier and more sample-sensitive.** p99 is computed from the slowest 1% of requests, so on a low-traffic window it rests on very few data points and can jump around. On a high-traffic project it is stable and meaningful. Always read p99 with the request rate in view; a dramatic p99 on a handful of requests is far less significant than the same value across tens of thousands.
+2. **p99 surfaces tail-only causes that never touch p95.** A single periodic lock, a cron-driven heavy query, a connection that queued for a long time during a brief pool exhaustion, or a cold-cache page read can push the slowest 1% out a long way while leaving the bulk of the distribution untouched. That is precisely the kind of intermittent, hard-to-reproduce problem this card is built to expose.
+
+The natural drill-downs are [PostgREST API Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgrest-api-latency-p95-ms) (is the whole distribution moving, or only the tail?), [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate) (is a specific query causing the stalls?), and [Deadlocks (last 5m)](/nerve-centre/kpi-cards/supabase/deadlocks-last-5m) (is lock contention producing the long waits?).
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Supabase project backing a B2B portal. p95 is steady at 90ms and p99 normally sits around 220ms. Snapshot taken on 30 Apr 26 at 14:15 BST. p95 looks fine all day, but p99 has started spiking on a clock.
+
+| Window | Requests | p95 | **p99** | State |
+| --- | --- | --- | --- | --- |
+| 14:00 to 14:05 | 38k | 91ms | 214ms | healthy |
+| 14:05 to 14:10 | 39k | 93ms | **640ms** | **BREACH** |
+| 14:10 to 14:15 | 37k | 90ms | 228ms | recovered |
+
+The card fires on the middle window. The headline reads **PostgREST API Latency p99 640ms (BREACH)**. The team reads:
+
+1. **p95 never moved, only p99 spiked, and then recovered.** The bulk of the API was healthy throughout. A thin slice of requests hit a severe stall for one five-minute window and then it cleared. That on/off pattern points at a periodic event, not a sustained regression.
+2. **The timing is suspicious.** The spike lands on a five-minute boundary, which often coincides with a scheduled job. Cross-reference [Top 10 Slowest Queries](/nerve-centre/kpi-cards/supabase/top-10-slowest-queries); a reporting aggregation runs every five minutes and briefly locks rows that the portal's read endpoints also touch.
+3. **The lock, not the query, is the cost.** [Deadlocks (last 5m)](/nerve-centre/kpi-cards/supabase/deadlocks-last-5m) shows zero deadlocks (nothing aborted), but `pg_stat_activity` during the window shows portal requests in `wait_event_type = 'Lock'`. They were not failing, just waiting behind the aggregation, which is exactly how a tail-only p99 spike forms.
+
+```text
+Confirm a periodic lock-wait tail:
+  SELECT wait_event_type, wait_event, count(*)
+  FROM pg_stat_activity
+  WHERE state = 'active'
+  GROUP BY 1, 2
+  ORDER BY 3 DESC;
+  -- during the spike window, expect Lock waits on the contended rows.
+
+Find the periodic heavy query:
+  SELECT query, calls, mean_exec_time, max_exec_time
+  FROM pg_stat_statements
+  ORDER BY max_exec_time DESC
+  LIMIT 10;
+```
+
+```text
+Fixes, in order:
+  1. Move the 5-minute aggregation off the hot rows (read from a replica,
+     or run against a materialised view refreshed off-peak).
+  2. If it must run live, reduce its lock footprint (smaller batches,
+     SELECT ... FOR SHARE only where needed, shorter transactions).
+  3. Stagger the schedule so it never overlaps a known traffic peak.
+```
+
+The team pointed the aggregation at a read replica ([Read Replicas](/nerve-centre/kpi-cards/supabase/read-replicas)); the periodic p99 spike vanished while p95 stayed exactly where it was. Chasing p95 would have found nothing, the problem only ever lived in the far tail.
+
+Three takeaways:
+
+1. **p99 is the periodic-stall detector.** When p95 is calm but p99 spikes on a rhythm, look for a scheduled job, a cron, or a batch process contending with live traffic for locks or connections.
+2. **Always read p99 alongside the request rate.** On low traffic the far tail rests on few samples and is noisy; the same value across high volume is a real, repeatable problem worth fixing.
+3. **A blown p99 with a healthy p95 is good news, not bad.** It means the fix is targeted: a single query, schedule, or lock, not a systemic slowdown. The whole API does not need re-architecting; one tail-causing path does.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with PostgREST API Latency p99 | What the combination tells you |
+| --- | --- | --- |
+| [PostgREST API Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgrest-api-latency-p95-ms) | The headline tail, against which p99 is the far tail. | p95 flat with p99 spiking equals a thin slice of severe stalls; both rising equals broad degradation. |
+| [PostgREST Request Rate (req/sec)](/nerve-centre/kpi-cards/supabase/postgrest-request-rate-reqsec) | Tells you how many samples the p99 rests on. | A high p99 on low volume is noise; on high volume it is a real, repeatable stall. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate) | Catches the specific query causing the tail. | A spike in slow queries aligning with the p99 spike pinpoints the offender. |
+| [Deadlocks (last 5m)](/nerve-centre/kpi-cards/supabase/deadlocks-last-5m) | Lock contention is a classic tail cause. | Lock waits (even without deadlocks) during a p99 spike equal queueing behind a heavy transaction. |
+| [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) | A brief pool exhaustion stalls a few requests. | A momentary saturation peak aligning with the p99 spike equals connection queueing. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/supabase/top-10-slowest-queries) | Surfaces the heaviest individual statements. | The periodic heavy query behind a rhythmic p99 spike usually appears here. |
+| [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) | Severe stalls can tip into timeouts and errors. | p99 climbing then 5xx appearing equals stalls crossing the timeout boundary. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite that reflects tail latency. | A persistent p99 breach erodes the composite even while p95 stays green. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase's own tooling:**
+
+> In the Supabase dashboard, open **Reports → API** and the **Logs → API / Edge** explorer for the per-route request-duration distribution PostgREST records. The dashboard latency charts and this card draw from the same request-log stream.
+> Compute the p99 yourself from the project's log explorer: the `api_logs` / edge request logs expose per-request response duration, which you can percentile at p99 over a matching window.
+> Separate API time from database time with `pg_stat_statements` (`max_exec_time` is the closest single-statement proxy for tail behaviour). If the SQL tail is fast but PostgREST p99 is high, the stall is pool wait, lock wait, or serialisation, not the query.
+> The managed-service console exposes equivalent latency charts; confirm it is showing p99 (not p95 or average) over a matching window before assuming a discrepancy.
+
+**Why our number may legitimately differ from Supabase's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sample size at the tail** | Card noisier on low traffic | p99 is computed from the slowest 1%; on a small window it rests on few requests and can differ markedly from an hourly-bucketed dashboard figure. |
+| **Window boundary** | Variable | The card's five-minute rolling p99 surfaces a short stall sharply; a longer dashboard bucket averages it away. |
+| **Server vs client timing** | Card lower than browser | This card is PostgREST server-side time only; client measurements add the network round trip and edge time. |
+| **Percentile method** | Marginal | p99 over sampled logs vs the full stream can differ by tens of ms at the extreme tail. |
+| **Route scope** | Variable | The card blends across routes; a dashboard view filtered to one endpoint can read very differently. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My p99 is jumping around wildly but p95 is rock solid. Is something broken?**
+Not necessarily. p99 is computed from the slowest 1% of requests, so on lower-traffic windows it rests on very few samples and is naturally noisy. Read it together with [PostgREST Request Rate (req/sec)](/nerve-centre/kpi-cards/supabase/postgrest-request-rate-reqsec): a volatile p99 on light traffic is sampling noise, while the same volatility across high volume is a real, intermittent stall worth chasing.
+
+**p99 spikes on a regular schedule. What causes that?**
+A periodic job contending with live traffic. The usual culprits are a cron-driven aggregation, a scheduled report, or a batch import that briefly locks rows or saturates the pool, stalling the slowest 1% of concurrent requests while the bulk stay fast. Check [Top 10 Slowest Queries](/nerve-centre/kpi-cards/supabase/top-10-slowest-queries) and `pg_stat_activity` during the spike; move the job to a read replica or an off-peak window to clear it.
+
+**Why is p99 so much higher than p95?**
+That gap is normal and healthy in moderation. p95 reflects routine load; p99 captures the rare severe events (a lock wait, a cold-cache scan, a momentary pool queue) that only a tiny fraction of requests hit. A wide p95-to-p99 gap means most of your API is fast and a thin slice occasionally stalls. The gap only becomes a problem when p99 crosses your alert threshold consistently or the share of slow requests grows.
+
+**Should I worry about p99 if p95 is well within target?**
+Yes, but proportionately. A healthy p95 with a breaching p99 is the best-case version of a latency problem: it is contained to a small, identifiable slice of requests, so the fix is targeted (one query, one schedule, one lock) rather than systemic. Ignoring it lets the tail-causing path grow until it starts dragging p95 too.
+
+**Does the card's p99 include Edge Function or Realtime latency?**
+No. This card measures PostgREST request latency only, the REST layer over Postgres. Edge Functions (Deno) and Realtime (WebSocket) are separate subsystems with their own behaviour; see [Edge Function Error Rate %](/nerve-centre/kpi-cards/supabase/edge-function-error-rate) and [Realtime Disconnect Rate (per min)](/nerve-centre/kpi-cards/supabase/realtime-disconnect-rate-per-min). If your slow path is a serverless function or a live subscription, this card will not show it.
+
+**Is 500ms the right p99 threshold for my project?**
+It is a sensible default for an interactive API. Projects whose busiest routes aggregate large datasets, export reports, or run heavy search will legitimately see a higher p99, and forcing it under 500ms is the wrong goal for those paths. Set the threshold per project in the Sensitivity tab to match the work your slowest legitimate endpoints do, so you alert on regressions rather than on expensive-by-design routes.
+
+**My Supabase dashboard p99 reads lower than this card. Why?**
+Usually bucket granularity. The card uses a five-minute rolling p99, which surfaces a short tail event sharply; a dashboard chart bucketed to an hour spreads that event across far more requests and reports a calmer number. Match the window and confirm both are showing p99 (not p95) before treating it as a real divergence; they read from the same underlying request-log stream.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*PostgREST API Latency p99 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

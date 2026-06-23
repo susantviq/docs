@@ -1,0 +1,165 @@
+---
+title: "Slow PostgREST Queries During Checkout Window, Supabase"
+sidebarTitle: "Slow PostgREST Queries During Checkout Window"
+description: "Slow PostgREST Queries During Checkout Window for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A table of the slow PostgREST queries that fired during an active checkout window, the moment a shopper is trying to pay. PostgREST is Supabase's auto-generated REST layer: it is the actual API your storefront and app call, so a slow PostgREST query is not an abstract database metric, it is a request a customer is sitting and waiting on. This card narrows the firehose to one question: which queries went slow *at the exact time orders were dropping*? It joins slow-query detection on the Supabase side with the checkout-conversion signal on the commerce side, so a platform team can tell the difference between "the database was slow at 3am when nobody cared" and "the database was slow during peak checkout and we lost baskets". When five or more slow queries co-occur with a measurable checkout drop, the card fires.
+
+| | |
+| --- | --- |
+| **What it tracks** | The individual slow PostgREST queries observed during a checkout window, listed row by row with the query, its latency, its call count, and the checkout-conversion movement in the same window. |
+| **Data source** | Slow PostgREST Queries During Checkout Window, broken down by row. The query side comes from PostgREST request timings and the underlying Postgres statement statistics (`pg_stat_statements`, slow-query logs); the checkout side comes from the connected commerce platform's checkout/order signal (Shopify, BigCommerce or Adobe Commerce). |
+| **Time window** | `5m`. A tight rolling 5-minute window so the slow queries and the checkout drop are genuinely co-occurring, not loosely correlated across an hour. |
+| **Alert trigger** | `>5 slow queries co-occur with checkout drop`. The card fires only when both conditions hold together: more than five slow queries *and* a measurable fall in checkout completion in the same 5-minute window. |
+| **Why it matters** | Slow queries are common and mostly harmless; slow queries while customers are paying are revenue leaving the building. By gating on the checkout drop, the card filters out the noise and surfaces only the slowness that is actually costing orders. |
+| **Reading the value** | An empty table is the goal. A populated table during a checkout drop is a live incident: the listed queries are your suspects, ordered by how much they are slowing the path to payment. |
+| **Roles** | platform/SRE, engineering, owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card is a co-occurrence join between two signals over the same 5-minute window, then a per-query breakdown:
+
+```text
+SIGNAL A - Slow PostgREST queries (Supabase side)
+  For each query seen via PostgREST in the window, capture:
+    query text (normalised), p95 latency, call count, total time
+  A query is "slow" if its latency exceeds the slow threshold
+  (the same basis as the Slow-Query Rate card).
+  Source: PostgREST request timings + pg_stat_statements / slow-query log.
+
+SIGNAL B - Checkout drop (ecom side)
+  checkout_completion_rate over the window vs trailing baseline
+  drop = baseline - current   (a fall in completed checkouts)
+  Source: the commerce connector's checkout/order signal.
+
+CO-OCCURRENCE / ALERT
+  slow_count = number of distinct slow queries in the window
+  FIRE when:  slow_count > 5  AND  checkout drop is material
+
+TABLE OUTPUT (when populated)
+  one row per slow query, ranked by total time in window:
+    query | p95 latency | calls | total time | seen during drop?
+```
+
+The design intent is the gate. Plenty of cards already report slow queries in general (see [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate) and [Top 10 Slowest Queries](/nerve-centre/kpi-cards/supabase/top-10-slowest-queries)). This card answers a sharper, revenue-shaped question: of all the slow queries, which ones were happening *while we were losing checkouts*? A slow nightly report does not appear here; a slow cart-or-inventory read during peak does. That is what makes it a Cross-Channel: Revenue at Risk card rather than a plain performance card.
+
+Query text is normalised (literals stripped, whitespace folded) so the same query with different parameters groups into one row, which is what makes the call-count column meaningful.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Supabase-backed headless store on Shopify. Baseline checkout completion sits around 68%. At 19:40 GMT on 18 Apr 26, a flash-sale email lands and traffic doubles. Snapshot of the card at 19:45, covering the 5-minute window 19:40 to 19:45:
+
+| Query (normalised) | p95 latency | Calls | Total time | During drop? |
+| --- | --- | --- | --- | --- |
+| `SELECT * FROM products WHERE category = $1` | 4,180 ms | 2,140 | 894 s | Yes |
+| `SELECT inventory_qty FROM products WHERE sku = $1` | 1,920 ms | 3,610 | 693 s | Yes |
+| `SELECT * FROM cart_items WHERE cart_id = $1` | 880 ms | 1,470 | 129 s | Yes |
+| `SELECT * FROM shipping_rates WHERE zone = $1` | 740 ms | 990 | 73 s | Yes |
+| `SELECT * FROM promo_codes WHERE code = $1` | 610 ms | 1,205 | 73 s | Yes |
+| `SELECT count(*) FROM page_views` | 5,300 ms | 60 | 318 s | No (analytics) |
+
+Checkout completion in the same window has fallen from 68% to 49%. The card fires: more than five slow queries co-occurring with a clear checkout drop.
+
+The ranking does the triage. The top row, an unbounded `SELECT *` on `products` filtered only by category, is taking over four seconds at p95 and was called 2,140 times. It has no covering index on `category`, so under doubled traffic it is doing repeated sequential scans. The inventory read by SKU is also slow and called even more often, because every product card and every add-to-basket touches it. Together these two queries account for the bulk of the total time in the window, and both are squarely on the path a paying customer walks.
+
+The analytics `count(*)` on `page_views` is slow too (5.3s) but the "During drop?" column reads No: it is a background dashboard query, not on the checkout path, so it is not a suspect for the lost baskets even though it is the single slowest query by latency. This is exactly the distinction the card exists to draw.
+
+```text
+Cost framing:
+  - Checkout completion 68% -> 49% during the 5m window.
+  - ~220 checkout sessions in the window at doubled traffic.
+  - Lost completions: 220 × (0.68 - 0.49) = ~42 orders not completed.
+  - At ~£70 AOV: ~£2,940 of checkout revenue at risk in 5 minutes
+    while the path was slow.
+```
+
+The remediation is targeted because the suspect list is short: add the missing index on `products(category)` and ensure `products(sku)` is indexed for the inventory read, or add a short-TTL cache in front of both. The team does not need to audit the whole database, the card has already pointed at the two queries that matter. After the index ships, the next snapshot shows those rows gone, the table empties, and completion climbs back toward 68%.
+
+Three takeaways:
+
+1. **The gate is the value.** Slow queries are everywhere; slow queries during a checkout drop are an incident. By requiring both conditions, the card surfaces the small set of queries that are actually costing orders and ignores the slow-but-harmless background load.
+2. **Rank by total time, not latency.** The slowest single query (the analytics `count(*)`) was not the problem; the problem was two moderately slow queries called thousands of times. Total time in window, latency times calls, is the right lens for blast radius.
+3. **The "During drop?" column is the line between suspect and bystander.** A query can be slow and still be innocent if it is off the customer path. Read that column before you start optimising, so you fix the query that is hurting customers, not just the one with the biggest number.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow PostgREST Queries During Checkout | What the combination tells you |
+| --- | --- | --- |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate) | The store-wide slow-query percentage. | A high overall slow-query rate plus a populated checkout table means the slowness is broad and has reached the customer path. |
+| [Top 10 Slowest Queries](/nerve-centre/kpi-cards/supabase/top-10-slowest-queries) | The all-purpose slow-query leaderboard over 24h. | Cross-check whether the checkout-path offenders are also chronic top-10 queries (a standing problem) or new (a regression). |
+| [PostgREST API Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgrest-api-latency-p95-ms) | The aggregate latency of the API layer this card breaks down. | Rising p95 plus a populated table localises the latency to specific checkout queries. |
+| [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) | Slow queries that time out become 5xx. | Slow table plus rising 5xx means queries are not just slow, they are failing, a harder customer impact. |
+| [Supabase QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/supabase/supabase-qps-spike-vs-ecom-order-rate) | The other cross-channel revenue-at-risk join. | A QPS spike that drives the slow queries connects the two cards into one story of contention. |
+| [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) | Slow queries hold connections longer. | Slow checkout queries plus a saturating pool is the path from "slow" to "outage". |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+Both halves of this card can be confirmed with native tooling.
+
+**The slow-query side (Supabase / Postgres):**
+
+> Confirm the offending queries directly in the **Supabase SQL Editor** using `pg_stat_statements`, the canonical source for per-statement timing:
+> `SELECT query, calls, mean_exec_time, total_exec_time FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 20;`
+> The project **Reports → Query Performance** view in the Supabase dashboard surfaces the same slow-statement ranking visually.
+> Use `EXPLAIN (ANALYZE, BUFFERS)` on a suspect query to confirm it is doing a sequential scan and to verify an index fixes it before you ship the change. PostgREST request timings can be cross-checked in the project logs (Logs → API).
+
+**The checkout side (the commerce platform):**
+
+- **Shopify:** Analytics → Reports → Conversion (checkout completion), or the checkout funnel in the Shopify analytics view for the same window.
+- **BigCommerce:** Analytics → Conversion, or the abandoned-cart view for the window.
+- **Adobe Commerce:** Reports → Conversion / Abandoned Carts for the window.
+
+**Why our table may legitimately differ from a raw `pg_stat_statements` read:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window scope** | Vortex IQ shows fewer rows | `pg_stat_statements` is cumulative since the last stats reset; this card is scoped to the 5-minute checkout window, so it shows only what was slow *then*, not all-time. |
+| **Checkout gate** | Vortex IQ shows fewer rows | A slow query off the checkout path (the analytics `count(*)` above) is excluded from the alert even though `pg_stat_statements` lists it near the top. |
+| **Normalisation** | Row grouping differs | We group by normalised query text; a raw view distinguishing literal values can show the same logical query as many rows. |
+| **Counter timing** | Marginal | `pg_stat_statements` mean/total times update on statement completion; a query still running at snapshot time may under-report until it finishes. |
+| **Checkout definition** | Variable | We read checkout movement as the connector reports it; a manual report counting paid vs initiated checkouts will show a different drop magnitude. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The table is empty during an incident, but checkout is clearly down. Where is the problem?**
+An empty table here is a strong, useful signal: the database is not the cause. If checkout is dropping and no slow PostgREST queries co-occur, look elsewhere, the payment gateway, a third-party script, a CDN or DNS issue, or the storefront frontend. This card deliberately stays empty when the database is healthy, so an empty table during a checkout drop redirects your investigation away from Postgres and saves you from chasing a database ghost.
+
+**How does the card know which queries are on the "checkout path"?**
+It correlates timing: queries whose elevated latency falls inside the same 5-minute window as the checkout drop are flagged "during drop". It does not parse query intent, so a query is judged by *when* it was slow, not by its name. This is why a genuinely checkout-relevant query is caught even if its table name does not say "checkout", and why a background query that happened to be slow at a quiet time is not.
+
+**Why more than five queries as the threshold? One slow checkout query can still hurt.**
+The `>5` count is the *alert* threshold, the point at which the Nerve Centre raises an incident, chosen so a single transient slow query during a momentary dip does not page anyone. The table itself populates below that threshold too; you can open it any time to see one or two slow checkout queries. The five-query gate is about deciding when the pattern is broad enough to be a genuine, actionable contention event rather than a blip.
+
+**Does this work if my app talks to Postgres directly rather than through PostgREST?**
+The checkout co-occurrence logic works regardless, but the per-query attribution is richest when traffic flows through PostgREST, because that layer gives clean request timings. For direct-connection queries, the card falls back to `pg_stat_statements` for the slow-query side, which still lists the statements and counts but without the PostgREST request context. The Supabase-distinctive value, seeing the actual API your app calls, is strongest on the PostgREST path.
+
+**The same query is listed multiple times with different latencies.**
+That should not happen if normalisation is working, identical logical queries group into one row. If you see duplicates, it usually means the queries differ in a way normalisation cannot collapse: different table or column names from dynamic SQL, or comments embedded in the query text. Standardise how the app emits the query so it normalises to a single shape, and the row will consolidate.
+
+**Can I use this card to set up alerting before a sale?**
+Yes, and it is one of its best uses. Before a known traffic event (a flash sale, a launch), pre-warm by checking the [Top 10 Slowest Queries](/nerve-centre/kpi-cards/supabase/top-10-slowest-queries) and indexing the checkout-path offenders in advance. Then watch this card live during the event: an empty table through peak is your confirmation that the database held; a populated one is your early warning to add capacity or roll back before the checkout drop compounds. Pair it with [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) for the capacity side of the same picture.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow PostgREST Queries During Checkout Window* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

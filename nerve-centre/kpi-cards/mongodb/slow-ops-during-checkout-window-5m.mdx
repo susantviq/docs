@@ -1,0 +1,163 @@
+---
+title: "Slow Ops During Checkout Window (5m), MongoDB"
+sidebarTitle: "Slow Ops During Checkout Window (5m)"
+description: "Slow Ops During Checkout Window (5m) for MongoDB instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The count of MongoDB operations that breached the slow-query threshold (default `slowms` of 100ms) inside the same rolling 5-minute window in which the storefront's checkout conversion dropped. This is a join card, not a raw database metric: it correlates the database profiler's slow-op stream against the ecommerce connector's checkout funnel. One slow `find` on a product page is noise; five slow ops landing in the exact window the checkout success rate fell off a cliff is a causal story. This card exists to answer the only question that matters during an incident: "Is the database why people stopped buying?"
+
+| | |
+| --- | --- |
+| **Data source** | Two streams joined on time. (1) MongoDB profiler entries via `db.system.profile` (or the diagnostic log when profiling level is 0) where `millis > slowms`, the same source as [Slow Ops (15m, >100ms)](/nerve-centre/kpi-cards/mongodb/slow-ops-15m-100ms). (2) The checkout funnel from the linked ecommerce connector (Shopify / BigCommerce / Adobe Commerce) sessions-to-orders rate. |
+| **Metric basis** | A row is emitted per slow op that falls inside a 5-minute window flagged as a checkout-drop window. "Checkout drop" is defined by the storefront connector's conversion delta, not by the database. The database supplies the suspect operations; the storefront supplies the symptom. |
+| **Join key** | UTC timestamp bucketed to the 5-minute window. Slow ops are matched to the checkout window they occurred in, then ranked by `millis` descending. |
+| **What counts as a "slow op"** | Any profiled operation (`query`, `command`, `update`, `insert`, `getmore`, `aggregate`) whose `millis` exceeds the instance `slowms`. The card surfaces namespace (`ns`), operation type (`op`), duration (`millis`), documents examined vs returned (`docsExamined` / `nreturned`), and plan summary (`COLLSCAN` vs `IXSCAN`). |
+| **What does NOT count** | (1) Slow ops outside a checkout-drop window (those live on [Slow Ops (15m, >100ms)](/nerve-centre/kpi-cards/mongodb/slow-ops-15m-100ms)); (2) checkout drops with no co-occurring slow ops (the cause is elsewhere, not the database); (3) operations on collections that are not on the checkout read/write path if the connector has a path scope configured; (4) internal replication or oplog ops. |
+| **Time window** | `5m` rolling. The window is short on purpose: checkout damage compounds by the minute, so the join resolution must be tight enough to attribute cause without smearing across unrelated traffic. |
+| **Alert trigger** | `>5 slow ops co-occur with checkout drop`. More than 5 slow ops landing inside a flagged checkout-drop window pages the on-call. The threshold deliberately requires both halves: slow ops alone do not fire, a checkout drop alone does not fire. |
+| **Sentiment** | Sensitivity card. The 5-op threshold is profile-configurable in the Sensitivity tab; high-traffic stores with chatty checkouts may raise it. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card runs in three steps, refreshed on the 5-minute window boundary:
+
+1. **Detect the checkout-drop window.** The linked storefront connector reports a rolling checkout conversion rate (orders / checkout-started sessions) per 5-minute bucket. A window is flagged when the current bucket falls materially below the trailing baseline for the same time-of-day and day-of-week. The database is not consulted in this step; the symptom is defined entirely storefront-side.
+
+2. **Pull the slow ops for that exact window.** For every flagged window, the engine reads MongoDB profiler entries where `millis > slowms` and `ts` falls inside the window. The default `slowms` is 100ms; the card honours whatever the instance is actually configured to, read from `db.getProfilingStatus()`. Each entry keeps `ns`, `op`, `millis`, `docsExamined`, `nreturned`, `planSummary`, and `appName`.
+
+3. **Join, count, rank.** Slow ops are bucketed into their window, counted, and sorted by `millis` descending. The headline is the count; the table is the ranked detail. The alert fires when `count > 5` for a window that is also flagged as a checkout drop.
+
+The crucial design choice is the **AND**: this is not "slow ops" and it is not "checkout drop", it is their intersection in time. A database under load during a quiet sales hour does not fire. A checkout drop caused by a payment-gateway outage (no slow ops) does not fire here either; it surfaces on the storefront connector's own cards. This card only lights up when the database is a plausible cause of lost revenue right now.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A DTC homeware brand runs its storefront on Shopify and keeps its live inventory, pricing rules, and cart-validation service on a self-managed MongoDB 6.0 replica set (one primary, two secondaries) behind the checkout API. Snapshot taken on 14 Apr 26 at 20:15 BST, the back half of an evening sales peak.
+
+The Shopify connector flags the 20:10 to 20:15 window as a checkout drop: started-checkout to order conversion fell from a trailing baseline of 71% to 38%. The MongoDB profiler stream for the same window returns the following slow ops (`slowms` = 100ms):
+
+| Rank | Namespace (`ns`) | Op | `millis` | docsExamined | nreturned | planSummary |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | `shop.inventory_levels` | query | 3,180 | 412,005 | 1 | **COLLSCAN** |
+| 2 | `shop.inventory_levels` | query | 2,940 | 412,005 | 1 | **COLLSCAN** |
+| 3 | `shop.inventory_levels` | query | 2,710 | 411,880 | 1 | **COLLSCAN** |
+| 4 | `shop.cart_validation` | command | 880 | 53,200 | 60 | IXSCAN |
+| 5 | `shop.inventory_levels` | query | 2,650 | 412,005 | 1 | **COLLSCAN** |
+| 6 | `shop.pricing_rules` | aggregate | 1,120 | 18,400 | 14 | IXSCAN |
+| 7 | `shop.inventory_levels` | query | 2,590 | 411,990 | 1 | **COLLSCAN** |
+
+Seven slow ops in a single flagged checkout-drop window. The card headline reads **7 slow ops during checkout drop** and the alert has fired (threshold is 5). The DBA does not need to guess; the table tells the whole story:
+
+- Five of the seven ops are full collection scans (`COLLSCAN`) on `shop.inventory_levels`, each examining roughly 412,000 documents to return a single one. That is the textbook signature of a **missing or dropped index**.
+- The `docsExamined : nreturned` ratio of 412,005 : 1 is the smoking gun. A healthy `IXSCAN` lookup on a single stock record should examine 1 to a handful of documents, not the whole collection.
+- The two `IXSCAN` ops (`cart_validation`, `pricing_rules`) are slow but proportionate; they are collateral, slowed by the same CPU and cache pressure the scans are causing, not the root cause.
+
+```text
+Attributing the revenue loss for this 5-minute window:
+  - Baseline conversion (same slot, trailing 4 weeks):  71%
+  - Observed conversion during window:                  38%
+  - Started-checkout sessions in window:                240
+  - Expected orders at baseline:    240 x 0.71  = ~170
+  - Observed orders:                240 x 0.38  = ~91
+  - Lost orders in this 5 min:      ~79
+  - Average order value:            £64
+  - Estimated lost revenue (5 min): 79 x £64    = ~£5,056
+```
+
+Root cause, confirmed minutes later: a migration deployed at 20:08 dropped and was rebuilding the `{ variant_id: 1, location_id: 1 }` compound index on `inventory_levels`. During the rebuild every stock check fell back to a `COLLSCAN`, checkout calls timed out, and shoppers abandoned. The fix was to roll the index build to a background build, or to ship the new index before dropping the old one. The DBA also raised the wider lesson with engineering: never drop a checkout-path index in a foreground build during trading hours.
+
+Three takeaways:
+
+1. **The join is the value.** Either signal alone is ambiguous. Slow ops during a quiet hour are a tuning backlog item. A checkout drop during a payment-gateway wobble is not a database problem. The intersection in time is what turns a vague "the site felt slow" into "these five COLLSCANs on inventory cost us roughly £5k in five minutes".
+2. **Read the plan summary first.** `COLLSCAN` in a checkout window is almost always a missing index or a query that stopped matching its index. `IXSCAN` ops that are slow point at cache pressure, lock contention, or genuinely large result sets, a different fix.
+3. **The `docsExamined : nreturned` ratio is the diagnostic.** A ratio near 1:1 means the index is doing its job. A ratio in the hundreds of thousands to one means you are scanning a collection to find a needle. That ratio, not raw `millis`, is what you take to the engineer who shipped the migration.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Slow Ops During Checkout Window | What the combination tells you |
+| --- | --- | --- |
+| [Slow Ops (15m, >100ms)](/nerve-centre/kpi-cards/mongodb/slow-ops-15m-100ms) | The unconditional slow-op count over a wider 15-minute window. | If this card is high but the checkout-window card is quiet, you have a tuning backlog but no live revenue impact. If both fire, the backlog has reached the checkout path. |
+| [Top 10 Slow Operations](/nerve-centre/kpi-cards/mongodb/top-10-slow-operations) | The 24-hour ranked detail of the worst ops by namespace and shape. | Tells you whether the ops in this window are chronic offenders or a brand-new regression from today's deploy. |
+| [COLLSCAN Operations (24h)](/nerve-centre/kpi-cards/mongodb/collscan-operations-24h) | The day-level count of full collection scans, the missing-index signal. | A spike here that coincides with this card confirms a dropped or unbuilt index on a checkout-path collection. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p95-ms) | The instance-wide read latency percentile. | If p95 is healthy but this card fires, the damage is concentrated in a few terrible ops, not broad slowdown. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/mongodb/query-latency-p99-ms) | The tail latency the slowest 1% of ops experience. | Slow ops in a checkout window almost always live in the p99 tail; rising p99 is the early warning before this card fires. |
+| [Connection Pool at >90% Saturation](/nerve-centre/kpi-cards/mongodb/connection-pool-at-90-saturation) | The capacity alert. | Slow ops hold connections open longer; a pool saturation alert in the same window means the slow ops are now starving healthy requests too. |
+| [MongoDB Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/mongodb/mongodb-pool-saturation-vs-traffic-burst) | The other capacity-side cross-channel join. | Distinguishes "slow because of bad queries" (this card) from "slow because too many concurrent connections" (that card). |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | The executive composite. | This card firing should pull the composite down; if the score is green while this is red, the composite weighting needs review. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MongoDB's own tooling:**
+
+> **Database profiler.** Run `db.setProfilingLevel(1, { slowms: 100 })` then query `db.system.profile.find({ millis: { $gt: 100 }, ts: { $gte: <window-start>, $lt: <window-end> } }).sort({ millis: -1 })` for the same window. This is the exact source the card reads; the rows should match one for one.
+> **Slow-query log.** When profiling level is 0, MongoDB still writes ops slower than `slowms` to the diagnostic log (`mongod.log`). Grep for `Slow query` lines with the window timestamps to cross-check.
+> **`db.currentOp()`.** For ops still running at snapshot time, `db.currentOp({ "secs_running": { $gte: 1 } })` shows live long-runners that the profiler will record once they complete.
+> **Atlas Profiler / Query Insights.** On MongoDB Atlas, the **Performance Advisor** and **Query Profiler** views surface the same slow ops with suggested indexes; the Atlas charts let you scrub to the exact 5-minute window.
+
+**Why our number may legitimately differ from the profiler:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Profiler sampling** | Vortex IQ count lower | If the instance runs `setProfilingLevel(1)` with a `sampleRate` below 1.0, only a fraction of slow ops are recorded; the card sees what the profiler captured. |
+| **`slowms` mismatch** | Either direction | The card honours the live `slowms`. If you query `system.profile` with a hard-coded 100ms but the instance is set to 50ms, your manual count will be higher. |
+| **Time zone** | Window edges shift | MongoDB `ts` is UTC; the card joins on UTC then renders in the merchant's display time zone. A manual query in local time can miss ops near the boundary. |
+| **Capped collection rollover** | Vortex IQ count lower for old windows | `system.profile` is a capped collection (default 1MB). On a busy instance it can roll over within minutes, dropping older entries before they are read. |
+| **Window flagging is storefront-side** | Card shows zero rows | If the storefront connector did not flag a checkout drop, the card emits no rows even when the profiler has slow ops. That is by design; without a drop there is nothing to attribute. |
+
+**Cross-channel reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| `shopify.checkout_conversion` / BigCommerce / Adobe equivalent | The checkout drop that defines the window comes from here. | If the storefront shows a drop but this card is empty, the database is exonerated; look at payment, theme, or app-script cards instead. |
+| [`mongo_slow_op_count`](/nerve-centre/kpi-cards/mongodb/slow-ops-15m-100ms) | This card's ops are a time-filtered subset of the 15m count. | The 15m count will always be greater than or equal to the checkout-window subset. |
+| Payment-gateway / checkout-app cards | Mutually exclusive root causes most of the time. | A checkout drop with no slow ops but a payment alert means the cause is the gateway, not Mongo. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**The card is empty but I know checkout was slow last night. Why no rows?**
+Three common causes. (1) The profiler was off (`setProfilingLevel(0)`) and the diagnostic log had already rotated, so there were no slow-op records to read. (2) The storefront connector did not flag that window as a checkout drop, perhaps the conversion dip was within normal variance for that time slot, so there was nothing to attribute slow ops to. (3) `system.profile` is a capped collection and rolled over before the engine read it. Lower the conversation: turn the profiler on (`setProfilingLevel(1, { slowms: 100 })`) and grow the profile collection on busy instances.
+
+**Why does a payment-gateway outage not show up here?**
+Because a gateway outage produces no slow MongoDB ops. Checkout conversion falls, the storefront flags the window, but the profiler stream for that window is clean, so the card stays empty. That empty result is informative: it tells you the database is not the cause. The drop will surface on the storefront connector's payment and checkout-app cards instead.
+
+**What is the difference between this card and Slow Ops (15m, >100ms)?**
+[Slow Ops (15m, >100ms)](/nerve-centre/kpi-cards/mongodb/slow-ops-15m-100ms) is the unconditional count: every slow op in the last 15 minutes, regardless of business impact. This card is the conditional intersection: only slow ops that landed inside a window where checkout conversion also dropped. One is a tuning backlog; this one is live revenue at risk.
+
+**The alert fired but every op is an `IXSCAN`, not a `COLLSCAN`. What now?**
+Slow `IXSCAN` ops are a different animal from missing-index scans. They usually mean one of: WiredTiger cache pressure (check [WiredTiger Cache Hit Rate %](/nerve-centre/kpi-cards/mongodb/wiredtiger-cache-hit-rate)), lock contention, a genuinely large result set that the index cannot avoid, or CPU saturation from a noisy neighbour. Start with cache hit rate and connection pool saturation rather than reaching for `createIndex`.
+
+**Does this work on a sharded cluster?**
+Yes, but read the namespaces carefully. On a sharded cluster the profiler runs per shard, so the card aggregates slow ops across shards for the window. A `COLLSCAN` confined to one shard can indicate a hot shard or poor shard-key distribution; pair with [Shard Balance Skew %](/nerve-centre/kpi-cards/mongodb/shard-balance-skew). A `mongos`-level scatter-gather query that fans out to every shard will show up as multiple slow ops with the same shape.
+
+**Why is the window only 5 minutes? My checkout funnel is noisy at that resolution.**
+Checkout damage compounds by the minute, so attribution has to be tight; a 30-minute window would smear unrelated traffic into the join and weaken the causal claim. If your store is low-volume and the 5-minute checkout signal is genuinely noisy, raise the alert threshold (the 5-op trigger) in the Sensitivity tab rather than widening the window. The window resolution is fixed; the threshold is yours to tune.
+
+**Can I scope this to only the collections on my checkout path?**
+Yes. If the connector has a path scope configured, the engine ignores slow ops on collections that are not on the checkout read/write path (for example, a reporting or analytics collection). Without a scope it counts all slow ops in the window, which is the safer default because a slow op on a shared collection can still steal CPU and cache from the checkout path.
+
+**The profiler adds overhead. Is it safe to leave on in production?**
+Profiling level 1 with a sensible `slowms` (100ms or higher) records only slow ops and has modest overhead on most workloads. Level 2 (record everything) is not recommended in production. If even level 1 is a concern on a very hot instance, rely on the diagnostic-log slow-query path instead, which logs slow ops without the capped-collection write, and lower the profile sample rate.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Slow Ops During Checkout Window (5m)* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

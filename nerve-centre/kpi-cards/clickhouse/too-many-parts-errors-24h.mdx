@@ -1,0 +1,164 @@
+---
+title: "Too Many Parts Errors (24h), ClickHouse"
+sidebarTitle: "Too Many Parts Errors (24h)"
+description: "Too Many Parts Errors (24h) for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ingest & Merges](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The count of `TOO_MANY_PARTS` errors (ClickHouse error code 252) thrown in the last 24 hours. This is ClickHouse-distinctive and it is a hard-failure counter, not a warning. When a MergeTree partition accumulates more active parts than `parts_to_throw_insert` allows, ClickHouse stops accepting inserts on that table and throws code 252 on every attempt until the part backlog drains. In plain terms: ingest is broken on that table right now, and data is being rejected. Any value above zero means writes are failing somewhere. This is the failure that [Active Parts (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) predicts; once this counter moves, the prediction has come true and the pipeline is dropping data.
+
+| | |
+| --- | --- |
+| **Data source** | Count of code-252 exceptions in `system.query_log` over 24h: `SELECT count() FROM system.query_log WHERE event_time > now() - INTERVAL 24 HOUR AND exception_code = 252`. Code 252 is `TOO_MANY_PARTS`. |
+| **What it tracks** | The number of insert attempts rejected with `TOO_MANY_PARTS` in the trailing 24 hours. Each count is a write that did not land. |
+| **Metric basis** | Error-code count from the query log, ClickHouse-distinctive. Unlike a generic failure count, code 252 has one specific cause: the parts cap on a partition was hit. |
+| **Why any >0 matters** | Code 252 means inserts are being refused. The producer is either retrying (back-pressure, latency, eventual data loss if buffers fill) or dropping the data outright. There is no "small" number here: a non-zero count is active data loss or back-pressure on ingest. |
+| **Time window** | `24h` (count over the trailing 24 hours so a burst earlier in the day is not missed by a short window). |
+| **Alert trigger** | `>0`. Any occurrence flags the card and pages the on-call DBA. This is a zero-tolerance counter. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine counts code-252 exceptions in `system.query_log` over the trailing day:
+
+```sql
+SELECT
+    count()                            AS too_many_parts_errors,
+    countDistinct(tables)              AS affected_tables,
+    max(event_time)                    AS last_error
+FROM system.query_log
+WHERE event_time > now() - INTERVAL 24 HOUR
+  AND exception_code = 252            -- TOO_MANY_PARTS
+```
+
+Error code 252 is `TOO_MANY_PARTS`, the exception ClickHouse raises when an insert would push a partition past `parts_to_throw_insert` active parts. The query log records the failed insert with this exception code, so counting code-252 rows over 24 hours gives the number of rejected writes. The `affected_tables` and `last_error` extras let a DBA see which table broke and whether it is still breaking or has since recovered.
+
+The 24-hour window is deliberately long. Unlike latency, which you want measured over minutes, an ingest failure that happened six hours ago still matters: it tells you data was lost or back-pressured during that window, even if the table has since drained and recovered. A five-minute window would let a serious morning outage disappear by lunchtime. The card keeps the full day in view so the incident is not silently forgotten.
+
+The threshold is zero because there is no benign level of this error. A single code 252 means at least one insert was refused. In a healthy pipeline this counter stays flat at zero indefinitely; it only moves when the merge scheduler has fallen so far behind that the engine has invoked its last-resort protection. That is why the alert fires on the first occurrence rather than waiting for a rate to build.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs ClickHouse behind an event-ingest pipeline. Snapshot taken on 14 Apr 26 at 13:00 BST, after an alert fired mid-morning.
+
+| 24h metric | Value |
+| --- | --- |
+| **TOO_MANY_PARTS errors (24h)** | **1,847** |
+| Affected tables | 1 (`events.clickstream_raw`) |
+| First error | 09:42 BST |
+| Last error | 12:58 BST |
+
+The Nerve Centre headline reads **1,847 TOO_MANY_PARTS errors (24h)**, flagged because it is above zero. The DBA reads three things:
+
+1. **Ingest on `clickstream_raw` has been broken for over three hours.** First error at 09:42, still erroring at 12:58. Every code 252 in that window is an insert that was refused. If the producer retries, it is back-pressured; if it does not, that data is gone.
+2. **It is one table, and it is the same table [Active Parts](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) was warning about.** The earlier amber on active parts (over 1,000 parts on `clickstream_raw`) was the leading indicator. The prediction came true at 09:42 when the partition crossed `parts_to_throw_insert`.
+3. **The error count tracks retry volume, not unique lost rows.** 1,847 is the number of *rejected attempts*; a producer retrying every few seconds inflates this. The real damage is measured by how much data the producer buffered versus dropped, which the DBA must check on the producer side.
+
+```text
+Incident response for active code 252:
+  1. Confirm the table and current part count:
+     SELECT table, count() FROM system.parts WHERE active AND table='clickstream_raw';
+  2. Stop the bleeding - reduce the inflow that is creating parts:
+     pause or throttle the ingest producer so merges can catch up.
+  3. Increase merge throughput so the backlog drains:
+     raise background_pool_size; watch system.merges drain the parts.
+  4. Do NOT just raise parts_to_throw_insert to make the error go away -
+     that hides the symptom and risks a far worse backlog later.
+  5. Fix the root cause: the producer is inserting tiny batches.
+     Batch to >=500k rows or enable async_insert=1 so each insert
+     creates one substantial part instead of dozens of small ones.
+```
+
+In this incident the producer had been changed the previous evening to flush per-event rather than in batches, so it created parts far faster than merges could consolidate them. Within three hours the partition hit the cap and ingest stopped. The fix was reverting to batched inserts; the backlog drained within twenty minutes once the inflow normalised and `background_pool_size` was temporarily raised. The producer's buffer had held most of the rejected data, so loss was limited, but the team confirmed that explicitly rather than assuming it.
+
+Three takeaways:
+
+1. **Any value above zero is an active incident.** This is not a metric to trend, it is an alarm. A non-zero count means writes are being refused right now or were refused recently. Treat the first occurrence as a page.
+2. **The error count is retry volume, not lost-row count.** A high number often means an aggressive retry loop, not catastrophic loss. Check the producer's buffering to size the real data impact.
+3. **Never fix this by raising the cap.** `parts_to_throw_insert` is a safety limit. Raising it to silence the error lets the backlog grow unbounded and turns a recoverable incident into a much harder one. Fix the insert shape at the source instead.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Too Many Parts Errors | What the combination tells you |
+| --- | --- | --- |
+| [Active Parts (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/active-parts-top-10-tables) | The leading indicator this counter confirms. | Active parts amber then this counter moving equals the predicted failure has arrived. |
+| [Too Many Parts Error or Parts Count >1000 on Any Table](/nerve-centre/kpi-cards/clickhouse/too-many-parts-error-or-parts-count-1000-on-any-table) | The Nerve Centre alert wrapping both the count and the error. | This card is the error detail; the alert card is the paging surface. |
+| [Merges In Progress](/nerve-centre/kpi-cards/clickhouse/merges-in-progress) | The merge throughput that drains the backlog. | Errors present plus few merges running equals a starved merge scheduler; raise background_pool_size. |
+| [Inserts per Second (live)](/nerve-centre/kpi-cards/clickhouse/inserts-per-second-live) | The inflow that created the part backlog. | High inserts/sec with this error equals an insert-shape problem at the source. |
+| [Partition Count (Top 10 Tables)](/nerve-centre/kpi-cards/clickhouse/partition-count-top-10-tables) | Over-granular partitioning multiplies part pressure. | Many partitions plus this error equals a partition key that is too fine-grained. |
+| [Failed Queries (24h)](/nerve-centre/kpi-cards/clickhouse/failed-queries-24h) | The broader failure counter that includes these. | Code 252 is a subset; a spike here reflected there confirms ingest is the dominant failure. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The composite that weights ingest failure heavily. | Any code 252 pulls the composite down sharply. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> Count the errors directly from `system.query_log` in `clickhouse-client`:
+> ```sql
+> SELECT count(), max(event_time) FROM system.query_log
+> WHERE event_time > now() - INTERVAL 24 HOUR AND exception_code = 252
+> ```
+> See the affected table and message with `SELECT event_time, tables, exception FROM system.query_log WHERE exception_code = 252 ORDER BY event_time DESC LIMIT 20`.
+> Confirm the live backlog with `SELECT table, count() FROM system.parts WHERE active GROUP BY table ORDER BY count() DESC`, and inspect the caps with `SELECT name, value FROM system.merge_tree_settings WHERE name IN ('parts_to_delay_insert','parts_to_throw_insert')`.
+> On **ClickHouse Cloud**, the same `system.query_log` query works in the SQL console, and the managed service surfaces ingest-error signals in its monitoring view.
+
+**Why our number may legitimately differ from a manual query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window boundary** | Slightly higher or lower | The card uses a trailing 24 hours from the refresh instant; a manual query at a different moment covers a slightly different day. |
+| **Retry counting** | Both count retries | Each rejected attempt is a separate log row, so both the card and a manual query count retries, not unique lost rows. To size data loss, check the producer. |
+| **Replica scope** | Card may differ | On a cluster the card reads the configured node's query log; inserts may have been routed to and rejected on another replica. Use `clusterAllReplicas('cluster', system.query_log)`. |
+| **Query-log retention** | Card lower if log rotated | If `query_log` TTL is under 24 hours, older errors have been purged from the table and neither the card nor a manual query can see them. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ClickHouse Event Ingest vs Ecom Orders](/nerve-centre/kpi-cards/clickhouse/clickhouse-event-ingest-vs-ecom-orders) | Code 252 stalls event ingest, so ingest diverges below the order/click rate it normally tracks. | Orders flowing but ingest flat with code 252 present equals the pipeline broken at the database, not upstream. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What exactly is error code 252?**
+Code 252 is ClickHouse's `TOO_MANY_PARTS` exception. It is thrown when an insert would push a MergeTree partition past `parts_to_throw_insert` active parts. At that point the engine refuses the insert to protect itself from an unbounded part backlog that would degrade reads and merges. The error is the engine's last-resort protection; it means the merge scheduler has fallen far behind the insert rate.
+
+**Does this counter mean I have lost data?**
+It means inserts were *refused*. Whether that became data loss depends on the producer. A well-behaved producer buffers and retries, so the data lands once the backlog drains, at the cost of back-pressure. A fire-and-forget producer drops the rejected rows. The error count tells you writes were rejected; you must check the producer's buffering and retry behaviour to know how much, if any, data was actually lost.
+
+**Why is the threshold zero? Surely a few are tolerable.**
+There is no benign level of code 252. Each one is a write the database refused, which never happens in a healthy pipeline. A "few" is just a small outage rather than a large one. Treating the first occurrence as a page is correct because the underlying condition (a partition at its parts cap) does not self-heal until the inflow drops or merges catch up.
+
+**Can I just raise parts_to_throw_insert to stop the errors?**
+No, and this is the most important warning on this card. Raising the cap silences the symptom while letting the part backlog grow even larger, which degrades query performance and makes the eventual reckoning far worse. The cap exists to protect you. The correct fix is to reduce the part-creation rate (batch inserts, enable `async_insert`) and increase merge throughput (`background_pool_size`), not to remove the safety limit.
+
+**The error count is huge but only one table is affected. Why so high?**
+Because a producer that retries every few seconds against a table stuck at its cap generates a code 252 on every attempt. Three hours of retries at one attempt per second is over ten thousand errors from a single broken table. The high count reflects retry frequency, not the severity of data loss. Read `affected_tables` (often just one) alongside the raw count.
+
+**The errors stopped, but the counter still shows a high number. Is it still broken?**
+Not necessarily. The counter covers a trailing 24 hours, so it includes errors from earlier in the day even after the table recovered. Check `max(event_time)` (the `last_error` value): if the last error was hours ago and `system.parts` shows the table back under its cap, ingest has recovered and the count is historical. The counter will fall as the 24-hour window rolls past the incident.
+
+**On ClickHouse Cloud, can I still hit this?**
+Yes. ClickHouse Cloud manages infrastructure but does not change the physics of parts and merges. A producer inserting in tiny batches will accumulate parts and can still trip `TOO_MANY_PARTS` on Cloud. The same `system.query_log` query identifies it, and the same fix (batch at the source or enable `async_insert`) applies.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Too Many Parts Errors (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

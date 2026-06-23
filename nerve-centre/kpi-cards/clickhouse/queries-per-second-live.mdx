@@ -1,0 +1,149 @@
+---
+title: "Queries per Second (live), ClickHouse"
+sidebarTitle: "Queries per Second (live)"
+description: "Queries per Second (live) for ClickHouse instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Queries per Second (live) is the rate at which the ClickHouse instance is accepting and executing queries, sampled in real time. For a platform team this is the single pulse that says "how busy is the database right now?" It is the denominator behind almost every other ratio on the board: error rate, slow-query rate, and latency percentiles all read differently at 50 QPS than at 5,000 QPS. A sudden QPS swing, up or down, is usually the first sign that something changed upstream: a deploy, a dashboard storm, a bot, or a stalled ingest pipeline.
+
+| | |
+| --- | --- |
+| **What it tracks** | The number of queries the server starts per second, computed live from the `Query` event delta in `system.events` divided by the sampling interval. |
+| **Data source** | Queries per Second (live) for the selected period, derived from the `Query` counter in `system.events` (a monotonic event counter) sampled at short intervals and differenced to produce a rate. |
+| **Metric basis** | Query starts, not query completions. A long-running query counts once at start; it does not inflate QPS while it runs. This keeps QPS a clean arrival-rate signal. |
+| **Aggregation window** | Real-time gauge (`RT`). The headline shows the latest sampled rate; the sparkline shows the recent trend. |
+| **Time window** | `RT` (real-time) |
+| **Alert trigger** | None. QPS is a context metric, not an alarm. Read it alongside the error, latency, and saturation cards which carry their own thresholds. |
+| **What counts** | All query starts the server records: SELECTs, INSERTs, DDL, and system queries, across native, HTTP, and wire-protocol interfaces. |
+| **What does NOT count** | Queries rejected before execution (for example, refused at the connection layer) and purely internal background operations (merges, mutations) that do not register as a `Query` event. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+ClickHouse exposes a monotonic `Query` counter in `system.events` that increments every time a query starts. QPS is the delta of that counter over the sampling interval:
+
+```sql
+-- Two samples a few seconds apart, differenced into a rate.
+-- Conceptually:
+--   qps = (Query_now - Query_prev) / (t_now - t_prev)
+SELECT value AS query_count_now
+FROM system.events
+WHERE event = 'Query';
+```
+
+The engine reads the `Query` event at each sample, subtracts the previous sample, and divides by the elapsed seconds to produce the live rate. Because `system.events` is a server-lifetime cumulative counter, a single reading is meaningless on its own; the rate only emerges from differencing two readings. On a multi-node cluster the card sums per-node rates to give cluster-wide QPS. See the At a glance summary for what the metric tracks and the worked example below for a typical reading.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs ClickHouse behind a real-time product-analytics dashboard plus an event-ingest pipeline. Normal weekday QPS sits around 800. Snapshot sequence taken on 14 Apr 26 across the morning:
+
+| Time (BST) | QPS (live) | What was happening |
+| --- | --- | --- |
+| 08:30 | 780 | Baseline, overnight batch finished |
+| 09:00 | 1,240 | Analysts arrive, dashboards refresh |
+| 09:05 | 4,900 | Sudden spike |
+| 09:20 | 1,180 | Back to morning normal |
+
+The 09:05 spike to 4,900 QPS is six times baseline. Three readings the team should take from this card:
+
+1. **QPS alone never tells you if a spike is good or bad.** Six times baseline could be a genuine traffic surge (great), a runaway dashboard with auto-refresh set to 1 second (wasteful), or a bot hammering an unauthenticated endpoint (a problem). To classify it, pair this card with [ClickHouse QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/clickhouse/clickhouse-qps-spike-vs-ecom-order-rate). If orders spiked too, it is real demand; if orders are flat, it is a dashboard storm or a bot.
+
+2. **QPS reframes every ratio on the board.** At 09:05 the [Query Error Rate %](/nerve-centre/kpi-cards/clickhouse/query-error-rate) card showed 0.8%. At baseline 800 QPS that is roughly 6 failed queries per second; at the spike's 4,900 QPS the same 0.8% is roughly 39 failed queries per second. The percentage looked stable but the absolute failure volume jumped 6x. Always read error and slow-query percentages against the QPS denominator.
+
+3. **A QPS collapse is as informative as a spike.** If QPS suddenly drops toward zero while the application is plainly still serving users, the database is likely refusing connections (check [Connection Pool Saturation %](/nerve-centre/kpi-cards/clickhouse/connection-pool-saturation)) or the ingest pipeline has stalled (check [Inserts per Second (live)](/nerve-centre/kpi-cards/clickhouse/inserts-per-second-live)). A flat-line at zero during business hours is an outage signal, not a quiet period.
+
+```text
+Sizing the 09:05 spike:
+  - Baseline QPS:        800
+  - Spike QPS:           4,900  (6.1x baseline)
+  - Error rate held at:  0.8%
+  - Failed queries/sec:  baseline ~6  ->  spike ~39
+  - p95 latency moved:   42ms -> 118ms (queuing under load)
+  - Verdict: classify against order rate before scaling.
+```
+
+The correct response to a QPS spike is to classify before reacting. If [ClickHouse QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/clickhouse/clickhouse-qps-spike-vs-ecom-order-rate) shows orders rising in step, scale capacity. If orders are flat, find the noisy client in `system.processes` or `system.query_log` (group by `initial_user` or `http_user_agent`) and rate-limit it rather than scaling the cluster to serve waste.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards platform teams should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Queries per Second | What the combination tells you |
+| --- | --- | --- |
+| [Query Error Rate %](/nerve-centre/kpi-cards/clickhouse/query-error-rate) | QPS is the denominator; error rate is the ratio. | A stable error percentage at rising QPS still means more absolute failures per second. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/clickhouse/query-latency-p95-ms) | Latency typically climbs as QPS approaches capacity. | Rising p95 with rising QPS equals queuing; rising p95 with flat QPS equals a slow query, not load. |
+| [Connection Pool Saturation %](/nerve-centre/kpi-cards/clickhouse/connection-pool-saturation) | A QPS collapse often means refused connections. | QPS dropping while saturation is at 100% confirms the pool is the bottleneck. |
+| [Inserts per Second (live)](/nerve-centre/kpi-cards/clickhouse/inserts-per-second-live) | The write-side companion to read QPS. | QPS steady but inserts at zero means the ingest pipeline stalled while reads carry on. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/clickhouse/slow-query-rate) | High QPS plus high slow-query rate compounds load. | Tells you whether the spike is cheap point queries or expensive scans. |
+| [ClickHouse Health Score](/nerve-centre/kpi-cards/clickhouse/clickhouse-health-score) | The executive composite that contextualises QPS. | Confirms whether a busy instance is also a healthy one. |
+| [ClickHouse QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/clickhouse/clickhouse-qps-spike-vs-ecom-order-rate) | Classifies a spike as real demand or noise. | QPS up with orders up equals real; QPS up with orders flat equals dashboard storm or bot. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in ClickHouse's own tooling:**
+
+> **`system.events`** for the cumulative `Query` counter: `SELECT value FROM system.events WHERE event = 'Query'`. Take two readings a few seconds apart and divide the difference by the elapsed time to reproduce the live rate.
+> **`system.metrics`** for the instantaneous `Query` gauge (queries currently running), which is a different thing: running queries, not arrival rate.
+> **`system.query_log`** for a historical, exact count: `SELECT count() FROM system.query_log WHERE type = 'QueryStart' AND event_time >= now() - 60` gives queries started in the last minute, divide by 60 for QPS.
+> **ClickHouse Cloud console** (managed service): the Metrics tab plots query rate per service over time.
+
+**Why our number may legitimately differ from a direct query:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sampling vs exact log** | Variable | The live card differences `system.events` over a short interval; `system.query_log` gives an exact retrospective count. Short-interval sampling can read slightly above or below the per-minute average during bursts. |
+| **Per-node vs cluster** | Our number higher | The card sums per-node QPS for cluster-wide rate; a single-node query reflects one node only. |
+| **Counter reset on restart** | One-off | `system.events` resets when the server restarts; a sample spanning a restart is discarded by the engine but a manual differenced reading would show a negative or nonsensical value. |
+| **Query type inclusion** | Variable | The `Query` event counts all query types (SELECT, INSERT, DDL, system). A manual count filtered to SELECTs only will read lower. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ClickHouse QPS Spike vs Ecom Order Rate](/nerve-centre/kpi-cards/clickhouse/clickhouse-qps-spike-vs-ecom-order-rate) | QPS should rise and fall roughly in step with storefront order/click rate. | QPS up with orders flat equals a non-shopper-driven spike (dashboard storm, bot, retry loop). |
+| Storefront traffic cards | Genuine demand moves both. | A divergence is the signal that the QPS change is internal, not customer-driven. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is there no alert threshold on QPS?**
+QPS has no inherently good or bad value. 5,000 QPS is healthy for one cluster and a crisis for another. Alerting lives on the consequence metrics (error rate, latency, saturation), which carry their own thresholds. QPS is the context you read those alarms against, not an alarm itself.
+
+**What is the difference between the `Query` event and the `Query` metric?**
+The `Query` event in `system.events` is a cumulative counter of queries started since server boot; differencing it gives arrival rate (this card). The `Query` metric in `system.metrics` is an instantaneous gauge of queries running right now. High concurrency (gauge) and high arrival rate (this card) are related but distinct: a few long queries can make the gauge high while QPS stays low.
+
+**My manual count from `system.query_log` does not match the card. Why?**
+Two reasons. First, the card samples `system.events` over a short live interval while the log gives an exact retrospective count, so they differ during bursts. Second, `system.query_log` only records queries if logging is enabled and not sampled down; if `log_queries` is off or `log_queries_probability` is below 1, the log undercounts. The live card reads the event counter directly and is unaffected by log sampling.
+
+**Does QPS include INSERT queries?**
+Yes. The `Query` event counts every query start regardless of type. If you want read-only QPS, filter `system.query_log` by `query_kind = 'Select'`. For most capacity decisions the combined figure is what matters, because INSERTs compete for the same threads and connections as reads.
+
+**QPS dropped to near zero during business hours. Is the card broken?**
+Almost certainly not, and that drop is a serious signal. The usual causes are: the connection pool is full and refusing new connections (check [Connection Pool Saturation %](/nerve-centre/kpi-cards/clickhouse/connection-pool-saturation)), the server is overloaded and queries are queuing rather than starting, or an upstream component stopped sending traffic. A genuine zero during business hours is an outage, not a quiet period.
+
+**How does QPS behave on a multi-node cluster?**
+The card sums per-node arrival rates into one cluster-wide QPS. If load is unbalanced (one node taking most queries), the cluster total can look healthy while one node is saturated. For per-node detail, query `system.events` on each node directly or use the Cloud console's per-node view.
+
+**Does a server restart affect the reading?**
+The `Query` event counter resets to zero on restart. The engine detects the reset (a sample lower than the previous) and discards that interval rather than reporting a negative rate, so the live card stays clean across restarts. A manual differenced reading spanning a restart would show a misleading negative value.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Queries per Second (live)* is one of hundreds of KPI pulses Vortex IQ tracks across ClickHouse and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

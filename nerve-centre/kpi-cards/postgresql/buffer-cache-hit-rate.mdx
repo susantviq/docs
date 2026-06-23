@@ -1,0 +1,162 @@
+---
+title: "Buffer Cache Hit Rate %, PostgreSQL"
+sidebarTitle: "Buffer Cache Hit Rate %"
+description: "Buffer Cache Hit Rate for PostgreSQL instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cache](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This gauge reports what fraction of PostgreSQL's page reads were served from its own shared-buffers cache rather than read from disk. It is the share of `blks_hit` in the total of `blks_hit + blks_read`. A high number means your working set fits in memory and queries rarely wait on storage; a number sliding below 95% on a production OLTP database is the classic sign that `shared_buffers` is undersized for your working set, or that a query pattern has started scanning more data than the cache can hold. For a DBA this is one of the cleanest early-warning gauges you have: it bends before latency does, so it gives you a head start on a memory-pressure problem before users feel it.
+
+| | |
+| --- | --- |
+| **What it tracks** | The ratio `blks_hit / (blks_hit + blks_read)`, expressed as a percentage: the proportion of buffer reads satisfied from shared memory rather than the operating system / disk layer. |
+| **Data source** | `blks_hit` and `blks_read` from `pg_stat_database` (per-database cumulative counters). The card reads the delta between polls so it reflects the recent window, not the all-time average since the stats were last reset. |
+| **Time window** | `RT/1h` (a live reading plus a one-hour rolling view to smooth short bursts). |
+| **Alert trigger** | `<95%`. On a production OLTP workload, a sustained hit rate under 95% is the threshold where disk reads start to materially affect latency. Analytics-heavy workloads can run lower by design; tune the threshold per instance. |
+| **Roles** | dba, platform, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The hit rate is a straightforward ratio of two cumulative counters:
+
+```text
+hit_rate = blks_hit / (blks_hit + blks_read)
+fire when: hit_rate < 0.95  (on a production OLTP profile)
+```
+
+`blks_hit` counts buffer reads that found the page already in PostgreSQL's shared-buffers cache. `blks_read` counts reads that did not, and had to go to the storage layer. Crucially, a `blks_read` "miss" in PostgreSQL terms does not always mean a physical disk seek: the page may still be sitting in the operating system's page cache, so PostgreSQL records a miss while the OS serves it from RAM. This is why a slightly-below-95% PostgreSQL hit rate on a Linux host can still feel fast, the OS is acting as a second cache tier. The gauge measures PostgreSQL's own cache only.
+
+Two computation details matter for reading the number correctly:
+
+1. **Delta, not lifetime.** The raw counters in `pg_stat_database` accumulate from the last stats reset, so the lifetime ratio is dominated by history and barely moves. The card computes the delta between polls, so a fresh problem (a new full-table-scan query, a cold cache after restart) shows up promptly instead of being buried under months of good history.
+
+2. **Per-database scope.** `pg_stat_database` reports per database. The card surfaces the active database(s); a rarely-touched database with a poor ratio over a tiny sample is not the same signal as your busy OLTP database dipping.
+
+The companion view at the table level is `pg_statio_user_tables` (`heap_blks_hit` / `heap_blks_read` per table), which tells you *which* table is causing a global dip, the natural drill-down when this gauge moves.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs PostgreSQL 15 backing a product-catalogue API on a host with 32 GB RAM and `shared_buffers` set to 8 GB. The hit rate normally sits at 99.4%. Snapshot taken on 27 Apr 26 at 13:20 BST after a release that added a new search feature.
+
+| Window | blks_hit | blks_read | Hit rate | State |
+| --- | --- | --- | --- | --- |
+| 12:00 to 13:00 (pre-release) | 1.81B | 10.9M | 99.40% | healthy |
+| 13:05 to 13:20 (post-release) | 0.42B | 31.5M | **93.0%** | **BREACH** |
+
+The card fires. The headline reads **Buffer Cache Hit Rate 93.0% (BREACH)**. The DBA reads:
+
+1. **Disk reads jumped sharply.** `blks_read` per minute roughly tripled while `blks_hit` per minute fell. Something is now reading pages that are not in the cache, and reading a lot of them.
+2. **Latency is starting to follow, but has not spiked yet.** Cross-reference [Query Latency p95 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p95-ms); it has crept from 22ms to 41ms. The hit-rate gauge bent first, which is exactly the head start this card is meant to give.
+3. **The timing points at the release.** The dip starts within minutes of the deploy that added search. The prime suspect is a new query doing a sequential scan over a large table that does not fit comfortably alongside the existing working set in 8 GB of shared buffers.
+
+```text
+Drill-down to the offending table:
+  SELECT relname,
+         heap_blks_hit,
+         heap_blks_read,
+         round(100.0 * heap_blks_hit
+               / nullif(heap_blks_hit + heap_blks_read, 0), 2) AS hit_pct
+  FROM pg_statio_user_tables
+  ORDER BY heap_blks_read DESC
+  LIMIT 5;
+
+  Result: products_search at 71% hit rate, heap_blks_read dominating.
+  -> the new search query scans products_search without a usable index,
+     pulling cold pages from disk on every request and evicting hot
+     catalogue pages, which drags the whole-database ratio down.
+```
+
+```text
+Fixes, in order of preference:
+  1. Add the missing index so the search query stops sequential-scanning.
+     (EXPLAIN (ANALYZE, BUFFERS) on the new query confirms Seq Scan + high reads.)
+  2. If the scan is unavoidable, consider whether shared_buffers (8 GB on a
+     32 GB host) should grow toward the common 25% guideline, but only after
+     confirming the working set genuinely exceeds the current cache.
+  3. Check pg_stat_statements for the new query's share of total reads.
+```
+
+The index fix is the right first move here: the cache did not shrink, a single badly-planned query started thrashing it. Throwing more `shared_buffers` at a missing index hides the symptom and wastes RAM.
+
+Three takeaways:
+
+1. **Hit rate bends before latency breaks.** That is the value of this gauge. By the time p95 latency is obviously bad, customers are already affected; a hit-rate dip gives you minutes-to-hours of warning to find the cause.
+2. **A sudden dip is usually a query, not a capacity wall.** When the rate falls right after a change, suspect a new full-table scan thrashing the cache, not a working set that quietly outgrew memory. The table-level drill-down (`pg_statio_user_tables`) finds it fast.
+3. **95% is an OLTP threshold, not a universal law.** A reporting or analytics database that deliberately scans large cold datasets will run lower and that is fine. Set the threshold to your workload; do not chase 99% on a database whose job is to read data that will never fit in cache.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Buffer Cache Hit Rate | What the combination tells you |
+| --- | --- | --- |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p95-ms) | The downstream symptom of cache misses. | Hit rate dips first; if latency follows, the misses are reaching real disk. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/postgresql/query-latency-p99-ms) | The tail most sensitive to disk reads. | A small hit-rate dip can blow out p99 long before p95 moves. |
+| [Slow-Query Rate %](/nerve-centre/kpi-cards/postgresql/slow-query-rate) | Catches the query causing the thrash. | A new slow query plus a hit-rate dip equals a missing index thrashing the cache. |
+| [Memory Usage %](/nerve-centre/kpi-cards/postgresql/memory-usage) | Distinguishes "cache too small" from "host out of RAM". | Low hit rate with memory headroom equals raise shared_buffers; no headroom equals scale the host. |
+| [Top Tables by Dead Tuples](/nerve-centre/kpi-cards/postgresql/top-tables-by-dead-tuples) | Bloat wastes cache on dead pages. | High bloat alongside a dip means the cache is holding dead weight. |
+| [Queries per Second (live)](/nerve-centre/kpi-cards/postgresql/queries-per-second-live) | Separates a load surge from a query regression. | Hit rate down with flat QPS equals a query change, not more traffic. |
+| [PostgreSQL Health Score](/nerve-centre/kpi-cards/postgresql/postgresql-health-score) | The composite that reflects cache efficiency. | A sustained dip nudges the composite before any alert-class card fires. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostgreSQL's own tooling:**
+
+> Compute it directly: `SELECT datname, blks_hit, blks_read, round(100.0 * blks_hit / nullif(blks_hit + blks_read, 0), 2) AS hit_pct FROM pg_stat_database WHERE datname = current_database();`. Note this is the lifetime ratio since the last reset, not the recent delta the card shows.
+> Drill to the table level with `pg_statio_user_tables` (`heap_blks_hit` / `heap_blks_read`) and to indexes with `pg_statio_user_indexes` to find the source of a dip.
+> Inspect a specific query with `EXPLAIN (ANALYZE, BUFFERS) <query>;`; the `Buffers: shared hit=... read=...` line is the per-query version of this metric.
+> On a managed service, the provider exposes a related metric: RDS / Aurora surface `BufferCacheHitRatio`, Cloud SQL reports cache-hit ratios in its insights, and Azure exposes a similar buffer-cache metric. These align with the gauge but may be sampled and scoped differently.
+
+**Why our number may legitimately differ from PostgreSQL's own view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Delta vs lifetime** | Card more responsive | The card uses the between-poll delta; a hand-run `pg_stat_database` query shows the lifetime average since reset, which moves slowly and looks healthier during a fresh dip. |
+| **OS page cache** | Card may look worse than felt latency | A `blks_read` miss may still be served from the Linux page cache in RAM; PostgreSQL counts it as a miss but the read is fast. The gauge measures PostgreSQL's cache only. |
+| **Stats reset** | Card resets too | `pg_stat_reset()` zeroes the counters; the lifetime ratio restarts, and the card's delta is unaffected but the source query looks different. |
+| **Per-database scope** | Possible mismatch | The card focuses on the active/busy database; a `SELECT` across all rows of `pg_stat_database` blends quiet databases in. |
+| **Managed-service definition** | Slight difference | Provider cache-hit metrics may include OS-level or instance-level caching, so a provider number can read higher than PostgreSQL's own `blks_hit` ratio. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My hit rate is 94% but queries feel fast. Is the alert a false alarm?**
+Possibly, and the usual reason is the operating-system page cache. A PostgreSQL `blks_read` miss can still be served from the OS page cache in RAM, so the read is fast even though PostgreSQL counts it as a miss. The gauge measures PostgreSQL's own shared-buffers cache, not the OS tier. If your latency cards are healthy and 94% is your normal baseline, lower the threshold for this instance in the Sensitivity tab rather than chasing it.
+
+**Should I just keep increasing shared_buffers until the rate hits 99%?**
+No. The common guidance is around 25% of host RAM for `shared_buffers`, because PostgreSQL relies on the OS page cache for the rest and oversizing shared buffers can hurt by double-caching and starving the OS. If the dip is caused by a single bad query thrashing the cache, more `shared_buffers` hides the problem; fix the query (usually a missing index) first. Only grow `shared_buffers` after confirming the genuine working set exceeds the current cache.
+
+**The rate dropped right after a deploy. Where do I start?**
+At the table level. Run the `pg_statio_user_tables` drill-down (ordered by `heap_blks_read`) to find which table is now generating the disk reads, then `EXPLAIN (ANALYZE, BUFFERS)` the new query against it. A sudden dip after a change is almost always a new sequential scan over a large table for want of an index, not a capacity problem.
+
+**Why does the card show a different number from my SELECT on pg_stat_database?**
+Because the card uses the recent delta between polls and the raw `pg_stat_database` query shows the lifetime average since the last stats reset. The lifetime ratio is dominated by history and moves very slowly, so during a fresh dip it can still read 99% while the card correctly shows the current 93%. The delta is what makes the card a useful early warning.
+
+**Does autovacuum or bloat affect the hit rate?**
+Indirectly, yes. A bloated table holds many dead tuples spread across more pages, so scans touch more pages to find live rows, which wastes cache on dead weight and lowers the effective hit rate. If a dip coincides with high bloat, check [Top Tables by Dead Tuples](/nerve-centre/kpi-cards/postgresql/top-tables-by-dead-tuples) and [Oldest Autovacuum Age (hours)](/nerve-centre/kpi-cards/postgresql/oldest-autovacuum-age-hours); cleaning up the table can recover both space and cache efficiency.
+
+**Is 95% the right threshold for an analytics or reporting database?**
+Often not. A database whose job is to scan large, cold datasets that will never fit in memory will run a lower hit rate by design, and that is correct behaviour, not a fault. The 95% default targets OLTP workloads where the working set should be hot. For analytics instances, set a lower, workload-appropriate threshold so you are alerted on genuine regressions rather than on the nature of the workload.
+
+**After a restart the rate is terrible. Is something wrong?**
+No, that is a cold cache. On restart `shared_buffers` is empty, so early reads are nearly all misses until the working set warms back up. The rate climbs as hot pages reload. This is expected; the delta-based reading recovers within minutes on a busy instance. If you restart often and the cold-start dip is noisy, consider `pg_prewarm` to reload known-hot relations on startup.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Buffer Cache Hit Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across PostgreSQL and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -1,0 +1,161 @@
+---
+title: "PostgREST 5xx Error Rate %, Supabase"
+sidebarTitle: "PostgREST 5xx Error Rate %"
+description: "PostgREST 5xx Error Rate % for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [PostgREST API](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The percentage of requests to your Supabase auto-generated REST API that returned a 5xx server error over the last five minutes. PostgREST is the layer that turns your Postgres schema into a REST API: every time your app calls `supabase.from('orders').select(...)`, it hits PostgREST, which translates that into SQL and runs it. For most Supabase apps, PostgREST *is* the backend. A 5xx here is not a client mistake (that would be a 4xx); it is the server failing to fulfil a valid request. When this climbs, your app is throwing errors to real users: products will not load, carts will not save, checkout fails. Anything above 1% means a measurable slice of your traffic is breaking.
+
+| | |
+| --- | --- |
+| **What it tracks** | The share of PostgREST responses with a 5xx status code (500, 502, 503, 504) over the rolling window: failed requests divided by total requests, times 100. |
+| **Data source** | Supabase API gateway / PostgREST request logs, surfaced via the project Logs (API/PostgREST) and the API analytics. Each request is logged with its status code, path, and timing. |
+| **Time window** | `5m` rolling. Fast enough to catch a regression within minutes of a deploy, short enough that a transient blip clears quickly. |
+| **Alert trigger** | `>1%`. Above this, the card turns red and feeds the Nerve Centre incident feed. For a customer-facing API, 1% is already a lot of broken sessions. Tune per project in the Sensitivity tab. |
+| **Why it matters** | PostgREST is the request path for the whole app. A 5xx spike here is the closest single number to "the app is down". Unlike a slow query (which is annoying), a 5xx is a hard failure the user sees as a broken page. |
+| **Reading the value** | 0 to 0.1% is normal background noise. 0.1 to 1% means something is degraded; find the failing path. Above 1% is an incident. A sudden jump to several percent right after a deploy is a regression; a slow climb usually means a resource ceiling (pool, memory, disk). |
+| **Roles** | engineering, platform/SRE, owner |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The gauge is the ratio of 5xx responses to total responses over the window:
+
+```text
+PostgREST 5xx Error Rate % = (5xx responses / total responses) × 100
+```
+
+Only **5xx** status codes count as failures here: 500 (internal error), 502 (bad gateway), 503 (service unavailable), 504 (gateway timeout). These are server-side failures. Deliberately excluded:
+
+- **4xx codes** (400, 401, 403, 404, 409, 422) are *client* errors: a malformed query, a missing JWT, a Row Level Security policy denial, a unique-constraint conflict. These are not server failures and belong on a different signal; lumping them in would mask real outages behind routine auth rejections.
+- **2xx and 3xx** are successes and form the bulk of the denominator.
+
+What actually produces a PostgREST 5xx in practice:
+
+- **Connection pool exhaustion:** PostgREST cannot get a database connection, so it returns 503/504. This is the single most common cause and links directly to Supavisor saturation.
+- **Statement timeouts:** a query exceeds the configured `statement_timeout` and PostgREST returns an error.
+- **Database errors:** a query hits a deadlock, an out-of-memory condition, or a Postgres-side fault that bubbles up as a 5xx.
+- **PostgREST restarts / schema-cache reloads:** during a schema reload or a restart, in-flight requests can briefly 5xx.
+- **Upstream gateway issues:** the API gateway in front of PostgREST returns 502/503 if PostgREST is unreachable.
+
+The window is rolling 5 minutes, so a burst lifts the rate within a poll or two and decays out once resolved. Note the denominator effect on low-traffic projects: a handful of 5xx against a small request count produces a large percentage, so the Sensitivity tab offers a minimum-request floor to avoid false alarms during quiet periods.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a headless storefront whose entire data layer is Supabase via PostgREST. The app calls PostgREST for product listings, cart operations, and order creation. Snapshot reviewed on 28 Apr 26 at 20:30 BST during an evening promotion.
+
+| Time | Requests (5m) | 5xx | 5xx rate | Dominant cause | Notable |
+| --- | --- | --- | --- | --- | --- |
+| 20:00 | 41,000 | 12 | 0.03% | transient | healthy |
+| 20:20 | 88,000 | 210 | 0.24% | statement timeouts | promo traffic building |
+| 20:28 | 132,000 | 3,560 | **2.70%** | 503 pool exhausted | checkout failing |
+| 20:35 | 96,000 | 240 | 0.25% | recovering | after mitigation |
+
+At 20:28 the card read **2.70%**, deep red. The promotion drove request volume up 3x; PostgREST could not get database connections fast enough and started returning 503s. Crucially, the failures clustered on the order-creation path (a multi-statement transaction that holds a connection longer), so checkout was hit hardest while product browsing mostly succeeded.
+
+```text
+Anatomy of the spike:
+  - Total requests (5m at 20:28):   132,000
+  - 5xx responses:                  3,560  (≈ 2.70%)
+  - Breakdown of the 3,560:
+      • 503 (pool exhausted):       3,100   ← root cause
+      • 504 (statement timeout):    360
+      • 500 (deadlock on orders):   100
+  - Supavisor pool saturation at 20:28:  98%
+  - The 5xx spike and the pool spike are the same event.
+
+Business impact while red (≈7 minutes):
+  - Order-creation calls failing at ~12%
+  - Estimated failed checkouts:     ~140 sessions
+  - Each is a customer who saw an error at the worst moment
+```
+
+What the team did, in order:
+
+1. **Found the linked cause fast.** The pinned [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) panel read 98% at the same moment, so this was pool exhaustion, not a code bug. That told them to relieve connection pressure, not roll back.
+2. **Shed connection load.** They reduced the order-creation transaction from four statements to two and added a `statement_timeout` so a slow order could not hold a connection open. Saturation fell, and the 5xx rate dropped to 0.25% within five minutes.
+3. **Sized for next time.** They scheduled a compute resize to lift the connection cap before the next promotion, so the same traffic leaves pool headroom.
+
+Three takeaways:
+
+1. **5xx here means the app is down for that slice of users.** Unlike latency (slow but working), a 5xx is a hard failure the customer sees. Treat any sustained reading over 1% as a live incident.
+2. **The cause is usually downstream, not in PostgREST.** PostgREST rarely fails on its own; it fails because it cannot get a connection (pool), the query times out, or the database errors. Always pair this card with pool saturation, memory, and query-error rate to find the real cause.
+3. **Watch which path fails.** A flat 2.7% project rate hid the fact that checkout was failing at 12% while browsing was fine. The path breakdown is where the money is; a 5xx on order-creation costs far more than a 5xx on a product image.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with PostgREST 5xx Error Rate | What the combination tells you |
+| --- | --- | --- |
+| [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) | Pool exhaustion is the most common cause of 5xx. | Both red together is the classic pool-exhaustion outage; relieve connections, do not roll back. |
+| [PostgREST 5xx Error Spike (>1% in 5m)](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-spike-1-in-5m) | The alert-feed card that fires on this metric. | This gauge is the live reading; that card is the incident entry it raises when the rate crosses 1%. |
+| [PostgREST API Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgrest-api-latency-p95-ms) | Latency usually rises before requests start failing outright. | Climbing latency then a 5xx spike is a degrade-to-fail pattern; act on the latency early warning. |
+| [Database Query Error Rate %](/nerve-centre/kpi-cards/supabase/database-query-error-rate) | DB-side errors bubble up as PostgREST 5xx. | If both move together, the fault is in the query/database layer, not the API layer. |
+| [Memory Usage %](/nerve-centre/kpi-cards/supabase/memory-usage) | An OOM or memory pressure produces 5xx. | High memory plus a 5xx spike points at resource exhaustion rather than a code regression. |
+| [Supabase Health Score](/nerve-centre/kpi-cards/supabase/supabase-health-score) | The composite that weights API error rate heavily. | A red 5xx rate drags the score; use the score for the executive headline. |
+| [Slow PostgREST Queries During Checkout Window](/nerve-centre/kpi-cards/supabase/slow-postgrest-queries-during-checkout-window) | Cross-channel view linking slow API calls to checkout drops. | Confirms whether the 5xx spike landed on the revenue path during a checkout window. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase's own tooling:**
+
+> **Project Dashboard → Logs → API / PostgREST** for the per-request log stream with status code, path, and timing. Filter by `status_code >= 500` to isolate the failures and see which paths are affected.
+> **Project Dashboard → Reports → API** for the request and error-rate charts the card aggregates, with status-code breakdowns over time.
+> **Logs Explorer** with a SQL filter on the API logs source (for example a count of requests where the status code is 500 or above) for an exact count over an arbitrary window when you need to reconcile a specific period.
+
+**Why our number may legitimately differ from the Supabase UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Window boundary** | Variable | Vortex IQ uses a rolling 5-minute window; the Supabase chart you are viewing may be set to 1h or 24h, which smooths the spike. Match the range before comparing. |
+| **What counts as an error** | Vortex IQ reads lower than an "all errors" chart | This card counts only 5xx. A Supabase error chart that includes 4xx (auth rejections, RLS denials, 404s) will show a higher rate; that is expected and intentional. |
+| **Minimum-request floor** | Vortex IQ may suppress | On low traffic, the floor avoids a few 5xx producing a misleading large percentage; the raw count is still recorded. |
+| **Log ingestion latency** | Brief lag | API logs land within seconds, but a heavy burst can delay aggregation by a poll, so a fresh incident may read slightly low on the first sample. |
+| **Gateway versus PostgREST** | Source-dependent | Some 502/503 originate at the API gateway when PostgREST is unreachable; depending on which log source you read, attribution between gateway and PostgREST can differ. The card folds gateway 5xx into the rate because the user experiences both as a server error. |
+
+**Cross-connector reconciliation:** if your app has its own front-end error tracking (an APM or RUM tool), a PostgREST 5xx spike should correspond to a rise in client-side API errors. If your front-end tool shows users hitting errors but this card is flat, the failure is upstream of PostgREST (CDN, the app's own server, a third-party API). If this card spikes but the front-end tool is quiet, the failing calls may be background jobs or Edge Functions rather than user sessions; cross-check [Edge Function Error Rate %](/nerve-centre/kpi-cards/supabase/edge-function-error-rate).
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why count only 5xx and not 4xx?**
+4xx codes are client errors: a bad query, a missing or expired JWT, a Row Level Security denial, a unique-constraint conflict. They are routine and expected (an unauthenticated user hitting a protected table generates a 401 by design). Counting them would bury real server outages under normal auth traffic. This card isolates 5xx so a spike unambiguously means the server is failing valid requests. Track 4xx separately if you need to watch auth or RLS rejection rates.
+
+**The rate spiked but my database CPU and memory look fine. What failed?**
+Almost certainly the connection pool. PostgREST returns 503/504 when it cannot get a database connection, and that happens at the pool layer while CPU and memory stay healthy. Check [Supavisor Pool Saturation %](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation) at the time of the spike; a reading near 100% confirms it. The fix is to relieve connection pressure (shorter transactions, a `statement_timeout`, harder pooling, or a tier with a higher cap), not to roll back code.
+
+**The rate jumped right after a deploy. Is it always pool related?**
+No. A spike that coincides exactly with a deploy is often a code or schema regression: a migration that broke a view PostgREST exposes, a renamed column the app still queries, or a schema-cache reload that briefly 5xx'd in-flight requests. Check the failing paths in the API logs; if they all hit one new or changed endpoint, roll back or fix the schema rather than scaling.
+
+**My rate is noisy on a low-traffic project. How do I stop false alarms?**
+The denominator effect: a few 5xx against a small request count is a large percentage. Set a minimum-request floor in the Sensitivity tab so a quiet 5-minute window does not trip the alert on three stray errors. The floor only suppresses the alert; the raw error count is still recorded for review.
+
+**Do statement timeouts count as 5xx here?**
+Yes. When a query exceeds `statement_timeout`, PostgREST returns a 5xx (typically 504), so timeouts inflate this rate. If the spike is dominated by timeouts rather than 503s, the cause is slow queries or lock contention rather than pool exhaustion. Cross-reference [Slow-Query Rate %](/nerve-centre/kpi-cards/supabase/slow-query-rate) and the deadlocks card to confirm.
+
+**Can I see which endpoint is failing, not just the overall rate?**
+The card surfaces the aggregate rate; the per-path breakdown lives in the Supabase API logs (filter by `status_code >= 500` and group by path). This matters because a flat overall rate can hide a critical path failing badly while everything else is healthy. Always drill into the path breakdown during an incident: a 5xx on checkout costs far more than a 5xx on a non-critical read.
+
+**Can I tune the 1% alert threshold?**
+Yes, in the Sensitivity tab. For a customer-facing API, 1% is already a lot of broken sessions, so many teams tighten it to 0.5%. A background-only API with retry logic might tolerate a higher threshold. Avoid setting it so high that an incident is well underway before the alert fires; the point of a 5-minute window is early detection.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*PostgREST 5xx Error Rate %* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

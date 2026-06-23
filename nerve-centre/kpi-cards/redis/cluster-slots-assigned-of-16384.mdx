@@ -1,0 +1,160 @@
+---
+title: "Cluster Slots Assigned (of 16384), Redis"
+sidebarTitle: "Cluster Slots Assigned (of 16384)"
+description: "Cluster Slots Assigned for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication & Cluster](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A Redis Cluster divides the keyspace into exactly 16384 hash slots, and every slot must be owned by a reachable primary for the whole keyspace to be serveable. This card is the live gauge of how many of those slots are currently healthy and assigned, read straight from `cluster_slots_ok` in `CLUSTER INFO`. A reading of 16384 is full coverage; anything below means some keys are unreachable and operations on those slots fail. For a platform or SRE team this is the heartbeat of cluster availability: one number that says "is my entire keyspace serveable right now?"
+
+| | |
+| --- | --- |
+| **Data source** | `cluster_slots_ok` from `CLUSTER INFO`, read across all reachable nodes. `<16384` means some keys unreachable (operations on those slots fail). |
+| **Metric basis** | Slot-ownership health, not key count or memory. Each of the 16384 slots is either owned by a reachable primary (counted) or not (missing). |
+| **Full-coverage value** | `16384`. A healthy cluster always reads exactly 16384 with `cluster_state:ok`. |
+| **Aggregation window** | `RT` (real-time). The gauge re-reads `CLUSTER INFO` on every poll cycle. |
+| **Alert trigger** | `<16384`. Any reading below full coverage means part of the keyspace is dark; this is the same condition the [Cluster Slot Coverage Gap](/nerve-centre/kpi-cards/redis/cluster-slot-coverage-gap-16384-slots-assigned) alert pages on. |
+| **What does NOT count toward coverage** | (1) Slots whose primary is down with no promoted replica; (2) slots in `fail`/`pfail` state. Slots in `MIGRATING`/`IMPORTING` during a reshard are still served and still counted. |
+| **Topology scope** | All shards in the cluster the connector targets. On managed services (AWS ElastiCache cluster mode, Azure Cache for Redis Enterprise, Redis Cloud) the same `CLUSTER INFO` view is read through the configured endpoint. |
+| **Standalone instances** | Not applicable. A non-cluster instance has no hash slots and reads `n/a`. |
+| **Time window** | `RT` (real-time, re-evaluated on every poll) |
+| **Alert trigger** | `<16384` |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calc */}
+The card issues `CLUSTER INFO` and reads the `cluster_slots_ok` line directly:
+
+```text
+slots_assigned = cluster_slots_ok      # 0 .. 16384
+coverage_pct   = cluster_slots_ok / 16384 * 100
+```
+
+`cluster_slots_ok` is Redis's own count of slots that are both assigned to a primary and whose primary is currently in an `ok` (reachable) state. The headline shows the raw count against 16384 and the coverage percentage. Two companion fields refine the reading: `cluster_slots_pfail` (slots whose owner is suspected dead by some node but not yet agreed) and `cluster_slots_fail` (slots whose owner is agreed dead). When everything is healthy these are both zero and `cluster_slots_ok` is 16384.
+
+Because each node holds its own view of the cluster and a network-partitioned node can report a stale, optimistic count, Vortex IQ reads `CLUSTER INFO` from every reachable node and takes the lowest `cluster_slots_ok` it sees. That ensures a minority node cannot mask a genuine coverage shortfall with a rosy local reading.
+{/* /HUMAN_AUTHORED:calc */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a Redis Cluster of three primaries (each with one replica) backing a session store and a read-through cache. Slots are split evenly: 0 to 5460, 5461 to 10922, 10923 to 16383. Snapshot taken on 09 May 26 across a 12-minute window during a rolling node upgrade.
+
+| Time (BST) | Event | `cluster_slots_ok` | `cluster_state` | Coverage |
+| --- | --- | --- | --- | --- |
+| 10:00 | Steady state | 16,384 | ok | 100% |
+| 10:04 | Primary C taken down for upgrade | 10,922 | fail | 66.7% |
+| 10:04:09 | Replica C-rep promoted to primary | 16,384 | ok | 100% |
+| 10:08 | Upgraded C rejoins as replica | 16,384 | ok | 100% |
+
+At 10:04 the team took primary C down to upgrade it. For the ~9 seconds it took the cluster to detect the loss and promote C's replica, slots 10923 to 16383 had no reachable owner, so `cluster_slots_ok` dropped to 10,922 (two shards' worth) and `cluster_state` read `fail`. As soon as C-rep was promoted, coverage returned to 16384.
+
+```text
+CLUSTER INFO at 10:04 (during the promotion window):
+  cluster_state:fail
+  cluster_slots_assigned:16384
+  cluster_slots_ok:10922
+  cluster_slots_pfail:0
+  cluster_slots_fail:5462
+  -> coverage 10922 / 16384 = 66.7%  -> below 16384 -> ALERT
+
+CLUSTER INFO at 10:04:09 (after promotion):
+  cluster_state:ok
+  cluster_slots_ok:16384            -> coverage restored
+```
+
+The Vortex IQ gauge dipped to **10,922 / 16,384 (66.7%)** for those seconds, then snapped back to **16,384 / 16,384 (100%)**. What the on-call engineer reads from this:
+
+1. **The dip was expected, the recovery was automatic.** Because primary C had a healthy replica, the cluster promoted it within the failover timeout and coverage was restored without intervention. A planned rolling upgrade shard-by-shard should produce exactly this pattern: brief dips that self-heal.
+2. **The size of the dip tells you how much was at risk.** Two shards' worth missing (5462 slots) means a third of the keyspace was unreachable for those 9 seconds. Had two shards been down at once, the dip would be larger and the recovery slower.
+3. **A dip that does not recover is the real incident.** If coverage had stayed at 10,922, it would have meant C had no replica to promote, turning a routine upgrade into a sustained outage. The value of this gauge is watching it return to 16384 promptly.
+
+```text
+Health framing for the upgrade:
+  - Full coverage baseline: 16,384 / 16,384
+  - Expected dip per shard upgraded: ~5,461 slots, < 10s
+  - Recovery requirement: a healthy replica per primary (so promotion can happen)
+  - Red flag: coverage that stays below 16,384 past the failover timeout
+  - Pre-check before next upgrade: confirm Connected Replicas = 1 per shard
+```
+
+Three takeaways for the on-call DBA:
+
+1. **16384 is the only fully healthy reading.** Any other number, even 16383, means at least one slot is unreachable and some keys are erroring. There is no "nearly full coverage" that is safe; it is binary in customer terms.
+2. **Brief dips during failover are normal; persistent shortfalls are incidents.** Watch the gauge return to 16384. Speed of recovery is governed by `cluster-node-timeout` and whether a replica exists to promote.
+3. **This gauge and the coverage-gap alert are the same signal, two views.** This card is the continuous number; the [Cluster Slot Coverage Gap](/nerve-centre/kpi-cards/redis/cluster-slot-coverage-gap-16384-slots-assigned) alert is its threshold page. Read them together: the gauge for trend, the alert for the wake-up.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to read alongside this one
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Cluster Slots Assigned | What the combination tells you |
+| --- | --- | --- |
+| [Cluster Slot Coverage Gap (<16384 slots assigned)](/nerve-centre/kpi-cards/redis/cluster-slot-coverage-gap-16384-slots-assigned) | The threshold alert this gauge feeds. | Same `cluster_slots_ok`: this card is the live number, that one is the page. |
+| [Connected Replicas](/nerve-centre/kpi-cards/redis/connected-replicas) | Replicas are what restore coverage after a primary dies. | Full coverage but zero replicas on a shard equals one host loss away from a gap. |
+| [Replica Lag (seconds)](/nerve-centre/kpi-cards/redis/replica-lag-seconds) | A promoted replica with high lag restores coverage but loses writes. | High lag at promotion equals coverage back, recent writes gone. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The executive composite that coverage dominates. | Any drop below 16384 collapses the health score; this card is the cause. |
+| [Instance Uptime](/nerve-centre/kpi-cards/redis/instance-uptime) | A reset uptime on a shard explains a coverage dip. | A recent restart on a node aligns with the dip in coverage. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/redis/operations-per-second-live) | Throughput tracks coverage during a dip. | OPS falling in proportion to lost slots confirms client errors on the dark range. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis itself:**
+
+> **`CLUSTER INFO`** is the authority: `redis-cli -c CLUSTER INFO` shows `cluster_state`, `cluster_slots_assigned`, and `cluster_slots_ok`.
+> **`CLUSTER SHARDS`** (Redis 7+) or **`CLUSTER NODES`** maps each slot range to its owning node, so a shortfall can be traced to a specific primary.
+> **`CLUSTER SLOTS`** returns the slot-to-node assignment as a structured list; a missing range is simply absent.
+> **`redis-cli --cluster check <host>:<port>`** runs Redis's own coverage audit and prints "[OK] All 16384 slots covered" or names the uncovered slots.
+
+**Why our number may legitimately differ from a single node's view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Per-node staleness** | We may show a lower count momentarily | A partitioned node reports its own optimistic `cluster_slots_ok`; we read all nodes and take the lowest, so we can show a dip a majority node has not yet agreed. |
+| **Failover in flight** | Transient dip then recovery | During promotion the count drops then returns; a `CLUSTER INFO` read after recovery shows 16384, while we captured the dip. |
+| **Reshard in progress** | No change, despite busy `CLUSTER NODES` | MIGRATING/IMPORTING slots are still served and still counted, so coverage stays 16384 throughout a reshard. |
+| **Poll cadence** | We may miss a sub-poll flap | A coverage dip shorter than the poll interval can be missed by both our gauge and a manual check; only sustained or repeated dips are reliably captured. |
+
+**Managed-service note:** AWS ElastiCache (cluster mode enabled), Azure Cache for Redis (Enterprise/clustered), and Redis Cloud all serve `CLUSTER INFO` through the configured endpoint, and each surfaces a "shards healthy" or "node group" health view in its own console. Reconcile our coverage count against the console's healthy-shard count: on an evenly split three-shard cluster, one unhealthy shard corresponds to roughly 5461 missing slots, two shards to roughly 10922.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My instance is a single standalone Redis. Why does this card read n/a?**
+Hash slots only exist in Redis Cluster mode. A standalone primary owns the whole keyspace implicitly and reports no `cluster_slots_ok`, so the gauge reads `n/a` and does not alert. For availability monitoring of a standalone setup, watch [Connected Replicas](/nerve-centre/kpi-cards/redis/connected-replicas) and [Instance Uptime](/nerve-centre/kpi-cards/redis/instance-uptime) instead.
+
+**The gauge dipped below 16384 for a few seconds during a node upgrade and recovered. Was that bad?**
+No, that is the expected pattern for a rolling upgrade. When you take a primary down, its slots are briefly unowned until a replica is promoted (bounded by `cluster-node-timeout`), so coverage dips and then returns. A self-healing dip means failover worked. The concerning case is a dip that does not recover, which means the dead primary had no replica to promote.
+
+**What is the difference between `cluster_slots_assigned` and `cluster_slots_ok`?**
+`cluster_slots_assigned` counts slots that have an owner configured (regardless of whether that owner is currently reachable); it should always be 16384 on a properly set-up cluster. `cluster_slots_ok` counts slots whose owner is configured and reachable. The gap between them is your coverage problem: assigned 16384 but ok 10922 means owners exist but one is down.
+
+**Can coverage read 16384 while I still have a problem?**
+Yes, in a subtle way. `cluster_slots_ok` only measures slot ownership and primary reachability. A cluster can be at full coverage while a replica is missing or lagging badly, so you are at full coverage but with no resilience: the next primary loss would open a gap. Always read this gauge with [Connected Replicas](/nerve-centre/kpi-cards/redis/connected-replicas) and [Replica Lag (seconds)](/nerve-centre/kpi-cards/redis/replica-lag-seconds) to confirm you can survive a failover, not just that you are healthy now.
+
+**During a reshard `CLUSTER NODES` shows slots MIGRATING. Why does coverage stay at 16384?**
+Migrating and importing slots are still served by their current owner throughout the move; clients are redirected with `ASK`/`MOVED` but never get `CLUSTERDOWN`. So coverage stays at full throughout a healthy reshard. A dip during a reshard would indicate the operation broke, which is rare and worth investigating.
+
+**We run `cluster-require-full-coverage no`. Does this gauge still reflect reality?**
+Yes. That setting changes how the cluster behaves when a slot is unserved (it keeps serving the slots it still owns rather than refusing commands cluster-wide) but it does not change `cluster_slots_ok`. The gauge reads the slot count directly, so a shortfall shows up whether or not `cluster_state` reports `fail`.
+
+**On ElastiCache the console says all shards healthy but the gauge dipped. Which do I trust?**
+Check timing and cadence. Managed-service health views often poll on a coarser interval (around 60 seconds) and smooth transient states, while we read `CLUSTER INFO` in real time and take the most pessimistic node view. A brief dip during an ElastiCache node replacement can be invisible in the console but real on the wire. Settle it with `redis-cli --cluster check` against the endpoint, which queries every node and reports actual coverage at that moment.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Cluster Slots Assigned (of 16384)* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

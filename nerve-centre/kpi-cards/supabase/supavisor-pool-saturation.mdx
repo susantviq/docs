@@ -1,0 +1,156 @@
+---
+title: "Supavisor Pool Saturation %, Supabase"
+sidebarTitle: "Supavisor Pool Saturation %"
+description: "Supavisor Pool Saturation % for Supabase projects. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Capacity](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> How full your Supabase connection pool is. Supavisor is Supabase's cloud-native connection pooler: it sits between your application and Postgres and multiplexes many client connections onto a smaller set of real database connections. Postgres can only handle a bounded number of direct connections (each one is a process that costs memory), and every Supabase tier has a hard connection cap. Supavisor lets hundreds or thousands of clients share that capped pool. This card shows how much of the pool is in use. At 90% you are one traffic burst away from clients being unable to get a connection at all, which means queries queue, time out, and the app starts throwing connection errors.
+
+| | |
+| --- | --- |
+| **What it tracks** | Active (checked-out) pooled connections as a percentage of the pool's configured maximum size. When this hits 100%, new connection requests wait in a queue or are refused. |
+| **Data source** | Supavisor pooler metrics for the project: the pool's configured `pool_size`/`max_client_conn` and the live count of in-use server connections. Surfaced via the project Database → Connection Pooling settings and infrastructure metrics. |
+| **Time window** | `RT/1m`: a real-time gauge with a 1-minute sustained view used for alerting, so a single-second spike does not trip the alarm but a sustained squeeze does. |
+| **Alert trigger** | `>90%`. Past this, the card turns red and feeds the Nerve Centre incident feed: the pool is nearly exhausted and a burst will cause connection failures. Tune per project in the Sensitivity tab. |
+| **Why it matters** | Pool exhaustion is one of the fastest paths from healthy to total outage. When the pool is full, even trivial queries cannot get a connection; the app sees `remaining connection slots are reserved` or pooler timeouts, and the storefront effectively goes down despite the database itself being healthy. |
+| **Reading the value** | Under 70% is comfortable. 70 to 90% means a busy pool with shrinking headroom; investigate connection leaks or under-pooling. Above 90% sustained means act now: a peak will exhaust it. Tier matters: Free and Pro have low hard caps, so they saturate far sooner than larger tiers. |
+| **Roles** | platform/SRE, engineering, owner |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The gauge is the ratio of in-use pooled connections to the pool's maximum:
+
+```text
+Supavisor Pool Saturation % = (active server connections / pool max size) × 100
+```
+
+A few definitions matter:
+
+- **Pool max size** is the ceiling Supavisor is configured to hold open to Postgres. It is bounded above by the tier's hard connection cap: Free and Pro tiers permit a small number of direct Postgres connections, while larger compute tiers allow more. You cannot pool your way past the underlying Postgres cap; Supavisor lets many clients *share* the capped connections, but the capped number is still the ceiling.
+- **Active server connections** is the count Supavisor currently has checked out doing work. In transaction-mode pooling (the most efficient mode), a connection is held only for the duration of a transaction and returned immediately, so a small pool can serve a large number of brief clients.
+- **Client connections** (the front side, what your app opens) can vastly exceed server connections because Supavisor multiplexes them. This card measures the *server* side (the scarce resource), not the client side.
+
+Two pooling modes change the behaviour: **transaction mode** returns the connection to the pool after each transaction (high multiplexing, the usual choice for serverless and high-concurrency apps), while **session mode** holds a server connection for the whole client session (needed for features like prepared statements or `LISTEN`/`NOTIFY`, but it saturates the pool far faster because each client monopolises a server slot for its entire lifetime).
+
+The alert uses a 1-minute sustained view: a momentary touch of 90% from a single burst is normal, but 90% held for a minute means the pool genuinely lacks headroom. The card reads the live ratio so you can watch it climb in real time during a traffic ramp.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a flash-sale storefront on Supabase Pro. The app is serverless (each function instance opens its own client connection), so they route everything through Supavisor in transaction mode. Their pool max is 60 server connections. Snapshot reviewed on 25 Apr 26 at 19:00 BST, two minutes into a scheduled drop.
+
+| Time | Client connections | Active server connections | Saturation | App symptom |
+| --- | --- | --- | --- | --- |
+| 18:55 | 220 | 26 / 60 | 43% | healthy |
+| 18:59 | 480 | 41 / 60 | 68% | healthy |
+| 19:00 | 1,310 | 57 / 60 | **95%** | first pooler timeouts |
+| 19:01 | 1,680 | 60 / 60 | **100%** | connection refused, checkout failing |
+
+At 19:00 the card read **95%** and at 19:01 it pinned at **100%**. The flash sale drove client connections from 480 to 1,680 in two minutes. Supavisor multiplexed them onto the 60-connection pool fine until demand for *concurrent* server connections exceeded 60, at which point new requests queued and then timed out. The database CPU and memory were both healthy; the bottleneck was purely the pool ceiling, which on Pro is bound by the tier's connection cap.
+
+```text
+What pinned the pool:
+  - Pool max:                        60 server connections
+  - Peak concurrent transactions:    ~80 wanting a slot at 19:01
+  - Slots available:                 60
+  - Overflow:                        ~20 requests queued, then timed out
+  - DB CPU at the time:              54%  (plenty of headroom)
+  - DB memory at the time:           71%  (fine)
+  → The database was healthy; the POOL was the outage.
+
+Mitigations the team applied:
+  - Confirmed transaction mode (it was) so connections release fast
+  - Cut the per-request query count on the product page from 4 to 1
+  - Added a short statement_timeout so a slow query cannot hog a slot
+  - Scheduled a compute resize to lift the connection cap for the next drop
+```
+
+What the team did, in order:
+
+1. **Immediate:** shed load by reducing the number of queries per page request, so each server connection was held for less time and the pool churned faster, which dropped saturation from 100% to about 78% within a minute.
+2. **Same day:** added a `statement_timeout` so a single slow query could not occupy a pool slot indefinitely and starve everyone else.
+3. **Before the next drop:** resized compute to a tier with a higher connection cap, lifting the pool max so the same burst left headroom.
+
+Three takeaways:
+
+1. **The pool can be the outage even when the database is fine.** CPU and memory were healthy throughout; the storefront still went down because there were no connection slots. Watch this card as closely as the resource gauges.
+2. **Tier caps the pool.** On Free and Pro the hard connection cap is low, so a modest burst saturates the pool. You cannot pool past the cap; if you genuinely need more concurrent connections, you need a bigger tier.
+3. **Hold time is your lever.** Saturation is concurrency times hold time. Shorter transactions (fewer queries per request, a `statement_timeout`, transaction-mode pooling) free slots faster and let a small pool serve far more clients.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Supavisor Pool Saturation | What the combination tells you |
+| --- | --- | --- |
+| [Connections In Use](/nerve-centre/kpi-cards/supabase/connections-in-use) | The absolute count behind the percentage. | The raw number tells you how close you are to the tier cap in connections, not just percent; read both. |
+| [Supavisor Pool at >90% Saturation](/nerve-centre/kpi-cards/supabase/supavisor-pool-at-90-saturation) | The alert-feed card that fires on this metric. | This gauge is the live reading; that card is the incident entry it raises when sustained over 90%. |
+| [Memory Usage %](/nerve-centre/kpi-cards/supabase/memory-usage) | Every connection costs memory. | High saturation and high memory together confirm too many backends; pooling harder relieves both. |
+| [PostgREST API Latency p95 (ms)](/nerve-centre/kpi-cards/supabase/postgrest-api-latency-p95-ms) | A starved pool makes API calls wait for a connection. | Latency rising in step with saturation means requests are queuing for a pool slot, not running slow queries. |
+| [PostgREST 5xx Error Rate %](/nerve-centre/kpi-cards/supabase/postgrest-5xx-error-rate) | Pool exhaustion surfaces as 5xx at the API. | Both red together is the classic pool-exhaustion outage signature. |
+| [Supavisor Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/supabase/supavisor-pool-saturation-vs-traffic-burst) | The cross-channel view linking saturation to revenue traffic. | Confirms whether a saturation spike coincides with a real revenue burst, sizing the business impact. |
+| [Database Queries per Second (live)](/nerve-centre/kpi-cards/supabase/database-queries-per-second-live) | Query volume drives connection demand. | A QPS climb that lifts saturation is your early warning to scale before the pool pins. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Supabase's own tooling:**
+
+> **Project Dashboard → Database → Connection Pooling** for the pooler configuration: the pool mode (transaction/session), pool size, and the connection string clients should use. This confirms the denominator the percentage is based on.
+> **Project Dashboard → Reports → Database** for the connection-count charts over time, including pooler client and server connections.
+> **SQL Editor** with `select count(*) from pg_stat_activity;` for the live count of backend connections on Postgres, and `show max_connections;` for the underlying cap, to cross-check the pool ceiling against the database cap.
+
+**Why our number may legitimately differ from the Supabase UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Client versus server connections** | Large gap | The Supabase pooler page distinguishes client (front-side) and server (back-side) connections. This card measures the scarce server side; the client count can be far higher and is not what saturation is about. |
+| **Sample timing** | Variable | The card reads live and uses a 1-minute sustained view for alerting; a Supabase chart averaged over a longer bucket smooths the peaks, so our instantaneous spike reads higher. |
+| **Pool size config** | Must match | If the pool was resized recently, confirm both views use the new max; a stale denominator skews the percentage. |
+| **Pool mode** | Behaviour differs | In session mode each client holds a server slot for its whole session, so saturation climbs and stays high; in transaction mode it churns. Make sure you are comparing the same mode. |
+| **Direct connections** | Bypass the pool | Connections that hit Postgres directly (not via the pooler port) consume the underlying cap without showing as pool saturation. If direct and pooled connections compete for the same cap, the pool can exhaust below 100% pool-saturation. |
+
+**Cross-connector reconciliation:** correlate saturation spikes with your front-end traffic source. If saturation climbs in step with a marketing-driven traffic burst (a campaign launch, a flash sale, an email send), that is expected load and the answer is capacity. If saturation climbs with flat front-end traffic, suspect a connection leak in the app (connections opened and never returned) or a long-running query hogging slots; that is a code fix, not a scaling one.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My app shows "remaining connection slots are reserved" or pooler timeouts. Is that this card?**
+Yes, that is the pool exhausting. When saturation hits 100%, new connection requests queue and then time out, and Postgres refuses direct connections once the cap is reached. Check this card at the time of the errors: a reading at or near 100% confirms it. The fix is to reduce hold time (shorter transactions, a `statement_timeout`), pool harder, or resize to a tier with a higher cap.
+
+**The database CPU and memory look fine but the app is down. How?**
+Pool exhaustion is an outage that does not touch CPU or memory. The database can be idle and the storefront still fail because there are no connection slots to run even a trivial query. This card exists precisely to catch that failure mode, which the resource gauges miss. Always read pool saturation alongside CPU and memory, not instead of them.
+
+**What is the difference between client and server connections?**
+Client connections are what your app opens to Supavisor; server connections are what Supavisor opens to Postgres. Supavisor multiplexes many clients onto few server connections, so you might have 2,000 clients and 60 server connections. This card measures the server side because that is the scarce, capped resource. A huge client count is fine as long as server saturation stays under 90%.
+
+**Should I use transaction mode or session mode?**
+Transaction mode for almost everything, especially serverless and high-concurrency apps: it returns the server connection after each transaction, so a small pool serves many clients. Use session mode only when you need session-scoped features (some prepared-statement patterns, `LISTEN`/`NOTIFY`, advisory locks held across statements). Session mode saturates the pool far faster because each client monopolises a slot for its whole lifetime.
+
+**I increased the pool size but it still saturates. Why?**
+The pool cannot exceed the tier's hard Postgres connection cap. If your pool max is already at the cap, raising the configured pool size does nothing; you are bounded by `max_connections` on the instance. To genuinely add capacity you need a larger compute tier (which raises the cap), or you need to cut connection demand (shorter transactions, fewer queries per request, fixing leaks).
+
+**Can I tune the 90% alert threshold?**
+Yes, in the Sensitivity tab. A spiky, bursty workload should alert earlier (say 80%) to give lead time before a burst pins the pool. A steady workload with predictable load can sit at 90%. Avoid going much higher: above 90% there is very little headroom, so the alert needs to fire while you still have time to shed load or scale.
+
+**Direct connections from a tool (psql, a migration runner) seem to push me over. Do they count?**
+They consume the underlying Postgres connection cap even though they bypass the pooler, so they reduce the slots available to the pool. A migration runner or a BI tool holding several direct connections can make the pool exhaust below 100% pool-saturation because the real cap is shared. Route application traffic through Supavisor and keep direct-connection tools to a minimum during peak windows.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Supavisor Pool Saturation %* is one of hundreds of KPI pulses Vortex IQ tracks across Supabase and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

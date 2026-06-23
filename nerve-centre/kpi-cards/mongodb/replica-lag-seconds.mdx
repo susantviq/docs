@@ -1,0 +1,139 @@
+---
+title: "Replica Lag (seconds), MongoDB"
+sidebarTitle: "Replica Lag (seconds)"
+description: "Replica Lag (seconds) for MongoDB deployments. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Replication & Sharding](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Replica Lag (seconds)** is how far behind the primary the slowest secondary is, measured as the gap between the primary's most recent oplog entry and the secondary's last-applied oplog entry. It answers two operational questions at once: "if the primary dies right now, how much data could I lose?" and "are my secondary reads stale?" Healthy lag is sub-second to a couple of seconds. The card alerts at 10s, because beyond that a failover risks data loss, secondary reads serve noticeably stale data, and a member may be on its way to falling off the oplog entirely.
+
+| | |
+| --- | --- |
+| **What it tracks** | The replication delay (in seconds) of the most-lagged secondary relative to the primary, across the replica set. |
+| **Data source** | Derived from `rs.status()`: the difference between the primary's `optimeDate` and each secondary's `optimeDate` (the same calculation `rs.printSecondaryReplicationInfo()` performs). |
+| **Time window** | `RT` (real-time, refreshed on the standard live interval). |
+| **Alert trigger** | `> 10s`. Lag beyond 10 seconds risks data loss on failover and serves stale secondary reads. |
+| **Calculation basis** | The maximum lag across all data-bearing secondaries; arbiters are excluded because they hold no data. |
+| **Units** | Seconds. |
+| **Roles** | platform, engineering, sre |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The card reads `rs.status()` and, for each data-bearing secondary, computes the difference between the primary's last applied oplog timestamp (`optimeDate`) and that secondary's `optimeDate`. This is precisely the figure MongoDB's own `rs.printSecondaryReplicationInfo()` helper reports as "replication lag". The card surfaces the *maximum* lag across all secondaries, because the cluster is only as safe as its slowest replica: a failover promotes a secondary, and if the most up-to-date eligible secondary is behind, the writes it has not yet applied are at risk.
+
+Two subtleties matter:
+
+1. **Idle-write artefact.** Lag is computed from oplog timestamps. On a set with little write traffic, a secondary can show a few seconds of apparent lag simply because the primary has not written a new oplog entry recently, so the secondary's last-applied entry is "old" without the secondary actually being behind. The engine treats this the way MongoDB does, by comparing against the primary's latest optime; on genuinely idle sets a small, stable reading is expected and is not a fault.
+2. **Arbiters and delayed members excluded.** Arbiters hold no data and report no meaningful optime, so they are excluded. Intentionally delayed members (configured with `secondaryDelaySecs` for point-in-time recovery) are excluded from the alerting maximum where the connector knows their configured delay, so a deliberately delayed hidden member does not constantly trip the 10s alert.
+
+The alert fires when the maximum genuine lag stays above 10 seconds. Sustained growth in this number (lag climbing steadily rather than holding flat) is the more serious signal: it means the secondary cannot keep up with the write rate and will eventually fall off the end of the oplog and require a full resync.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 3-node replica set (1 primary, 2 secondaries) backing the order and inventory services. Secondary reads are enabled for the reporting dashboards. Snapshot taken on 03 Jun 26 at 09:30 BST, during a large overnight bulk-import job that ran long.
+
+| Member | Role | optime gap vs primary | Lag (s) | Note |
+| --- | --- | --- | --- | --- |
+| node-a:27017 | PRIMARY | 0 | 0 | Taking writes |
+| node-b:27017 | SECONDARY | 2s | 2 | Healthy |
+| node-c:27017 | SECONDARY | 47s | 47 | **Alert: lag > 10s and climbing** |
+
+The card headline reads **47s** (the maximum across secondaries). node-b is fine at 2s, but node-c has fallen 47 seconds behind and the trend over the last few minutes is upward (it was 18s five minutes ago). Two consequences are live right now:
+
+1. **Failover risk.** If node-a fails in this state, an election would prefer node-b (only 2s behind), but if node-b were also unavailable, promoting node-c would lose up to 47 seconds of acknowledged-on-primary writes that node-c never applied. That is potential order data loss.
+2. **Stale secondary reads.** The reporting dashboards reading from node-c are showing data nearly a minute old. For inventory counts during a busy period, that staleness can cause overselling decisions.
+
+```text
+Reading the lag trend:
+  lag flat and small (0-3s)        -> healthy, normal replication
+  lag flat but elevated on idle set -> oplog-timestamp artefact, usually benign
+  lag climbing steadily            -> secondary cannot keep up; will fall off the oplog -> resync
+  lag spikes then recovers          -> a transient (a long write, an index build, a network blip)
+```
+
+What the team does: a climbing lag during a bulk import points at the secondary's apply throughput being saturated by the write volume, or at I/O contention on node-c specifically. They check whether node-c is also doing a background index build, confirm the oplog window is comfortably larger than the lag (so the member will recover rather than need a resync), and consider throttling the import's batch size. They cross-check [Replica Set Members (state)](/nerve-centre/kpi-cards/mongodb/replica-set-members-state) to confirm node-c is still `SECONDARY` and not slipping into `RECOVERING`, and [Elections (24h)](/nerve-centre/kpi-cards/mongodb/elections-24h) to confirm the lag has not already triggered a failover.
+
+Three takeaways:
+
+1. **Lag is your real-world RPO.** The recovery-point objective is not a config setting; it is whatever this card reads at the moment the primary fails. A 47s lag means up to 47s of potential data loss on an unlucky failover.
+2. **The trend matters more than the absolute value.** A flat 12s is far less alarming than a 4s reading that doubles every minute. Climbing lag means the secondary is losing the race against the write rate and heading for a resync.
+3. **Stale reads are a silent correctness bug.** If you read from secondaries, lag directly degrades data freshness. A dashboard or an inventory check on a lagged secondary is quietly serving old numbers; tie read-staleness expectations to this card.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Replica Lag | What the combination tells you |
+| --- | --- | --- |
+| [Replica Set Members (state)](/nerve-centre/kpi-cards/mongodb/replica-set-members-state) | The topology behind the lag. | Confirms whether the lagged member is still `SECONDARY` or slipping into `RECOVERING`. |
+| [Replica Set Member Lag >10s or in RECOVERING State](/nerve-centre/kpi-cards/mongodb/replica-set-member-lag-10s-or-in-recovering-state) | The alert-list partner. | Lists every member breaching the lag or recovery threshold for one-glance triage. |
+| [Elections (24h)](/nerve-centre/kpi-cards/mongodb/elections-24h) | The failover-stability peer. | High lag plus frequent elections means the set is unstable and risking data loss on each flap. |
+| [Operations per Second (live)](/nerve-centre/kpi-cards/mongodb/operations-per-second-live) | The write-load context. | A lag rise that tracks an ops spike means the secondary cannot keep pace with write volume. |
+| [Database Disk Usage %](/nerve-centre/kpi-cards/mongodb/database-disk-usage) | The capacity peer. | A near-full disk on the secondary can stall apply and inflate lag. |
+| [MongoDB Health Score](/nerve-centre/kpi-cards/mongodb/mongodb-health-score) | The composite roll-up. | Confirms whether replication lag is dragging overall health below its threshold. |
+| [Last Successful Backup (hours ago)](/nerve-centre/kpi-cards/mongodb/last-successful-backup-hours-ago) | The other data-durability surface. | High lag plus stale backups means both recovery paths are weak at once. |
+| [Chunks Pending Migration](/nerve-centre/kpi-cards/mongodb/chunks-pending-migration) | The sharded-cluster peer. | Heavy balancer migration can compete for I/O and inflate lag on a shard's secondaries. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in MongoDB's own tooling:**
+
+> Run `rs.printSecondaryReplicationInfo()` in `mongosh` for the per-secondary lag figures the card is built from, or `rs.status()` to read each member's `optimeDate` and compute the gap against the primary yourself.
+> Check `db.printReplicationInfo()` on the primary to see the oplog window (first-to-last entry time span); the lag must stay well inside this window or the secondary will fall off and need a full resync.
+> On **MongoDB Atlas**, the Metrics tab exposes a "Replication Lag" chart per secondary node; pick the most-lagged node to match the card's maximum-across-secondaries reading.
+> `rs.status().members[].stateStr` confirms whether a lagged member has dropped into `RECOVERING`.
+
+**Why our number may legitimately differ from MongoDB's native view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Max vs per-node** | Card may read higher | The card surfaces the maximum across all secondaries; a native per-node chart for a healthy node will show less. Compare against the worst node. |
+| **Idle-write artefact** | Both may overstate | On a low-write set, oplog-timestamp gaps make lag look non-zero even when replication is current; this affects both our reading and `rs.printSecondaryReplicationInfo()`. |
+| **Delayed members** | Card lower | Intentionally delayed members are excluded from our alerting maximum where their configured delay is known; a raw `rs.status()` includes their full configured delay. |
+| **Sampling instant** | Brief difference | The card polls on a fixed interval; a live `rs.status()` taken seconds apart can differ during a fast-changing lag event. |
+
+**Cross-connector reconciliation:** pair with [MongoDB Pool Saturation vs Traffic Burst](/nerve-centre/kpi-cards/mongodb/mongodb-pool-saturation-vs-traffic-burst) to see whether a write burst that drove pool pressure is the same event inflating lag. For divergence investigations, use Vortex Mind.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My write traffic is low and the card shows a few seconds of lag. Is something wrong?**
+Almost certainly not. Replication lag is derived from oplog timestamps, and on a quiet set the primary may not have written a new oplog entry for a few seconds, which makes the secondary's last-applied entry look "old" even though it is fully caught up. A small, stable reading on a low-write set is the idle-write artefact and is benign. Watch for lag that *climbs* under real write load; that is the genuine signal.
+
+**Which secondary does the headline number represent?**
+The maximum across all data-bearing secondaries: the card always shows your worst replica, because failover safety and read-staleness risk are governed by the slowest member. To see per-node detail, open [Replica Set Members (state)](/nerve-centre/kpi-cards/mongodb/replica-set-members-state) or the per-node Atlas replication-lag chart.
+
+**My lag is flat at 12s, above the alert, but not growing. How urgent is it?**
+Less urgent than climbing lag, but still worth fixing. Flat elevated lag usually means the secondary is keeping pace with writes but at a steady offset, often due to I/O or CPU constraints on that node, network latency between sites, or a sustained high write rate. Confirm the oplog window comfortably exceeds the lag so the member will not fall off, then address the underlying constraint. Climbing lag is the emergency; flat elevated lag is a capacity conversation.
+
+**Does a delayed (hidden) member trip this alert?**
+Where the connector knows a member's configured `secondaryDelaySecs`, that member is excluded from the alerting maximum, so a deliberately delayed point-in-time-recovery member does not constantly fire the alert. If you see a delayed member counted, check that its delay is configured at the replica-set level and that the connector can read the config.
+
+**What happens if lag exceeds the oplog window?**
+That is the failure this card is designed to prevent. If a secondary falls so far behind that the oldest oplog entry it still needs has already been overwritten on the primary, it can no longer catch up incrementally and must perform a full initial resync, which is slow and resource-heavy. Run `db.printReplicationInfo()` on the primary to see the oplog window; keep lag well inside it. Persistently climbing lag is your warning to act before this point.
+
+**Should I tune the 10s threshold?**
+10s is a sensible default that balances data-loss risk against alert noise. Sets that serve secondary reads for freshness-sensitive use (live inventory, financial dashboards) may want a tighter threshold; geographically distributed sets with a remote secondary may tolerate more. The sensitivity threshold is configurable per profile in the Sensitivity tab.
+
+**Does reading from secondaries make lag worse?**
+Read load on a secondary competes with its replication-apply work, so heavy secondary reads can slow apply and inflate lag, especially on an undersized node. If your lag rises in step with reporting or analytics read traffic on a secondary, that node may need more capacity or the read load should be redistributed.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Replica Lag (seconds)* is one of hundreds of KPI pulses Vortex IQ tracks across MongoDB and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

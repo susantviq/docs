@@ -1,0 +1,181 @@
+---
+title: "Storage Usage %, Elasticsearch"
+sidebarTitle: "Storage Usage %"
+description: "Storage Usage % for Elasticsearch clusters. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Disk used as a percentage of capacity, measured against Elasticsearch's disk watermarks rather than just raw free space. This matters because Elasticsearch does not wait until the disk is full to take action: at the low watermark (default 85%) it stops allocating new shards to a node, at the high watermark (90%) it relocates shards off the node, and at the **flood-stage watermark (default 95%) it marks every index with a shard on that node read-only**. The flood-stage block is the dangerous one: writes start failing and your indexing pipeline stalls. This card is your early warning to free space or add capacity before you hit that wall.
+
+| | |
+| --- | --- |
+| **Data source** | Per-node disk usage from `GET /_nodes/stats/fs` (`fs.total.total_in_bytes` and `fs.total.available_in_bytes`) and `GET /_cat/allocation`, expressed relative to the configured watermarks. |
+| **Metric basis** | Used / total as a percentage, evaluated against `cluster.routing.allocation.disk.watermark.low / high / flood_stage`. The card tracks the highest-usage node, since one node hitting flood stage blocks writes to its indexes. |
+| **Aggregation window** | Real-time, polled every 60 seconds. Disk fills gradually, so the live value plus its trend is what matters. |
+| **Watermarks (defaults)** | Low 85% (no new shard allocation), high 90% (relocate shards away), flood-stage 95% (indexes go read-only). Configurable as a percentage or absolute size. |
+| **The cliff** | At flood stage, Elasticsearch applies `index.blocks.read_only_allow_delete: true` to affected indexes. Writes fail until you free space AND clear the block; it does not auto-clear on every version. |
+| **What "usage" includes** | Shard data, translog, Lucene segments and, critically, merge scratch space. A large segment merge can transiently spike usage well above the steady-state figure. |
+| **Managed-service note** | Elastic Cloud autoscaling can add storage automatically; AWS OpenSearch/Elasticsearch Service exposes `FreeStorageSpace` / `ClusterUsedSpace` CloudWatch metrics that map to the same usage. |
+| **Time window** | `RT` (real-time, polled every 60 seconds) |
+| **Alert trigger** | `> 90% (watermark)`. Crossing the high watermark raises the card; approaching flood stage pages on-call. |
+| **Roles** | owner, engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The percentage is straightforward; the meaning comes from the watermark it is measured against:
+
+```text
+per node:
+  used_bytes  = fs.total.total_in_bytes - fs.total.available_in_bytes
+  usage_pct   = used_bytes / fs.total.total_in_bytes * 100
+
+card value = max(usage_pct) across data nodes   # worst node wins
+
+band mapping (default watermarks):
+  usage < 85%        healthy
+  85% <= usage < 90% low watermark   -> no new shards allocate here
+  90% <= usage < 95% high watermark  -> ES relocates shards off this node
+  usage >= 95%       flood stage      -> affected indexes go READ-ONLY
+```
+
+The card reports the worst (highest-usage) data node, not the cluster average, because Elasticsearch enforces watermarks per node: one node at 95% turns its indexes read-only even if the cluster average is a comfortable 60%. This is why a "60% full" cluster can still stop accepting writes. The gauge bands align to the watermarks so the colour tells you which enforcement stage you are in, and the alert fires at the high watermark to give you headroom before flood stage.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A platform team runs a 4-node Elasticsearch cluster. Storefront search indexes are small and stable, but a time-series logging index grows continuously and is not on a delete-after-N-days policy. Snapshot taken on 30 Apr 26 at 02:50 BST. The card reads **91%** and has raised at the high watermark.
+
+```text
+GET /_cat/allocation?v
+shards  disk.indices  disk.used  disk.avail  disk.total  disk.percent  node
+   118        410gb      437gb        43gb       480gb            91   es-data-03
+   116        402gb      420gb        60gb       480gb            87   es-data-01
+   117        405gb      425gb        55gb       480gb            88   es-data-02
+   115        398gb      415gb        65gb       480gb            86   es-data-04
+```
+
+es-data-03 is at 91%, into the high-watermark band. Elasticsearch is already trying to relocate shards off it, but the other nodes are at 86 to 88% and approaching the low watermark themselves, so there is nowhere comfortable to move shards to. The whole cluster is filling, with es-data-03 leading.
+
+The on-call's decision tree:
+
+1. **How far from flood stage?** 91% on the worst node; flood stage is 95%. At the current logging-index growth rate of roughly 8 GB/hour split across nodes, es-data-03 has only a few hours before it goes read-only. This is urgent.
+2. **What is consuming the space?** `GET /_cat/indices?v&s=store.size:desc` shows the logging index is 60% of total storage with 90 days of retention nobody asked for. The fast win is deleting old indices.
+3. **Free space, then clear the block (if needed).** They delete log indices older than 14 days, dropping usage to 68%. Had any index already hit flood stage and gone read-only, freeing disk alone would not be enough on this version; they would also clear the block:
+
+```text
+PUT /_all/_settings
+{ "index.blocks.read_only_allow_delete": null }
+```
+
+4. **Prevent recurrence.** They attach an ILM (Index Lifecycle Management) policy to roll over and delete the logging index automatically, so disk never creeps back to the watermark.
+
+```text
+Why the worst-node rule matters here:
+  - Cluster average usage:  88%   (looks "fine, plenty of room")
+  - Worst node (es-data-03): 91%  (already relocating, near flood stage)
+  - If we had watched the AVERAGE, we would have missed that one node was
+    hours from turning its indexes read-only and stalling all writes.
+  - The card surfaced the worst node, which is the one that actually
+    triggers Elasticsearch's enforcement.
+```
+
+Three takeaways:
+
+1. **It is the worst node, not the average, that takes the cluster read-only.** A healthy-looking average hides the node that is about to hit flood stage. Always size headroom to the busiest node.
+2. **Flood stage causes write failures, not data loss.** Your data is safe; you simply cannot index new documents until space is freed and the read-only block is cleared. But a stalled indexing pipeline means stale search results, which shoppers do feel.
+3. **The real fix is lifecycle management, not deletion.** Manually deleting indices buys time once; an ILM rollover-and-delete policy stops the disk ever reaching the watermark again. Treat a flood-stage scare as the prompt to automate retention.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards platform teams should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Storage Usage | What the combination tells you |
+| --- | --- | --- |
+| [Cluster Status (green / yellow / red)](/nerve-centre/kpi-cards/elasticsearch/cluster-status-green-yellow-red) | Disk pressure is a top cause of red status. | A node at flood stage cannot allocate shards, so disk-driven unallocation turns the cluster yellow or red. |
+| [Unassigned Shards](/nerve-centre/kpi-cards/elasticsearch/unassigned-shards) | The symptom when disk blocks allocation. | High disk plus rising unassigned shards equals "no node has room to place these shards". |
+| [Bulk Rejections (24h)](/nerve-centre/kpi-cards/elasticsearch/bulk-rejections-24h) | Writes fail once flood stage hits. | Disk at flood stage plus bulk rejections equals a stalled indexing pipeline; clients are being told to back off. |
+| [Last Snapshot Age (hours)](/nerve-centre/kpi-cards/elasticsearch/last-snapshot-age-hours) | Snapshots free retention pressure. | Confirm backups are current before deleting old indices to reclaim disk. |
+| [Elasticsearch Health Score](/nerve-centre/kpi-cards/elasticsearch/elasticsearch-health-score) | Disk is a weighted component. | Crossing the watermark collapses the disk sub-score and drags the composite down. |
+| [Active Node Count](/nerve-centre/kpi-cards/elasticsearch/active-node-count) | Adding capacity is the other fix. | If retention cannot be cut, the answer is more nodes; node count confirms the cluster scaled. |
+| [Initializing / Relocating Shards](/nerve-centre/kpi-cards/elasticsearch/initializing-relocating-shards) | High watermark triggers relocation. | A node past the high watermark generates relocating shards as ES moves data to roomier nodes. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Elasticsearch's own tooling:**
+
+> **`GET /_cat/allocation?v`** for per-node disk used, available and percent. This is the clearest view and matches the card's worst-node logic.
+> **`GET /_nodes/stats/fs`** for the raw filesystem bytes the card derives the percentage from.
+> **`GET /_cat/indices?v&s=store.size:desc`** to find which indexes are consuming the space.
+> **`GET /_cluster/settings?include_defaults=true&filter_path=**.disk.watermark*`** to confirm your actual low/high/flood-stage thresholds.
+> **`GET /_cluster/allocation/explain`** to confirm a shard is unassigned specifically because of the disk watermark.
+
+On managed services the same usage appears as `FreeStorageSpace` and `ClusterUsedSpace` on AWS OpenSearch/Elasticsearch Service (CloudWatch), and on the Elastic Cloud deployment storage page.
+
+**Why our value may legitimately differ from a manual check:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Worst node vs average** | Card higher | The card reports the busiest node (the one that triggers enforcement); a cluster-average reading will look lower. |
+| **Merge scratch space** | Transient spike | A large segment merge temporarily consumes extra disk; the card may show a brief jump the steady-state size does not. |
+| **Watermark config** | Band shifts | If you have changed the watermarks from defaults, the alert bands move; reconcile against your actual `disk.watermark` settings. |
+| **Poll timing** | Brief lag | The card samples every 60 seconds; on a fast-filling node the native call can read a percent or two higher between polls. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [ES Product Index Doc Count vs Ecom Catalog](/nerve-centre/kpi-cards/elasticsearch/es-product-index-doc-count-vs-ecom-catalog) | A read-only product index stops absorbing catalogue updates. | Disk at flood stage plus doc-count drift equals product-sync writes silently failing into a read-only index. |
+| [Search QPS Spike vs Ecom Traffic](/nerve-centre/kpi-cards/elasticsearch/search-qps-spike-vs-ecom-traffic) | Reads still work when writes are blocked. | Flood stage blocks writes but searches continue, so high QPS with stalled indexing means search results are going stale. |
+
+<details>
+<summary><em>Documentation cross-reference (same-concept peer)</em></summary>
+
+Disk watermarks with a read-only flood-stage block are an Elasticsearch/OpenSearch mechanism, not a generic database feature.
+
+- OpenSearch equivalent: identical `cluster.routing.allocation.disk.watermark.low/high/flood_stage` settings and read-only block behaviour.
+- Generic database equivalent: most engines simply fail writes when the disk fills; few have a graduated low/high/flood enforcement model.
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My cluster is only 60% full on average but writes are failing. How?**
+Watermarks are enforced per node, not per cluster. If one node hits 95% (flood stage) while others sit low, the indexes with a shard on that node go read-only even though the average looks fine. This card reports the worst node precisely to surface this. Check `GET /_cat/allocation?v` and rebalance or free space on the busiest node.
+
+**An index went read-only after a disk spike, but I have since freed space and it is still read-only. Why?**
+On some Elasticsearch versions the flood-stage read-only block (`index.blocks.read_only_allow_delete`) does not clear automatically when disk drops back below the watermark. After freeing space, clear it manually: `PUT /_all/_settings {"index.blocks.read_only_allow_delete": null}`. Newer versions auto-clear, but always verify writes resume.
+
+**What is the difference between the low, high and flood-stage watermarks?**
+Low (85%) stops new shards being allocated to that node. High (90%) makes Elasticsearch actively relocate existing shards off the node to roomier ones. Flood stage (95%) marks the node's indexes read-only to protect against running fully out of disk. Only flood stage stops writes; low and high are about shard placement.
+
+**The usage jumped several percent then dropped back within minutes. Is that a leak?**
+Almost certainly a segment merge. Lucene merges temporarily need extra scratch space (roughly the size of the segments being merged) before reclaiming it. Large merges produce a transient spike that resolves on its own. It only matters if the spike pushes you over flood stage; otherwise it is normal background housekeeping.
+
+**Should I just raise the flood-stage watermark to 98% to buy room?**
+Only as an emergency stopgap, and with great care. The watermarks exist to keep room for merges and translog; running a node above 95% risks a merge actually filling the disk, which can corrupt shards. The right fix is freeing space (retention/ILM) or adding capacity, not moving the safety line closer to the cliff.
+
+**How do I stop this happening again after a flood-stage incident?**
+Attach an Index Lifecycle Management (ILM) policy that rolls over indexes by size or age and deletes them past your retention window. Time-series and logging indexes are the usual culprits because they grow without bound. ILM keeps disk from ever creeping to the watermark, turning a recurring fire-drill into a non-event.
+
+**Does this count snapshot storage?**
+No. Snapshots are written to a separate registered repository (object storage such as S3, GCS or a shared filesystem), not the node data disks this card measures. Snapshot repository capacity is tracked separately; pair with [Last Snapshot Age (hours)](/nerve-centre/kpi-cards/elasticsearch/last-snapshot-age-hours) for backup health.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Storage Usage %* is one of hundreds of KPI pulses Vortex IQ tracks across Elasticsearch and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

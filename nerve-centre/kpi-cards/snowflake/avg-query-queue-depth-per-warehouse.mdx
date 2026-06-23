@@ -1,0 +1,143 @@
+---
+title: "Avg Query Queue Depth per Warehouse, Snowflake"
+sidebarTitle: "Avg Query Queue Depth per Warehouse"
+description: "Avg Query Queue Depth per Warehouse for Snowflake accounts. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Avg Query Queue Depth per Warehouse** measures how many queries, on average, are waiting in line before they can run on each warehouse. In Snowflake a query queues when its warehouse has no free slot, either because all running slots are busy (overload) or because a multi-cluster warehouse is still spinning up a cluster (provisioning). A small, transient queue is normal under burst; a queue that stays deep is the clearest single signal that a warehouse is undersized for its workload. This is a Snowflake-distinctive metric: because compute and storage are decoupled and warehouses scale independently, sustained queueing is something you fix by resizing or enabling multi-cluster scaling, not by tuning queries.
+
+| | |
+| --- | --- |
+| **What it tracks** | The average number of queries waiting before execution, per warehouse, over the selected period, derived from queue-time signals in query history. |
+| **Data source** | `detail`: From `QUEUED_PROVISIONING_TIME` plus `QUEUED_OVERLOAD_TIME` in `QUERY_HISTORY`. Snowflake-distinctive: sustained queue equals warehouse undersized. |
+| **Time window** | `1h` (rolling last hour, refreshed on the live polling cycle). |
+| **Alert trigger** | `> 5 sustained`. A queue depth holding above 5 queries pages the platform on-call. |
+| **Roles** | owner, platform, SRE, data engineering, FinOps |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+The card derives queue depth from the queue-time columns Snowflake records on every query in `QUERY_HISTORY`: `QUEUED_OVERLOAD_TIME` (milliseconds a query waited because the warehouse had no free compute slot) and `QUEUED_PROVISIONING_TIME` (milliseconds a query waited while a multi-cluster warehouse provisioned an additional cluster). For each warehouse, the engine uses the accumulated queue time across concurrent queries in the window to estimate the average number of queries waiting at once, per warehouse, rather than reporting raw wait milliseconds. A reading of "0 to 1" means queries rarely wait; a reading of "5 sustained" means, on average, five queries are stacked behind the running set at any moment, which is the line where the workload is materially throttled by compute, not by the queries themselves. See the worked example below for how to read it against credit cost.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A data platform team runs `BI_WH` (a Medium, single-cluster warehouse) serving fifteen concurrent dashboard users plus an hourly ELT job that lands on the same warehouse. Snapshot taken on 16 Apr 26 at 10:15 BST, mid-morning peak.
+
+| Warehouse | Size | Clusters | Avg queue depth (1h) | Read |
+| --- | --- | --- | --- | --- |
+| `BI_WH` | Medium | 1 (max 1) | **6.4** | Sustained breach, queries stacking up |
+| `ELT_WH` | Large | 1 | 0.3 | Healthy |
+| `ADHOC_WH` | Small | 1 (max 3) | 1.1 | Brief provisioning waits, acceptable |
+
+The card turns red on `BI_WH` at an average queue depth of 6.4, above the threshold of 5 sustained. The platform team's read:
+
+1. **`BI_WH` is undersized for its concurrent load, full stop.** Six queries waiting on average at peak means dashboard users are watching spinners while their queries sit behind the ELT job and each other. The queue is `QUEUED_OVERLOAD_TIME` dominant (no free slots), not provisioning, because `BI_WH` is single-cluster and cannot spin up a second cluster to absorb the burst.
+2. **The cause is two workloads sharing one warehouse.** The hourly ELT job and fifteen interactive users are competing for the same Medium warehouse. Interactive dashboards need low-latency concurrency; batch ELT needs throughput. Putting them on the same single-cluster warehouse guarantees contention at the top of every hour.
+3. **The fix is a warehouse change, and it can save money.** Two options: enable multi-cluster scaling on `BI_WH` (set `MIN_CLUSTER_COUNT = 1`, `MAX_CLUSTER_COUNT = 3`, `SCALING_POLICY = STANDARD`) so it adds clusters automatically under queue pressure and drops them when the burst passes, or move the ELT job to its own warehouse so interactive users stop competing with it. Multi-cluster only bills extra clusters while they run, so it absorbs the peak without paying for a permanently larger warehouse.
+
+```text
+Cost vs experience trade-off for BI_WH:
+  Option A - Resize Medium -> Large (always on):
+    Doubles the credit rate 24/7, even off-peak. Overkill.
+  Option B - Multi-cluster Medium, MAX_CLUSTER_COUNT = 3:
+    Pays for extra clusters only during the ~2 peak hours/day.
+    Clears the queue at peak; idles back to one cluster off-peak.
+  => Option B clears the queue (depth 6.4 -> ~1) at a fraction of A's cost.
+```
+
+Three takeaways:
+
+1. **Sustained queue depth is the cleanest "undersized warehouse" signal Snowflake gives you.** Unlike latency, which mixes execution time and wait time, queue depth isolates the wait. A deep, sustained queue is almost never a query problem; it is a capacity problem you fix by resizing or scaling clusters.
+2. **Separate overload queueing from provisioning queueing.** `QUEUED_OVERLOAD_TIME` means "no free slots, add capacity"; `QUEUED_PROVISIONING_TIME` means "a cluster is still warming up", which is brief and self-correcting on multi-cluster warehouses. A queue that is mostly provisioning time settles on its own; a queue that is mostly overload time will not.
+3. **Queueing and credit cost pull in opposite directions, so read them together.** Resizing up clears the queue but burns more credits; under-provisioning saves credits but throttles users. Pair this card with [Credits by Warehouse (7d)](/nerve-centre/kpi-cards/snowflake/credits-by-warehouse-7d) and [Avg Cost per Query ($)](/nerve-centre/kpi-cards/snowflake/avg-cost-per-query) to find the size that clears the queue without overspending.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards to reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Avg Query Queue Depth | What the combination tells you |
+| --- | --- | --- |
+| [Warehouse Saturation %](/nerve-centre/kpi-cards/snowflake/warehouse-saturation) | Confirms the running slots are maxed before queries even queue. | High saturation plus deep queue equals a warehouse fully spoken for and turning work away. |
+| [Query Latency p95 (ms)](/nerve-centre/kpi-cards/snowflake/query-latency-p95-ms) | p95 includes queue time; this card isolates the wait. | A high p95 explained by a deep queue is a capacity problem, not a query problem. |
+| [Query Latency p99 (ms)](/nerve-centre/kpi-cards/snowflake/query-latency-p99-ms) | A queued query can land in the extreme tail. | Flat queue plus high p99 means a heavy query; deep queue plus high p99 means waiting, not work. |
+| [Credits by Warehouse (7d)](/nerve-centre/kpi-cards/snowflake/credits-by-warehouse-7d) | The cost side of any resize decision. | Find the smallest warehouse change that clears the queue without overspending. |
+| [Avg Cost per Query ($)](/nerve-centre/kpi-cards/snowflake/avg-cost-per-query) | Quantifies the credit impact of resizing up. | A modest cost-per-query rise to clear a deep queue is usually worth it. |
+| [Warehouse Queueing Sustained (>5 queries queued)](/nerve-centre/kpi-cards/snowflake/warehouse-queueing-sustained-5-queries-queued) | The Nerve Centre alert built on this metric. | This card is the live gauge; the alert is the paging event when the queue holds above 5. |
+| [Active Warehouses](/nerve-centre/kpi-cards/snowflake/active-warehouses) | Context on how many warehouses are running. | Deep queue on one warehouse while others sit idle suggests workload routing, not total capacity. |
+| [Snowflake Health Score](/nerve-centre/kpi-cards/snowflake/snowflake-health-score) | The composite that weights queueing. | Sustained queueing drags the composite down even when latency averages look acceptable. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Snowflake's own tooling:**
+
+> **Snowsight to Admin to Warehouses**, select a warehouse, and read the activity chart: it shows running versus queued queries over time, which is the visual equivalent of this card.
+> **`SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY`** for `AVG_RUNNING` and `AVG_QUEUED_LOAD` per warehouse over time, the most direct native source.
+> **`QUERY_HISTORY`** for the per-query `QUEUED_OVERLOAD_TIME` and `QUEUED_PROVISIONING_TIME` columns that underpin the card.
+
+To inspect average queued load per warehouse over the last hour:
+
+```sql
+SELECT WAREHOUSE_NAME, AVG(AVG_QUEUED_LOAD) AS avg_queued
+FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY
+WHERE START_TIME >= DATEADD('hour', -1, CURRENT_TIMESTAMP())
+GROUP BY WAREHOUSE_NAME
+ORDER BY avg_queued DESC;
+```
+
+**Why our number may legitimately differ from Snowflake's UI:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Source view** | Marginal | The Warehouses chart in Snowsight samples `WAREHOUSE_LOAD_HISTORY`; the card derives from per-query queue times in `QUERY_HISTORY`. Both measure the same thing but aggregate slightly differently. |
+| **ACCOUNT_USAGE latency** | Brief lag | `WAREHOUSE_LOAD_HISTORY` and `QUERY_HISTORY` in `ACCOUNT_USAGE` can trail live activity by up to 45 minutes. |
+| **Overload vs provisioning** | Variable | If the card weights overload and provisioning queueing equally and you read only overload in the UI, a multi-cluster warehouse mid-provision can show a higher card value. |
+| **Per-warehouse vs account** | Apparent gap | The card reports per warehouse; an account-wide view averages across all warehouses and reads lower when most are idle. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [`slow-analytics-queries-during-checkout-window`](/nerve-centre/kpi-cards/snowflake/slow-analytics-queries-during-checkout-window) | Queueing during peak ecom windows is higher-impact. | A queue building during checkout peak delays the live dashboards the business is watching. |
+| Ecom order volume (Shopify / BigCommerce / Adobe) | No direct causal link. | A queue spike during a promotion slows merchandising's reporting exactly when they need it fastest. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My queue depth spikes briefly at the top of every hour then clears. Should I worry?**
+Usually not. A short spike that clears within minutes is a normal burst, typically a scheduled job kicking off. The alert fires on *sustained* queue depth above 5, not on transient spikes, precisely because brief queueing is expected. Only act if the depth holds above the threshold for a sustained period; that is the signal of a genuine capacity shortfall.
+
+**What is the difference between overload queueing and provisioning queueing?**
+`QUEUED_OVERLOAD_TIME` is time spent waiting because the warehouse's running slots were all busy: the warehouse is simply too small or too contended, and the fix is more capacity. `QUEUED_PROVISIONING_TIME` is time spent waiting while a multi-cluster warehouse spins up an additional cluster: it is brief and self-correcting. A queue dominated by overload time needs a resize or more clusters; a queue dominated by provisioning time settles on its own.
+
+**Should I resize the warehouse up or enable multi-cluster scaling?**
+Resize up when a single query is genuinely too heavy for the current size (it needs more memory and compute per query). Enable multi-cluster scaling when the problem is concurrency: many queries competing for slots. Most sustained-queue cases are concurrency problems, so multi-cluster is usually the better and cheaper answer, because it only bills extra clusters while they are needed.
+
+**Why is queue depth a Snowflake-specific concern?**
+Because Snowflake decouples compute from storage and lets each warehouse scale independently, queueing is something you control directly by sizing and multi-cluster policy. On a traditional database, contention is a tuning and indexing problem; on Snowflake, sustained queueing is first and foremost a warehouse-configuration problem. That is why this metric points so cleanly at "the warehouse is undersized".
+
+**Can a deep queue cause query failures?**
+Indirectly, yes. A query that queues long enough can breach `STATEMENT_TIMEOUT_IN_SECONDS` (the timeout clock includes queue time) and be cancelled. If you see a deep queue alongside a rising [Query Error Rate %](/nerve-centre/kpi-cards/snowflake/query-error-rate), some queries are timing out while waiting. Clearing the queue resolves both.
+
+**One warehouse is queueing while others sit idle. What does that mean?**
+It means the problem is workload routing, not total account capacity. You have spare compute; it is just on the wrong warehouse. Either move some of the queued workload to an idle warehouse, or, if the workloads genuinely belong together, scale the busy one. Check [Active Warehouses](/nerve-centre/kpi-cards/snowflake/active-warehouses) and [Credits by Warehouse (7d)](/nerve-centre/kpi-cards/snowflake/credits-by-warehouse-7d) to see where the spare capacity and the cost sit.
+
+**Why does the card show queueing when Snowsight's warehouse chart looks flat?**
+Two common reasons: `ACCOUNT_USAGE` latency (the chart and the card may be reading slightly different time slices), and the difference between per-query queue time in `QUERY_HISTORY` and the sampled load in `WAREHOUSE_LOAD_HISTORY`. Cross-check with the `WAREHOUSE_LOAD_HISTORY` query above over the same hour to confirm the underlying signal before assuming a discrepancy.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Avg Query Queue Depth per Warehouse* is one of hundreds of KPI pulses Vortex IQ tracks across Snowflake and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

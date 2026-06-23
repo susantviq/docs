@@ -1,0 +1,125 @@
+---
+title: "Command Latency p99 (ms), Redis"
+sidebarTitle: "Command Latency p99 (ms)"
+description: "Command Latency p99 (ms) for Redis instances. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Performance](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> **Command Latency p99 (ms)** is the 99th-percentile server-side command execution time, in milliseconds: the experience of the slowest 1% of commands. On a single-threaded engine that slowest 1% matters far more than the fraction suggests, because every slow command stalls the thread and delays everything queued behind it. This is a Hero, sensitivity-tier card. A clean p95 next to a blown p99 is the signature of a small number of genuinely pathological events (an oversized key, a long Lua script, an RDB fork pause, or a swap stall) rather than a broad slowdown.
+
+| | |
+| --- | --- |
+| **What it tracks** | The 99th-percentile server-side command execution latency, in milliseconds. The slowest 1 command in every 100 takes at least this long. |
+| **Data source** | `LATENCY HISTORY` (Redis 7+ per-event latency monitoring) where enabled, otherwise client-side sampling of command round-trips with the network baseline subtracted. Engine-side time only. |
+| **Time window** | `RT/5m` (real-time, computed over a trailing 5-minute window). |
+| **Alert trigger** | `> 50ms`. The p99 threshold is deliberately higher than p95 (10ms): the deep tail tolerates more, but 50ms is where the slowest 1% starts visibly hurting application response times. |
+| **Why it matters** | Tail latency on a shared, single-threaded resource is head-of-line blocking. A 50ms p99 command does not just affect that one request; it delays the next commands in the queue too. |
+| **What does NOT count** | Network round-trip, connection setup, and client-side work. This is the time spent inside the Redis server. |
+| **Roles** | engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+The card computes the 99th percentile of per-command execution timings across the trailing 5-minute window and converts to milliseconds. Where Redis 7+ latency monitoring is active, timings are sourced from the server's `LATENCY HISTORY` event log; otherwise Vortex IQ samples command round-trips client-side and subtracts the measured network baseline to estimate the server-side figure. The 5-minute window matters more for p99 than for p50: the deep tail is where rare events live, and a window short enough to react but long enough to be statistically meaningful keeps a single spike from either dominating or vanishing. Because Redis runs commands on one thread, a p99 of 50ms means that for that slowest 1% the entire instance was unavailable for up to 50ms at a stretch, which is why the deep tail is treated as a Hero signal rather than a curiosity.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+An SRE team runs a Redis 7.0 primary with RDB persistence enabled for a cart and session store. Snapshot taken on 22 May 26 at 02:05 BST, during an overnight batch import.
+
+| Reading | Value | Status |
+| --- | --- | --- |
+| Command Latency p50 | 70us | Healthy |
+| [Command Latency p95](/nerve-centre/kpi-cards/redis/command-latency-p95-ms) | 2.1ms | Within threshold (10ms) |
+| **Command Latency p99** | **88ms** | **Breached (threshold 50ms)** |
+| [Last RDB Save (minutes ago)](/nerve-centre/kpi-cards/redis/last-rdb-save-minutes-ago) | 3 | Recent save |
+| [Memory Used vs Maxmemory %](/nerve-centre/kpi-cards/redis/memory-used-vs-maxmemory) | 64% | Comfortable |
+
+The shape is unusual: p50 and even p95 look fine, but p99 has blown out to 88ms. That p95-to-p99 cliff (2.1ms to 88ms) is the giveaway. It is not a hot key dragging a slice of traffic; it is a small number of multi-tens-of-millisecond stalls. The recent RDB save (3 minutes ago) is the clue. On RDB persistence, Redis forks a child process to write the snapshot, and on a large dataset that `fork()` triggers a copy-on-write page-table copy that can pause the main thread for tens of milliseconds. The batch import inflated the dataset and the write rate, so the save took longer and the fork pause was bigger.
+
+```text
+Diagnosis trail for the 22 May p99 breach:
+  - p50 70us, p95 2.1ms -> everyday traffic is healthy
+  - p99 88ms -> a few commands stalled hard
+  - p95->p99 cliff (2.1ms -> 88ms) -> rare, large stalls, not a hot key
+  - RDB save 3 min ago + heavy import -> fork() / copy-on-write pause is the suspect
+
+Fix applied:
+  - Move the heavy import to a replica or off-peak window
+  - Tune save points so snapshots do not coincide with write bursts
+  - Confirm THP (transparent huge pages) is disabled (it worsens fork latency)
+  Result the next night (23 May): p99 back to 9ms during the import
+```
+
+The lesson: a p99-only breach with healthy p95 almost never means "the instance is overloaded". It means something rare and heavy happened a handful of times. The usual culprits are persistence forks, a swap stall, or a single very large key being touched. Find the rare event, do not scale the node blindly.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Command Latency p99 | What the combination tells you |
+| --- | --- | --- |
+| [Command Latency p95 (ms)](/nerve-centre/kpi-cards/redis/command-latency-p95-ms) | The shallower tail. | A big p95-to-p99 cliff means rare, heavy stalls; both high means a broad slowdown. |
+| [Command Latency p50 (us)](/nerve-centre/kpi-cards/redis/command-latency-p50-us) | The median baseline. | Healthy p50 with blown p99 confirms the problem is the deep tail only. |
+| [SLOWLOG Entries (15m)](/nerve-centre/kpi-cards/redis/slowlog-entries-15m) | Counts commands over the slowlog threshold. | Confirms whether the tail is named commands or invisible engine pauses (forks, swap). |
+| [Top 10 SLOWLOG Commands](/nerve-centre/kpi-cards/redis/top-10-slowlog-commands) | Names the offenders. | If SLOWLOG is empty but p99 is high, the stall is engine-level (fork/swap), not a command. |
+| [Last RDB Save (minutes ago)](/nerve-centre/kpi-cards/redis/last-rdb-save-minutes-ago) | Persistence-fork timing. | A p99 spike coinciding with a recent save points straight at fork latency. |
+| [Memory Fragmentation Ratio](/nerve-centre/kpi-cards/redis/memory-fragmentation-ratio) | Detects swap (ratio < 1). | A p99 breach with fragmentation below 1 means swap stalls, fixable only with more RAM. |
+| [Redis Health Score](/nerve-centre/kpi-cards/redis/redis-health-score) | The composite. | Deep-tail breaches drag the composite; this card explains the cause. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Redis's own tooling:**
+
+> `LATENCY HISTORY command`, `LATENCY LATEST`, and `LATENCY DOCTOR` (Redis 7+). `LATENCY DOCTOR` is especially useful for p99 work: it names probable causes (fork, expire cycle, AOF rewrite) for the spikes it has recorded.
+> `SLOWLOG GET 25` for named slow commands. If SLOWLOG is empty while p99 is high, the stall is an engine-level pause (fork, swap, expire cycle), not a command, which is the key fork in the diagnosis.
+> `INFO persistence` for `rdb_last_fork_usec` and `latest_fork_usec`, which report exactly how long the last fork blocked the main thread (in microseconds), and `INFO stats` for `latest_fork_usec`.
+> `redis-cli --intrinsic-latency 60` to measure host scheduling jitter and rule out a CPU-starved or noisy-neighbour VM.
+
+On a managed service, cross-check the engine-side latency metrics in CloudWatch (`SuccessfulReadRequestLatency`, `SuccessfulWriteRequestLatency`) for ElastiCache and MemoryDB, and on ElastiCache watch `EngineCPUUtilisation` around the spike, since fork and snapshot work shows up there.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Sampling vs native monitor** | Either | Without the Redis 7+ latency monitor, the deep tail is harder to capture by sampling; rare stalls may be under- or over-counted depending on sample timing. |
+| **Window length** | Either | A 5-minute percentile smooths a single fork spike that a momentary `LATENCY LATEST` check would show at full height. |
+| **Per-node vs aggregate** | Either | Cluster per-shard reporting versus a console-wide aggregate. A single bad shard can dominate one and be averaged away in the other. |
+| **Network included** | CLI higher | `redis-cli --latency` includes the round-trip; this card is server-side only. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My p99 spikes but SLOWLOG is empty. What does that mean?**
+That is the classic engine-level-pause signature. SLOWLOG only records command execution time, so it misses stalls that happen between commands: persistence forks, the expire cycle, AOF rewrites, or swap. Check [Last RDB Save (minutes ago)](/nerve-centre/kpi-cards/redis/last-rdb-save-minutes-ago) and `INFO persistence` for `latest_fork_usec`, and check [Memory Fragmentation Ratio](/nerve-centre/kpi-cards/redis/memory-fragmentation-ratio) for swap. An empty SLOWLOG with a high p99 almost always points one of these ways.
+
+**Why is the p99 threshold (50ms) higher than the p95 threshold (10ms)?**
+Because the deep tail naturally tolerates more. Even a healthy instance will occasionally see a fork pause or a one-off large command, and you do not want to page on every rare event. The 50ms line is set where the slowest 1% becomes large enough to be felt in application response times, rather than just statistically present.
+
+**Should I worry about p99 if p50 and p95 are healthy?**
+It depends what is driving it. If the cause is a periodic fork pause that you can move off-peak, it is a tuning task, not an emergency. If the cause is a single very large key that any request can hit, it is a latent landmine: today only 1% hit it, but a traffic shift could make it 10%. Use [Top 10 SLOWLOG Commands](/nerve-centre/kpi-cards/redis/top-10-slowlog-commands) to tell which.
+
+**How does persistence cause p99 spikes specifically?**
+Both RDB snapshots and AOF rewrites fork a child process. The fork itself copies the parent's page tables, and on a large dataset that copy can block the main thread for tens of milliseconds. After the fork, copy-on-write means write-heavy workloads keep duplicating pages, adding memory pressure. The fix is to schedule saves away from write bursts, keep the dataset sized so forks are cheap, and disable transparent huge pages, which dramatically worsen fork latency.
+
+**Can a single large key really move the p99 on its own?**
+Yes. If one `HGETALL` against a 500,000-field hash takes 80ms and it is called even a few times a minute, those calls land in the slowest 1% and set the p99. The instance can be otherwise idle. This is why p99 is a Hero card: it surfaces individually rare but individually severe events that averages hide completely.
+
+**Does AOF (append-only file) persistence help or hurt p99?**
+AOF with `appendfsync everysec` is gentle on the common path, but AOF rewrites still fork and can cause the same tail spikes as RDB. `appendfsync always` is the dangerous setting: it fsyncs on every write, which can add disk latency to the deep tail directly. Watch [Last AOF Rewrite Status](/nerve-centre/kpi-cards/redis/last-aof-rewrite-status) and correlate rewrite windows with p99 spikes.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Command Latency p99 (ms)* is one of hundreds of KPI pulses Vortex IQ tracks across Redis and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

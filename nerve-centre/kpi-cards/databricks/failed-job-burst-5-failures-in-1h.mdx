@@ -1,0 +1,154 @@
+---
+title: "Failed Job Burst (>5 failures in 1h), Databricks"
+sidebarTitle: "Failed Job Burst (>5 failures in 1h)"
+description: "Failed Job Burst for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Sensitivity](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> An alert that fires when more than 5 Databricks job runs reach a `FAILED` (or `TIMEDOUT`) terminal state within a rolling 1-hour window. This card is Databricks-distinctive: pipeline failures cascade fast. One broken upstream table or one expired token can fail every dependent job in minutes, so a single root cause can produce a burst of five, ten, or twenty failures almost simultaneously. The burst pattern is the signal that this is a systemic problem, not five unrelated one-off failures.
+
+| | |
+| --- | --- |
+| **Data source** | Databricks Jobs API, `GET /api/2.1/jobs/runs/list`, reading the terminal `result_state` of each completed run. Reconciled against the `system.lakeflow.job_run_timeline` system table for the historical record. |
+| **Metric basis** | A count of distinct job runs whose `result_state` is `FAILED` or `TIMEDOUT` with an `end_time` inside the trailing 60 minutes. The alert is a burst detector, not a daily total. |
+| **Aggregation window** | `1h` rolling, evaluated every minute. |
+| **Alert trigger** | `>5 jobs FAILED in last 1h`. The sixth failure inside the hour escalates the card. |
+| **Why a burst, not a single failure** | A lone failure is routine (transient cloud error, a flaky external API). Five or more in an hour almost always share a root cause: a schema change broke a shared table, a credential expired, a cluster pool ran out of capacity, or an upstream job failed and took its downstream dependents with it. |
+| **What counts** | Any scheduled or triggered job run reaching `FAILED` or `TIMEDOUT`. Retries that ultimately fail count; retries that ultimately succeed do not. |
+| **What does NOT count** | (1) Runs that succeeded; (2) `CANCELED` runs (a human stopped them deliberately); (3) `SKIPPED` runs; (4) tasks within a job, the count is at run level, not task level, to avoid double-counting a multi-task job. |
+| **Time zone** | Workspace time zone for chart axes; UTC for cross-connector windowing. |
+| **Time window** | `1h` rolling. |
+| **Roles** | owner, platform engineering, data engineering on-call |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The engine maintains a rolling 60-minute window over completed job runs and counts terminal failures:
+
+```text
+failed_burst = COUNT(run)
+               WHERE run.result_state IN ('FAILED', 'TIMEDOUT')
+               AND   run.end_time >= (now - 60 minutes)
+
+FIRE when failed_burst > 5
+```
+
+`TIMEDOUT` is grouped with `FAILED` because, from a pipeline-health perspective, a job that blew past its timeout is just as broken as one that threw an exception, and timeouts often appear in bursts when a shared cluster is saturated. `CANCELED` is excluded: a cancellation is a deliberate human action, not a failure, and including it would fire the alert every time someone aborts a stuck run.
+
+Counting happens at the run level, not the task level. A single workflow with twelve tasks that fails counts as 1, not 12. This is deliberate: the failure of one upstream task usually cascades to fail every downstream task in the same run, and counting tasks would make a single broken job look like a burst on its own. The burst signal is meant to catch many separate jobs failing, which is the fingerprint of a shared root cause.
+
+The window is evaluated every minute against the Jobs API. Because the API reports a run's `result_state` only once the run reaches a terminal state, the alert is necessarily reactive: it fires after the failures land, not before. For predictive cost-runaway on jobs that are still alive, pair with [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h).
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A data engineering team runs a medallion architecture on Databricks feeding an ecommerce analytics layer: bronze ingestion jobs land raw order and product data, silver jobs clean and conform it, gold jobs build the marts that BI dashboards read. Snapshot taken on 14 Apr 26 at 03:40 BST, mid-nightly-batch.
+
+| Time | Job | Layer | result_state | Likely cause |
+| --- | --- | --- | --- | --- |
+| 03:12 | bronze-orders-ingest | Bronze | FAILED | Source schema added a non-null column |
+| 03:14 | silver-orders-clean | Silver | FAILED | Upstream bronze table empty |
+| 03:15 | silver-order-items | Silver | FAILED | Upstream bronze table empty |
+| 03:18 | gold-revenue-mart | Gold | FAILED | Upstream silver missing |
+| 03:19 | gold-customer-360 | Gold | FAILED | Upstream silver missing |
+| 03:22 | gold-inventory-snapshot | Gold | TIMEDOUT | Waited on missing silver, hit timeout |
+
+By 03:22 the rolling 1-hour count has reached **6 failed runs** and the card escalates with the headline **6 job failures in 1h, cascade from bronze-orders-ingest**. The on-call data engineer reads the burst correctly in seconds: this is not six problems, it is one problem (the bronze ingest broke) cascading down the medallion.
+
+The triage playbook the burst enables:
+
+1. **Read the burst, not the individual failures.** The timestamps cluster tightly (03:12 to 03:22) and the dependency chain is obvious: bronze failed first, everything downstream failed because its input was missing. The root cause is the 03:12 failure; the other five are collateral.
+2. **Find the trigger.** The bronze job log shows a schema-evolution error: the source system added a `loyalty_tier` column declared `NOT NULL`, and the ingest job's strict schema rejected it. A one-line fix (enable schema evolution or add the column to the target) unblocks the whole chain.
+3. **Decide on the rerun order.** Fixing and rerunning bronze first, then triggering the downstream jobs in dependency order, is far cheaper than blindly rerunning all six and watching the downstream ones fail again on still-missing data.
+4. **Quantify the blast radius.** [Top 10 Failing Workflows (7d)](/nerve-centre/kpi-cards/databricks/top-10-failing-workflows-7d) confirms whether this is a first-time break or a recurring fragility, and [Pipeline Lag (since last success)](/nerve-centre/kpi-cards/databricks/pipeline-lag-since-last-success) shows how stale the gold marts now are for the morning's dashboards.
+
+```text
+Why the burst framing saves time:
+  - Naive reading: "6 jobs failed, open 6 tickets, debug 6 stack traces."
+  - Burst reading: "1 root cause at 03:12, 5 downstream casualties.
+    Fix 1, rerun in order, done."
+  - The cascade structure is the diagnosis. A burst that all points
+    back to one upstream job is a dependency cascade; a burst of
+    unrelated jobs failing at once is usually shared infrastructure
+    (a cluster pool, a credential, a metastore outage).
+```
+
+The reading that distinguishes the two burst shapes: if every failure traces to one upstream job, fix that job. If the failures are unrelated jobs that just happened to fail together, suspect shared infrastructure (an expired service principal token, a metastore hiccup, or a cluster pool that ran dry).
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Failed Job Burst | What the combination tells you |
+| --- | --- | --- |
+| [Failed Jobs (24h)](/nerve-centre/kpi-cards/databricks/failed-jobs-24h) | The daily triage queue behind the burst alert. | A burst that lifts the 24h total sharply is a new incident; a flat 24h total with no burst is steady-state. |
+| [Job Success Rate (24h)](/nerve-centre/kpi-cards/databricks/job-success-rate-24h) | The proportional health view. | A burst that drops success rate below 95% is materially damaging the batch. |
+| [Top 10 Failing Workflows (7d)](/nerve-centre/kpi-cards/databricks/top-10-failing-workflows-7d) | Tells you if the bursting jobs are chronically fragile. | The same workflow topping the list weekly equals a structural fix needed, not a rerun. |
+| [Pipeline Lag (since last success)](/nerve-centre/kpi-cards/databricks/pipeline-lag-since-last-success) | Measures the downstream staleness the burst caused. | High lag after a burst means dashboards are serving stale data right now. |
+| [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) | Catches the jobs heading toward a TIMEDOUT failure. | A long-running job that later times out is a future contributor to the burst. |
+| [DLT Pipeline Status Distribution](/nerve-centre/kpi-cards/databricks/dlt-pipeline-status-distribution) | The DLT-pipeline equivalent of the burst. | Many DLT pipelines in Failed state alongside the job burst equals a workspace-wide event. |
+| [Pipeline Lag vs Ecom Order Flow](/nerve-centre/kpi-cards/databricks/pipeline-lag-vs-ecom-order-flow) | The cross-channel impact of a stalled pipeline. | A burst that stalls ingestion while orders keep flowing means the business is generating data the pipeline cannot land. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **Workflows → Job runs** in the workspace UI, filtered to the last hour and to the Failed and Timed out statuses. The count there should match this card.
+> **`databricks jobs list-runs`** on the Databricks CLI, or `GET /api/2.1/jobs/runs/list`, filtered by `result_state` and `end_time`, to reproduce the count programmatically.
+> **`system.lakeflow.job_run_timeline`** system table for the authoritative historical record of every run's terminal state, useful for post-incident reconstruction of the exact cascade order.
+
+**Why our count may legitimately differ from the Job runs page:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Run-level vs task-level** | Vortex IQ count lower | The card counts at run level; if you read the UI at task level a single multi-task failure can look like several. |
+| **TIMEDOUT inclusion** | Vortex IQ count higher | We group `TIMEDOUT` with `FAILED`; if you filter the UI to Failed only, timeouts will be missing. |
+| **CANCELED exclusion** | Vortex IQ count lower | Deliberately cancelled runs are excluded; the UI may show them under a combined filter. |
+| **Polling cadence** | Brief lag | The card evaluates every minute; a failure in the last few seconds may not yet be counted. |
+| **Retry handling** | Variable | A run that failed then succeeded on retry does not count; a run that exhausted retries counts once. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [Pipeline Lag vs Ecom Order Flow](/nerve-centre/kpi-cards/databricks/pipeline-lag-vs-ecom-order-flow) | A burst that breaks ingestion shows up as rising pipeline lag while orders continue. | Lag flat despite a burst means the failed jobs were not on the critical ingestion path. |
+| Shopify / BigCommerce / Adobe order feeds | Order volume keeps flowing regardless of the burst; the data just stops landing. | A growing gap between source order count and landed rows quantifies the business impact of the stalled pipeline. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Five of my jobs failed but the alert did not fire. Why?**
+The trigger is strictly *more than* 5, so the sixth failure within the hour is what escalates the card. Exactly 5 failures sits just under the threshold. If your estate is small and you want earlier warning, lower the threshold in the Sensitivity tab; a 3-job burst is a reasonable setting for a workspace with only a handful of scheduled jobs.
+
+**One job with twelve tasks failed and I expected a burst. Why is the count 1?**
+The card counts at run level, not task level, on purpose. The failure of one task usually cascades to fail the remaining tasks in the same run, so counting tasks would make a single broken job masquerade as a burst. The burst signal is specifically designed to catch *many separate jobs* failing, which is the fingerprint of a shared root cause across your estate.
+
+**A job failed, retried, and then succeeded. Is it in the count?**
+No. Only runs whose final terminal state is `FAILED` or `TIMEDOUT` are counted. A run that recovered on retry is treated as a success. This keeps the burst signal focused on genuine, unrecovered failures rather than transient blips that the retry policy already absorbed.
+
+**Are cancelled runs counted?**
+No. `CANCELED` runs are excluded because cancellation is a deliberate human action, not a failure. If they were included, every time an engineer aborted a stuck run during an incident the alert would fire, adding noise during exactly the moment you want a clean signal.
+
+**The burst points at six unrelated jobs with no shared dependency. What does that mean?**
+That is the second burst shape and it usually points at shared infrastructure rather than a data cascade. Common causes: an expired service principal or PAT token breaking authentication across jobs, a metastore or Unity Catalog hiccup, a cluster pool that ran out of capacity so new clusters could not start, or a cloud-provider zone issue. Check token expiry and pool capacity first.
+
+**Does this include Delta Live Tables pipeline failures?**
+Not directly. This card reads the Jobs API runs. DLT pipelines have their own lifecycle and are tracked on [DLT Pipeline Status Distribution](/nerve-centre/kpi-cards/databricks/dlt-pipeline-status-distribution). During a workspace-wide event you will often see both this card and the DLT card light up together; read them as one incident.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Failed Job Burst (>5 failures in 1h)* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

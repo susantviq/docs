@@ -1,0 +1,147 @@
+---
+title: "Active Clusters, Databricks"
+sidebarTitle: "Active Clusters"
+description: "Active Clusters for Databricks workspaces. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Executive Overview](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The count of Databricks compute clusters currently in a `RUNNING` (or `RESIZING`) state in the connected workspace. For a platform team, this is the single fastest answer to "how much compute is alive and billing DBUs right now?" Every running cluster, whether it is doing useful work or sitting idle, is consuming DBUs and underlying cloud instances. A sudden jump in active clusters is usually the first visible symptom of a runaway notebook, a misconfigured job pool, or an autoscaling event that has not scaled back down.
+
+| | |
+| --- | --- |
+| **Data source** | Databricks Clusters API, `GET /api/2.1/clusters/list`, filtered to `state IN (RUNNING, RESIZING)`. Reconciled against the workspace `system.compute.clusters` system table for historical context. |
+| **Metric basis** | A live count of cluster objects in a running state, not a count of DBUs. One large cluster and one single-node cluster each count as 1. Read this card with [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) to weight the count by cost. |
+| **Aggregation window** | `RT` (real-time), polled every 60 seconds against the Clusters API. |
+| **What counts** | All-purpose (interactive) clusters and job clusters currently `RUNNING` or `RESIZING`. SQL warehouses are counted separately on [Active SQL Warehouses](/nerve-centre/kpi-cards/databricks/active-sql-warehouses) because they bill on a different DBU SKU. |
+| **What does NOT count** | (1) Clusters in `TERMINATED`, `TERMINATING`, or `PENDING` state; (2) SQL warehouses (own card); (3) Delta Live Tables compute, which is surfaced via [DLT Pipeline Status Distribution](/nerve-centre/kpi-cards/databricks/dlt-pipeline-status-distribution); (4) serverless compute, which has no persistent cluster object to count. |
+| **Cluster types included** | Both interactive all-purpose clusters and ephemeral job clusters. The breakdown by type is available on hover; job clusters that spin up and terminate per run will cause this number to fluctuate by design. |
+| **Time zone** | Workspace time zone for chart axes; UTC for cross-connector windowing. |
+| **Time window** | `RT` (real-time, refreshed every 60 seconds). |
+| **Alert trigger** | None by default. Pair with [Avg Cluster CPU Utilisation %](/nerve-centre/kpi-cards/databricks/avg-cluster-cpu-utilisation) and [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h) to turn a raw count into a cost or capacity signal. |
+| **Roles** | owner, platform engineering, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+The value is a straight count of cluster records returned by the Clusters API where the `state` field is `RUNNING` or `RESIZING`:
+
+```text
+active_clusters = COUNT(cluster) WHERE cluster.state IN ('RUNNING', 'RESIZING')
+```
+
+`RESIZING` is included because an autoscaling cluster mid-scale is still live and billing; excluding it would make the count flicker downward during every scale event. `PENDING` clusters (instances requested from the cloud provider but not yet ready) are deliberately excluded so the number reflects compute that is actually available to run work, not compute that is still being provisioned.
+
+The card does not weight by node count, instance type, or DBU rate. A 64-node Photon cluster and a single-node `m5.large` cluster both add 1 to the total. That is intentional: this is the "how many things are alive" pulse, and the cost weighting lives on the DBU Burn cards. To convert the count into a cost figure, the platform team should cross-reference [DBU by Cluster (7d)](/nerve-centre/kpi-cards/databricks/dbu-by-cluster-7d), which attributes DBUs to each cluster individually.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A retail data platform team runs a single Databricks workspace on AWS supporting an ecommerce analytics estate: hourly ingestion jobs, a nightly transformation batch, and a handful of analysts running interactive notebooks. Snapshot taken on 14 Apr 26 at 09:15 BST.
+
+| Cluster name | Type | State | Nodes | DBU/hour |
+| --- | --- | --- | --- | --- |
+| prod-ingest-hourly | Job | RUNNING | 4 | 6.0 |
+| prod-nightly-transform | Job | TERMINATED | 0 | 0 |
+| analytics-shared | All-purpose | RUNNING | 2 to 8 (autoscale) | 3.0 to 12.0 |
+| ds-sandbox-aanya | All-purpose | RUNNING | 1 | 1.5 |
+| ds-sandbox-marco | All-purpose | RESIZING | 2 to 6 | 3.0 to 9.0 |
+
+The Vortex IQ dashboard headline reads **4 active clusters** (the nightly transform terminated cleanly at 06:00 and is correctly excluded; the two sandboxes and two prod clusters are live, and `ds-sandbox-marco` is counted because `RESIZING` is treated as live).
+
+What the platform lead reads from this in ten seconds:
+
+1. **The expected baseline at 09:15 is 2 to 3.** The hourly ingest job and the shared analytics cluster are meant to be up during business hours. Two data-science sandboxes being live as well is the variable part.
+2. **`ds-sandbox-marco` is resizing upward at 09:15.** A single analyst's sandbox scaling from 2 to 6 nodes first thing in the morning is worth a glance, it usually means a notebook cell triggered a wide shuffle. Not an incident, but a candidate for the [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h) review if it stays large with no jobs attached.
+3. **The headline count alone is not a cost statement.** Four clusters could be four single-node sandboxes (cheap) or one of them could be a 64-node Photon job (expensive). The lead immediately glances at [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) to weight the count.
+
+```text
+Why the count matters for cost control:
+  - 4 active clusters at 09:15 is normal for this estate.
+  - If the same card reads 11 active clusters at 23:00 (out of hours),
+    that is the signal: job clusters that should have auto-terminated
+    are still alive, or someone left an interactive cluster running.
+  - Each idle all-purpose cluster left overnight at ~3 DBU/hour for
+    8 hours = 24 DBU wasted per cluster per night.
+  - At an illustrative blended rate of $0.55/DBU, that is ~$13/cluster/night,
+    or ~$4,700/year per forgotten cluster.
+```
+
+The single most valuable habit this card enables: a quick out-of-hours sanity check. The number that is "normal" at 10:00 should be far lower at 02:00. A flat or rising count overnight is almost always auto-termination not firing.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Active Clusters | What the combination tells you |
+| --- | --- | --- |
+| [Active SQL Warehouses](/nerve-centre/kpi-cards/databricks/active-sql-warehouses) | The other half of live compute, on a different DBU SKU. | Together they give the complete "what is billing right now" picture across clusters and warehouses. |
+| [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) | Weights the raw count by actual cost. | A high cluster count with low DBU burn equals many small clusters; a low count with high burn equals a few large ones. |
+| [Avg Cluster CPU Utilisation %](/nerve-centre/kpi-cards/databricks/avg-cluster-cpu-utilisation) | Tells you whether the live clusters are doing work. | Many active clusters at under 30% CPU equals over-provisioning and a right-sizing opportunity. |
+| [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h) | Quantifies the cost of clusters that are alive but not working. | High idle DBU plus a high cluster count equals auto-termination misconfigured. |
+| [DBU by Cluster (7d)](/nerve-centre/kpi-cards/databricks/dbu-by-cluster-7d) | Attributes spend to each individual cluster. | Identifies which of the active clusters is the expensive one. |
+| [Long-Running Jobs (>1h)](/nerve-centre/kpi-cards/databricks/long-running-jobs-1h) | Long jobs keep job clusters alive longer. | A rising cluster count that tracks long-running jobs is a stuck job, not a leak. |
+| [Databricks Health Score](/nerve-centre/kpi-cards/databricks/databricks-health-score) | The composite that folds compute state into one number. | An abnormal cluster count is one of the inputs that can drag the score below 70. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Databricks:**
+
+> **Compute** page in the workspace UI: the list of all-purpose and job clusters with their live state. Filter to "Running" to match this card.
+> **`databricks clusters list`** via the Databricks CLI, or `GET /api/2.1/clusters/list` directly, then count records with `state = RUNNING` or `RESIZING`.
+> **`system.compute.clusters`** system table in Unity Catalog for the historical record of cluster lifecycle events, useful for confirming what was running at a past timestamp.
+
+**Why our number may legitimately differ from the Compute page:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Polling cadence** | Brief lag | Vortex IQ polls every 60 seconds; a cluster that started or terminated in the last minute may not yet be reflected. The Compute page is live on refresh. |
+| **`RESIZING` handling** | Vortex IQ count may be higher | We count `RESIZING` as active; if you filter the UI strictly to `RUNNING` you may see one fewer during a scale event. |
+| **Job cluster churn** | Both fluctuate | Ephemeral job clusters appear and disappear per run; the count you see depends on the exact second you look. |
+| **Serverless compute** | Vortex IQ count lower | Serverless SQL and serverless jobs have no persistent cluster object; they do not appear here. Track serverless via DBU burn instead. |
+| **Workspace scope** | Variable | This card counts one connected workspace. A multi-workspace account will show each workspace's count separately. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | What causes divergence |
+| --- | --- | --- |
+| [DBU Burn vs Ecom Order Volume](/nerve-centre/kpi-cards/databricks/dbu-burn-vs-ecom-order-volume) | More active clusters during peak ecom traffic is normal; the compute scales with the workload. | A rising cluster count with flat order volume is the classic inefficiency signal. |
+| [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) | Cluster count and DBU burn should rise and fall together. | Count flat but DBU rising equals clusters scaling up internally; count rising but DBU flat equals many tiny clusters. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does the count keep changing even when nobody is doing anything?**
+Job clusters are ephemeral by design: a scheduled job spins up a dedicated cluster, runs, and terminates. If you have jobs running every few minutes, the count will breathe up and down naturally. The number to watch is the floor (how low does it get between jobs) and the out-of-hours value, not the moment-to-moment fluctuation.
+
+**Does this count SQL warehouses?**
+No. SQL warehouses bill on a separate DBU SKU and have their own lifecycle, so they live on the [Active SQL Warehouses](/nerve-centre/kpi-cards/databricks/active-sql-warehouses) card. To see total live compute, read both cards together.
+
+**A cluster is showing as active here but I terminated it.**
+Termination is not instant. The cluster moves through `TERMINATING` before reaching `TERMINATED`, and the cloud provider takes time to release the instances. The card excludes `TERMINATING`, so within one poll cycle (up to 60 seconds) the count will drop. If it persists for several minutes, check the Compute page for a stuck termination.
+
+**Why is serverless compute not counted?**
+Serverless SQL warehouses and serverless jobs do not expose a persistent cluster object via the Clusters API, because the compute is managed entirely by Databricks. There is nothing to count. The cost of serverless still shows up in [DBU Burned (24h)](/nerve-centre/kpi-cards/databricks/dbu-burned-24h) via the billable usage system table, so the spend is never invisible, just not on this card.
+
+**What is a healthy number for my workspace?**
+There is no universal answer; it depends on your job schedule and team size. The right approach is to learn your own baseline: note the count at a few times of day for a week, then treat deviations from that pattern as the signal. The most reliable alert in practice is "count out-of-hours is materially above the overnight baseline", which points straight at auto-termination not firing.
+
+**Can I set an alert on this card?**
+This specific card ships without a default threshold because the "right" count is workspace-specific. For cost-anomaly alerting, use the sensitivity-class cards that are tuned for it: [DBU Burn +50% Week-over-Week](/nerve-centre/kpi-cards/databricks/dbu-burn-50-week-over-week) and [Idle Cluster DBU Wasted (24h)](/nerve-centre/kpi-cards/databricks/idle-cluster-dbu-wasted-24h). You can also set a custom sensitivity threshold on this card in the Sensitivity tab if your estate has a stable expected count.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Active Clusters* is one of hundreds of KPI pulses Vortex IQ tracks across Databricks and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.
