@@ -1,0 +1,162 @@
+---
+title: "Transactions Failing to Save (SuiteScript errors), NetSuite"
+sidebarTitle: "Transactions Failing to Save (SuiteScript errors)"
+description: "Transactions Failing to Save (SuiteScript errors) flags record-save failures that block transactions, often silently inside background scripts. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ecommerce Platform](/nerve-centre/connectors#connectors-by-type)
+
+> SuiteScript record-save failures block transactions. P1 because they often happen silently inside background scripts, dropping sales orders, invoices, and inventory updates without anyone noticing.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> SuiteScript is the automation that runs your NetSuite account: scripts that create sales orders from storefront feeds, post invoices, apply payments, update inventory, and sync data. When one of those scripts hits an error while saving a record, the record does not save. If the script runs in the background (a scheduled or map/reduce job, or a user-event script firing on import), the failure is invisible: no one sees an error message, and the transaction simply never appears. This card surfaces those silent save failures so a dropped order or a missing invoice is caught in minutes, not at month-end.
+
+| | |
+| --- | --- |
+| **What it counts** | The number of record-save failures attributed to SuiteScript errors in the lookback. Includes user-event, scheduled, map/reduce, RESTlet, and Suitelet save failures where a transaction or supporting record failed to commit. |
+| **Tax treatment** | n/a directly, but a failed invoice save means revenue and its tax never posted, so failures can understate both revenue and tax liability until fixed. |
+| **Currency** | n/a for the count. Any value context (the dollar size of dropped transactions) is shown in reporting currency. |
+| **Subsidiary scope** | Respects dashboard filter. Scripts run account-wide but the affected records belong to subsidiaries, so the count is scoped to the subsidiaries in the filter. |
+| **Time window** | `RT` (real-time; the list and count reflect failures as they occur). |
+| **Alert trigger** | Fires on `greater than 0 errors in the last 1 hour`. Any save failure is worth surfacing immediately; this is a P1 because the failures are silent. |
+| **Roles** | owner, finance, engineering |
+| **Chart type** | Alert list (one row per failure, with script name and affected record). |
+| **Why it matters** | A failed save silently drops sales orders, invoices, and inventory updates. The data simply is not there, so no downstream report can flag the gap. This is a Hero, P1 card because invisible data loss is the most dangerous kind. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+The card reads SuiteScript execution outcomes and surfaces the cases where a script error prevented a record from saving. It focuses on save failures specifically (rather than every logged warning), because a failed save is the outcome that loses data: the transaction or supporting record never commits to the database. It covers the full range of script types that can write records, including user-event scripts that fire when a record is created or imported, scheduled and map/reduce jobs that batch-process transactions, and RESTlets and Suitelets that external systems call to push data in. Each failure is surfaced with enough context (the script involved, the record type, the time) to route it to the right owner.
+
+The logic is a count and a list rather than a value, because the urgent question is "did something fail to save", not "how much". The default alert fires on any failure in the trailing hour, which reflects the P1 nature of silent data loss: unlike a slow report or a late close, a dropped transaction produces no error anyone sees and no gap any downstream report can detect, because the record that would prove the gap exists is exactly the record that never saved. The card does not retry or auto-fix the failure; it surfaces it so engineering can diagnose the script error and finance can confirm whether a dropped transaction needs to be re-entered.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A high-volume DTC and wholesale brand on NetSuite OneWorld. Two subsidiaries: a US parent (USD) and an EU sub (EUR). Storefront orders flow in through a nightly integration; invoices and inventory updates are posted by scheduled scripts. Annual revenue roughly $60M. Window covers a single hour on the morning of 18 Jun 26. Reporting currency USD. These figures are illustrative.
+
+| Script / source | Record type affected | Failures in the hour | Estimated value dropped (USD) |
+| --- | --- | --- | --- |
+| Order import (user-event) | Sales Order | 14 | 9,800 |
+| Invoice generation (scheduled) | Invoice | 6 | 4,200 |
+| Inventory sync (map/reduce) | Inventory Adjustment | 23 | n/a (quantity, not value) |
+| Payment application (RESTlet) | Customer Payment | 3 | 2,100 |
+| **Failures on this card** | | **46** | **16,100 directly** |
+
+Five things to notice:
+
+1. **Forty-six silent failures in a single hour is a P1 because nothing else in the stack will tell you.** This is the defining property of the card. When a sales order import fails to save, there is no errored sales order sitting in a queue for someone to notice; the order simply does not exist in NetSuite. No revenue report shows a gap, because the report only sums the orders that did save. No fulfilment team gets a pick ticket, because there is nothing to pick. The customer, meanwhile, has a confirmation email from the storefront and is waiting for goods that NetSuite has no record of. The only way to know this happened is to watch the script execution layer itself, which is exactly what this card does. Without it, the 14 dropped orders surface days later as customer complaints and a revenue shortfall nobody can explain.
+
+2. **The order-import failures are the most commercially damaging, even though they are not the most numerous.** The map/reduce inventory sync dropped 23 records, the largest count, but those are quantity adjustments that will often be reattempted on the next sync cycle, so the data loss can be self-healing. The 14 dropped sales orders are not self-healing: each is a real customer order with a real payment taken on the storefront that now has no fulfilment path in NetSuite. At an estimated 9,800 USD they are also the largest direct revenue exposure. The card surfaces both counts, but reading them by commercial impact rather than raw volume is what tells operations to chase the 14 orders first.
+
+3. **The pattern across script types usually points at one root cause, not four.** When user-event, scheduled, map/reduce, and RESTlet scripts all start failing in the same hour, the cause is rarely four separate bugs. It is far more often a single shared dependency that broke: a custom field that was changed or removed, a saved search the scripts all reference that now times out, a governance or concurrency limit being hit under load, or a deployment that pushed a broken library script all the others depend on. The card lists the failures by script, but the diagnostic move is to look for the common thread. A controller seeing failures spread across unrelated scripts should suspect an infrastructure or configuration change, not a coincidence of four bugs.
+
+4. **The dropped invoice and payment rows are a revenue-and-cash integrity problem that compounds into the close.** Six invoices that failed to save mean revenue (and its tax) that never posted to the GL, so the period understates revenue and tax liability until the invoices are re-created. Three customer payments that failed to apply mean cash that was received but is not reflected against the customer's AR, so DSO and cash-application metrics are quietly wrong. If these failures are not caught and corrected before period close, finance closes the books on understated revenue and misstated AR, and the error only surfaces during reconciliation or audit. The value column exists so finance can judge materiality and decide whether the close can proceed or must wait for re-entry.
+
+5. **Real-time detection at the one-hour grain is the whole point, because the cost of a save failure scales with how long it stays undiscovered.** A dropped order caught within the hour can be re-imported before the customer ever notices, fulfilment proceeds normally, and the GL is correct by end of day. The same dropped order discovered a week later is a customer-service escalation, a manual order re-entry, a fulfilment scramble, and a revenue figure that was wrong in last week's board pack. Because the failures are invisible to every downstream report, the only thing that limits the damage is detection speed. The alert firing on any failure in the trailing hour is calibrated to that reality: there is no "acceptable" number of silent save failures to let accumulate, so the threshold is effectively zero.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Transactions Failing to Save |
+| --- | --- |
+| [SuiteScript Execution Errors (24h)](/nerve-centre/kpi-cards/netsuite/suitescript-execution-errors-24h) | The broader script-error population; this card is the save-failure subset that loses data. |
+| [Saved Search Timeout Rate (24h)](/nerve-centre/kpi-cards/netsuite/saved-search-timeout-rate-24h) | A timing-out saved search a script depends on is a common cause of save failures. |
+| [Commerce Orders Without NetSuite SO](/nerve-centre/kpi-cards/netsuite/commerce-orders-without-netsuite-so) | A dropped order import shows up here as a storefront order with no matching SO. |
+| [Inventory Item On-Hand Went Negative (any Location)](/nerve-centre/kpi-cards/netsuite/inventory-item-on-hand-went-negative-any-location) | A failed inventory-update save can leave on-hand wrong or negative. |
+| [Open Transactions Pending Approval / Error](/nerve-centre/kpi-cards/netsuite/open-transactions-pending-approval-error) | Errored transactions that did partially save land here. |
+| [NetSuite Health Score](/nerve-centre/kpi-cards/netsuite/netsuite-health-score) | Save failures are one of the strongest negative inputs to overall account health. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against NetSuite
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in NetSuite:**
+
+SuiteScript execution and errors are visible in NetSuite's script monitoring, so this card triangulates against the platform's own logs:
+
+> **Customization → Scripting → Script Execution Logs** (filter to type Error to see failed executions, with the script and the timestamp)
+> **Customization → Scripting → Scripts** then a script's **Execution Log** subtab (per-script error history)
+> **Customization → Scripting → Script Deployments** (status and logging level per deployment; a deployment set to log only errors will show less than one set to debug)
+> **Saved search**: a Script Execution Log saved search filtered to error level over the lookback, grouped by script and record type, which is close to the failure population the card surfaces
+> **System Notes and the missing-record test**: because a failed save leaves no record, the proof is often the absence of an expected transaction; cross-check against the storefront or source system for records that should exist but do not
+
+The headline difference is that NetSuite's execution logs record that a script errored, but they do not, on their own, tell you a business transaction failed to save or estimate its commercial impact, and they require someone to go and look. The card continuously watches the save-failure subset, attributes it to the affected record type, and alerts in real time.
+
+**Why our number may legitimately differ from NetSuite's script logs:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Save failures vs all errors** | Card is lower | The card focuses on errors that prevented a record from saving; the raw execution log includes warnings and non-fatal errors that did not lose data. |
+| **Logging level** | Either | A deployment logging only errors records fewer entries than one logging debug; the card depends on what the script logs, so under-logged scripts can hide failures. |
+| **Governance and timeout failures** | Either | A script killed by a governance or usage limit may log differently from a thrown error; whether it counts depends on how the failure was raised. |
+| **Retried and self-healing jobs** | Card may show fewer | Map/reduce and scheduled jobs that reattempt on the next cycle can resolve a failure before it is counted as a permanent loss. |
+| **Subsidiary scope** | Either | The card scopes affected records to the subsidiaries in the filter; the raw script log is account-wide. |
+| **External-call failures** | Either | A RESTlet that errored before NetSuite processed the request may be visible in the caller's logs but not fully in NetSuite's. |
+| **Lookback window** | Either | The one-hour alert grain differs from a saved search run over a day or a week; counts will not match across different windows. |
+
+There is no cross-connector reconciliation table for the financial sense, but the most important cross-channel check is below.
+
+**Cross-connector reconciliation, the cross-channel finding:**
+
+The proof of a silent save failure usually lives in the source system, not in NetSuite, because the whole problem is that the record never reached NetSuite. The single most valuable join is against the connected storefront's order feed:
+
+| Card | Expected relationship | What the comparison reveals |
+| --- | --- | --- |
+| [shopify.orders](/nerve-centre/shopify/orders) | Every storefront order should have a NetSuite SO | A storefront order with no matching SO is the fingerprint of a dropped order-import save; the storefront has the order, NetSuite never received it. |
+| [bigcommerce.orders](/nerve-centre/bigcommerce/orders) | Same | A BigCommerce order with no SO confirms the import failed silently. |
+| [adobe_commerce.orders](/nerve-centre/adobe_commerce/orders) | Same | Same dynamic; Adobe Commerce order present, NetSuite SO absent. |
+
+The cross-channel finding that no single platform can produce: a SuiteScript save failure is invisible inside NetSuite (the dropped record leaves no trace), but it becomes unmistakable the moment you join NetSuite to the storefront. The storefront knows it sent an order; NetSuite has no SO for it. Neither system, alone, can tell you a transaction was lost, because each only knows its own state. Vortex IQ joins the storefront order feed to the NetSuite SO list and to the SuiteScript error log, and the intersection (storefront order present, NetSuite SO absent, script error logged at the same minute) is a single, confident root-cause finding: this specific order was dropped by this specific script at this time. That triangulation turns a vague "revenue looks low" into a precise list of orders to re-import, which is the difference between a five-minute fix and a week-long reconciliation.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**What does "failing to save" actually mean?**
+When SuiteScript tries to create or update a record and hits an error during the save, the record does not commit to the database. The transaction simply does not exist afterwards. This card surfaces those failures specifically, as distinct from script warnings or non-fatal errors that did not lose any data.
+
+**Why is this a P1 and a Hero card?**
+Because the failures are silent. A dropped order or invoice leaves no errored record in a queue and produces no gap any downstream report can flag, since the record that would prove the gap is exactly the one that never saved. Invisible data loss is the most dangerous kind, so the card treats any failure in the trailing hour as worth alerting immediately.
+
+**Which script types does it cover?**
+The full range that can write records: user-event scripts firing on create or import, scheduled and map/reduce jobs that batch-process transactions, and RESTlets and Suitelets that external systems call to push data in. Wherever a script saves a record, a failure of that save is in scope.
+
+**How do I find a record that never saved?**
+You look for its absence. Because the record is not in NetSuite, the proof usually lives in the source system. For dropped order imports, compare the storefront order feed to the NetSuite sales-order list; an order present in the storefront with no matching SO is the fingerprint of a failed save. The card surfaces the script error and the timing; the source-system join confirms exactly which records were lost.
+
+**Why do failures across several scripts often share one cause?**
+Because scripts share dependencies. A changed or removed custom field, a saved search that started timing out, a governance or concurrency limit hit under load, or a deployment of a broken library script can break many scripts at once. When failures appear across unrelated scripts in the same window, suspect a shared cause rather than four separate bugs.
+
+**Does the card retry or fix the failure?**
+No. It detects and prioritises. Correcting a dropped transaction is a deliberate action: engineering diagnoses the script error and fixes the root cause, and finance confirms whether the dropped record needs to be re-entered to keep the GL correct. The card preserves the human-in-the-loop so the correction has a clean audit trail.
+
+**How does logging level affect what I see?**
+The card depends on what scripts log. A deployment configured to log only errors records fewer entries than one logging debug-level detail. If a script under-logs, a failure can be harder to detect. Keeping critical transaction scripts at an appropriate logging level is part of making this card reliable.
+
+**Multi-currency and FX, do they matter here?**
+Not for the count; a failure is a failure regardless of currency. FX only affects the value context, the estimated dollar size of dropped transactions, which is shown in the reporting currency. The detection and alerting never move with FX.
+
+**How does OneWorld change the reading?**
+Scripts generally run account-wide, but the records they fail to save belong to specific subsidiaries. The card scopes the affected records to the subsidiaries in your filter, so you can isolate whether dropped transactions are hitting one subsidiary (often a sign of a sub-specific configuration or integration) or spread across the group (more likely a shared script or platform issue).
+
+**B2B vs DTC, does it read differently?**
+The mechanism is identical, but the exposure differs. High-volume DTC and omnichannel businesses push large numbers of orders, payments, and inventory updates through scripts, so a save failure can drop many small transactions fast. B2B operations push fewer but larger transactions, so a single dropped invoice or SO can be very high value. Read counts by commercial impact, not raw volume.
+
+**How does a save failure distort period close?**
+Significantly. A failed invoice save means revenue and its tax never posted; a failed payment application means received cash is not reflected against AR. If these are not caught and corrected before the close, the books lock on understated revenue, misstated AR, and wrong cash-application figures, and the error only surfaces during reconciliation or audit. Pair with the period-close cards to ensure outstanding failures are resolved before locking.
+
+**How does this compare to error handling in other ERPs?**
+All extensible ERPs let custom code fail. NetSuite's SuiteScript is unusually pervasive (much of standard automation runs through it), so silent save failures are a meaningful operational risk and worth dedicated monitoring. Oracle and SAP have their own extension frameworks with their own error logs; the principle is the same, but the card is purpose-built for SuiteScript's execution model and the storefront-to-SO join that proves a dropped transaction.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Transactions Failing to Save (SuiteScript errors)* is one of hundreds of KPI pulses Vortex IQ tracks across NetSuite and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

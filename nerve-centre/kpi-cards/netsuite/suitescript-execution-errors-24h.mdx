@@ -1,0 +1,160 @@
+---
+title: "SuiteScript Execution Errors (24h), NetSuite"
+sidebarTitle: "SuiteScript Execution Errors (24h)"
+description: "SuiteScript Execution Errors (24h): count of SuiteScript runtime errors in the last 24 hours. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ecommerce Platform](/nerve-centre/connectors#connectors-by-type)
+
+> Count of SuiteScript runtime errors in the last 24h. Custom scripts that error block records from saving, so this is a direct measure of whether your automation layer is healthy.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> The number of SuiteScript runtime errors logged across your account in the last 24 hours. SuiteScript is the custom-code layer that automates NetSuite: it validates records, posts integrations, applies pricing rules, and pushes data to and from your commerce platform. When a script errors it can block the record it was running on from saving, which means an order does not post, an invoice is not created, or a sync silently stops. A common cause is an external app changing the shape of the data it sends, so a script that expected one field layout suddenly receives another and throws. This card is the early-warning system for that whole class of failure.
+
+| | |
+| --- | --- |
+| **What it counts** | The count of SuiteScript execution errors recorded in the script execution logs over a rolling 24-hour window, across all deployed scripts (user event, scheduled, map/reduce, RESTlet, Suitelet, client). Each logged error is one count. |
+| **What an error means** | A script raised an unhandled exception during execution. Depending on the script type this may block the triggering record from saving, halt a scheduled job, or fail an inbound or outbound integration call. |
+| **Common cause** | An external integration changing its payload shape (a renamed field, a new required value, a changed data type) so a script that parsed the old shape throws on the new one. Other causes: governance limit exceeded, permission change, a referenced record deleted. |
+| **Currency** | n/a; this is a count of errors, not money. |
+| **Subsidiary scope** | Account-wide. Scripts run at the account level, so errors are not scoped per subsidiary, though the records they touch may be. |
+| **Time window** | `24H` (rolling) |
+| **Alert trigger** | `greater than 10` errors in the window, driven by the script-health sentiment key |
+| **Roles** | owner, finance, engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your NetSuite data. The card reads the script execution log over a rolling 24-hour window and counts every entry recorded at error severity. It does not attempt to judge which errors are serious, every logged error counts toward the headline, because in a healthy account the steady-state error count is very low and any sustained rise is a signal worth investigating.
+
+The number is a leading indicator, not a financial figure. A single error might be a one-off (a user deleted a record a script later referenced); a cluster of the same error repeating is almost always a systemic break (an integration payload changed, a permission was revoked, a governance limit was hit). The alert fires above ten in the window because that is the level at which a steady stream of failures is almost certainly hitting real records rather than being isolated noise. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A US health and beauty brand on NetSuite (single subsidiary, USD) selling through BigCommerce DTC and a B2B portal. Annual revenue ~$30M. Order import from BigCommerce to NetSuite is handled by a user event script plus a scheduled map/reduce job. Window: 24 hours ending 22 Jun 26, 09:00.
+
+| Script | Type | Errors in 24h | Records affected | Symptom |
+| --- | --- | --- | --- | --- |
+| BC_Order_Import_UE | User Event | 84 | 84 sales orders | Orders not saving |
+| BC_Order_Import_MR | Map/Reduce | 12 | 84 (retries) | Retry loop failing |
+| Pricing_Rule_Apply | User Event | 3 | 3 invoices | Edge-case discount |
+| Tax_Nexus_Sync | RESTlet | 1 | 1 customer | Transient timeout |
+| **Total (this card)** | | **100** | | |
+
+Five things to notice:
+
+1. **The headline is 100 errors against an alert line of 10, and 96 of them trace to a single root cause.** The instinct on seeing "100 errors" is to imagine a hundred separate problems, but the breakdown shows the opposite: 84 from the import user event and 12 from its retry job are the same failure counted at two stages of the same pipeline. The card's value is that it surfaces the count fast, within the 24-hour window, so the engineering team is looking at the script log on the morning it broke rather than discovering three days later that orders stopped posting. Speed of detection is the entire point of a rolling-24h hero card.
+
+2. **The root cause is the textbook one: BigCommerce changed its order payload.** Investigation of the BC_Order_Import_UE log shows every error is the same null-reference exception on a field the script expected to read from the inbound order. BigCommerce released a change that renamed a customer-address field, and the import script, which parsed the old field name, now reads null and throws before it can save the sales order. The 12 map/reduce errors are the scheduled retry job re-attempting the same 84 orders and failing identically. This is exactly the "external-app integration changing payload shape" pattern the card is built to catch.
+
+3. **The business impact is invisible on every other dashboard until this card fires.** Because the sales orders never saved, NetSuite has no record of them. Revenue is not recognised, AR is not created, inventory is not depleted, and the warehouse never gets a fulfilment to pick. To the finance team, the day simply looks quiet. To the customer, the order looks complete because BigCommerce took the payment. The gap between "customer paid" and "NetSuite knows" is precisely the leak that the [Commerce Orders Without NetSuite SO](/nerve-centre/kpi-cards/netsuite/commerce-orders-without-netsuite-so) and [Ecom Orders Missing Matching NetSuite Cash Sale / Invoice](/nerve-centre/kpi-cards/netsuite/ecom-orders-missing-matching-netsuite-cash-sale-invoice) cards quantify in dollars. This card catches the cause; those cards measure the consequence.
+
+4. **The fix is small and the avoided cost is large.** The remedy is a one-line script change to read the new field name (plus a defensive null check so a future rename degrades gracefully instead of throwing). That is perhaps an hour of engineering time. The avoided cost is the 84 orders that would otherwise sit unbilled, plus every order that would fail in the same way over the days until someone noticed manually. On a brand doing $30M a year, a day of unposted DTC orders is easily $80,000 to $100,000 of revenue stranded outside the GL, and the longer it runs the harder the back-fill becomes because the orders pile up and the inventory picture drifts. The ROI on acting within the 24-hour window rather than the next month is enormous.
+
+5. **Not every error is equal, so read the breakdown, not just the headline.** The Pricing_Rule_Apply errors (3) and the Tax_Nexus_Sync error (1) are noise by comparison: an edge-case discount combination and a transient API timeout that the next run will clear. A naive reading that treats all 100 errors as one emergency wastes time; a reading that clusters by script and by error message immediately isolates the 96 that matter. The hero card's job is to get you to open the log; the log's job is to tell you which cluster to fix first. Always triage by repeated identical message before assuming the whole count is one incident.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with SuiteScript Execution Errors |
+| --- | --- |
+| [Transactions Failing to Save (SuiteScript Errors)](/nerve-centre/kpi-cards/netsuite/transactions-failing-to-save-suitescript-errors) | The record-level consequence of the errors this card counts. |
+| [Commerce Orders Without NetSuite SO](/nerve-centre/kpi-cards/netsuite/commerce-orders-without-netsuite-so) | When an import script errors, orders never become sales orders; this card shows the dollar leak. |
+| [Ecom Orders Missing Matching NetSuite Cash Sale / Invoice](/nerve-centre/kpi-cards/netsuite/ecom-orders-missing-matching-netsuite-cash-sale-invoice) | The billing-document gap a failing import script creates. |
+| [Saved Search Timeout Rate (24h)](/nerve-centre/kpi-cards/netsuite/saved-search-timeout-rate-24h) | Companion health metric; both rise when the account is under load or misconfigured. |
+| [Open Transactions Pending Approval / Error](/nerve-centre/kpi-cards/netsuite/open-transactions-pending-approval-error) | Records stuck in an error state, often downstream of a script failure. |
+| [NetSuite Health Score](/nerve-centre/kpi-cards/netsuite/netsuite-health-score) | The roll-up; SuiteScript errors are a major input to overall account health. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against NetSuite
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in NetSuite:**
+
+NetSuite logs every script execution, so this card reconciles cleanly against the native execution log and the script deployment views. The closest native places to triangulate against:
+
+> **Customization → Scripting → Script Execution Log** (the master log; filter by Type = Error and date for the 24-hour window to match the headline)
+> **Customization → Scripting → Scripts** (each script's own execution log tab shows errors for that specific deployment)
+> **Customization → Scripting → Script Deployments** (confirm a deployment is active and check its status; a disabled deployment stops erroring but also stops working)
+> **Saved search**: a Script Execution Log saved search filtered to Detail = Error, grouped by Script and by error message, which is the breakdown the worked example uses to cluster the count
+> **Setup → Company → System Notes** (when an error traces to a deleted or changed record, system notes show who changed what and when)
+
+The headline difference between this card and the raw execution log is interpretation. The execution log shows you every line; the card counts them over a fixed rolling window and alerts when the count crosses a level that, in practice, means something is systematically broken rather than misfiring once.
+
+**Why our number may legitimately differ from the Script Execution Log:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Log level filtering** | Either | The card counts entries at error severity; a raw log view that includes audit, debug, and system levels will show a far larger total. Match the log filter to Error only. |
+| **Window boundary** | Small | The card uses a rolling 24-hour window; a log view filtered to "today" uses a calendar day. Near midnight the two can differ by the orders processed in the boundary hours. |
+| **Retries counted** | Either | A scheduled or map/reduce job that retries a failed record logs an error on each attempt. The card counts each logged attempt; a human counting "failed orders" might count the underlying record once. |
+| **Logging suppressed in code** | Card may understate | A script that catches its own exception and logs at debug or audit rather than error will not appear at error severity. Well-behaved error handling can hide failures from this card; the [Transactions Failing to Save](/nerve-centre/kpi-cards/netsuite/transactions-failing-to-save-suitescript-errors) card catches those at the record level. |
+| **Disabled deployments** | Card reads lower | Disabling a broken deployment stops the errors but also stops the work; the count drops while the underlying problem (unprocessed records) grows. |
+
+**Cross-connector reconciliation, the killer cross-channel finding:**
+
+A SuiteScript error count on its own is an engineering metric. Joined to the commerce connectors it becomes a revenue metric, and that is where the hero status is earned.
+
+| Card | Expected relationship | What the comparison reveals |
+| --- | --- | --- |
+| [Commerce Orders Without NetSuite SO](/nerve-centre/kpi-cards/netsuite/commerce-orders-without-netsuite-so) | Causal | A spike in import-script errors is followed within hours by a rise in orphaned commerce orders. The two cards moving together pinpoints a broken import pipeline as the cause. |
+| [shopify.orders](/nerve-centre/shopify/orders) | Volume context | Compare the commerce order volume during the error window against the NetSuite sales orders created. The gap is the count of orders the failing script never posted. |
+| [bigcommerce.orders](/nerve-centre/bigcommerce/orders) | Volume context | Same. In the worked example, 84 BigCommerce orders versus 0 saved NetSuite sales orders is the failure made visible in business terms. |
+| [adobe_commerce.orders](/nerve-centre/adobe_commerce/orders) | Volume context | Adobe Commerce order volume against posted sales orders; a divergence dated to the error spike isolates the import script as the break. |
+| [Ecom Orders Missing Matching NetSuite Cash Sale / Invoice](/nerve-centre/kpi-cards/netsuite/ecom-orders-missing-matching-netsuite-cash-sale-invoice) | Causal | A failing billing or invoicing script leaves fulfilled orders unbilled; this card explains why that card's count just jumped. |
+| [google_ads.cost](/nerve-centre/google_ads/cost) | Wasted spend frame | If paid traffic is still driving orders the import script is silently dropping, you are paying to acquire orders that never reach your books. |
+
+The killer cross-channel finding is this: a SuiteScript error spike, on its own, looks like an engineering ticket; joined to commerce order volume it becomes a dollar figure the CFO understands instantly. When BC_Order_Import_UE threw 84 times, NetSuite alone could only say "84 errors". Vortex IQ overlays the 84 BigCommerce orders that paid but never posted, prices them at the customer-paid total, and reports "$92,000 of orders are stranded outside your GL because a script broke at 02:14 this morning". No single platform can produce that sentence. NetSuite sees the errors but not the commerce orders; the commerce platform sees the orders but not the NetSuite failure. The join turns a log line into a board-level number, and it turns the hour of engineering time to fix the script into one of the highest-ROI actions on the entire dashboard.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**A few errors a day, is that normal?**
+Usually yes. Most accounts have a low baseline of transient errors: an occasional API timeout, an edge-case data combination, a user deleting a record mid-process. The alert is set above ten precisely so that this baseline noise does not fire it. What matters is a sustained rise or a cluster of identical errors, which almost always means something systemic broke rather than a one-off misfire.
+
+**The count spiked but our orders look fine. What happened?**
+Check whether the errors are on a non-blocking script. Some script types (after-submit user events, scheduled jobs) error without preventing the triggering record from saving, so the order posts but a downstream action (a sync push, a notification, a custom field update) fails. The order is fine; the side effect is not. Read the breakdown by script to see which automations actually broke.
+
+**Why is a payload change such a common cause?**
+Because your integration layer depends on the shape of data that external systems control. When a commerce platform, payment gateway, or marketplace renames a field, changes a data type, or makes a previously optional value required, any script that parsed the old shape throws on the new one. The defensive fix is to write scripts that validate and null-check inbound data rather than assuming a fixed shape, but in practice many scripts are written against the shape that existed on the day they were built.
+
+**Can a script error block an order from saving entirely?**
+Yes, and this is the most serious case. A before-submit or before-save user event script that throws prevents the record from being committed at all. The order, invoice, or fulfilment simply does not exist in NetSuite. This is why the card is a hero metric: a blocking error is a silent revenue leak, and the only way to know early is to watch the error count.
+
+**Does this card cover scheduled and map/reduce jobs as well as real-time scripts?**
+Yes. The count includes user event, client, Suitelet, RESTlet, scheduled, and map/reduce script types. A failing scheduled job often retries, so it can contribute multiple log entries for the same underlying records; cluster by script and message to separate distinct failures from retries.
+
+**We are on OneWorld. Are errors scoped per subsidiary?**
+Scripts execute at the account level, so the error count is account-wide and not split by subsidiary. The records a script touches do belong to subsidiaries, so when you investigate a cluster you may find it concentrated in one subsidiary's transaction flow (for example a tax script that only errors for one country's nexus rules), but the headline count is account-wide.
+
+**Could disabling a broken script make this number look better while making things worse?**
+Yes, and it is a real trap. Disabling the deployment stops the errors, so the card drops, but the work the script did stops too, so unprocessed records quietly accumulate. A falling error count after a deployment is disabled is not a fix, it is a deferral. The honest fix is to repair the script and re-enable it, then watch both this card and the downstream order and invoice cards return to normal.
+
+**How does this differ from the Transactions Failing to Save card?**
+This card counts logged script errors; the [Transactions Failing to Save](/nerve-centre/kpi-cards/netsuite/transactions-failing-to-save-suitescript-errors) card counts the records that did not commit as a result. They are two views of the same problem from opposite ends: one is the cause (the script threw), the other is the effect (the record is missing). A script that catches its own exception and logs at debug can show on the transactions card without showing here, which is why both exist.
+
+**Do SuiteScript errors affect revenue recognition?**
+Indirectly but materially. If a billing or invoicing script fails, the Cash Sale or Invoice that recognises revenue is never created, so revenue for those orders is not recognised in the period and ASC 606 treatment cannot be applied to a document that does not exist. The error itself is not an accounting event, but its consequence (a missing revenue document) absolutely is. This is the link to the cross-channel billing-gap cards.
+
+**Will fixing the script automatically back-fill the missing records?**
+No. Fixing the script stops new failures; it does not recreate the records that already failed to save. Those have to be re-imported or manually created. This is why early detection matters so much: a one-hour fix on the morning of the break leaves you with a small back-fill, whereas a month-late discovery can leave hundreds of orders to reconstruct, with the inventory and AR picture having drifted in the meantime.
+
+**NetSuite vs other ERPs on script health?**
+SuiteScript is NetSuite-specific, so this exact metric does not transfer, but the concept does. SAP S/4HANA exposes ABAP runtime errors through transaction ST22 (the short dump analysis) and application-log monitoring; Oracle ERP Cloud surfaces integration and BPM faults through its monitoring consoles. The common thread is that every ERP with a custom-automation layer needs a live error-rate watch, and the same cross-channel value applies: the error count only becomes a business number when joined to the commerce volume it is dropping.
+
+**Can Ask Viq tell me which script broke?**
+Yes. Ask Viq can return the breakdown by script and error message for the window, so you can ask "what is causing the SuiteScript error spike?" and get the cluster analysis the worked example describes, including the most-repeated message and the count of affected records, without opening the execution log manually.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*SuiteScript Execution Errors (24h)* is one of hundreds of KPI pulses Vortex IQ tracks across NetSuite and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

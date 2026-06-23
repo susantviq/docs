@@ -1,0 +1,163 @@
+---
+title: "Inventory Item On-Hand Went Negative (any Location), NetSuite"
+sidebarTitle: "Inventory Item On-Hand Went Negative (any Location)"
+description: "Inventory Item On-Hand Went Negative (any Location) alerts when an item's location-level on-hand or available drops below zero, a data-integrity and oversell red flag. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ecommerce Platform](/nerve-centre/connectors#connectors-by-type)
+
+> Inventory Item On-Hand Went Negative (any Location): an alert when any item's location-level on-hand or available drops below zero, a data-integrity and oversell red flag.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> On-hand inventory should never be a negative number. You cannot physically have less than zero of something on a shelf. When NetSuite shows a negative on-hand or available quantity for an item at a location, it almost always means a transaction posted out of sequence, a fulfilment recorded stock that was never received, or a sync error let an order ship against stock that does not exist. This card lists every item-location combination that has gone negative so the problem is caught before it corrupts costing, oversells customers, or distorts the GL.
+
+| | |
+| --- | --- |
+| **What it counts** | Each item-and-location combination whose on-hand or available quantity has dropped below zero. One row per offending item-location, with the negative quantity and the location named. |
+| **Tax treatment** | n/a directly, but negative on-hand distorts inventory valuation, which feeds COGS and therefore taxable margin. |
+| **Currency** | Reporting currency for the valuation impact shown per row. |
+| **Subsidiary scope** | Respects dashboard filter. On OneWorld, locations belong to subsidiaries, so the list is scoped by the subsidiaries in the filter. |
+| **Time window** | `RT` (real-time; reflects the current quantity state of each item-location). |
+| **Alert trigger** | Fires when `any item-location available is less than 0`. Any negative is a flag; there is no benign negative on-hand. |
+| **Roles** | owner, operations, engineering |
+| **Chart type** | Alert list (one row per negative item-location). |
+| **Why it matters** | Negative on-hand is a data-integrity failure that silently corrupts costing, enables overselling, and breaks downstream inventory sync. It is a Hero card because the damage compounds the longer it goes unseen. |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+The card evaluates inventory quantity per item per location and lists any combination where on-hand or available has fallen below zero. It reads the location-level quantity rather than the item-level total, because a company-wide total can look healthy while a single warehouse is deeply negative, and the negative location is exactly the problem to fix. The card surfaces the offending item, the location, the negative quantity, and the valuation impact, so operations can prioritise by both severity and dollar exposure. It distinguishes on-hand (physical) from available (on-hand minus committed) where the data allows, because a negative available with positive on-hand is a different, usually less severe, problem than a negative physical on-hand.
+
+The logic is a list rather than a single number, because each negative item-location is a discrete defect with its own root cause and its own owner. There is no threshold to tune beyond zero itself; any negative on-hand is, by definition, impossible in the physical world and therefore always a data error worth investigating. The card does not attempt to auto-correct the quantity (that requires an inventory adjustment booked by a human with the right authority); it surfaces the defect so it can be triaged, root-caused, and corrected before it propagates into costing and downstream sync.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A fast-growing apparel brand on NetSuite OneWorld with omnichannel fulfilment. Two subsidiaries: a US parent (USD) with three locations (main DC, retail-store stock, and a 3PL) and a UK sub (GBP) with one DC. Annual revenue roughly $35M. Snapshot taken 18 Jun 26. Reporting currency USD. These figures are illustrative.
+
+| Item | Location | On-hand | Available | Valuation impact (USD) |
+| --- | --- | --- | --- | --- |
+| Hooded sweatshirt, black, M | US 3PL | -42 | -42 | -1,260 |
+| Running short, navy, L | US main DC | 0 | -18 | n/a (committed greater than on-hand) |
+| Trainer sock, 3-pack | US retail store | -6 | -6 | -54 |
+| Rain jacket, olive, XL | UK DC | -120 | -120 | -7,200 |
+| **Rows on this card** | | **4 negative item-locations** | | |
+
+Five things to notice:
+
+1. **The UK rain jacket at minus 120 units is the priority, and not just because it is the largest negative.** A negative on-hand of that size almost never happens by a single miskeyed transaction; it usually means stock was being fulfilled and sold for a sustained period against inventory that was never received into the system, or that a receipt was deleted after the goods had already shipped. At minus 120 with a 7,200 USD valuation impact, the GL is now carrying a negative inventory asset for this item at the UK DC, which is nonsensical and will distort the UK subsidiary's inventory valuation and COGS until corrected. This row should be triaged first because it has both the largest data-integrity damage and the largest financial distortion, and because a negative that deep implies an ongoing process failure rather than a one-off slip.
+
+2. **The navy running short is a different and milder problem: on-hand is zero but available is minus 18.** This is not a physical impossibility in the same way; it means more units are committed to open orders than are physically on hand. In practice it signals overselling: 18 units have been promised to customers that the warehouse does not have. The fix is not an inventory adjustment but a demand-side decision (expedite a receipt, reallocate from another location, or contact customers about a delay). The card separates this from a true negative on-hand because the root cause and the owner differ: negative available is a sales-and-allocation problem, negative physical on-hand is a data-integrity problem. Treating them identically would send operations chasing the wrong fix.
+
+3. **A company-wide total would hide all four of these, which is the entire reason the card works at location grain.** If the black sweatshirt is minus 42 at the 3PL but plus 300 at the main DC, the item-level total is healthily positive and no item-total report would ever flag it. But the 3PL is still carrying an impossible negative, the 3PL's costing is wrong, and any fulfilment routing that trusts the 3PL number will misbehave. By evaluating each item-location independently, the card catches defects that net-positive totals mask. This is one of the most common reasons negative on-hand goes undetected for weeks: the headline inventory number looks fine.
+
+4. **Negative on-hand silently corrupts costing, which is why operations and finance both need to see it.** NetSuite values inventory using a cost method (average cost, FIFO, or standard) that assumes non-negative quantities. When on-hand goes negative, the cost layers break: the system has to value units it does not believe it has, and the resulting COGS and inventory-asset figures drift from reality. Left uncorrected through period close, this flows into gross margin and taxable income. The valuation-impact column exists precisely so finance can see the dollar size of the distortion and decide whether it is material enough to block the close. A negative on-hand is therefore not just an ops annoyance; it is a financial-statement integrity issue.
+
+5. **The pattern across rows points at the root cause faster than any single row does.** Three of the four negatives are at locations with external or semi-automated stock movement (a 3PL, a retail store, a high-volume DC) and one is at the UK DC. When negatives cluster at locations with integration-driven inventory updates (3PL feeds, store POS sync, marketplace fulfilment), the likely culprit is a sync or sequencing failure: a shipment posted before its receipt, a cancelled order that did not restore stock, or a SuiteScript that updates quantities out of order. When they cluster at a single manual-entry location, the culprit is more likely process or training. Reading the list as a pattern rather than four isolated rows is how operations and engineering decide whether to fix four transactions or fix one broken integration.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+| Card | Why pair it with Inventory On-Hand Went Negative |
+| --- | --- |
+| [ERP vs Ecom Inventory Variance](/nerve-centre/kpi-cards/netsuite/erp-vs-ecom-inventory-variance) | A negative in NetSuite usually means the storefront and ERP have diverged; this card quantifies the gap. |
+| [Inventory Sync Drift](/nerve-centre/kpi-cards/netsuite/inventory-sync-drift) | Sync failures are the most common cause of negative on-hand. |
+| [On-Hand Inventory Value by Location](/nerve-centre/kpi-cards/netsuite/on-hand-inventory-value-by-location) | The valuation context for where the negative sits. |
+| [OOS with Open SO Demand](/nerve-centre/kpi-cards/netsuite/oos-with-open-so-demand) | Negative available means demand exceeds stock, the oversell signal. |
+| [Transactions Failing to Save (SuiteScript errors)](/nerve-centre/kpi-cards/netsuite/transactions-failing-to-save-suitescript-errors) | A failed save can drop a receipt or restock, producing a negative. |
+| [Items Below Reorder Point](/nerve-centre/kpi-cards/netsuite/items-below-reorder-point) | The healthy version of low stock; pair to separate genuine stockouts from data errors. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against NetSuite
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in NetSuite:**
+
+Inventory quantity by location is native, so this card triangulates directly against NetSuite's own inventory views:
+
+> **Reports → Inventory → Inventory on Hand** (quantity by item and location; sort ascending on on-hand to surface negatives)
+> **Lists → Accounting → Items** then drill an item to its **Locations** subtab (per-location on-hand, committed, and available for a single item)
+> **Reports → Inventory → Inventory Valuation Detail** (shows where a negative quantity is producing a nonsensical valuation)
+> **Saved search**: an Item saved search with a location-quantity column filtered to "quantity on hand less than 0" or "quantity available less than 0", grouped by location; this is essentially the population the card lists
+> **SuiteAnalytics workbook**: an Inventory Balance workbook sliced by item and location, filtered to negative, gives the per-location detail the card displays
+
+The headline difference is that NetSuite's inventory reports show quantities but do not, by default, alert you the moment a quantity crosses below zero. The card adds continuous detection and surfaces the negative the day it happens, rather than when someone next runs the report.
+
+**Why our number may legitimately differ from a NetSuite inventory report:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **On-hand vs available** | Either | The card flags both negative on-hand and negative available; a report showing only on-hand will miss the negative-available rows where stock is oversold but physically zero. |
+| **Timing of correction** | Card may show fewer | If an inventory adjustment was just posted to fix a negative, the card updates in real time while a cached report may still show the old negative. |
+| **Location scope** | Either | The card respects the subsidiary filter, so locations outside the selected subsidiaries are excluded; a report run at the parent may include them. |
+| **In-transit and intercompany** | Either | Inter-location or intercompany transfers in flight can momentarily show negative at the receiving or sending location until both legs post. |
+| **Bin and lot detail** | Either | For bin- or lot-tracked items, a negative at bin level can exist while the location total is positive; the card's grain affects what it catches. |
+| **Non-inventory item types** | Card excludes | Non-inventory, service, and drop-ship items do not carry on-hand and are excluded; a broad item report may list them. |
+| **Pending fulfilment posting** | Either | A fulfilment recorded but not yet posted can create a transient negative that resolves when the posting completes. |
+
+There is no cross-connector reconciliation table in the formal sense, but the most useful cross-channel finding is below.
+
+**Cross-connector reconciliation, the cross-channel finding:**
+
+| Card | Expected relationship | What the comparison reveals |
+| --- | --- | --- |
+| [shopify.inventory](/nerve-centre/shopify/inventory) | Should match NetSuite on-hand | When NetSuite goes negative for a location that feeds Shopify, the storefront often still shows positive stock, so Shopify keeps selling against inventory NetSuite knows does not exist, deepening the negative. |
+| [bigcommerce.inventory](/nerve-centre/bigcommerce/inventory) | Should match NetSuite on-hand | Same dynamic on BigCommerce; the storefront and ERP drift apart and the storefront wins the race to sell. |
+| [adobe_commerce.inventory](/nerve-centre/adobe_commerce/inventory) | Should match NetSuite on-hand | Adobe Commerce Multi-Source Inventory can mask the divergence per source until the ERP negative is reconciled. |
+
+The cross-channel finding that no single platform can produce: a negative on-hand in NetSuite paired with a still-positive quantity on the storefront is the textbook oversell loop. NetSuite alone sees the negative but not what the storefront is advertising. The storefront alone sees positive stock and keeps taking orders. Only by joining the NetSuite location quantity to the connected storefront's published inventory does the loop become visible, and it explains why a negative on-hand keeps getting deeper instead of stabilising: every new storefront order ships against phantom stock and pushes the NetSuite number further below zero. Catching this intersection early is the difference between correcting a minus 12 and untangling a minus 200 a fortnight later.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**How can on-hand even go negative?**
+You cannot physically have less than zero of something, so a negative on-hand is always a data error. The usual causes are a fulfilment or shipment posting before the matching receipt, a deleted or reversed receipt after goods already shipped, an out-of-sequence sync from a 3PL or marketplace, a cancelled order that did not restore stock, or a SuiteScript that updated quantities in the wrong order. The card flags the impossible state so you can find which of these happened.
+
+**What is the difference between negative on-hand and negative available?**
+On-hand is physical stock. Available is on-hand minus what is committed to open orders. A negative on-hand is a physical impossibility and a pure data-integrity defect. A negative available with zero or positive on-hand means more units are promised to customers than you physically have, which is an oversell and a sales-allocation problem rather than a data error. The card separates them because the root cause and the owner differ.
+
+**Why is this a Hero card?**
+Because the damage compounds silently. A negative on-hand corrupts inventory costing (average cost, FIFO, and standard all assume non-negative quantities), distorts COGS and margin, breaks downstream inventory sync, and on a connected storefront fuels an oversell loop. The longer it goes unseen, the deeper it gets and the harder it is to unwind. Real-time detection is high-value precisely because of that compounding.
+
+**Why does the card look at locations instead of the item total?**
+Because a company-wide total can be healthily positive while a single location is deeply negative, and the negative location is the real problem. An item that is minus 42 at a 3PL and plus 300 at the main DC nets positive, so no item-total report flags it, yet the 3PL's costing is wrong and any fulfilment routing that trusts the 3PL number will misbehave. Location grain is what makes the card catch these.
+
+**How does OneWorld change the reading?**
+Locations belong to subsidiaries, so the list is scoped by the subsidiaries in your dashboard filter. A negative at a UK-sub location distorts the UK subsidiary's inventory valuation and COGS specifically. Intercompany transfers in flight between subsidiaries can also momentarily show negative at one leg until both post, so check whether a negative is a genuine defect or a transient transfer artefact.
+
+**Does multi-currency or FX affect this card?**
+The quantity itself is currency-agnostic; a negative count is a negative count. FX only affects the valuation-impact column, which is shown in the reporting currency. So the detection never moves with FX, only the dollar size of the distortion does.
+
+**Will the card fix the negative for me?**
+No. Correcting a negative on-hand requires an inventory adjustment booked by someone with the right authority, and often a root-cause fix to the process or integration that caused it. The card detects and prioritises; the correction is a deliberate human action so the audit trail of the adjustment is preserved.
+
+**B2B vs DTC, does it read differently?**
+The defect is identical, but the cause profile differs. DTC and omnichannel businesses see more negatives from storefront and marketplace sync racing ahead of ERP receipts. B2B and wholesale businesses see more from large-shipment receiving timing, bulk transfers, and 3PL feeds. The card reads the same; the triage path depends on where your stock movement is automated.
+
+**What role do bin and lot tracking play?**
+For bin- or lot-tracked items, a negative can exist at the bin or lot level while the location total is still positive, or vice versa. The grain at which the card evaluates determines what it catches. If you run granular bin tracking, expect the card to surface bin-level negatives that a location-total report would smooth over.
+
+**Could a transient negative resolve itself?**
+Sometimes. A fulfilment recorded but not yet posted, or one leg of a transfer that has not completed, can create a brief negative that clears when the matching transaction posts. Because the card is real-time, a transient negative may appear and then disappear. A negative that persists across refreshes is the one that needs investigation; a flicker that self-resolves is usually a posting-sequence artefact.
+
+**How does a SuiteScript error cause this?**
+Many businesses post inventory movements through scheduled or event-driven SuiteScript (3PL integrations, marketplace fulfilment sync, bulk adjustments). If a script that should restore or receive stock fails silently, the offsetting quantity never posts and the location goes negative. This is why operations and engineering are both card owners. Pair with the SuiteScript error card to connect a failed save to a negative on-hand.
+
+**Does this distort period close?**
+Yes, if material. A negative on-hand produces a nonsensical inventory valuation that flows into COGS and margin. Finance may need the negatives corrected before locking the period, which is why the valuation-impact column matters: it tells the controller whether the distortion is large enough to block the close. Pair with the period-close cards to see whether outstanding negatives are holding up a lock.
+
+**How does this compare to other ERPs?**
+Most inventory-capable ERPs can technically allow negative on-hand, and some even permit it by configuration to support sell-ahead workflows. NetSuite tracks quantity per item per location, which is the grain this card uses. Whether negative is "allowed" or "blocked" is a configuration choice; regardless of the setting, the card treats any negative as worth surfacing, because even where it is permitted by config it still corrupts costing and signals a process gap.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Inventory Item On-Hand Went Negative (any Location)* is one of hundreds of KPI pulses Vortex IQ tracks across NetSuite and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

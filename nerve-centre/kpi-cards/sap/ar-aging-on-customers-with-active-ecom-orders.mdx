@@ -1,0 +1,151 @@
+---
+title: "AR Aging on Customers with Active Ecom Orders, SAP"
+sidebarTitle: "AR Aging on Customers with Active Ecom Orders"
+description: "AR Aging on Customers with Active Ecom Orders flags the credit-control gap where a customer keeps ordering on the storefront while past-due on SAP accounts receiv..."
+---
+
+**Card class:** [Cross-Channel](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/connectors#connectors-by-type)
+
+> A customer who is past-due on your SAP ledger but still placing fresh orders on the storefront is a credit-control hole. This card finds them before the loss compounds.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> This is a pure cross-channel finding. It joins two systems that usually never speak: FI-AR open items in S/4HANA Cloud (what the customer owes and how late it is) and live order activity on the commerce platforms (what the customer is buying right now). When a Business Partner has open AR aged past the threshold and is simultaneously placing new ecom orders, you are extending more credit to someone who has not paid for the last lot. In a clean SAP setup, FSCM credit management should have blocked them and `BusinessPartnerIsBlocked` should be true. When this card lights up, the control did not fire, and every new order is good money chasing bad.
+
+| | |
+| --- | --- |
+| **What it detects** | A customer with open, past-due AR in S/4HANA Cloud who is still placing new orders on a connected storefront. The credit-control gate that should have stopped them did not. |
+| **How the join works** | The card matches the commerce customer to a SAP Business Partner (customer role), pulls that partner's FI-AR open items and their aging buckets, and intersects with new ecom orders inside the window. A row appears only when both sides are true: aged past the threshold on AR and active on ecom. |
+| **SAP side** | FI-AR open items (open customer invoices and debit memos), aged from net due date into buckets. The card reads the Business Partner customer role, the open-item balance, the oldest past-due item, and whether `BusinessPartnerIsBlocked` is set. FSCM credit management (FSCM-CR) is where the block should originate. |
+| **Commerce side** | New orders placed inside the window per matched customer, across Shopify, BigCommerce, Adobe Commerce, and other connected storefronts. An order counts as active whether it is paid, on terms, or pending fulfilment. |
+| **Common root cause** | Credit management not switched on for the storefront's order path, a missing or stale customer-to-Business-Partner match (so AR is keyed to a different partner), a manually released credit case that was never re-blocked, or DTC card orders bypassing the B2B credit check entirely. |
+| **How to resolve** | Confirm the customer-to-Business-Partner match, review the open items and the credit case in FSCM, set or confirm `BusinessPartnerIsBlocked`, and wire the credit check into the order-acceptance path on the storefront so future orders are gated automatically. |
+| **Data source / freshness** | SAP FI-AR open items and Business Partner data via OData against the live system; commerce orders via each platform's order API. Vortex IQ polls every 15 minutes by default. |
+| **Time window** | `30D vsP` (rolling 30 days vs the prior 30) |
+| **Alert trigger** | any customer with AR aged past 60 days who has placed new ecom orders in the window |
+| **Roles** | owner, finance |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your SAP data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A B2B trade-supplies merchant runs S/4HANA Cloud (Company Code 1000, GBP) with a BigCommerce B2B portal on Net-30 terms and a Shopify DTC store for spot card orders. The 30-day window ends 12 Mar 26. Four matched customers are shown.
+
+| Customer (Business Partner) | Open AR balance | Oldest past-due | Aging bucket | New ecom orders (window) | `BusinessPartnerIsBlocked` |
+| --- | --- | --- | --- | --- | --- |
+| Ridgeway Builders Ltd | £18,400 | 74 days | 60-90d | £6,200 (BigCommerce) | false |
+| Hatton Trade Co | £9,750 | 41 days | 30-60d | £3,100 (BigCommerce) | false |
+| Marsh & Sons | £27,900 | 98 days | 90d+ | £4,800 (Shopify DTC) | false |
+| Calder Supplies | £12,000 | 0 days (current) | current | £5,400 (BigCommerce) | false |
+
+Four things to notice:
+
+1. **Ridgeway and Marsh both trip the alert; Hatton and Calder do not.** The alert is aged-past-60-days plus active ecom orders. Ridgeway (74 days) and Marsh (98 days) qualify. Hatton is only 41 days past due, inside the threshold. Calder is fully current and simply buying normally, which is exactly what you want.
+2. **Marsh & Sons is the killer row.** 98 days past due on £27,900, and still able to place a £4,800 Shopify DTC order. The DTC card path never ran the B2B credit check, so the credit-management block on the B2B portal did nothing. This is the classic leak: the control exists on one channel and not the other.
+3. **`BusinessPartnerIsBlocked` is false on every row, including the two that should be true.** That is the headline failure. In a correctly wired setup, Ridgeway and Marsh should both carry a credit block sourced from FSCM-CR, and the storefront order path should honour it. The flag being false on a 98-day debtor means the control gate is not connected end to end.
+4. **The fix is two moves, not one.** Set the block in FSCM for the qualifying partners (immediate), then wire the credit check into the order-acceptance path on every channel including DTC (structural). Pair this card with [Blocked Customers (BusinessPartnerIsBlocked=true)](/nerve-centre/kpi-cards/sap/blocked-customers-businesspartnerisblockedtrue) to confirm the block lands, and with [Customer Credit Utilisation](/nerve-centre/kpi-cards/sap/customer-credit-utilisation) to set sensible limits before it happens again.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+This card is the detection of a credit-control gap. To act on it and to prevent recurrence, pair it with the AR and credit-management cards below.
+
+| Card | Why pair it with AR Aging on Customers with Active Ecom Orders |
+| --- | --- |
+| [Blocked Customers (BusinessPartnerIsBlocked=true)](/nerve-centre/kpi-cards/sap/blocked-customers-businesspartnerisblockedtrue) | The control side. This card finds who should be blocked; that card shows who actually is. The two should agree, and when they do not, the gap is the leak. |
+| [Customer Credit Utilisation](/nerve-centre/kpi-cards/sap/customer-credit-utilisation) | The prevention. Sensible FSCM credit limits stop a customer reaching this state in the first place. |
+| [AR Aging 60 Days](/nerve-centre/kpi-cards/sap/ar-aging-60-days) | The full aged-debt view across all customers, not just those with active ecom orders. Use it to see the wider AR-at-risk position. |
+| [Overdue Invoice Value](/nerve-centre/kpi-cards/sap/overdue-invoice-value) | The total money sitting past due. This card is the subset of that exposure where the customer is still spending. |
+| [High-Value Overdue Invoices](/nerve-centre/kpi-cards/sap/high-value-overdue-invoices) | The largest single overdue items, where chasing effort pays back fastest. |
+| [Days Sales Outstanding](/nerve-centre/kpi-cards/sap/days-sales-outstanding) | The portfolio-level collection-speed metric. A rising DSO is the macro signal behind individual rows on this card. |
+| [Orders on Credit Hold](/nerve-centre/kpi-cards/sap/orders-on-credit-hold) | The orders the control did catch. The contrast with this card shows where the gate worked and where it did not. |
+| [shopify.total_revenue](/nerve-centre/kpi-cards/shopify/total-revenue) / [bigcommerce.total_revenue](/nerve-centre/kpi-cards/bigcommerce/total-revenue) / [adobe_commerce.total_revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | The channels generating the new orders. Knowing which channel is leaking tells you where to wire the credit check. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against SAP
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in S/4HANA Cloud:**
+
+The closest native equivalents inside the SAP Fiori launchpad are:
+
+> **Manage Customer Line Items** Fiori app (the FBL5N equivalent) for open AR items per customer with net due dates
+> **Process Receivables** Fiori app for the collections worklist and aging buckets
+> **Manage Credit Accounts** / **Manage Credit Cases** Fiori apps (FSCM-CR) for the credit limit, exposure, and block status
+> **Manage Business Partner** for the customer role and the `BusinessPartnerIsBlocked` indicator
+> **Embedded Analytics**: query the AR open-item CDS view filtered to past-due items and the credit-exposure CDS view
+
+To reconcile a single row, open Manage Customer Line Items for the Business Partner, filter to open items, and confirm the oldest net due date and the aged balance match the card. Then open Manage Credit Cases for the same partner to see whether a credit block exists and why it did or did not stop the order.
+
+Common mistakes when comparing against SAP's own reports:
+
+- **Aging from document date instead of net due date.** Aging buckets run from the net due date, not the invoice posting date. A report that ages from document date overstates how late an item is by the payment-terms period. The card uses net due date, matching the standard collections view.
+- **Reading total AR instead of past-due AR.** A customer can carry a large open balance that is entirely current. The card counts only items aged past the threshold; a total-balance report includes current items that are not at risk.
+- **Looking only at the B2B channel.** The credit block lives on the B2B order path in most setups, so a B2B-only view misses DTC card orders that bypass it entirely. The card joins all connected channels, which is the whole point.
+- **Stale customer-to-Business-Partner match.** If the commerce customer is matched to the wrong Business Partner, the AR shows against a different partner and the row never forms. Confirm the match before concluding a customer is clean.
+
+**Why our number may differ from SAP's reports:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Net due date vs document date aging** | Either | The card ages from net due date; a report aged from document date shows items as older than the collections-standard view. |
+| **Past-due vs total AR** | Card lower | The card counts only items aged past the threshold; a total open-AR report includes current items. |
+| **Channel scope** | Card higher | A SAP-only credit view sees the B2B path; the card adds DTC and other channels, surfacing leaks the B2B view cannot. |
+| **Customer-to-Business-Partner match** | Either | A wrong or missing match keys AR to a different partner, so a row may be missing in the card or present in SAP under another partner. |
+| **Credit case timing** | Small | A block released or set between two polls creates a brief mismatch between the card and the live FSCM state. |
+| **Company Code scope** | Either | A customer trading across two Company Codes has AR split between them; the card respects the dashboard Company Code filter. |
+
+**Cross-connector reconciliation, the killer finding:**
+
+The value of this card is the join itself. SAP knows who is late. The storefront knows who is still spending. Only the intersection tells you where credit control is actually leaking.
+
+| Card | Expected relationship | What causes legitimate divergence |
+| --- | --- | --- |
+| [shopify.total_revenue](/nerve-centre/kpi-cards/shopify/total-revenue) | New Shopify orders from a past-due customer should be zero once the credit block is wired in | DTC card path bypasses the B2B credit check, so a blocked B2B customer can still buy on DTC. This is the most common leak and the highest-value fix. |
+| [bigcommerce.total_revenue](/nerve-centre/kpi-cards/bigcommerce/total-revenue) | New B2B orders from a blocked partner should be stopped at order acceptance | A manually released credit case that was never re-blocked, or a Net-30 portal that accepts the order then relies on a downstream SAP block that does not flow back to the storefront. |
+| [adobe_commerce.total_revenue](/nerve-centre/kpi-cards/adobe-commerce/total-revenue) | As BigCommerce | Adobe Commerce B2B company-account structures can place orders under a child account whose match to the SAP Business Partner differs from the parent, so AR aged on the parent does not gate the child's orders. |
+
+The most useful pivot from a flagged row is into [Blocked Customers (BusinessPartnerIsBlocked=true)](/nerve-centre/kpi-cards/sap/blocked-customers-businesspartnerisblockedtrue) to confirm the block was applied, and into [Customer Credit Utilisation](/nerve-centre/kpi-cards/sap/customer-credit-utilisation) to set a limit that prevents the next occurrence.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is this a cross-channel card and not just an AR card?**
+Because the risk only exists at the join. AR aging on its own is a finance report. New orders on their own are a sales signal. The danger is the overlap: a customer who is both late and still buying. Neither system sees that alone, which is why the credit control so often fails to fire.
+
+**Should not FSCM credit management already stop this?**
+In a fully wired setup, yes. FSCM-CR holds the credit limit and exposure and should block the Business Partner when they breach it, setting `BusinessPartnerIsBlocked` and stopping new Sales Documents. This card exists because the block frequently is not connected end to end, especially on DTC card paths that never run the B2B credit check. The card is the safety net under the control.
+
+**Why is `BusinessPartnerIsBlocked` false on a customer who is clearly past due?**
+Three common reasons: credit management is not switched on for that order path, a credit case was manually released and never re-blocked, or the customer's exposure sits under a different Business Partner because of a matching problem. The card surfaces the contradiction; the fix is to set the block and confirm it on the [Blocked Customers](/nerve-centre/kpi-cards/sap/blocked-customers-businesspartnerisblockedtrue) card.
+
+**A customer is past due but the overdue amount is tiny. Why are they flagged?**
+The alert keys on aging past the threshold combined with active ordering, not on the size of the balance. A small but very old item still indicates a customer who is not paying on terms while continuing to buy. If you want to prioritise by value, pair with [High-Value Overdue Invoices](/nerve-centre/kpi-cards/sap/high-value-overdue-invoices).
+
+**Does a DTC card order really count as extending credit?**
+A prepaid card order is not credit in itself, but it still matters here for two reasons. First, it shows the customer is actively trading while past due on the B2B ledger, which is a relationship and risk signal. Second, it proves the DTC path is not honouring the B2B block, which is the leak you need to close before they place a Net-30 order on the same account.
+
+**How does the card handle a customer trading across multiple Company Codes?**
+AR is held per Company Code, so a customer trading in two legal entities has two open-item balances. The card respects the dashboard Company Code filter. For a group view, run the AR side across the relevant Company Codes and confirm the Business Partner is the same across them.
+
+**How fresh is the data?**
+Both sides poll every 15 minutes by default. A credit case set or released in SAP, or a new order placed on the storefront, appears at the next poll. For a live decision, the native Manage Credit Cases and Manage Customer Line Items apps are real-time; the card is at most one poll behind.
+
+**Can the card auto-block the customer?**
+No. The card detects and reports; setting `BusinessPartnerIsBlocked` and managing the credit case happen in SAP, which keeps the system of record authoritative and auditable. Vortex IQ surfaces the finding and the evidence so Finance can act with confidence.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*AR Aging on Customers with Active Ecom Orders* is one of hundreds of KPI pulses Vortex IQ tracks across SAP and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

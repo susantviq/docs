@@ -1,0 +1,124 @@
+---
+title: "Ecom Customers Absent from D365, Microsoft Dynamics 365"
+sidebarTitle: "Ecom Customers Absent from D365"
+description: "Ecom Customers Absent from D365 counts buyers with orders but no customer master record. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Ecommerce Platform](/nerve-centre/connectors#connectors-by-type)
+
+> The count of customers who have placed ecommerce orders but have no matching record in the D365 customer master. Until they are promoted, their orders cannot be invoiced and revenue cannot post.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A count of distinct ecommerce buyers who have placed at least one order on the connected commerce platform but who do not have a corresponding entry in the D365 customer master. A sales order cannot be invoiced against a customer that does not exist in the ledger, so every absent customer is a revenue-recognition blocker sitting just before the GL. The card is the leak detector between the storefront and the customer master.
+
+| | |
+| --- | --- |
+| **What it counts** | The number of distinct commerce-platform customers (matched on email and, where available, normalised name and address) that have no matching record in the D365 customer master. A buyer who has ordered but was never created or promoted as a Business Central customer / Finance &amp; Operations customer counts here. Once the customer master entry lands and the match resolves, the buyer drops off the count. |
+| **Currency** | Not applicable. This is a count of customer records, not a monetary figure. The downstream revenue impact is monetary, but the card itself is a number. |
+| **Time window** | `7D` (rolling 7-day view of buyers active in the last week who are still missing from the master) |
+| **Alert trigger** | `count > 10`. More than ten absent customers in the window signals a systematic promotion or sync problem rather than a handful of one-off edge cases. |
+| **Roles** | owner, finance, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Microsoft Dynamics 365 data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A DTC supplements brand on Shopify Plus feeding Business Central via a Power Automate integration that is supposed to create a BC customer for every new buyer before the order syncs as a sales order. The snapshot covers the rolling week ending 11 Jun 26.
+
+| Source | Count | Notes |
+| --- | --- | --- |
+| Distinct buyers with orders in the last 7 days | 1,284 | From the commerce platform |
+| Matched to a D365 customer master record | 1,261 | Email match, normalised |
+| **Ecom Customers Absent from D365 (this card)** | **23** | Above the alert threshold of 10 |
+| Of which: orders already placed and unbillable | 23 | Each is a blocked sales order |
+
+Four things to notice:
+
+1. **23 buyers, 23 blocked orders, zero invoiced revenue from them.** Each absent customer represents an order that cannot be turned into a sales invoice because there is no ledger account to post against. The count is small, but the revenue it gates is real and it compounds daily until the master is fixed.
+2. **Above the threshold means systematic, not sporadic.** A count of 1 or 2 is usually a genuine edge case (a malformed email, a guest checkout with no contact). 23 in a week points at a broken or throttled promotion step in the integration, which is the actionable read.
+3. **This sits one step upstream of the invoicing gap.** These buyers are missing from the master entirely. The related [Commerce Orders Without a Business Central Sales Order](/nerve-centre/kpi-cards/microsoft-dynamics/commerce-orders-without-business-central-sales-order) card catches the next failure mode, where the customer exists but the order still did not create a sales order. Read the two together to localise the break.
+4. **The likely root cause is upstream in Dataverse.** If the integration writes a Dataverse contact first and then promotes it to a D365 customer, a stalled promotion step leaves the buyer in Dataverse but absent from the master. The [Customers in Dataverse Not Promoted to D365](/nerve-centre/kpi-cards/microsoft-dynamics/customers-in-dataverse-not-promoted-to-d365) card confirms whether that is what is happening.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+This card is the entry point to a chain of customer-master and order-promotion failures. Walk the chain with these.
+
+| Card | Why pair it with Ecom Customers Absent from D365 |
+| --- | --- |
+| [Customers in Dataverse Not Promoted to D365](/nerve-centre/kpi-cards/microsoft-dynamics/customers-in-dataverse-not-promoted-to-d365) | The upstream cause. A contact stuck in Dataverse that never promoted is a common reason a buyer is absent from the master. |
+| [Ecom Customers Absent from D365 Customer Master](/nerve-centre/kpi-cards/microsoft-dynamics/ecom-customers-absent-from-d365-customer-master) | The customer-master-specific view of the same leak, useful for confirming the match logic. |
+| [Commerce Orders Without a Business Central Sales Order](/nerve-centre/kpi-cards/microsoft-dynamics/commerce-orders-without-business-central-sales-order) | The next failure downstream. Customer exists, order still did not create a sales order. |
+| [Ecom Orders Missing a Matching D365 Free Text Invoice](/nerve-centre/kpi-cards/microsoft-dynamics/commerce-orders-without-business-central-sales-order) | The final step. The invoice that should have posted but did not. |
+| [Active Customers](/nerve-centre/kpi-cards/microsoft-dynamics/msd-active-customers) | The denominator. Absent customers as a share of active customers tells you how leaky the pipeline is. |
+| [New Customers (30d)](/nerve-centre/kpi-cards/microsoft-dynamics/new-customers-30d) | New buyers are the most likely to be absent. A spike in new customers with a spike here points at onboarding throughput. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against Microsoft Dynamics 365
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Business Central / Finance &amp; Operations:**
+
+> **Business Central: Customers list** (search by email or name for the specific buyer; if absent, they are not in the master)
+> **Business Central: Sales > Sales Orders** (the order will be missing or stuck because there is no customer to post against)
+> **Finance &amp; Operations: Accounts receivable > Customers > All customers** (filter by the buyer's email or account)
+> **Power Platform admin centre: Flows > Run history** (check the customer-create / promotion flow for failures)
+> **Dataverse: Contacts / Accounts table** (the buyer may exist here but not in the D365 master)
+
+To verify a single absent customer, take an email from the card's drill-down and search the Business Central Customers list or the Finance &amp; Operations All customers page. If no record returns, the card is correct and the buyer genuinely has no master entry. Then check the integration flow's run history for the create step around that buyer's order timestamp; a failed or skipped run is usually the smoking gun.
+
+**Why our number may legitimately differ:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Match logic strictness** | Either | The card matches on email and normalised identity. A buyer who exists in the master under a slightly different email may show as absent here while appearing present to a human scanning the list. |
+| **Guest checkout / no contact** | Card higher | Orders placed with no usable email or as a one-off guest may never be intended for promotion, yet still count as absent until filtered out. |
+| **Snapshot vs live promotion** | Card higher | A buyer promoted moments ago may still show on a 7-day rolling count until the next refresh resolves the match. |
+| **Multi-entity customer scope** | Either | A buyer may exist in one legal entity's customer master but not the one their order should post into. Scope the comparison to the correct entity. |
+| **Sync lag** | Card up to 15 min behind | A customer created via the integration in the last few minutes may not yet be reflected in the match. |
+
+This is an inherently cross-connector card: it only exists because a buyer is present on the commerce side and absent on the D365 side. Pair it with the commerce platform's customer list to confirm the buyer really did order, then with the D365 customer master to confirm they really are missing.
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does an absent customer block revenue?**
+A sales invoice must post against a customer account in the ledger. If the buyer has no record in the customer master, there is nothing to invoice and nothing to recognise. The order sits in limbo until the master entry is created and the order can be promoted and invoiced.
+
+**Is this the same as orders not syncing?**
+No, it is one step earlier. This card is about the customer record being missing. [Commerce Orders Without a Business Central Sales Order](/nerve-centre/kpi-cards/microsoft-dynamics/commerce-orders-without-business-central-sales-order) is about the order not landing even when the customer exists. Both are leaks, at different points in the pipeline.
+
+**What usually causes a spike above the threshold?**
+A broken, throttled, or unauthenticated customer-create step in the integration. Token expiry, a Dataverse promotion failure, or an API rate limit during a sales spike are the usual suspects. The flow run history in the Power Platform admin centre is the place to confirm.
+
+**Do guest checkouts count?**
+They can, if they reach the order stage with an identity the integration would normally promote. Genuine guest-only orders with no usable contact are noise; persistent guest-driven counts are usually a sign the storefront and the integration disagree on what constitutes a promotable customer.
+
+**Why does a customer I just created still show as absent?**
+Rolling 7-day counts plus a short sync cache mean a very recent creation can take a refresh cycle to resolve. If a buyer created hours ago is still showing, check the match key, because a mismatched email will keep them absent indefinitely.
+
+**Can I clear the count by bulk-creating customers?**
+Yes, and that is usually the remediation: create or promote the missing customers, then re-run the order promotion so the blocked orders can invoice. The better fix is to repair the integration step so the absence does not recur.
+
+**Does this card cover both Business Central and Finance &amp; Operations?**
+Yes. The concept of a customer master record that an invoice must post against is common to both. The card matches against whichever D365 customer master your environment uses.
+
+**What is the freshness on this card?**
+The card refreshes on a short cache, typically under 15 minutes, so newly created customers resolve quickly and newly placed orders surface fast. The 7-day window keeps the focus on currently active buyers rather than historical noise.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Ecom Customers Absent from D365* is one of hundreds of KPI pulses Vortex IQ tracks across Microsoft Dynamics 365 and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

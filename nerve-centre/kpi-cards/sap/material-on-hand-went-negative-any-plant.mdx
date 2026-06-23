@@ -1,0 +1,129 @@
+---
+title: "Material On-Hand Went Negative (any Plant), SAP"
+sidebarTitle: "Material On-Hand Went Negative (any Plant)"
+description: "Material On-Hand Went Negative (any Plant) fires when on-hand stock for any material at any plant drops below zero in MM-IM. Negative on-hand signals double-posting, a unit-of-measure conversion error, or a stock-transfer race."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+> An integrity alert that fires when on-hand stock for any material at any plant falls below zero.
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Physical stock cannot be less than zero. When the SAP MM-IM (Materials Management, Inventory Management) on-hand quantity for a material at a plant reads negative, something is wrong with the postings, not the warehouse. The usual causes are a goods movement posted twice, a unit-of-measure conversion that multiplied or divided a quantity wrongly, or a stock-transfer race where the issue posted before the receipt. The card watches every material at every plant and raises a P1 the instant any on-hand quantity crosses below zero, because a negative on-hand poisons availability checks, COGS, and the inventory valuation that feeds the balance sheet.
+
+| | |
+| --- | --- |
+| **What it counts** | The number of material / plant combinations whose current on-hand quantity in MM-IM is below zero. A reading of `0` is the healthy state. Any positive number is a live data-integrity breach that needs a goods-movement investigation. |
+| **What triggers it** | A goods movement (goods issue, goods receipt, transfer posting, or stock-transport order step) that drives the unrestricted-use stock for a material at a plant or storage location below zero. Most commonly a double-posted issue, a wrong UoM conversion, or an issue posted ahead of its matching receipt. |
+| **Data source** | SAP S/4HANA Cloud MM-IM stock figures (plant and storage-location level on-hand). The card reads current stock, not a historical snapshot. |
+| **Company Code scope** | Plants roll up to Company Codes. The card flags by plant but the valuation impact lands on the owning Company Code's inventory accounts. |
+| **Real-time vs batch** | Real-time. The card re-checks on every connector poll, so a corrected posting clears the flag without waiting for an overnight job. |
+| **Time window** | `RT` (real-time, evaluated continuously) |
+| **Alert trigger** | `any Material on_hand < 0` |
+| **Roles** | owner, operations, engineering |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your SAP data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A multi-plant distributor running SAP S/4HANA Cloud with three plants feeding an ecommerce storefront. The card is read on 12 Mar 26 and reports `2`. The two breaching material / plant rows look like this.
+
+| Material | Plant | On-hand before | Movement posted | On-hand after | Likely cause |
+| --- | --- | --- | --- | --- | --- |
+| MAT-1001 (boxed kit) | 1000 Main DC | 40 EA | Goods issue 60 EA (delivery double-posted) | -20 EA | Double-posted goods issue |
+| MAT-2002 (bulk powder) | 2000 Regional | 0 KG | Goods issue 500 (entered in G as 500, base UoM KG) | -500 KG | UoM conversion error |
+| **Card reading** | | | | **2** | |
+
+Four things to notice:
+
+1. **A double-posted goods issue is the classic cause.** MAT-1001 had 40 units on hand. A delivery for 60 units posted its goods issue twice (an API retry that did not honour idempotency, or a user who clicked twice), so the system recorded a 60-unit issue against a 40-unit position and the on-hand went to -20. The physical warehouse never had negative stock; the ledger does. The fix is to reverse one of the duplicate goods-issue documents, which restores on-hand to a true figure.
+2. **A unit-of-measure conversion error multiplies the damage.** MAT-2002 is held in base unit KG but sold in 25 KG bags. A goods issue entered 500 in the bag unit, but the conversion factor was wrong and the system posted 500 KG instead of 20 bags. The on-hand swung to -500 KG. UoM errors are dangerous because they are silent: the document looks valid and only the negative on-hand reveals it. Always check the alternative-UoM conversion in the material master when a quantity looks an order of magnitude off.
+3. **The stock-transfer race is the third pattern.** Not shown above, but common: a stock-transport order between two plants posts the issue at the sending plant before the receipt clears at the receiving plant. For a brief window the in-transit material can read negative at one node. If your process posts issue and receipt asynchronously, the card can flicker positive during the race and clear when the receipt lands. Persistent negatives, not transient ones, are the real problem.
+4. **The downstream blast radius is valuation and availability.** A negative on-hand feeds straight into the moving-average price calculation (a negative quantity can distort the price per unit), into COGS when the next issue posts, and into the availability check that the storefront uses to decide whether to sell. A negative on-hand can let the website oversell or, worse, can corrupt the inventory valuation that flows to the balance sheet. That is why the card is a P1 and not a warning.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+A negative on-hand is the acute symptom; the inventory-integrity story is broader. Pair this card with these to see the wider stock-data picture.
+
+| Card | Why pair it with Material On-Hand Went Negative |
+| --- | --- |
+| [Inventory Sync Drift](/nerve-centre/kpi-cards/sap/inventory-sync-drift) | Shows where the commerce storefront's stock figure has drifted from SAP's MM-IM figure. A negative on-hand in SAP is a frequent root cause of drift. |
+| [SAP Total Inventory Value](/nerve-centre/kpi-cards/sap/sap-total-inventory-value) | The valuation roll-up that a negative on-hand distorts. Watch this for an unexplained dip when negatives appear. |
+| [Low Stock Alerts](/nerve-centre/kpi-cards/sap/low-stock-alerts) | The neighbouring availability signal. A material reading negative will also trip low-stock logic, so the two often light up together. |
+| [Inventory Aging](/nerve-centre/kpi-cards/sap/inventory-aging) | Helps confirm whether a material with erratic on-hand is genuinely moving or whether the postings are noise. |
+| [Journals by Source Module](/nerve-centre/kpi-cards/sap/journals-by-source-module) | MM goods movements generate FI postings. A spike in MM-sourced journals can correlate with the double-posting that drove the negative. |
+| [SAP S/4HANA Health Score](/nerve-centre/kpi-cards/sap/sap-s4hana-health-score) | The composite roll-up. Negative on-hand is one of the integrity inputs that pulls the score down. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against SAP
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in S/4HANA Cloud:**
+
+The closest native equivalents inside the SAP Fiori launchpad are:
+
+> **Stock - Single Material / Stock Overview** apps for the on-hand position by plant and storage location
+> **Material Documents Overview** (conceptually transaction MB51) to find the goods movements that drove the position negative
+> **Manage Stock / Physical Inventory** apps for the count-and-correct workflow
+> **Embedded Analytics**: the stock-quantity query that reads MM-IM on-hand by material and plant
+
+Direct link template: `https://my{tenant}.s4hana.cloud.sap/sap/bc/ui2/flp#StockSingleMaterial-display`
+
+The Stock Overview on-hand quantity should match this card to the unit: a material / plant that the card flags as negative will show a negative unrestricted-use quantity in Stock Overview. To find the cause, open Material Documents Overview filtered to that material and plant, sort by posting date, and look for a duplicate goods issue, an oversized quantity, or an issue whose matching receipt has not posted.
+
+Common mistakes when comparing against SAP's own reports:
+
+- **Reading total stock instead of unrestricted-use stock.** A material can have positive blocked or quality-inspection stock while unrestricted-use is negative. The card watches the availability-relevant on-hand, so a total-stock report can look fine while the card is correct.
+- **Looking at the wrong storage location.** On-hand can be positive at the plant level but negative at one storage location if a transfer posting is mid-flight. Always drill to the storage-location level when reconciling.
+- **Treating a transient transfer race as a true negative.** A stock-transport order in flight can briefly show negative in transit. The persistent negatives are the ones that need a reversal; the transient ones clear on their own.
+
+**Why our number may differ from SAP's reports:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Unrestricted-use vs total stock** | Either | The card reads availability-relevant on-hand. A report that sums all stock types (blocked, in-inspection, unrestricted) can net to positive while the card correctly flags a negative unrestricted position. |
+| **Plant vs storage-location granularity** | Card higher | A plant-level total can be positive while one storage location is negative. The card flags at the level where the negative actually exists. |
+| **Transient transfer races** | Card higher (briefly) | An in-flight stock-transport order can show negative for a moment. The card may flicker; the persistent count is the meaningful one. |
+| **Special stock segments** | Either | Consignment, project, and sales-order stock are tracked in separate special-stock segments. Whether these are in scope affects the count. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is a negative on-hand a P1 rather than a warning?**
+Because it poisons three downstream systems at once. It distorts the moving-average price and therefore inventory valuation on the balance sheet, it corrupts COGS on the next goods issue, and it feeds the availability check that the storefront uses to decide whether to accept an order. A single negative on-hand can let the website oversell and can misstate the value of inventory. The blast radius is financial as well as operational, so the card treats it as top tier.
+
+**Does a negative on-hand mean physical stock is actually missing?**
+No. Physical stock cannot be negative. A negative on-hand is always a posting problem: a movement recorded twice, a wrong quantity, or an issue posted before its receipt. The warehouse may be perfectly accurate; it is the ledger that is wrong. The fix is to find and reverse the offending material document, not to count the shelf.
+
+**What are the most common root causes?**
+In order of frequency: a double-posted goods issue (often an API retry without idempotency, or a user double-click), a unit-of-measure conversion error in the material master (the quantity comes out an order of magnitude off), and a stock-transfer race where the issue posts ahead of the receipt. Less common causes include backflushing in production that consumes more than was received, and a reversal posted against the wrong document.
+
+**Can the card flicker during a stock transfer?**
+Yes, briefly. If your stock-transport process posts the issue and receipt asynchronously, the in-transit material can read negative at one node for a short window. The card is real-time, so it may show a transient positive and then clear. The negatives worth chasing are the persistent ones, not the ones that resolve themselves within a poll cycle.
+
+**Does it look at unrestricted-use stock or all stock types?**
+The availability-relevant on-hand, which is unrestricted-use at the plant and storage-location level. Blocked stock, quality-inspection stock, and special-stock segments are tracked separately in SAP. A material can have positive blocked stock and still be flagged by the card if its unrestricted-use position is negative, which is the correct behaviour because unrestricted-use is what the storefront can sell.
+
+**How do I clear the alert?**
+Find the goods movement that drove the position negative (Material Documents Overview, sorted by posting date) and reverse the duplicate or correct the quantity. Once the on-hand returns to zero or positive, the card clears on the next connector poll. There is no manual acknowledgement; the card reflects live MM-IM state.
+
+**Does it cover consignment and special stock?**
+The default scope is the standard unrestricted-use on-hand by plant and storage location. Consignment, sales-order, and project stock sit in special-stock segments with their own logic. Whether a given special segment is in scope depends on the connector configuration; the headline alert targets the standard plant stock that drives availability and valuation.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Material On-Hand Went Negative (any Plant)* is one of hundreds of KPI pulses Vortex IQ tracks across SAP and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.
