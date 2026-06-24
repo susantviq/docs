@@ -1,0 +1,144 @@
+---
+title: "Orders with Dispatch SLA Missed, PostNord"
+sidebarTitle: "Orders with Dispatch SLA Missed"
+description: "Orders with Dispatch SLA Missed for PostNord stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/overview#card-classes-explained)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> Count of store orders whose promised dispatch deadline came and went without a PostNord label being printed and the parcel handed to the carrier, measured over the trailing 7 days against the prior 7. This is a despatch-side metric, not a delivery one: it catches orders stuck on the warehouse floor before PostNord ever sees them. Every breached order is a customer who paid for a cut-off they were promised at checkout (for example "order by 14:00 for same-day despatch") and did not get.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(DISTINCT order_id WHERE dispatch_deadline < first_carrier_handoff_scan OR (dispatch_deadline < now AND no PostNord label printed))` over the rolling 7-day window, period-over-period. One order counts once even if it contains several parcels. |
+| **Data source** | Joins the store order feed (Shopify / BigCommerce / Adobe Commerce order `created_at` plus the store's despatch-SLA rule) against PostNord's label and first-scan events. Label creation comes from the PostNord Booking / Shipping API; the first carrier handoff comes from `GET /shipments/v1/parcels/{id}/events` (event types `INFORMED`, `EXPECTED`, `IN_TRANSIT` / first depot scan). |
+| **Dispatch deadline source** | The store's own promised cut-off, configured per warehouse and per service in the connector manifest (for example "MyPack Home orders placed before 14:00 CET despatch same working day; after 14:00 despatch next working day"). Weekends and Nordic public holidays are excluded from the working-day clock. |
+| **Despatch vs delivery** | This card is upstream of [On-Time Delivery Rate](/nerve-centre/kpi-cards/postnord/on-time-delivery-rate). An order can hit its dispatch SLA here and still arrive late at the door if PostNord's network slips; conversely a missed dispatch here almost always becomes a late delivery downstream. |
+| **What counts as "dispatched"** | First PostNord movement scan, not label print. A printed label that never gets a depot scan is still a missed dispatch: the parcel sat on the floor. This mirrors the gap behaviour on [Shipments with Tracking-Event Gap](/nerve-centre/kpi-cards/postnord/shipments-with-tracking-event-gap). |
+| **Scope** | Outbound only. Return labels and replacement-order labels are excluded. Pre-orders, back-orders and made-to-order lines are excluded when tagged in the store feed, because their dispatch clock has not started. |
+| **Multi-country** | Aggregates across all configured PostNord marketer accounts (SE / NO / DK / FI). Each country can carry its own cut-off time and holiday calendar; the working-day clock is applied per destination account. |
+| **Refresh cadence** | Hourly. An order flips to "breached" the moment its deadline passes with no qualifying handoff scan ingested. |
+| **Time window** | `7D vsP` (rolling 7 days versus the prior 7). |
+| **Alert trigger** | `>0 orders breached`. This is a zero-tolerance card: any breached order is a paid-for promise broken, so the alert fires on the first one. |
+| **Roles** | owner, operations, finance |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your PostNord and store-order data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+The Stockholm outdoor-apparel brand, around 2,350 orders per week, Shopify front-end, single Gothenburg warehouse, PostNord MyPack across SE / NO / DK / FI. Checkout promise: "Order by 14:00 CET on a working day and we despatch the same day." Reading taken at 09:00 CET on 18 Mar 26 for the trailing 7 days (11 Mar 26 to 17 Mar 26), compared against 04 Mar 26 to 10 Mar 26.
+
+| Order cohort (7D) | Orders | Met dispatch SLA | Breached | Breach % |
+| --- | --- | --- | --- | --- |
+| MyPack Home (SE) | 1,210 | 1,201 | 9 | 0.7% |
+| MyPack Collect (SE) | 640 | 639 | 1 | 0.2% |
+| Cross-border (NO / FI / DK) | 380 | 372 | 8 | 2.1% |
+| Express | 120 | 120 | 0 | 0.0% |
+| **All PostNord (this card)** | **2,350** | **2,332** | **18** | **0.8%** |
+| Prior 7 days | 2,290 | 2,287 | 3 | 0.1% |
+
+The card reads **18** breached orders, up from 3 the week before. The alert at `>0` is tripped (it is always tripped when any order breaches). Five things to notice:
+
+1. **The week-on-week jump is the story, not the absolute.** 3 breaches the prior week is the normal floor (a stray late pick, a printer jam). 18 is a six-fold rise and clusters in two cohorts: cross-border (8) and MyPack Home SE (9). When a zero-tolerance card jumps like this, look for a single root cause, not 18 separate ones.
+2. **The cross-border 8 are the customs-paperwork bottleneck.** Norway is outside the EU customs union, so cross-border MyPack needs a complete CN23 before the label can be booked. If the fulfilment integration started emitting incomplete customs data on 14 Mar 26, those orders cannot get a valid PostNord label and sit past the 14:00 cut-off. Cross-reference [Exception Rate](/nerve-centre/kpi-cards/postnord/exception-rate) for a matching `CUSTOMS_HELD` rise.
+3. **The MyPack Home SE 9 are a floor-time problem, not a carrier one.** PostNord never saw these orders, so this is a pick-pack-print issue upstream of the carrier: a staffing gap on the 14 Mar afternoon shift, or a Shopify-to-warehouse webhook delay that hid orders from the pick queue. Check the despatch timestamps: if they all cluster after 13:00 on one day, it is a shift-capacity problem.
+4. **Each breached order is a refund-and-goodwill liability.** A customer who paid for same-day despatch and did not get it is a candidate for a shipping refund (SEK 49 to 79 here) plus a where-is-my-order ticket. 18 breaches is roughly SEK 1,100 of shipping-fee exposure plus around 2.5 staff-hours of customer-service time, before any downstream late-delivery cost.
+5. **This card is the leading edge of revenue-at-risk.** A dispatch miss today is a late delivery in 1 to 3 days and a possible return or refund in 7 to 14. Acting now (clear the floor backlog, fix the CN23 feed) is far cheaper than absorbing the refund and the review damage later. That is why it sits in the Cross-Channel: Revenue at Risk class.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+Dispatch SLA breach is the earliest revenue-at-risk signal in the despatch chain. Pair it with these to find the cause and size the downstream impact:
+
+| Card | Why pair it with Dispatch SLA Missed | What the combination tells you |
+| --- | --- | --- |
+| [Shipments with Tracking-Event Gap](/nerve-centre/kpi-cards/postnord/shipments-with-tracking-event-gap) | The "label printed but no scan" subset. | A breached order with a printed label that never scans is the same parcel showing on both cards: it left the system but never reached PostNord. |
+| [Label Generation Success](/nerve-centre/kpi-cards/postnord/label-generation-success) | Whether labels could even be printed. | A label-success dip explains a dispatch-breach spike: no label means no handoff means a missed cut-off. |
+| [On-Time Delivery Rate](/nerve-centre/kpi-cards/postnord/on-time-delivery-rate) | Downstream delivery outcome. | A dispatch miss today is a late delivery in 1 to 3 days; OTD dips after this card spikes. |
+| [Late Shipments](/nerve-centre/kpi-cards/postnord/late-shipments) | Downstream count of the same parcels. | Most dispatch breaches convert to late shipments; the conversion ratio tells you how much slack the carrier absorbed. |
+| [Exception Rate](/nerve-centre/kpi-cards/postnord/exception-rate) | Customs and address exceptions that block label booking. | A cross-border dispatch-breach cluster usually matches a `CUSTOMS_HELD` or `ADDRESS_INVALID` rise. |
+| [Avg Transit (days)](/nerve-centre/kpi-cards/postnord/avg-transit) | The clock that starts only once dispatch happens. | A late dispatch eats into the transit budget; the customer feels the sum of both delays. |
+| Cross-connector: [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | The upstream queue this card draws from. | Climbing unfulfilled orders predicts dispatch breaches 1 to 2 days later. |
+| Cross-connector: [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream money impact. | Each breached order is a shipping-refund candidate; refund rate ticks up at 7 to 14 day lag. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostNord's own portal:**
+
+This card is a join, so no single PostNord screen shows it. Reconcile in two halves. For the despatch-deadline half, use your store admin (Shopify **Orders** filtered by created date and fulfilment status, or the BigCommerce / Adobe equivalent) against your own published cut-off rule. For the carrier-handoff half, use the [PostNord Business Portal](https://portal.business.postnord.com) → **Shipments** list and **Reports → Tracking Events**, and check each order's first depot scan time against its booking time.
+
+The closest like-for-like check is: take the breached order IDs from the card, find each in the PostNord portal, and confirm the first `IN_TRANSIT` scan timestamp is after your published cut-off (or absent entirely).
+
+**Why our number may legitimately differ from a manual count:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Tracking-event ingestion lag** | Ours can over-count briefly | PostNord pushes scans in batches; a parcel handed off just before the cut-off may not have its first scan ingested yet, so the card classes it as breached until the scan lands. Scan timestamps in the portal are in carrier-local time (CET / CEST), the card normalises to UTC. |
+| **Working-day clock differences** | Either | The card excludes Nordic public holidays per destination country; a manual count using a plain calendar will diverge around Midsummer, Constitution Day (NO, 17 May), and the Christmas / Epiphany cluster. |
+| **Label-print vs handoff definition** | Ours stricter | The portal shows a booked label as "created"; this card does not treat a created-but-never-scanned label as dispatched. A floor-stranded parcel reads as breached here but "shipped" in a naive portal export. |
+| **Cut-off time source** | Either | The portal has no notion of your checkout promise; the deadline lives only in the connector manifest. If your published cut-off and the manifest disagree, the card follows the manifest. |
+| **Multi-account aggregation** | n/a | The card sums across SE / NO / DK / FI accounts; the portal is usually viewed per account. Drill down per country to match. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | Causes of legitimate divergence |
+| --- | --- | --- |
+| [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Upstream queue. | Webhook failures, manual fulfilment holds, fraud-review holds delay fulfilment without breaching a dispatch promise. |
+| [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream money. | Refunds have many drivers; dispatch breach is one input at 7 to 14 day lag. |
+| [PostNord Shipments with Tracking-Event Gap](/nerve-centre/kpi-cards/postnord/shipments-with-tracking-event-gap) | Overlapping population. | The gap card is parcel-level and 24H; this card is order-level and 7D. A multi-parcel order with one stranded parcel shows differently on each. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple shippers)</em></summary>
+
+Dispatch-SLA breach counts exist with conceptually similar definitions across other carriers. These are not parallel measurements of the same orders.
+
+- [`bring.bri_dispatch_sla_missed`](/nerve-centre/kpi-cards/bring/orders-with-dispatch-sla-missed) (adjacent Nordic carrier)
+- [`royal_mail.roy_late_shipments_count`](/nerve-centre/kpi-cards/royal-mail/late-shipments) (UK peer, delivery-side)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does this fire on a single order when my other cards have percentage thresholds?**
+Because the unit here is a broken paid-for promise, not a network-health average. A customer who bought a "despatch today" cut-off and did not get it has a concrete grievance regardless of how small the percentage is. The card is deliberately zero-tolerance so the operations lead sees the first breach and can intervene before it becomes a cluster. If you genuinely want to suppress single strays, raise the threshold in **Settings → Alerts → PostNord Dispatch SLA**, but most merchants keep it at zero.
+
+**An order shows breached but I know it was handed to PostNord on time. Why?**
+Ingestion lag. PostNord's first depot scan can land 30 minutes to several hours after the physical handoff, especially on the late-afternoon collection that follows your cut-off. The card waits for a movement scan, not a printed label, so a parcel handed off at 13:55 whose first scan ingests at 16:10 reads as breached in between. It self-corrects when the scan arrives. If a parcel is still breached 24 hours later, it was probably never actually collected: check [Shipments with Tracking-Event Gap](/nerve-centre/kpi-cards/postnord/shipments-with-tracking-event-gap).
+
+**How is the dispatch deadline set, and what about weekends and holidays?**
+The deadline is your own published cut-off, configured per warehouse and per service in the connector manifest. The working-day clock skips weekends and the public-holiday calendar for the destination country, so a Friday-15:00 order on a same-day-by-14:00 rule is due the following Monday, not Saturday. Norway's 17 May, Sweden's Midsummer, and the Nordic Christmas cluster all shift the clock. If your manifest cut-off is wrong, the card will be wrong: keep it in sync with your checkout copy.
+
+**Does a cross-border customs hold count as my fault?**
+The card counts it as a breach because the customer experienced a missed despatch, but the root cause is usually upstream of PostNord. Norway and Iceland sit outside the EU customs union, so cross-border MyPack needs a complete CN23 (HS code, value, recipient ID) before PostNord will book the label. Incomplete customs data blocks the label, the cut-off passes, and the order breaches. Fix it in the fulfilment integration that generates the CN23, not at the carrier. A cross-border breach spike with a matching `CUSTOMS_HELD` rise on [Exception Rate](/nerve-centre/kpi-cards/postnord/exception-rate) confirms this pattern.
+
+**Multi-parcel orders: how are they counted?**
+One order counts once. If a three-parcel order has two parcels dispatched on time and one stranded, the order is breached (the customer's order is not complete). To see the stranded parcel specifically, use the parcel-level [Shipments with Tracking-Event Gap](/nerve-centre/kpi-cards/postnord/shipments-with-tracking-event-gap) card.
+
+**The count spiked but my warehouse says nothing changed. Where do I look?**
+Three usual causes, in order: (1) a label-booking outage, check [Label Generation Success](/nerve-centre/kpi-cards/postnord/label-generation-success) and [API Error Rate](/nerve-centre/kpi-cards/postnord/api-error-rate) for a matching dip; (2) a store-to-warehouse webhook delay that hid orders from the pick queue, the breaches will cluster tightly in time; (3) a cut-off-clock edge, did a public holiday compress two days of orders into one despatch window? If all three are clear, it is a genuine floor-capacity gap on a specific shift.
+
+**Why is this in the Revenue at Risk class rather than Delivery Performance?**
+Because it measures money the merchant has already taken against a promise not yet kept. It is the earliest point in the chain where a paid-for commitment is at risk, ahead of transit, ahead of delivery, ahead of returns. Catching it here is the cheapest possible intervention, which is exactly what a revenue-at-risk card is for.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Orders with Dispatch SLA Missed* is one of hundreds of KPI pulses Vortex IQ tracks across PostNord and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

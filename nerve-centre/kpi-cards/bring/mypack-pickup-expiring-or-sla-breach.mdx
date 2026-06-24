@@ -1,0 +1,137 @@
+---
+title: "Mypack Pickup Expiring or SLA Breach, Bring"
+sidebarTitle: "Mypack Pickup Expiring or SLA Breach"
+description: "Mypack Pickup Expiring or SLA Breach for Bring stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A real-time work queue of Bring Mypack (Pakke i postkasse / pickup point) parcels that are approaching the end of their pickup-holding window, plus orders that have blown their dispatch deadline. Mypack parcels delivered to a Posten parcel locker or a post-in-shop (Post i Butikk) are held for a fixed number of days, then returned to sender if the recipient never collects them. This card surfaces those parcels before they expire so the despatch and customer-service teams can prompt the customer, and flags orders sitting past their promised hand-over time so they can be pushed out of the warehouse.
+
+| | |
+| --- | --- |
+| **What it surfaces** | Two stacked alert lists. (1) Mypack consignments whose pickup-holding window is within the warning threshold of expiry and still uncollected (`status = AVAILABLE_FOR_PICKUP` and `pickup_expiry_at <= now + warning_window`). (2) Orders whose dispatch SLA has already passed without a Bring label and first scan (`promised_dispatch_at < now` and no booking confirmation). |
+| **Data source** | Bring Tracking API `GET /tracking/api/v2/trackingByReference/{shipmentNumber}` plus the booking record from the Mybring Booking API. The card reads `status`, the pickup-point event (`COLLECTED_BY_RECIPIENT` vs `READY_FOR_PICKUP`), the holding-deadline event date, and the local order's promised dispatch timestamp. |
+| **Mypack holding window** | Bring holds a pickup-point parcel for a set number of days from the `READY_FOR_PICKUP` scan (commonly 7 calendar days for Pakke til hentested, configurable by the carrier agreement). After expiry the parcel is booked on its return leg back to the sender. The card's warning window defaults to the final 48 hours before that deadline. |
+| **Service scope** | Mypack / pickup-point products only (Bring Pickup Parcel, Pakke til hentested, Pakke i postkasse where a collection step exists). Bring Home Delivery Parcel (handed to the door) does not have a pickup-holding window and is excluded from list (1); a missed home delivery shows on [Failed Deliveries](/nerve-centre/kpi-cards/bring/failed-deliveries) instead. |
+| **Dispatch-SLA scope** | All Bring outbound products with a promised hand-over time on the order. A missed dispatch SLA here is the warehouse-floor failure (label never booked) and is distinct from a carrier transit delay. |
+| **Time window** | `RT` (real time). The card re-evaluates on each tracking-event ingestion cycle, typically every 15 to 60 minutes. |
+| **Alert trigger** | `>5 Mypack pickups expiring soon OR orders past dispatch deadline`. Either limb fires the alert. The Mypack limb counts parcels inside the warning window; the dispatch limb counts orders past their promised hand-over with no booking. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Bring data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A Norwegian DTC outdoor-apparel brand based in Oslo, around 1,900 outbound parcels per week, splits volume roughly 55 percent Bring Pickup Parcel (Mypack to a Posten locker or Post i Butikk), 35 percent Bring Home Delivery Parcel and 10 percent cross-border to Sweden. The carrier agreement holds pickup-point parcels for 7 calendar days; the warning window is the final 48 hours. Reading taken at 08:00 CEST on 14 Apr 26.
+
+The card shows two lists:
+
+| List | Trigger condition | Count now | Detail |
+| --- | --- | --- | --- |
+| Mypack expiring soon | `READY_FOR_PICKUP` + within 48h of the 7-day deadline + uncollected | 7 | 4 at a Posten locker, 3 at Post i Butikk |
+| Orders past dispatch SLA | promised hand-over passed, no Bring booking confirmation | 2 | Both promised same-day cut-off of 13:00, still unbooked at 08:00 next day |
+
+The Mypack limb reads **7**, which trips the `>5` threshold, so the card is in alert. Five things to notice:
+
+1. **Each expiring parcel is a recoverable sale, not a lost one (yet).** A parcel that expires and goes back on its return leg costs the merchant the outbound carriage, the return carriage, and almost always a refund. Prompting the customer in the final 48 hours typically recovers 40 to 60 percent of otherwise-expiring Mypack parcels. The action is a targeted "your parcel is waiting, collect by 16 Apr 26" SMS or email, not a generic reminder.
+2. **Locker parcels and Post i Butikk parcels behave differently.** A Posten parcel locker (Pakkeboks) frees space on a fixed cadence and the carrier may shorten the hold during peak; a Post i Butikk hold is more forgiving. If your expiring list skews to lockers during December peak, expect the effective hold to be shorter than the nominal 7 days.
+3. **The dispatch-SLA limb is a warehouse problem, not a carrier problem.** Those 2 unbooked orders never reached Bring. The fix is upstream: check that the label-booking step ran (see [Label Generation Success](/nerve-centre/kpi-cards/bring/label-generation-success)) and that the Mybring Booking API was reachable (see [Bring Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/bring/bring-tracking-api-unavailable-5xx)).
+4. **Holding deadlines are in carrier-local time.** The `READY_FOR_PICKUP` scan timestamp and the holding deadline are recorded in the pickup point's local time (CET / CEST for Norway). If you read the card in UTC the deadline can appear an hour or two earlier than the customer experiences it; always show the customer the local collect-by date.
+5. **Expiry is seasonal.** Collection discipline drops over public holidays and the Christmas window. Expect the expiring count to rise across Påske (Easter) and the 23 Dec to 2 Jan window even at flat volume, because recipients are travelling and lockers fill faster.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+This card is a real-time work queue. Pair it with these to diagnose cause and measure the leakage it prevents:
+
+| Card | Why pair it with this alert | What the combination tells you |
+| --- | --- | --- |
+| [Mypack Pickup Expiry Rate](/nerve-centre/kpi-cards/bring/mypack-pickup-expiry-rate) | The trailing percentage view of the same problem. | This card is the live queue; the rate card is the trend. A rising expiry rate over 30 days means your collect-by messaging is not landing. |
+| [Home vs Mypack vs Business Door](/nerve-centre/kpi-cards/bring/home-vs-mypack-vs-business-door) | How much of your volume is exposed to pickup expiry at all. | If Mypack is 55 percent of volume, expiry risk is structural; if it is 10 percent, a spike here is an anomaly worth a closer look. |
+| [Orders with Dispatch SLA Missed](/nerve-centre/kpi-cards/bring/orders-with-dispatch-sla-missed) | The trailing count behind this card's dispatch limb. | The dispatch limb here is the live queue; that card is the period total and the revenue-at-risk view. |
+| [Label Generation Success](/nerve-centre/kpi-cards/bring/label-generation-success) | Why an order missed its dispatch SLA. | A dip in label success directly feeds the dispatch limb of this card: no label, no booking, no hand-over. |
+| [Failed Deliveries](/nerve-centre/kpi-cards/bring/failed-deliveries) | The home-delivery analogue of a missed collection. | A missed door delivery and an expired locker parcel are different failure modes with the same downstream cost: a refund. |
+| [Returned to Sender](/nerve-centre/kpi-cards/bring/returned-to-sender) | Where expired Mypack parcels end up. | Expired pickups convert into return-leg consignments; a spike here lags a spike there by the holding window. |
+| Cross-connector: [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream impact. Expired and returned parcels drive refunds. | A sustained expiring queue predicts a refund-rate rise once the return legs clear, typically 7 to 14 days later. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Bring's own tooling:**
+
+[Mybring](https://www.mybring.com/) is the merchant portal. The pickup status of a consignment lives under **Tracking** (search the shipment number) and the holding deadline shows as the pickup-point event with its collect-by date. Bulk despatch and booking status live under **Booking → Shipments**. For the customer-facing view, Bring's public tracking at [tracking.bring.com](https://tracking.bring.com/) shows the same `READY_FOR_PICKUP` event and the collect-by date the recipient sees.
+
+The closest like-for-like view is *Tracking, status Available for pickup, sorted by holding-deadline ascending*. The dispatch-SLA limb has no direct equivalent in Mybring; it is computed from your own order's promised hand-over time against the absence of a Bring booking confirmation.
+
+**Why our number may legitimately differ from Mybring:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Tracking-event ingestion lag** | Ours can lag | Bring's Tracking API surfaces scans in batches. A `COLLECTED_BY_RECIPIENT` scan from 30 minutes ago may not be ingested yet, so a just-collected parcel can still show in our expiring list for one ingestion cycle. We err towards keeping it in the queue rather than dropping it early. |
+| **Carrier-local time vs UTC** | Boundary hours off | Holding deadlines are recorded in pickup-point local time (CET / CEST). The card stores in UTC and converts for display; a parcel near the midnight boundary can appear in a different hour bucket than Mybring shows. |
+| **Warning-window definition** | Ours wider or narrower | The card's 48-hour warning window is a Vortex IQ setting, not a Bring field. Mybring shows the absolute deadline; we show "expiring soon" relative to a threshold you can tune in the Sensitivity tab. |
+| **Holding-period overrides** | Either | Bring may shorten the effective hold during peak or for full lockers. If the carrier shortens the hold mid-flight, our countdown (based on the nominal agreement) can be optimistic; trust the live pickup-point event over the nominal window during December. |
+| **Dispatch-SLA source** | Ours only | The dispatch limb is computed from your order's promised hand-over time, which Bring never sees. Mybring cannot reconcile it because the data does not exist on the carrier side. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | Causes of legitimate divergence |
+| --- | --- | --- |
+| [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Upstream input to the dispatch limb. | Webhook delivery failures, manual fulfilment delays, B2B / pre-order flows. |
+| [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream impact of expired pickups. | Refund rate has many drivers; pickup expiry is one input among several. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple carriers)</em></summary>
+
+Pickup-point holding and expiry concepts exist across other locker and parcel-shop carriers (PostNord, DHL Packstation, InPost). These are not parallel measurements of the same parcels; each carrier has its own holding window and event vocabulary.
+
+- [Mypack Pickup Expiry Rate](/nerve-centre/kpi-cards/bring/mypack-pickup-expiry-rate)
+- [Orders with Dispatch SLA Missed](/nerve-centre/kpi-cards/bring/orders-with-dispatch-sla-missed)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why does a parcel I know was collected still show in the expiring list?**
+Ingestion lag. Bring surfaces the `COLLECTED_BY_RECIPIENT` scan in a batch, not instantly. For up to one ingestion cycle (15 to 60 minutes) a just-collected parcel can linger in the queue. The card deliberately keeps a parcel in the list until the collected scan is confirmed rather than dropping it on an assumption; a collected parcel that never clears after several cycles points to a tracking-event gap (see [Shipments with Tracking-Event Gap](/nerve-centre/kpi-cards/bring/shipments-with-tracking-event-gap)).
+
+**What is the difference between this card's two lists?**
+The Mypack limb is a carrier-side problem the customer must solve (collect the parcel). The dispatch limb is a warehouse-side problem you must solve (book the label and hand the parcel over). They share a card because both are time-critical work queues that, left alone, end in a refund, but the owners and the fixes are different.
+
+**Can I change the 48-hour warning window?**
+Yes. The warning window and the `>5` count threshold are both configurable per profile in the Sensitivity tab. A high-Mypack-volume merchant may want a 72-hour window to give more reminder runway; a low-volume merchant may want a tighter window to keep the queue small.
+
+**Why does the expiring count spike over holidays even though my volume is flat?**
+Collection behaviour, not despatch behaviour. Recipients travel over Påske and Christmas, lockers fill and the carrier may shorten the effective hold, and reminder emails get buried. Expect the queue to grow across public-holiday windows; pre-empt it by front-loading reminder messaging before the holiday rather than during it.
+
+**Does this count Bring Home Delivery Parcels?**
+Not in the Mypack limb. Home Delivery has no pickup-holding window, so a missed home delivery is not an "expiring pickup"; it shows on [Failed Deliveries](/nerve-centre/kpi-cards/bring/failed-deliveries). Home Delivery orders can appear in the dispatch-SLA limb if they were never booked.
+
+**A parcel expired and went back to me. Where do I see that?**
+On [Returned to Sender](/nerve-centre/kpi-cards/bring/returned-to-sender). Once the holding window lapses, Bring books the parcel on its return leg; it leaves this card's expiring list and enters the return-to-sender flow. Track the two together to size the true cost of uncollected pickups.
+
+**What is the playbook when the Mypack limb crosses the threshold?**
+In order: (1) trigger the collect-by reminder to every customer in the warning window with the local collect-by date and the pickup-point name, (2) for high-value orders, follow up with a second channel (SMS if the first was email), (3) check whether the spike is concentrated at specific pickup points (a single full locker can generate a cluster), (4) if the dispatch limb is also firing, fix the booking pipeline first since unbooked orders never even reach a pickup point.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Mypack Pickup Expiring or SLA Breach* is one of hundreds of KPI pulses Vortex IQ tracks across Bring and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

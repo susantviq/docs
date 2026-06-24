@@ -4,26 +4,23 @@ sidebarTitle: "Days to Token Expiry"
 description: "Days to Token Expiry for Japan Post stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
 ---
 
-**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Shipping & Courier](/nerve-centre/connectors#connectors-by-type)
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Operational Health](/nerve-centre/connectors#connectors-by-type)
 
 ## At a glance
 
 {/* HUMAN_AUTHORED:tldr */}
-> Days remaining until the merchant's Japan Post API authentication token expires. When the token expires, every label-generation call, tracking lookup, and claim-status query stops working until the merchant re-authenticates. The card alerts at 14 days remaining to give operations time to renew before the cliff.
+> Days remaining until the merchant's Japan Post API authentication token expires. When the token expires, every label and manifest call, every tracking lookup, and every claim-status query stops working until the merchant re-authenticates. The card reads in real time and alerts at 14 days remaining so the despatch team has time to renew before the cliff rather than discovering it at the counter on a Monday morning.
 
 | | |
 | --- | --- |
-| **What it counts** | `(token_expiry_timestamp - now) ÷ 86400` (seconds-to-days). The token is OAuth2-style, with a typical lifetime of 90 days for production credentials. |
-| **Delivery success criterion** | n/a, this is an integration-health metric, not an operational metric. |
-| **On-time threshold** | n/a. |
-| **Returns / RTO** | n/a. |
-| **Service level scope** | n/a. The token is account-wide; one token covers Yu-Pack, Yu-Pack Cool, EMS, Letter Pack, and the Tracking and Claims APIs. |
-| **Currency** | n/a. |
-| **Token type** | Japan Post issues two separate token classes: (a) production tokens (90-day lifetime, refreshable up to 30 days before expiry), (b) sandbox / staging tokens (30-day lifetime, separate credentials). The card defaults to production; sandbox tokens are not surfaced unless explicitly connected. |
-| **Refresh behaviour** | Japan Post supports refresh-token flow; the merchant can renew the token any time within the 30-day pre-expiry window. After expiry, full re-authentication is required (manual portal login, MFA challenge, contract verification by Japan Post account team for some enterprise tiers). |
-| **Multi-environment merchants** | A merchant with separate production and sandbox accounts has two tokens; the card surfaces the nearest expiry across all connected accounts. |
-| **Time window** | `RT` (real-time, computed on every card refresh) |
-| **Alert trigger** | `<14 days`, escalating to critical at `<7 days`. Tokens at `<3 days` should trigger a paged alert. |
+| **What it tracks** | `(token_expiry_timestamp - now) ÷ 86400` (seconds converted to whole days). The Japan Post API uses an OAuth2-style bearer token whose production lifetime is typically 90 days, refreshable inside a 30-day pre-expiry window. |
+| **Data source** | Token metadata returned by the Japan Post API auth handshake (issued-at and expires-at timestamps), captured on every Vortex IQ health-check against the connector. This is an integration-health metric, not an operational despatch metric. |
+| **Token scope** | The token is account-wide: one credential covers Yu-Pack, Yu-Pack Cool (chilled / frozen), EMS, Letter Pack, and the Tracking and Claims endpoints. There is no per-service token. |
+| **Token classes** | Japan Post issues (a) production tokens (90-day lifetime, refreshable), and (b) sandbox / staging tokens (shorter 30-day lifetime, separate credentials). The card defaults to the production token; sandbox is surfaced only when explicitly connected. |
+| **Refresh behaviour** | Japan Post supports a refresh-token flow. The merchant can renew at any time inside the 30-day pre-expiry window with no re-authentication. After expiry, full re-authentication is required: portal login, MFA challenge, and for some enterprise contract tiers a verification step with the Japan Post account team. |
+| **Multi-environment merchants** | A merchant running separate production and sandbox accounts holds two tokens. The card surfaces the nearest expiry across all connected Japan Post accounts. |
+| **Time window** | `RT` (real time, recomputed on every card refresh). |
+| **Alert trigger** | `<14 days` (warn), escalating to critical at `<7 days`. Tokens at `<3 days` should page on-call. |
 | **Roles** | owner, operations |
 {/* /HUMAN_AUTHORED:tldr */}
 
@@ -34,92 +31,92 @@ Calculated automatically from your Japan Post data. See the At a glance summary 
 ## Worked example
 
 {/* HUMAN_AUTHORED:worked_example */}
-A Japanese-headquartered DTC apparel brand based in Osaka, ~3,200 outbound parcels per week. Reading at 09:30 JST on 12 Apr 26.
+A Japanese-headquartered DTC apparel and homeware brand based in Osaka, around 3,200 outbound parcels per week, roughly 80 percent Yu-Pack domestic and 20 percent EMS for overseas orders. Reading taken at 09:30 JST on 12 Apr 26.
 
 | Token | Issued | Expiry | Days remaining | Status |
 | --- | --- | --- | --- | --- |
 | Production (primary) | 17 Jan 26 | 17 Apr 26 | 5 days | CRITICAL |
 | Sandbox (test environment) | 28 Mar 26 | 27 Apr 26 | 15 days | OK |
 
-What's interesting:
+The card reads **5 days** (it always surfaces the nearest expiry, which is the production token). The `<7 days` critical band is tripped. Five things to notice:
 
-1. **The production token has 5 days remaining and is in the critical band.** The card alerts at `<14 days`; this reading should have triggered an action ticket roughly 9 days ago. The alert escalates to paged-on-call at `<3 days`. Operations needs to renew TODAY; if the token expires at 17 Apr 26 23:59 JST, every label-generation call after that timestamp will return `401 Unauthorized` and warehouse operations will halt.
-2. **The renewal window is open right now.** Japan Post supports refresh-token flow during the 30-day pre-expiry window; this token entered the renewal window on 18 Mar 26. The simplest action is to invoke the refresh-token endpoint, which extends the token by another 90 days without requiring re-authentication. This is a 30-second engineering task.
-3. **The cost of letting the token expire is meaningful.** At 3,200 weekly parcels, even a 6-hour outage during business hours blocks ~120 outbound shipments. Each blocked shipment ages into a customer-experience issue and (for time-sensitive Yu-Pack Cool refrigerated SKUs) into spoilage. Worst case: token expires Friday evening, full re-authentication requires Japan Post account team support which is unavailable until Monday morning, ~48 hours of downtime, 900+ blocked shipments.
-4. **The sandbox token at 15 days is fine.** Sandbox tokens are shorter-lived (30 days) but lower-impact; if a sandbox token expires the only effect is that pre-production testing breaks until renewed. Treat the alert priority as informational, not paged.
-5. **The right operational pattern is automated refresh.** Most enterprise Japan Post integrations should be running a scheduled job (cron, Cloud Scheduler, etc.) that refreshes the token every 30 to 45 days, well before the alert fires. If this card ever drops below 30 days, the automated refresh is broken; treat that as a higher-priority signal than the token itself.
+1. **This reading should already have a ticket against it.** The warn alert fires at `<14 days`, so operations was first notified around 03 Apr 26. The escalation to paged on-call lands at `<3 days`, which is 14 Apr 26. The window to act calmly is closing: renew today, do not wait for the page.
+2. **The renewal window is open right now, so this is a 30-second job.** Japan Post supports refresh-token flow inside the 30-day pre-expiry window, which this token entered on 18 Mar 26. Invoking the refresh endpoint extends the token by a further 90 days with no portal login, no MFA, no account-team involvement. Letting it lapse converts a 30-second engineering task into a multi-step re-authentication.
+3. **The cost of letting it expire is operational, not theoretical.** At 3,200 weekly parcels the brand despatches roughly 530 a day. A 6-hour outage during business hours blocks around 130 outbound shipments. Each blocked parcel ages into a despatch-SLA miss, and for the Yu-Pack Cool chilled SKUs the brand ships, a blocked label can mean a missed refrigerated collection slot and product spoilage.
+4. **Worst case is a weekend expiry.** If the token expires at 17 Apr 26 23:59 JST (a Friday), and the underlying credentials need account-team verification to re-issue, the team may not recover the connection until Monday. That is roughly 48 hours and around 900 blocked shipments, plus the recovery backlog.
+5. **The sandbox token at 15 days is fine.** Sandbox tokens are shorter-lived but low-impact: if one expires, only pre-production testing breaks. Treat that alert as informational, never paged. The real-world pattern to aim for is an automated refresh job (cron, Cloud Scheduler, Lambda EventBridge) that renews every 30 to 45 days. If this card ever drops below 30 days, your automation is broken; that is a higher-priority signal than the token itself.
 {/* /HUMAN_AUTHORED:worked_example */}
 
 ## Sibling cards merchants should reference together
 
 {/* HUMAN_AUTHORED:siblings */}
-| Card | Why pair it with Days to Token Expiry |
-| --- | --- |
-| [API Error Rate](/nerve-centre/kpi-cards/japan-post/api-error-rate) | The downstream signal. When the token expires, every API call returns 401; API error rate spikes immediately. The two cards are complementary: token-expiry is the leading indicator, API error rate is the lagging confirmation. |
-| [Label Generation Success](/nerve-centre/kpi-cards/japan-post/label-generation-success) | The most operationally critical API call. Token expiry causes label-generation failure first; the card's success rate drops to 0% on token death. |
-| [Total Shipments](/nerve-centre/kpi-cards/japan-post/shipments) | The downstream impact. Token outage blocks new label generation; shipment volume drops to zero hours into an outage. |
-| Cross-connector: any other carrier connector with auth tokens (Royal Mail, USPS, etc.) | Same pattern, same operational priority. Treat token-expiry across all shipping carriers as a single class of integration-health signal. |
-| Cross-connector: payment-gateway auth tokens (Stripe, PayPal) | Same shape, different impact. Payment-gateway token expiry blocks revenue collection rather than fulfilment; the operational impact is faster and harder. |
+Token expiry is the leading integration-health signal. Pair it with the cards that show the downstream blast radius:
+
+| Card | Why pair it with Days to Token Expiry | What the combination tells you |
+| --- | --- | --- |
+| [API Error Rate](/nerve-centre/kpi-cards/japan-post/api-error-rate) | The lagging confirmation. When the token dies, every call returns 401 and API error rate spikes to 100 percent. | Token expiry is the prediction; API error rate is the proof. If error rate spikes while days-remaining is still high, the cause is something other than expiry (revocation, rate limiting, account change). |
+| [Label Generation Success](/nerve-centre/kpi-cards/japan-post/label-generation-success) | The most operationally critical call. | Label generation fails first on token death; this card drops to 0 percent the moment the token lapses. It is the fastest visible symptom on the warehouse floor. |
+| [Shipments](/nerve-centre/kpi-cards/japan-post/shipments) | The volume impact. | New labels cannot be created during an outage, so shipment volume flat-lines within hours. A sudden drop to zero with a low days-remaining reading is an expiry, not a quiet day. |
+| [Orders with Dispatch SLA Missed](/nerve-centre/kpi-cards/japan-post/orders-with-dispatch-sla-missed) | The customer-facing consequence. | Every hour the token is down, the despatch-SLA miss count climbs. This card quantifies the promise broken to customers while the integration was offline. |
+| [Japan Post Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/japan-post/japan-post-tracking-api-unavailable-5xx) | Distinguishes "our auth failed" from "their service is down". | A 401 storm is your token; a 5xx storm is Japan Post's infrastructure. Reading both side by side stops you re-authenticating against an outage you did not cause. |
+| [Label / Customs Doc Print Failures Spike](/nerve-centre/kpi-cards/japan-post/label-customs-doc-print-failures-spike) | EMS-specific downstream impact. | Token death blocks CN23 customs document generation too; international orders stall as well as domestic. |
 {/* /HUMAN_AUTHORED:siblings */}
 
-## Reconciling against the vendor's own dashboard
+## Reconciling against the source
 
 {/* HUMAN_AUTHORED:reconcile */}
-**Where to look in Japan Post's own portal:**
+**Where to look in Japan Post's own tooling:**
 
-[Japan Post Business Customer Portal](https://www.post.japanpost.jp/biz/) → *API Settings / Developer Console* (API管理). The view shows token issued-at and expiry-at timestamps, plus a refresh button for the production token. Sandbox tokens are managed via a separate developer subdomain.
+[Japan Post Business Customer Portal](https://www.post.japanpost.jp/biz/) then *API Settings / Developer Console* (API管理). The view shows the production token's issued-at and expires-at timestamps in JST, plus a refresh control. Sandbox tokens are managed under a separate developer subdomain. English-language reference exists for the EMS endpoints; the broader API documentation is JP-language primary.
 
-For the Japan Post API documentation including OAuth flow, refer to the developer reference (Japan Post developer portal, JP-language primary; English documentation is available for EMS endpoints only).
+The closest like-for-like view is the production token's *expires-at* timestamp. Convert it to days-remaining against the current JST clock and it should match the card to within one day. Scan and event timestamps elsewhere in the Japan Post APIs are reported in carrier-local time (JST), so all of this maths is in the same time zone at source; Vortex IQ stores in UTC internally and converts back for display.
 
 **Why our number may legitimately differ from Japan Post's portal:**
 
 | Reason | Direction | Why |
 | --- | --- | --- |
-| **Time-zone (JST vs UTC)** | Boundary days | The token expiry timestamp is stored in JST natively; Vortex IQ converts to UTC for the days-remaining calculation. For the most part this affects only sub-day precision. |
-| **Refresh latency** | Vortex IQ slightly stale | When a refresh-token call extends the expiry, Vortex IQ picks up the new expiry on the next API health-check (typically every 5 to 15 minutes); the portal updates immediately. |
-| **Account-tier differences** | Either | Enterprise contract customers sometimes have longer-lived tokens (180 days) negotiated as part of the contract; the card reads whatever Japan Post returns in the token metadata. |
-| **Multi-account merchants** | Vortex IQ shows the nearest-expiry across all connected accounts | The portal shows per-account; reconcile by checking each account separately. |
-| **Sandbox vs production conflation** | Possible | Default to production; if the connected credential is a sandbox token by mistake, the card surfaces it but the operational impact is different. |
+| **Time zone (JST vs UTC)** | Sub-day precision only | The token expiry is native JST; Vortex IQ converts to UTC to compute days-remaining, then rounds to whole days. A boundary near midnight JST can show one day's difference for a few hours. |
+| **Refresh ingestion latency** | Ours briefly stale | When a refresh call extends the expiry, the portal updates instantly. Vortex IQ picks up the new expires-at on the next health-check, typically within 5 to 15 minutes. |
+| **Account-tier differences** | Either | Enterprise contract customers sometimes negotiate longer-lived tokens (180 days). The card reads whatever Japan Post returns in the token metadata, so it tracks the real value rather than assuming 90 days. |
+| **Multi-account merchants** | Ours shows nearest expiry | The portal is per-account; the card shows the soonest expiry across all connected accounts. Reconcile by checking each account individually. |
+| **Sandbox vs production conflation** | Possible | The card defaults to production. If a sandbox credential is connected by mistake, the displayed value is the sandbox token's shorter lifetime; the operational impact is different. |
 
 **Cross-connector reconciliation:**
 
-This card has no carrier-side counterpart, but the integration-health pattern is shared across every shipping connector:
+This card has no carrier-side counterpart (token health is an integration concept, not a parcel concept), but the pattern is shared across every authenticated connector. The right view is "all carrier and payment integration health on one panel" so a single token lapse never becomes a single point of failure.
 
-| Card | Expected relationship | Why |
+| Card | Expected relationship | Causes of legitimate divergence |
 | --- | --- | --- |
-| [`royal_mail.roy_auth_token_expiry_days`](/nerve-centre/kpi-cards/royal-mail/days-to-token-expiry) | Same shape, different network | Royal Mail's API uses a different token lifecycle (typically 60-day with auto-refresh on every call), so the same merchant's two tokens won't co-expire. |
-| [`fedex.fedex_oauth_expiry`](/nerve-centre/fedex/fedex_oauth_expiry) | Same shape | FedEx OAuth is short-lived (1-hour bearer tokens, refresh-on-demand); the days-remaining concept doesn't apply. |
-| [`stripe.stripe_secret_key_status`](/nerve-centre/stripe/stripe_secret_key_status) | Same operational priority, different mechanism | Stripe API keys do not expire by default but can be rotated; treat both as "integration secrets" requiring monitoring. |
-
-The right view is "all carrier and payment integration health together"; running a single dashboard panel that surfaces token-expiry and key-status across every connected service prevents single-point-of-failure outages.
+| [`royal_mail.roy_auth_token_expiry_days`](/nerve-centre/kpi-cards/royal-mail/days-to-token-expiry) | Same shape, different lifecycle | Royal Mail's API token rotates on a different cadence, so a merchant running both carriers will not see the two tokens co-expire. Monitor each independently. |
+| [`shippo.api_token_health`](/nerve-centre/kpi-cards/shippo/api-error-rate) | Aggregator auth covering many carriers | When Shippo or EasyPost is the integration layer, one aggregator token gates every carrier behind it, so the blast radius of an expiry is wider than a single national carrier. |
 {/* /HUMAN_AUTHORED:reconcile */}
 
 ## Known limitations / merchant FAQs
 
 {/* HUMAN_AUTHORED:faqs */}
 **The alert fired at 14 days. Do I have to act now?**
-Not immediately, but plan to act within 7 days. The 14-day threshold is set deliberately to give operations a buffer; tokens at 14 days remaining can be refreshed at any time. The escalation path: alert at 14 days (informational ticket), at 7 days (action ticket), at 3 days (paged on-call). If you have a scheduled refresh job, the 14-day alert is a check that the job is healthy; if the job is broken and you act manually now, you have 14 days to fix the automation before the next renewal.
+Not this minute, but plan to act within 7 days. The 14-day threshold is a deliberate buffer; a token at 14 days can be refreshed at any time. The escalation path is: warn at 14 days (informational ticket), action ticket at 7 days, paged on-call at 3 days. If you run a scheduled refresh job, the 14-day alert is really a check that the job is healthy; if it fired, the automation may have skipped a run, so fix that first.
 
-**What happens when the token actually expires?**
-Every Japan Post API call returns `401 Unauthorized` immediately. Concrete impact in operational order: (1) Label-generation calls fail, the warehouse cannot print Yu-Pack / EMS labels for new orders. (2) Tracking-status updates stop pulling, customer-facing tracking page goes stale. (3) Claim-status queries fail, claims-team cannot check status. (4) Cost / invoice data stops updating in Vortex IQ. The operational severity is highest at #1; warehouse productivity drops to zero for Japan Post-routed shipments until the token is renewed.
+**What actually happens when the token expires?**
+Every Japan Post API call returns `401 Unauthorized` immediately. In operational order of pain: (1) label and manifest generation fails, so the warehouse cannot print Yu-Pack, Yu-Pack Cool, EMS, or Letter Pack labels for new orders; (2) tracking-status pulls stop, so the customer-facing tracking page goes stale; (3) claim-status queries fail, so the claims team is blind; (4) cost and invoice data stops updating in Vortex IQ. Severity is highest at (1): despatch productivity for Japan Post-routed orders drops to zero until the token is renewed.
 
 **How long does re-authentication take?**
-For a still-within-the-renewal-window token: 30 seconds via the refresh-token API call. For an expired token: 10 minutes if the merchant credentials are valid (manual portal login + MFA + re-issue token). For a token where the underlying account credentials need verification (e.g. enterprise contract customers needing Japan Post account team approval): 4 to 24 business hours during normal hours, longer over weekends.
+A token still inside the renewal window: about 30 seconds via the refresh endpoint. An already-expired token with valid credentials: roughly 10 minutes (portal login plus MFA plus token re-issue). A token where the underlying account needs verification, which can happen for enterprise contract customers, can take 4 to 24 business hours, and longer over a weekend or Japanese public holiday.
 
 **Can I disable the alert if I have automated refresh in place?**
-Possibly, but reconsider. The right pattern is to leave the alert active and tune it to fire only when automation breaks. If automated refresh runs every 30 days, set a separate alert at `<45 days` to surface "automation didn't run on schedule" before the regular 14-day threshold fires. Don't disable the safety net.
+Reconsider rather than disable. The better pattern is to leave the alert active and add a second, earlier alert at `<45 days` that surfaces "the automated refresh did not run on schedule" well before the standard 14-day threshold. Disabling the safety net entirely means a broken cron job goes unnoticed until the cliff.
 
-**My token expired over a weekend and operations was blocked Monday morning. How do I prevent this?**
-Three layered defences. (a) Run automated refresh on a schedule that doesn't depend on humans (cron / Cloud Scheduler / Lambda EventBridge). (b) Set the alert at `<14 days` so manual intervention is possible during business hours. (c) Document the manual renewal procedure in your runbook so on-call engineers can act outside business hours, including the Japan Post account team contact for emergency re-issue.
+**My token expired over a weekend and the warehouse was blocked on Monday. How do I prevent that?**
+Three layered defences. (a) Run automated refresh on a schedule that does not depend on a human being awake (cron, Cloud Scheduler, EventBridge). (b) Keep the `<14 days` alert so a manual fix is possible during business hours. (c) Document the manual renewal steps in your runbook, including the Japan Post account-team emergency contact, so on-call engineers can recover outside business hours. Note that Japan Post account-team support is itself JST business-hours, so a Friday-evening expiry is the highest-risk scenario.
 
-**My multi-region brand has separate Japan Post accounts for different markets. Do I get one card or many?**
-The card reads the nearest-to-expiry token across all connected accounts. To monitor each account separately, configure each as a distinct connector in Vortex IQ; each will produce its own card. For most merchants the nearest-expiry view is sufficient because all accounts should be on the same renewal cadence.
+**My multi-region brand runs separate Japan Post accounts per market. One card or many?**
+By default the card reads the nearest-to-expiry token across all connected accounts, so it is one card showing the soonest cliff. To monitor each account separately, connect each as its own connector profile in Vortex IQ; each then produces its own card. For most merchants the nearest-expiry view is enough because all accounts should share a renewal cadence.
 
-**The token says 90 days remaining but the API still returned 401. Why?**
-Three usual causes. (a) **Account-credential change at Japan Post side.** Token is technically valid but the underlying account permissions changed (e.g. a contract amendment, payment dispute, password rotation). Check the Japan Post portal for any account-level notifications. (b) **Token revocation.** Japan Post can revoke a token outside the natural expiry (rare, usually for security incidents on Japan Post's side or detected unauthorised use of the token). (c) **Rate limiting.** Hitting the API too aggressively can produce 401-like errors; check API Error Rate for parallel symptoms.
+**The card says 90 days remaining but the API still returned 401. Why?**
+Three usual causes. (a) An account-credential change on the Japan Post side: the token is technically valid but the underlying account permissions changed (a contract amendment, a payment dispute, a password rotation). Check the portal for account-level notices. (b) Token revocation, which Japan Post can do outside the natural expiry, usually for a security event. (c) Rate limiting, which can produce 401-like responses under aggressive call volume; check [API Error Rate](/nerve-centre/kpi-cards/japan-post/api-error-rate) for a parallel spike.
 
 **Why is the expiry 90 days and not longer?**
-Japan Post's security model uses 90-day tokens as a reasonable balance between operational stability and credential-rotation security. Longer tokens reduce operational friction but expand the attack window if a token is leaked; shorter tokens force more frequent rotation but improve security posture. The 90-day default is industry-typical for high-trust integrations. Some Japan Post enterprise contracts negotiate 180-day tokens for very mature customers; ask your Japan Post account team if needed.
+Japan Post's 90-day default balances operational stability against credential-rotation security: longer tokens reduce friction but widen the window if a credential leaks. Some mature enterprise contracts negotiate 180-day tokens; ask your Japan Post account team. Whatever the agreed lifetime, the card reads the real expires-at value, so a negotiated 180-day token is reflected accurately.
 {/* /HUMAN_AUTHORED:faqs */}
 
 ---

@@ -1,0 +1,133 @@
+---
+title: "Shipments with Tracking-Event Gap, PostNord"
+sidebarTitle: "Shipments with Tracking-Event Gap"
+description: "Shipments with Tracking-Event Gap for PostNord stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/overview#card-classes-explained)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A table of individual PostNord parcels that have gone silent: shipments whose last tracking scan is older than the expected interval for their current status, with no new event for longer than the gap threshold, in the trailing 24 hours. A gap means the parcel has stopped emitting scans while still in transit. Sometimes that is harmless ingestion lag; often it is a stuck, lost or stranded parcel, and a customer about to ask where their order is. Each row is one parcel you can chase before it becomes a refund.
+
+| | |
+| --- | --- |
+| **What it lists** | One row per parcel where `now - last_event_time > gap_threshold` while the parcel is in a non-terminal status (not delivered, not returned, not cancelled). Columns: consignment ID, order reference, service code, destination country, last event type, last event time (carrier-local and hours-ago), and status. |
+| **Data source** | The event stream from `GET /shipments/v1/parcels/{id}/events` (PostNord Shipments API), evaluated against the expected next-event interval for each status. Booking and service code come from the PostNord Booking / Shipping API; the order reference is joined from the store order feed. |
+| **Gap threshold by status** | The threshold is status-aware, not a flat number. A parcel `IN_TRANSIT` between two depots is allowed a longer silence than one `OUT_FOR_DELIVERY`; a freshly `INFORMED` (label booked) parcel with no first scan after the expected pickup is flagged sooner. Defaults sit around 24 to 36 hours for line-haul and tighten to 8 to 12 hours for last-mile statuses. |
+| **What "stale" means** | A parcel is stale when its silence exceeds its status threshold. The alert counts stale parcels, not all in-transit parcels: a parcel scanning normally never appears here. |
+| **Ingestion-lag vs real gap** | Some gaps are PostNord's batched scan delivery catching up; the card cannot distinguish these perfectly in real time, so a short-lived gap can self-clear when a delayed batch lands. A gap that persists across multiple refreshes is far more likely to be a genuinely stuck parcel. |
+| **Cross-border** | Cross-border parcels (NO / FI especially) naturally have longer legitimate silences at customs; their thresholds are widened so customs dwell does not flood the table. A cross-border parcel silent well past its customs window is still flagged. |
+| **Scope** | Outbound, in-transit parcels only. Delivered, returned and cancelled parcels drop off the table the moment a terminal event lands. Return-leg parcels are tracked separately. |
+| **Refresh cadence** | Hourly, which suits a 24-hour evaluation window. |
+| **Time window** | `24H`. The table reflects parcels stale within the last 24 hours; it is an operational worklist, not a trend. |
+| **Alert trigger** | `>0 stale`. Any stale parcel populates the table and trips the alert: the table is meant to be worked to zero each day. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your PostNord data. See the At a glance summary above for what the table tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+The Stockholm outdoor-apparel brand. Reading taken at 09:00 CET on 18 Mar 26, evaluating parcels stale in the last 24 hours. The table shows 11 stale parcels:
+
+| Consignment | Order | Service | Dest | Last event | Last seen (CET) | Hours silent | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 00370...8821 | #SE-48211 | MyPack Home | SE | `IN_TRANSIT` Hallsberg | 16 Mar 21:40 | 35 | In transit |
+| 00370...8822 | #SE-48219 | MyPack Home | SE | `IN_TRANSIT` Hallsberg | 16 Mar 21:55 | 35 | In transit |
+| 00370...9034 | #NO-12044 | Cross-border | NO | `CUSTOMS_HELD` Oslo | 16 Mar 08:10 | 49 | Customs |
+| 00370...9112 | #FI-30781 | Cross-border | FI | `INFORMED` (booked) | 16 Mar 14:00 | 43 | No first scan |
+| 00370...7765 | #SE-48150 | MyPack Collect | SE | `OUT_FOR_DELIVERY` | 17 Mar 19:20 | 14 | Last mile |
+| ...6 more rows | | | | | | | |
+
+Five things this list tells the operations lead:
+
+1. **The two Hallsberg parcels are a cluster, not two coincidences.** Both went silent at the same depot within 15 minutes of each other and have been quiet 35 hours. That is a sortation-hub signal: a missort batch, or a scanner outage at Hallsberg (Sweden's largest terminal). One stuck parcel is bad luck; two at the same depot at the same time is an incident. Check [Exception Rate](/nerve-centre/kpi-cards/postnord/exception-rate) for a `MISSORT` rise on the SE account.
+2. **The Oslo customs row is the most urgent for the customer.** 49 hours at `CUSTOMS_HELD` for a Norway cross-border parcel usually means missing or incomplete CN23 documentation. This will not self-clear; someone has to supply the customs data or the parcel gets returned. This is a where-is-my-order ticket waiting to happen, and a cross-border RTS waiting to happen, see [Return Rate by PostNord Service Code](/nerve-centre/kpi-cards/postnord/return-rate-by-postnord-service-code).
+3. **The Finland `INFORMED` row never got a first scan.** The label was booked 43 hours ago and PostNord has no movement event. The parcel was probably never collected: it is sitting on the warehouse floor or was missed by the carrier pickup. This is the same parcel that would show as a breach on [Orders with Dispatch SLA Missed](/nerve-centre/kpi-cards/postnord/orders-with-dispatch-sla-missed). Physically find it today.
+4. **The Collect `OUT_FOR_DELIVERY` row at 14 hours is borderline.** Last-mile silence has a tighter threshold (8 to 12 hours) because a parcel out for delivery should scan as delivered or as a failed attempt within the day. 14 hours silent suggests a missed delivery scan or a parcel that did not make it onto the round. Lower urgency than the customs row but worth a check.
+5. **The table is a worklist, not a dashboard.** The aim is to clear it to zero each morning: chase the customs doc, find the floor-stranded parcel, raise a PostNord trace on the Hallsberg cluster. Every row resolved before the customer notices is a where-is-my-order ticket and a potential refund avoided. That is why it sits in the Revenue at Risk class.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+The gap table is the daily operational worklist. Pair it with these to find the cause and size the downstream risk:
+
+| Card | Why pair it with Tracking-Event Gap | What the combination tells you |
+| --- | --- | --- |
+| [Orders with Dispatch SLA Missed](/nerve-centre/kpi-cards/postnord/orders-with-dispatch-sla-missed) | The "never got a first scan" subset. | A booked-but-never-scanned parcel appears on both: it left your system but never reached PostNord. |
+| [Exception Rate](/nerve-centre/kpi-cards/postnord/exception-rate) | The status many gaps are stuck in. | A cluster of gaps at one depot usually matches a `MISSORT` or `WEATHER_DELAY` rise. |
+| [Late Shipments](/nerve-centre/kpi-cards/postnord/late-shipments) | The downstream outcome. | A parcel silent past its transit budget becomes a late shipment; the gap table is the early warning. |
+| [On-Time Delivery Rate](/nerve-centre/kpi-cards/postnord/on-time-delivery-rate) | The aggregate this feeds. | Persistent gaps drag OTD down 1 to 3 days later. |
+| [Returned to Sender](/nerve-centre/kpi-cards/postnord/returned-to-sender) | Where unresolved customs gaps end up. | A `CUSTOMS_HELD` parcel that stays silent often becomes an RTS. |
+| [PostNord Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/postnord/postnord-tracking-api-unavailable-5xx) | The false-positive check. | A spike in gaps across all parcels at once is usually the tracking feed being down, not the parcels being stuck. |
+| Cross-connector: [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Upstream queue for never-scanned parcels. | A floor-stranded parcel often started as a fulfilment that never truly shipped. |
+| Cross-connector: [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream money. | Unresolved gaps convert to where-is-my-order tickets and refunds at a few days lag. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the vendor's own dashboard
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in PostNord's own portal:**
+
+[PostNord Business Portal](https://portal.business.postnord.com) → **Shipments**, then open each flagged consignment ID to view its full event timeline, or **Reports → Tracking Events** to scan last-event times in bulk. PostNord does not surface a "stale parcel" list of its own; you would have to sort the shipments list by last-event time and eyeball which ones have gone quiet. This card automates that sort and applies the status-aware threshold.
+
+The closest like-for-like check is: take each consignment ID from the table, open it in the portal, and confirm the last event time matches and that no newer event exists. Remember the portal shows scan timestamps in carrier-local time (CET / CEST), while the card normalises to UTC internally and shows both local and hours-ago in the table.
+
+**Why our table may legitimately differ from the portal:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Tracking-event ingestion lag** | Ours over-lists briefly | PostNord delivers scans in batches; a parcel that actually scanned 20 minutes ago may still look silent here until the batch ingests, so it appears on the table and then drops off. Persistent rows across refreshes are the real gaps. |
+| **Status-aware threshold** | Either | The card flags by status (last-mile silence is suspicious sooner than line-haul silence); a flat last-event sort in the portal will flag a different set. |
+| **Carrier-local vs UTC** | Display only | Scan timestamps are in CET / CEST in the portal; the card shows local time in the table but evaluates the gap in UTC. The hours-silent figure is unaffected. |
+| **Customs widening** | Ours lists fewer cross-border | Cross-border thresholds are widened for legitimate customs dwell; a manual sort would over-flag normal customs holds. |
+| **Terminal-event drop-off** | Ours faster to clear | A parcel that delivers drops off the table immediately on the delivered scan; a portal export taken minutes earlier may still list it. |
+| **API outage masking** | Both blind | If the PostNord tracking feed is down, neither the card nor the portal sees new scans; the gap table can balloon. Confirm against [PostNord Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/postnord/postnord-tracking-api-unavailable-5xx) before treating a mass-gap as real. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | Causes of legitimate divergence |
+| --- | --- | --- |
+| [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Upstream for never-scanned parcels. | A fulfilment can be marked shipped on label print without the parcel ever moving. |
+| [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream money. | Refunds have many drivers; an unresolved gap is one input at a few days lag. |
+| [PostNord Orders with Dispatch SLA Missed](/nerve-centre/kpi-cards/postnord/orders-with-dispatch-sla-missed) | Overlapping population. | That card is order-level and 7D; this is parcel-level and 24H. A multi-parcel order with one silent parcel shows on both at different granularity. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**A parcel shows on the table but PostNord's portal has a newer scan than my last-seen time. Which is right?**
+The portal, momentarily. PostNord delivers scans to its API in batches, so a parcel that physically scanned 20 minutes ago can still look silent to the card until that batch ingests. The card errs toward listing the parcel (better a false alarm you can dismiss than a stuck parcel you miss). If a row is on the table for one refresh and gone the next, it was ingestion lag. A row that survives several hourly refreshes is a genuine gap worth chasing.
+
+**Why is the threshold different for different parcels?**
+Because expected silence differs by status. A parcel `IN_TRANSIT` on a long line-haul leg can legitimately go quiet for a day or more between depot scans, so its threshold is wide (24 to 36 hours). A parcel `OUT_FOR_DELIVERY` should resolve to delivered or failed within the day, so its threshold is tight (8 to 12 hours). A flat threshold would either flood the table with normal line-haul silences or miss stuck last-mile parcels. The status-aware threshold targets the silences that actually matter.
+
+**The whole table just filled up at once. Are all these parcels really stuck?**
+Almost certainly not. A sudden mass-gap across many parcels is the tracking feed being down, not every parcel stopping at once. Check [PostNord Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/postnord/postnord-tracking-api-unavailable-5xx) first. If the API is erroring, the gaps are an artefact: no new scans are arriving for anything. Wait for the feed to recover and the table to drain before treating any row as a real stuck parcel.
+
+**A cross-border parcel has been silent 30 hours at customs. Is that a gap?**
+Maybe not yet. Cross-border thresholds are widened because customs dwell is a normal, legitimate silence, especially for Norway and Finland. A parcel quiet 30 hours at `CUSTOMS_HELD` may still be inside its widened window. But a parcel silent well past that window (the worked example's 49-hour Oslo row) is flagged because it has exceeded even the customs allowance, and almost always means missing CN23 documentation that someone has to supply.
+
+**A label was booked but the parcel never got a first scan. Why is it here?**
+Because a booked-but-never-scanned parcel is the highest-value catch on this table: it means PostNord never received the parcel. It is sitting on your warehouse floor, or the carrier pickup missed it. This same parcel shows as a breach on [Orders with Dispatch SLA Missed](/nerve-centre/kpi-cards/postnord/orders-with-dispatch-sla-missed). Find it physically today: a never-collected parcel will eventually be cancelled or re-booked, and the customer is already waiting.
+
+**How should I work this table day to day?**
+As a worklist to clear to zero. Each morning: (1) dismiss the rows that self-cleared overnight (ingestion lag); (2) chase customs-held rows by supplying missing documentation; (3) physically locate any never-scanned rows; (4) raise a PostNord trace on any depot cluster (two or more parcels silent at the same hub). Resolving a row before the customer notices avoids a ticket and a possible refund, which is the entire point of catching the gap early.
+
+**Does a delivered parcel ever get stuck on the table?**
+No. The moment a terminal event (delivered, returned, cancelled) ingests, the parcel drops off the table. If a delivered parcel lingers, its delivered scan has not ingested yet (the same batching lag), and it will clear on the next refresh. The table only ever holds parcels in a non-terminal status.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Shipments with Tracking-Event Gap* is one of hundreds of KPI pulses Vortex IQ tracks across PostNord and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

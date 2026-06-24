@@ -1,0 +1,138 @@
+---
+title: "Label Print Failures Spike, Bring"
+sidebarTitle: "Label Print Failures Spike"
+description: "Label Print Failures Spike for Bring stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/connectors#connectors-by-type)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A real-time alarm for a sudden drop in Bring label-booking success. Every Bring shipment starts with a booking call to the Mybring Booking API that returns a label (PDF or ZPL) and a shipment number. When that call fails, errors, or returns an unprintable label, the parcel cannot leave the warehouse. This card watches the rolling one-hour success rate and fires the moment booking success falls below the floor, so the despatch team can stop, diagnose and clear the backlog before a queue of unshippable orders builds up.
+
+| | |
+| --- | --- |
+| **What it tracks** | The rolling one-hour label-booking success rate: `COUNT(successful label bookings) / COUNT(all booking attempts)` over the trailing 60 minutes, plus a list of the failing attempts and their error reasons. |
+| **Data source** | The Mybring Booking API (`POST` to the Booking endpoint) response status and the returned label artefact. The card reads the HTTP status, the Bring error code / message, and whether a printable label (`labelUrl` / label payload) came back. A 2xx with no label still counts as a failure. |
+| **Common failure reasons** | Booking API 4xx (invalid address, missing or malformed postcode, unsupported service for the destination, weight or dimension out of range, expired or invalid API token / customer number), Booking API 5xx (Bring-side outage), timeouts, and successful responses that return no printable label. |
+| **Relationship to the success-rate card** | This alert is the spike detector; [Label Generation Success](/nerve-centre/kpi-cards/bring/label-generation-success) is the steady-state trend of the same underlying metric. This card exists to page someone fast; that card exists to watch the baseline. |
+| **Time window** | `RT` (real time), evaluated over a rolling 1-hour window so a short burst of failures is caught quickly without single-shipment noise. |
+| **Alert trigger** | `label success <95% in last 1h`. For a warehouse booking 200 labels an hour, that is more than 10 failures in 60 minutes. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Bring data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+The same Oslo outdoor-apparel brand, around 1,900 parcels a week, booking through the Mybring Booking API in batches as orders are picked. On a normal weekday morning the warehouse books roughly 220 labels an hour at a steady 99.1 percent success. Reading taken at 10:00 CEST on 14 Apr 26.
+
+In the trailing hour:
+
+| Outcome | Count (last 1h) | Share |
+| --- | --- | --- |
+| Label booked successfully | 198 | 90.0% |
+| 4xx: invalid or missing postcode | 14 | 6.4% |
+| 4xx: unsupported service for destination (SE cross-border) | 5 | 2.3% |
+| 5xx / timeout | 3 | 1.4% |
+| **Total attempts** | **220** | **100%** |
+
+Success is **90.0 percent**, well below the `<95%` floor, so the card is in alert. Five things to notice:
+
+1. **The dominant reason is address data, not Bring.** 14 of the 22 failures are invalid or missing postcodes. That is an upstream data-quality problem (a checkout that let bad postcodes through, or a recent catalogue or theme change that broke address validation), not a carrier outage. The fix is to correct the addresses and re-book, then close the gap at checkout.
+2. **The cross-border failures are a configuration problem.** 5 failures are an unsupported service for a Swedish destination, meaning someone selected a domestic Norway product for a cross-border order. Check the rate-shopping or service-mapping rules; the destinations are fine, the chosen Bring product is wrong for them.
+3. **The 3 5xx / timeout failures are the only carrier-side signal here.** If that limb were dominant instead, this would be a Bring outage and you would cross-check [Bring Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/bring/bring-tracking-api-unavailable-5xx) and [API Error Rate](/nerve-centre/kpi-cards/bring/api-error-rate). At 1.4 percent it is background noise, retry and move on.
+4. **Unbooked orders become a dispatch-SLA problem within hours.** Every failed label is an order that cannot ship. If they are not cleared the same day they flow straight into the dispatch limb of [Mypack Pickup Expiring or SLA Breach](/nerve-centre/kpi-cards/bring/mypack-pickup-expiring-or-sla-breach) and [Orders with Dispatch SLA Missed](/nerve-centre/kpi-cards/bring/orders-with-dispatch-sla-missed).
+5. **A token or customer-number problem fails everything at once.** If you ever see this card drop to near zero across all destinations and services simultaneously, suspect an expired or revoked Mybring API token or a wrong customer number, not address data. Check [Days to Token Expiry](/nerve-centre/kpi-cards/bring/days-to-token-expiry) first.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+This card pages you when booking breaks. Pair it with these to find the cause and measure the fallout:
+
+| Card | Why pair it with this alert | What the combination tells you |
+| --- | --- | --- |
+| [Label Generation Success](/nerve-centre/kpi-cards/bring/label-generation-success) | The steady-state trend of the same metric. | This card catches the spike; that card shows whether the baseline is quietly drifting down over days. |
+| [Bring Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/bring/bring-tracking-api-unavailable-5xx) | Distinguishes a Bring outage from your data problem. | If both fire together, it is Bring; if only this one fires, it is your address data or service mapping. |
+| [API Error Rate](/nerve-centre/kpi-cards/bring/api-error-rate) | The broad health view across all Bring API calls. | A rising API error rate that includes booking calls corroborates a carrier-side cause. |
+| [Days to Token Expiry](/nerve-centre/kpi-cards/bring/days-to-token-expiry) | The single most common cause of a total booking failure. | An expired Mybring token fails every booking at once; check this before anything else when success drops to near zero. |
+| [Orders with Dispatch SLA Missed](/nerve-centre/kpi-cards/bring/orders-with-dispatch-sla-missed) | The downstream cost of unbooked labels. | Every failed label that is not cleared the same day shows up here as a missed dispatch. |
+| [Mypack Pickup Expiring or SLA Breach](/nerve-centre/kpi-cards/bring/mypack-pickup-expiring-or-sla-breach) | The real-time dispatch queue the failures feed. | Failed bookings pile into the dispatch limb of that card within hours. |
+| Cross-connector: [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | The order backlog that label failures create. | A booking-failure spike here predicts a rising unfulfilled-orders count in Shopify shortly after. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Bring's own tooling:**
+
+[Mybring](https://www.mybring.com/) under **Booking** shows successful shipments and lets you re-book failed ones; the booking confirmation and any error message appear there. The [Mybring API documentation](https://developer.bring.com/) (Booking API) lists the error codes the booking endpoint returns, which is the authoritative reference for decoding a failure reason. There is no native Bring "label failure rate" dashboard; Bring records successful bookings, not your client-side attempts, so the count of failed attempts lives only in your integration.
+
+The closest like-for-like view is *Booking → shipments created in the last hour*, compared against the number of orders your warehouse tried to book in the same hour.
+
+**Why our number may legitimately differ from Mybring:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Bring only sees successes** | Ours lower | The Booking API records a shipment only when a booking succeeds. Failed attempts (4xx, timeouts) never become a Mybring record, so Mybring cannot show a denominator. Our success rate counts attempts; Mybring counts results. This is the core reason the two cannot be reconciled directly. |
+| **Client-side retries** | Either | If your integration auto-retries a failed booking and the retry succeeds, Mybring shows one shipment while the card counted two attempts (one fail, one success). Retry policy changes the denominator. |
+| **2xx with no label** | Ours stricter | A booking that returns success but no printable label counts as a failure here because the parcel still cannot ship. Mybring may record it as a created shipment. |
+| **Window alignment** | Boundary minutes | The card uses a rolling 60-minute window; Mybring's list uses whatever time filter you set. Align the window before comparing counts. |
+| **Carrier-local time** | Display only | Mybring timestamps are in carrier-local time (CET / CEST). The card stores in UTC and converts for display. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | Causes of legitimate divergence |
+| --- | --- | --- |
+| [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Downstream effect of failed bookings. | Manual re-booking, partial fulfilment, B2B flows. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple carriers)</em></summary>
+
+Label-booking and print-failure concepts exist across other carrier and multi-carrier integrations (EasyPost, Shippo, PostNord). On a multi-carrier aggregator the failure may originate at the aggregator or at the underlying carrier; on a single-carrier integration like Bring it is the Mybring Booking API directly. These are not parallel measurements of the same bookings.
+
+- [Label Generation Success](/nerve-centre/kpi-cards/bring/label-generation-success)
+- [API Error Rate](/nerve-centre/kpi-cards/bring/api-error-rate)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why can I not reconcile this against a Mybring report?**
+Because Bring only records successful bookings. A failed booking attempt never becomes a Mybring shipment, so there is no carrier-side denominator to compare against. The failure count lives only in your integration's view of the Booking API responses. Use Mybring to confirm which shipments succeeded, not to audit the failures.
+
+**The card dropped to nearly zero success across everything at once. What happened?**
+That pattern is almost always authentication, not data. An expired or revoked Mybring API token, a wrong customer number, or a changed API user fails every booking regardless of address. Check [Days to Token Expiry](/nerve-centre/kpi-cards/bring/days-to-token-expiry) first, then the credential configuration, before you start fixing addresses.
+
+**Most of my failures are invalid postcodes. How do I stop them?**
+Close the gap at checkout. Invalid or missing Norwegian postcodes (four digits) usually mean checkout address validation is off or a recent theme or catalogue change broke it. Add or restore postcode validation at the point of order capture; correcting addresses after the fact in Mybring is firefighting, not a fix.
+
+**Is a 5xx from Bring counted the same as a bad address?**
+Counted the same in the success rate (both are failed bookings) but diagnosed differently. A cluster of 5xx and timeouts is a Bring outage, cross-check [Bring Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/bring/bring-tracking-api-unavailable-5xx). A cluster of 4xx is your data or service mapping. The card lists each failure's reason so you can tell them apart at a glance.
+
+**Why a rolling one-hour window instead of a daily rate?**
+Speed. A daily rate would dilute a 30-minute booking outage into a barely visible blip and you would not learn about it until the backlog was large. The one-hour window pages you while there is still time to clear the queue the same day. For the longer trend, read [Label Generation Success](/nerve-centre/kpi-cards/bring/label-generation-success).
+
+**Can I tune the 95 percent floor?**
+Yes, the threshold and window are configurable per profile in the Sensitivity tab. A very high-volume warehouse may tolerate a slightly lower floor to avoid paging on small bursts; a low-volume merchant where every parcel matters may want a tighter floor.
+
+**What is the playbook when this card fires?**
+In order: (1) read the failure reasons on the card, if they are dominated by 5xx / timeouts treat it as a Bring outage and check the carrier-health cards; (2) if dominated by 4xx address errors, pull the failing orders, correct the addresses and re-book; (3) if dominated by unsupported-service errors, fix the service-mapping or rate-shopping rules; (4) if success collapsed across the board, check the API token and customer number; (5) once cleared, confirm the unbooked orders did not slip past their dispatch SLA on [Orders with Dispatch SLA Missed](/nerve-centre/kpi-cards/bring/orders-with-dispatch-sla-missed).
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Label Print Failures Spike* is one of hundreds of KPI pulses Vortex IQ tracks across Bring and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

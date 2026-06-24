@@ -1,0 +1,146 @@
+---
+title: "Shipments with Tracking-Event Gap, Bring"
+sidebarTitle: "Shipments with Tracking-Event Gap"
+description: "Shipments with Tracking-Event Gap for Bring stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/overview#card-classes-explained)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A live table of in-transit Bring shipments that have gone silent: no new tracking event for longer than the expected scan interval, inside the trailing 24 hours. A parcel with no fresh scan is a parcel you cannot see, and a silent parcel is the single best leading indicator of a delivery failure, a lost parcel, or a tracking-feed outage. Each row is one stale consignment with its last-known state.
+
+| | |
+| --- | --- |
+| **What it lists** | One row per in-transit Bring consignment whose most recent tracking event is older than the staleness threshold for its stage, evaluated over the trailing 24 hours. Columns surface the consignment number, Bring product code, last event type, last event timestamp (carrier-local), hours since last scan, destination, and the linked order. |
+| **Data source** | The Bring Tracking API (`GET /tracking/api/v2/tracking`) event stream per consignment, joined to the outbound booking from the Bring Booking API and the originating store order. The card compares each consignment's latest event timestamp against `now`. |
+| **Cross-channel join** | Stale shipments are listed regardless of sales channel; each row links back to its order so a marketplace parcel and a D2C parcel are triaged on one screen. |
+| **Staleness logic** | The expected gap depends on the stage. A parcel mid-transit between Norwegian terminals should scan every few hours; a parcel at a Mypack pickup point legitimately sits with no movement until collected (those are excluded from "stale" and handled on the Mypack cards). The threshold is tuned per product and stage so a normal pause does not raise a row. |
+| **Bring product scope** | All in-transit outbound Bring products. Delivered, collected and returned consignments drop off the list; only live, in-flight parcels can be stale. |
+| **Time window** | `24H`. This is a real-time triage table refreshed continuously, scoped to the last 24 hours so it shows what is actionable right now, not historical gaps. |
+| **Alert trigger** | `>0 stale`. Zero-tolerance: any single silent in-transit parcel is one customer about to ask "where is my order", so the alert fires on the first stale row. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calculation */}
+For every live Bring consignment, the card reads the event list from the Bring Tracking API, takes the most recent event timestamp, and computes the gap to `now`. If the gap exceeds the expected scan interval for that consignment's current stage, the parcel is flagged stale and added as a row.
+
+The "expected interval" is the key piece of logic. A parcel that has just been booked but not yet collected has a different normal silence than a parcel mid-line-haul or one out for delivery. A Mypack parcel waiting at a pickup point is supposed to be still, so the card does not treat pickup-point dwell as a gap; that is tracked separately on the Mypack expiry cards. The threshold is set per product code and per stage so the table surfaces genuine anomalies, not expected pauses.
+
+All event timestamps arrive in carrier-local time (Norwegian time for NO-origin parcels). The card stores in UTC and renders the "hours since last scan" column against your display timezone, so the staleness figure is consistent regardless of where you read it. Because the Tracking API itself has ingestion latency, the card is conservative: a parcel that scanned 20 minutes ago but whose event has not yet propagated will not be wrongly flagged once the next sync lands.
+
+Calculated automatically from your Bring tracking data. See the At a glance summary above and the worked example below.
+{/* /HUMAN_AUTHORED:calculation */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+The same Oslo outdoor-apparel brand, around 1,900 outbound orders per week on Bring. Reading taken at 09:00 CET on 14 Apr 26; the table reflects the trailing 24 hours.
+
+| Consignment | Product code | Last event | Last scan (CET) | Hours stale | Destination |
+| --- | --- | --- | --- | --- | --- |
+| 70 7195 1234 5678 | Pakke levert hjem (5800) | In transit, Oslo terminal | 13 Apr 26 02:10 | 30.8 | Tromso, NO |
+| 70 7195 2234 5679 | Pakke til hentested (5000) | Recipient notified | 12 Apr 26 18:40 | 38.3 | Bergen, NO |
+| 70 7195 3234 5680 | Nordic export (SE) | Export, customs hold | 12 Apr 26 22:05 | 34.9 | Gothenburg, SE |
+| 70 7195 4234 5681 | Pakke levert hjem (5800) | In transit, Trondheim | 13 Apr 26 06:30 | 26.5 | Bodo, NO |
+
+The table lists **4** stale shipments. The alert at `>0 stale` is tripped. Five things to notice:
+
+1. **The Tromso row is the classic long-haul gap, but 30 hours is too long.** A Pakke levert hjem parcel to northern Norway will have legitimate multi-hour gaps between terminal scans, but 30 hours with no movement after an Oslo-terminal scan is anomalous. This is the parcel to chase with Bring first; it may be mis-sorted or stuck.
+2. **The Bergen Mypack row is a different story.** "Recipient notified" means the parcel reached the pickup point and the customer was told. 38 hours of silence after that is normal dwell, the customer simply has not collected yet, so this row may be a tuning artefact rather than a true gap. Cross-check [Mypack Pickup Expiry Rate](/nerve-centre/kpi-cards/bring/mypack-pickup-expiry-rate); if dwell is expected at this stage it should not be on the gap list.
+3. **The Gothenburg export row is a customs hold, which is a real, explainable gap.** The last event is "customs hold", so the parcel is genuinely stuck at the border, not lost. This is actionable: it needs a customs document chase. Pair with [NO Export Customs Clearance Rate](/nerve-centre/kpi-cards/bring/no-export-customs-clearance-rate); a hold here is exactly the kind of friction that card aggregates.
+4. **A whole-table spike is a feed problem, not 50 lost parcels.** If this table jumps from 4 rows to 200 in one refresh, the likely cause is the Bring Tracking API being slow or down, not 200 parcels simultaneously going missing. Check [Bring Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/bring/bring-tracking-api-unavailable-5xx) before dispatching anyone to chase parcels; a feed outage makes every live parcel look stale at once.
+5. **This is revenue at risk you can act on within the hour.** Each stale row is a parcel that, if genuinely stuck, becomes a WISMO ticket, a refund, or a claim. Catching it while it is still in-flight lets you intervene (chase Bring, reship, pre-empt the customer) before it becomes a [Failed Deliveries](/nerve-centre/kpi-cards/bring/failed-deliveries) or [Open Claims](/nerve-centre/kpi-cards/bring/open-claims) entry days later.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+The tracking-event gap table is a real-time triage tool. Pair it with these to tell a real gap from a feed artefact and to size the downstream cost:
+
+| Card | Why pair it with Tracking-Event Gap | What the combination tells you |
+| --- | --- | --- |
+| [Bring Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/bring/bring-tracking-api-unavailable-5xx) | A feed outage makes every live parcel look stale. | If this card spikes at the same time as the API card, the parcels are fine and the feed is down; do not chase. |
+| [NO Export Customs Clearance Rate](/nerve-centre/kpi-cards/bring/no-export-customs-clearance-rate) | Export rows often stall at customs. | A customs hold is an explainable gap, not a lost parcel; the clearance card tells you if it is a one-off or a pattern. |
+| [Mypack Pickup Expiry Rate](/nerve-centre/kpi-cards/bring/mypack-pickup-expiry-rate) | Pickup-point dwell can look like a gap. | A "recipient notified" parcel sitting still is normal until expiry; this card tells you whether dwell is the real risk. |
+| [Exception Rate](/nerve-centre/kpi-cards/bring/exception-rate) | Gaps often precede exceptions. | A parcel silent now frequently throws an exception in the next 24 to 48 hours; the gap is the early warning. |
+| [Failed Deliveries](/nerve-centre/kpi-cards/bring/failed-deliveries) | Downstream outcome of an unresolved gap. | A stale parcel that never recovers becomes a failed delivery; chasing gaps reduces this count. |
+| [Open Claims](/nerve-centre/kpi-cards/bring/open-claims) | Lost parcels become claims. | A genuinely missing stale parcel is a claim in waiting; resolving it early avoids the claim. |
+| [Orders with Dispatch SLA Missed](/nerve-centre/kpi-cards/bring/orders-with-dispatch-sla-missed) | The despatch-end companion. | This card catches parcels that go silent in transit; that card catches orders that never shipped on time. Together they cover both ends of the journey. |
+| Cross-connector: [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream impact. | Unresolved gaps drive WISMO tickets and refunds at a few days lag. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Bring's own tooling:**
+
+[Bring Tracking](https://tracking.bring.com/) for the per-consignment event history (enter the consignment number to see the full scan list and the last event), and [Bring Mybring](https://www.mybring.com/) → **Shipments → Shipment list** to see the same consignments with their latest status and to filter for parcels stuck in a given state. The Tracking API that feeds this card is the same source the public tracking page reads, so the last event you see on tracking.bring.com should match the last event on the row, allowing for ingestion lag.
+
+The closest like-for-like check is: take a flagged consignment number, open it on tracking.bring.com, and confirm the last event timestamp matches the card's "last scan" column. If the public page shows a newer event than the card, the difference is ingestion latency and will clear on the next sync.
+
+**Why our number may legitimately differ from the public tracking page:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Tracking-event ingestion lag** | Ours can lag | The Bring Tracking API surfaces scans within minutes to a few hours of the physical event. A parcel that scanned recently may still show as stale here until the event propagates; the public page may update first. This is the most common source of a false-positive row. |
+| **Carrier-local scan timestamps** | Display only | Bring stamps scans in Norwegian local time. The card converts to your display timezone for the "hours stale" figure; the public page shows local time. Compare the same clock when reconciling. |
+| **Staleness threshold tuning** | Ours can flag dwell | Pickup-point dwell and customs holds are legitimate pauses. If a row looks normal on the public page (parcel waiting to be collected), the threshold for that stage may need tuning so expected dwell stops raising a row. |
+| **API outage** | Ours higher | If the Bring Tracking API is returning 5xx errors, every live parcel goes silent in our index at once and the table fills with false rows. Reconcile against [Bring Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/bring/bring-tracking-api-unavailable-5xx) before acting. |
+| **Consignment state transition** | Ours can lag | A parcel that just delivered drops off this list only once the delivered scan ingests; for a short window it may still appear as a live stale parcel. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | Causes of legitimate divergence |
+| --- | --- | --- |
+| [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Upstream input; an order with no consignment cannot be a transit gap. | An order stuck before booking shows on the Shopify card, not here; here is transit-only. |
+| [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream impact of unresolved gaps. | Refunds have many drivers; a transit gap is one early input. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple carriers)</em></summary>
+
+Tracking-event-gap tables exist with conceptually similar definitions across other carriers and multi-carrier aggregators. These are not parallel measurements of the same shipments. For aggregators (EasyPost, Shippo) the gap is measured against the underlying carrier's scans surfaced through the aggregator feed; for single carriers like Bring it is measured against that carrier's own scan stream.
+
+- [`postnord.shipments-with-tracking-event-gap`](/nerve-centre/kpi-cards/postnord/shipments-with-tracking-event-gap) (Nordic carrier peer)
+- [`easypost.tracking-event-gap`](/nerve-centre/kpi-cards/easypost/tracking-event-gap) (multi-carrier aggregator peer)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**A parcel on the list looks fine when I check Bring tracking. Why is it flagged?**
+Almost always ingestion latency. The Bring Tracking API surfaces scans minutes to hours after the physical event, so a parcel that scanned recently can still read as stale here until the event lands in our index. If the public page shows a newer event than the row, it will clear on the next sync. If it persists for several hours past a fresh public scan, raise it.
+
+**The whole table jumped from a handful of rows to dozens. Are all those parcels lost?**
+Almost certainly not. A sudden whole-table spike is the signature of a Bring Tracking API outage: every live parcel goes silent in our index at once because no scans are arriving. Check [Bring Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/bring/bring-tracking-api-unavailable-5xx) first. Do not send anyone to chase parcels until you have ruled out a feed problem.
+
+**Why is a Mypack parcel at a pickup point showing as a gap?**
+A "recipient notified" Mypack parcel legitimately sits still until the customer collects it, so it should not normally be flagged. If it is, the staleness threshold for the pickup stage needs tuning. Pickup-point dwell is tracked on [Mypack Pickup Expiry Rate](/nerve-centre/kpi-cards/bring/mypack-pickup-expiry-rate), not here; this card is for unexpected silence in active transit.
+
+**A customs hold is showing as a gap. Is that wrong?**
+No, that is a real, explainable gap. A parcel held at customs is genuinely not moving, and you should act on it (chase the customs document). The difference from a lost parcel is that the last event tells you why it stopped. Pair with [NO Export Customs Clearance Rate](/nerve-centre/kpi-cards/bring/no-export-customs-clearance-rate) to see if it is a one-off or a pattern.
+
+**Why a 24-hour window and not longer?**
+This is a real-time triage table: it shows what is actionable now. A parcel silent for days is no longer a fresh gap, it is a failed delivery or a claim, and lives on [Failed Deliveries](/nerve-centre/kpi-cards/bring/failed-deliveries) and [Open Claims](/nerve-centre/kpi-cards/bring/open-claims). The 24-hour scope keeps the table to parcels you can still save.
+
+**Does the staleness threshold differ by product?**
+Yes. A line-haul parcel between Norwegian terminals should scan every few hours; an export parcel crossing a border legitimately has longer gaps; a pickup-point parcel is supposed to dwell. The threshold is set per product code and per stage so a normal pause does not raise a false row.
+
+**What is the playbook when a row is a genuine gap?**
+In order: (1) confirm it is not a feed artefact by checking the public tracking page and [Bring Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/bring/bring-tracking-api-unavailable-5xx); (2) read the last event type, a customs hold or pickup dwell is explainable, a mid-transit terminal scan with no follow-up is not; (3) for an unexplained mid-transit gap, chase Bring with the consignment number via Mybring; (4) pre-empt the customer with a proactive update before they raise a WISMO ticket; (5) if the parcel cannot be located, start the claim early on [Open Claims](/nerve-centre/kpi-cards/bring/open-claims) rather than waiting for the customer.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Shipments with Tracking-Event Gap* is one of hundreds of KPI pulses Vortex IQ tracks across Bring and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

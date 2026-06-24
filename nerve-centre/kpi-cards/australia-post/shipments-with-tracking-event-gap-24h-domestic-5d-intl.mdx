@@ -1,0 +1,137 @@
+---
+title: "Shipments with Tracking-Event Gap >24h (domestic) / >5d (intl), 24H"
+sidebarTitle: "Shipments with Tracking-Event Gap >24h (domestic) / >5d (intl)"
+description: "Shipments with Tracking-Event Gap >24h (domestic) / >5d (intl) for Australia Post stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Cross-Channel: Revenue at Risk](/nerve-centre/overview#card-classes-explained)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A live list of in-transit parcels that have gone silent: domestic parcels with no new AusPost tracking scan for more than 24 hours, and international parcels with no scan for more than 5 days. The two thresholds reflect different realities: a domestic parcel should scan at least daily, while an international parcel sits legitimately silent during customs clearance, so it gets a 5-day grace window before it counts as stale.
+
+| | |
+| --- | --- |
+| **What it lists** | Every in-transit shipment whose time-since-last-scan exceeds its threshold: `now - last_scan_at > 24h` (domestic) or `> 5d` (international). Delivered and returned-to-sender parcels are excluded; only live, undelivered parcels can be stale. |
+| **Data source** | AusPost Shipping & Tracking API `GET /shipping/v1/track` (tracking events per article). The card reads the most recent event timestamp per live article and compares it against now in carrier-local time. |
+| **Domestic vs international split** | The threshold is set by destination: AU domestic parcels are stale at 24 hours of silence; international parcels (AusPost International Standard / Express, outbound) are stale at 5 days, the grace window that covers normal AU export plus destination customs clearance. |
+| **Why customs gets a grace window** | International parcels routinely show no scan for several days while clearing AU export and destination customs (the B374 export declaration, destination duty / VAT processing). Applying the 24-hour domestic rule would flag every healthy international parcel. The 5-day window suppresses that noise while still catching genuinely lost international shipments. |
+| **Time window** | `24H` (real-time list, refreshed on each tracking-event ingest). This is a now-state list of currently-stale parcels, not a trailing aggregate. |
+| **Alert trigger** | `>0 stale`. Any parcel past its silence threshold appears on the list and fires. A single stuck parcel is a customer about to ask where their order is. |
+| **Roles** | owner, operations, customer service |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+{/* HUMAN_AUTHORED:calc */}
+For every shipment that is currently in transit (despatched, not yet delivered, not returned to sender), the card finds the timestamp of its most recent AusPost tracking event and computes the silence:
+
+`gap = now - last_scan_at`
+
+It then applies the threshold for that parcel's destination:
+
+`is_stale = (destination = domestic AND gap > 24h) OR (destination = international AND gap > 5d)`
+
+Both `now` and `last_scan_at` are evaluated in carrier-local time (AEST / AEDT for the AU legs) because AusPost scan timestamps are recorded in local time. A parcel that has never scanned at all (label created, no first lodgement scan) is measured from its despatch / manifest time, so a labelled-but-never-lodged parcel becomes stale at the 24-hour mark exactly like a parcel that stalled mid-transit. The list is sorted by gap descending, so the longest-silent parcels (the highest customer-anxiety risk) sit at the top.
+
+The card is a leading indicator, not a delivery-outcome metric. A stale parcel has not necessarily failed; it has stopped reporting. But silence beyond the threshold is the earliest signal you get that a parcel is stuck, lost, or never lodged, hours to days before the customer raises a "where is my order" ticket. Catching it here lets you reach the customer before they reach you.
+{/* /HUMAN_AUTHORED:calc */}
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A Perth DTC supplements brand, around 9,200 outbound parcels a month, mostly AusPost Parcel Post domestic with a growing AusPost International Standard book to New Zealand, Singapore and the US. Reading taken at 09:00 AWST on 14 Apr 26, live list.
+
+| Parcel | Destination | Last scan | Gap | Last status | Likely cause |
+| --- | --- | --- | --- | --- | --- |
+| AP9X...4471 | Domestic (metro Perth) | 12 Apr 26, 14:20 | 42h | "In transit, facility WA" | Stuck at sorting facility |
+| AP9X...8830 | Domestic (regional NSW) | 12 Apr 26, 18:05 | 39h | "On its way" | Regional leg delay |
+| AP9X...1192 | Domestic (metro Brisbane) | (no scan) | 27h since manifest | "Information received" only | Labelled, never lodged |
+| AP9X...7765 | International (US) | 08 Apr 26, 09:40 | 6d 1h | "Departed AU, in transit to destination" | Customs hold, past grace |
+| AP9X...3301 | International (NZ) | 09 Apr 26, 16:10 | 5d 4h | "Arrived destination country" | Destination customs backlog |
+
+The card lists **5 stale parcels**: 3 domestic over the 24-hour line, 2 international over the 5-day line. The alert is tripped (any non-zero count fires). Five things to notice:
+
+1. **The "no scan, only information received" parcel is the most urgent.** AP9X...1192 has never had a physical scan, only the electronic manifest event. That is the classic "labelled but never lodged" failure: the parcel is probably sitting on the warehouse bench, not lost in the AusPost network. This is a same-day fix on your floor, and it is also a missed dispatch (see [Orders with Carrier Dispatch SLA Missed](/nerve-centre/kpi-cards/australia-post/orders-with-carrier-dispatch-sla-missed)).
+2. **The two facility-stuck domestic parcels are genuine carrier silences.** 42 and 39 hours with a real last scan inside an AusPost facility means the parcel is in the network but not moving. Proactively email those customers now with a "running a little behind, here is your tracking" message; reaching them before they ask kills the ticket.
+3. **The international parcels are legitimately later but still worth watching.** Both are just past the 5-day grace, both with a plausible customs explanation. The grace window did its job by not flagging them on day 2. Past day 5, lodge a query: the US parcel's "departed AU" with no destination scan for 6 days may be a customs paperwork issue (check the B374 declaration and commercial invoice).
+4. **This is the leading edge of your WISMO queue.** Every parcel on this list is a customer who is about to wonder where their order is. The list size today predicts the customer-service ticket volume in 24 to 72 hours. Use it as a proactive-outreach worklist, not just an alert.
+5. **A spike in domestic stale counts is a network signal.** Five parcels is a normal day for this volume. Fifty would point at an AusPost facility incident, a regional disruption, or a public-holiday backlog. Read a spike against [On-Time Delivery Rate](/nerve-centre/kpi-cards/australia-post/on-time-delivery-rate) and [Exception Rate](/nerve-centre/kpi-cards/australia-post/exception-rate): rising stale counts lead a falling OTD by a day or two.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+This is the earliest stuck-parcel signal you have. Pair it with these to find the cause and the downstream impact:
+
+| Card | Why pair it with Tracking-Event Gap | What the combination tells you |
+| --- | --- | --- |
+| [Orders with Carrier Dispatch SLA Missed](/nerve-centre/kpi-cards/australia-post/orders-with-carrier-dispatch-sla-missed) | A never-scanned parcel is both stale here and a missed dispatch there. | Separates "labelled but not lodged" (your floor) from "lodged but stalled in transit" (the carrier). |
+| [On-Time Delivery Rate](/nerve-centre/kpi-cards/australia-post/on-time-delivery-rate) | The delivery-outcome metric this leads. | Rising stale counts predict a falling OTD at 24 to 48 hours. This is the early warning; OTD is the confirmation. |
+| [Exception Rate](/nerve-centre/kpi-cards/australia-post/exception-rate) | Many stale parcels eventually throw a formal exception. | A parcel silent for 48 hours often becomes a "held / unable to deliver" exception. Watch the two together to see silence convert into exceptions. |
+| [Late Shipments](/nerve-centre/kpi-cards/australia-post/late-shipments) | The delivered-late count downstream. | Stale parcels that recover usually arrive late; the stale list today seeds the late count next week. |
+| [International Customs Clearance Rate (<5d)](/nerve-centre/kpi-cards/australia-post/international-customs-clearance-rate-5d) | The international half of this card, as a rate. | The international parcels on this list are the same population that fails the 5-day customs-clearance rate; read both to size the customs problem. |
+| [AusPost Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/australia-post/auspost-tracking-api-unavailable-5xx) | A false-positive guard. | If the tracking API is down, scans are not arriving and parcels look stale when they are actually moving. Always check API health before treating a stale spike as a network incident. |
+| [Returned to Sender](/nerve-centre/kpi-cards/australia-post/returned-to-sender) | Where some stale parcels end up. | A long-silent parcel sometimes resolves as a returned-to-sender rather than a delivery. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the source
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in the carrier's own tooling:**
+
+For any single parcel, the truth is the [Australia Post tracking page](https://auspost.com.au/mypost/track/) or the article view inside [Australia Post MyPost Business](https://auspost.com.au/mypost-business), which shows the full scan history with the timestamp of the most recent event. The card's "gap" is simply now minus that last event time. To reconcile a stale entry, open the article on the AusPost portal and confirm the last scan timestamp matches what the card read; the gap should agree to within the ingestion lag. For international parcels the AusPost portal shows the AU-side scans and, where the destination carrier shares data with AusPost, the destination scans too; gaps between AU departure and destination arrival are normal during the customs window.
+
+AusPost records every scan in carrier-local time (AEST / AEDT for the AU legs, destination-local for international destination scans). The card computes the gap against carrier-local now, so a parcel last scanned at 23:50 AEST is roughly a 9-hour gap at 09:00 the next morning, not a day.
+
+**Why our number may legitimately differ from the carrier's view:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Tracking-event ingestion lag** | Ours can over-count stale | AusPost pushes scans in batches; if a scan happened an hour ago but has not reached our index, the parcel looks more silent than it is. A parcel right at the 24-hour line can flip on and off the list as the batched scan lands. Treat parcels just over the threshold as provisional. |
+| **API outage** | Ours can over-count stale | If the AusPost tracking API is returning 5xx (see [AusPost Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/australia-post/auspost-tracking-api-unavailable-5xx)), no scans arrive and the whole book ages into staleness even though parcels are moving normally. Always rule out API health first. |
+| **Carrier-local vs UTC** | Boundary effects | Scan timestamps are carrier-local; daylight-saving transitions can shift a near-threshold gap by an hour. Material only for parcels sitting right on the line. |
+| **International destination-scan sharing** | Ours can over-count stale | Some destination carriers share scans with AusPost slowly or not at all, so an international parcel can be moving in the destination country while AusPost (and therefore the card) shows nothing. The 5-day grace covers most of this, but a poorly-integrated destination can still look stale. |
+| **Never-lodged parcels** | By design | A label created but never physically lodged shows only the electronic "information received" event. We measure its gap from manifest time and call it stale at 24 hours. The AusPost portal shows the same single event; the interpretation (lost vs never lodged) is yours. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | Causes of legitimate divergence |
+| --- | --- | --- |
+| [`shopify.fulfillment_status`](/nerve-centre/kpi-cards/shopify/fulfillment-status) | Upstream. Orders fulfilled in Shopify but with no carrier movement. | Shopify marks fulfilled on label print; a fulfilled order with no AusPost scan is exactly the never-lodged case this card catches. |
+| [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream. Long-stale parcels convert to refund requests. | Many drivers feed refunds; stale parcels are one input at a 3 to 10 day lag. |
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**Why is the international threshold 5 days when domestic is 24 hours?**
+Because international parcels go legitimately silent during customs. An international parcel can sit with no scan for 2 to 4 days while it clears AU export (the B374 declaration) and destination customs (duty / VAT processing), all of which is normal. Applying the 24-hour domestic rule would flag every healthy international parcel and bury the genuinely lost ones. The 5-day grace covers normal customs while still catching real failures.
+
+**A parcel shows as stale but AusPost tracking shows a recent scan. Why the mismatch?**
+Ingestion lag. AusPost batches its scan pushes, so a scan that exists on the AusPost portal may not have reached our index yet. Parcels sitting right at the threshold flip on and off the list as the batched scan lands. Treat anything within an hour or two of the line as provisional and confirm on the AusPost portal.
+
+**Half my book suddenly went stale. Is the carrier broken?**
+Probably not. Check [AusPost Tracking API Unavailable / 5xx](/nerve-centre/kpi-cards/australia-post/auspost-tracking-api-unavailable-5xx) first. If the tracking API is down, no scans arrive and every in-transit parcel ages into staleness even though the physical network is fine. A genuine network incident shows as a cluster around one facility or region, not a uniform book-wide silence.
+
+**What do I do with a domestic parcel that has never scanned at all?**
+Treat it as never lodged, not lost. It shows only the electronic "information received" event because the label was created but the parcel was probably never physically handed to AusPost. Find it on the warehouse floor, lodge it today, and check [Orders with Carrier Dispatch SLA Missed](/nerve-centre/kpi-cards/australia-post/orders-with-carrier-dispatch-sla-missed), it is also counted there as a missed dispatch.
+
+**Should I contact the customer about every stale parcel?**
+Use the list as a proactive-outreach worklist, prioritised by gap. The longest-silent parcels are the highest customer-anxiety risk and the most likely to generate a ticket. A short, honest "your order is running a little behind, here is the tracking" email sent before the customer asks consistently reduces WISMO ticket volume and protects review sentiment. For international parcels inside a plausible customs window, hold off until past the 5-day grace.
+
+**Why is this a real-time list rather than a daily count?**
+Because its value is timing. A daily aggregate tells you how many parcels were stale yesterday; the real-time list tells you which parcels are stale right now so you can act before the customer does. The whole point is to get ahead of the WISMO queue, which only works if the list is live.
+
+**My international parcels keep appearing just past the 5-day line. Is that a problem?**
+Read it against [International Customs Clearance Rate (<5d)](/nerve-centre/kpi-cards/australia-post/international-customs-clearance-rate-5d). If a particular destination consistently breaches 5 days, the cause is usually paperwork (incomplete or incorrect B374 export declaration, missing commercial invoice or HS codes) or a destination-country customs backlog. Fix the documentation on the outbound side first; that is the part you control.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*Shipments with Tracking-Event Gap >24h (domestic) / >5d (intl)* is one of hundreds of KPI pulses Vortex IQ tracks across Australia Post and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.

@@ -9,19 +9,20 @@ description: "Exception Rate for Shippo stores. Tracked live in Vortex IQ Nerve 
 ## At a glance
 
 {/* HUMAN_AUTHORED:tldr */}
-> Share of Shippo-printed shipments that hit a carrier exception event during transit (weather hold, address issue, damage, customs, retry). The leading-indicator companion to [Late Shipments](/nerve-centre/kpi-cards/shippo/late-shipments): exceptions today drive late deliveries 2 to 5 days from now.
+> Share of Shippo-printed shipments that hit a carrier exception event during transit (weather hold, address correction, customs hold, damage, refused, recipient-not-home retry, missort). The leading-indicator companion to [Failed Deliveries](/nerve-centre/kpi-cards/shippo/failed-deliveries) and [Late Shipments](/nerve-centre/kpi-cards/shippo/late-shipments): exceptions logged today drive late and failed deliveries two to five days from now.
 
 | | |
 | --- | --- |
-| **What it counts** | `COUNT(transactions WHERE tracking_history contains status_code IN exception_set) / COUNT(transactions)`. A single shipment with multiple exception scans counts once. |
-| **API endpoint** | Shippo `GET /tracks`. Reads `tracking_history[].status` for every event, looking for codes mapped to "exception". |
-| **Exception set** | Carrier-tagged events: weather delay, address correction, customs hold, damage, refused, recipient-not-home retry, missorted, mechanical delay, security inspection. Excludes terminal "delivered". |
-| **Carrier scope** | **All carriers pooled.** USPS publishes "Delivery Exception", "Insufficient Address". UPS uses "Address Correction", "Adverse Weather". FedEx uses "Customer Not Available", "Operational Delay". DHL similar. Shippo normalises into one set. |
-| **Returns / RTO** | RTO is itself an exception. Counted here AND in [Returned to Sender](/nerve-centre/kpi-cards/shippo/returned-to-sender). |
-| **Cost implication** | Each exception costs $5 to $30 in CS time, address-correction fees ($16+ on UPS, ~$11 on USPS), and refund risk. A 3% rate on 10k shipments per month = 300 exceptions = $1,500 to $9,000 monthly cost. |
-| **Q4 / peak amplification** | Typically rises to 4 to 8% in late November / early December as carrier networks saturate. Peak around 8 December; 30D window smooths daily noise. |
-| **Time window** | `30D vsP` |
-| **Alert trigger** | `>3%`, drives the `exception_rate` sentiment. Good &lt;1%, warn >3%. |
+| **What it counts** | `COUNT(transactions WHERE tracking_history contains status_code IN exception_set) / COUNT(transactions)` over the rolling 30 days. A single shipment with multiple exception scans counts once, not once per scan. |
+| **Data source** | Shippo `GET /tracks`. Reads `tracking_history[].status` for every scan on every shipment, matching codes mapped to the normalised exception set. Shippo aggregates these scans across all underlying carriers. |
+| **Exception set** | Carrier-tagged events normalised by Shippo: address correction, customs hold, weather / adverse-conditions delay, damage, refused, recipient-not-home retry, missorted, mechanical delay, security inspection. The terminal `DELIVERED` status is excluded. |
+| **Carrier scope** | **All underlying carriers pooled.** USPS publishes "Delivery Exception" and "Insufficient Address"; UPS uses "Address Correction" and "Adverse Weather"; FedEx uses "Customer Not Available" and "Operational Delay"; DHL is similar. Shippo flattens these into one comparable set. Split by carrier on [Shipments by Underlying Carrier](/nerve-centre/kpi-cards/shippo/shipments-by-underlying-carrier). |
+| **Returns / RTO** | A return-to-origin is itself an exception. It is counted here AND on [Returned to Sender](/nerve-centre/kpi-cards/shippo/returned-to-sender), so the two cards overlap by design. |
+| **In-flight handling** | An exception scan counts as soon as it lands, even if the parcel later recovers and delivers on time. The card measures risk surfaced, not damage confirmed. |
+| **Cost implication** | Each exception costs roughly $5 to $30 in CS time, plus address-correction fees ($16+ on UPS, around $11 on USPS), plus refund risk. A 3 percent rate on 10,000 shipments per month is 300 exceptions, or $1,500 to $9,000 of monthly cost. |
+| **Q4 / peak amplification** | Typically rises to 4 to 8 percent in late November and early December as carrier networks saturate. Peaks around 8 Dec. The 30-day window smooths daily noise. |
+| **Time window** | `30D vsP` (rolling 30 days, period over period). |
+| **Alert trigger** | `>3%`, driving the `exception_rate` sentiment. Good below 1 percent, warn above 3 percent. |
 | **Roles** | owner, operations |
 {/* /HUMAN_AUTHORED:tldr */}
 
@@ -32,24 +33,24 @@ Calculated automatically from your Shippo data. See the At a glance summary abov
 ## Worked example
 
 {/* HUMAN_AUTHORED:worked_example */}
-A US DTC supplements brand on Shopify, ~12,000 shipments per month via Shippo (USPS Priority + UPS Ground). Reading taken at 09:00 ET on 12 Mar 26 for the trailing 30 days.
+A US DTC supplements brand on Shopify, around 12,000 shipments per month via Shippo, split USPS Priority and UPS Ground with a thin DHL Express international tail. Reading taken at 09:00 ET on 12 Mar 26 for the trailing 30 days (10 Feb 26 to 11 Mar 26).
 
-| Exception type | Count | Share of total |
+| Exception type | Count (30D) | Share of total |
 | --- | --- | --- |
 | Address correction (USPS / UPS) | 220 | 1.8% |
 | Recipient not home retry (FedEx / UPS) | 95 | 0.8% |
-| Weather delay (carrier-wide) | 70 | 0.6% |
+| Weather / adverse-conditions delay (carrier-wide) | 70 | 0.6% |
 | Customs hold (DHL international) | 40 | 0.3% |
-| Damage / inspection | 25 | 0.2% |
+| Damage / security inspection | 25 | 0.2% |
 | **All exceptions (this card)** | **450** | **3.7%** |
 
-The card reads **3.7%** with the alert at `>3%` **tripped at warn**. Five things to notice:
+The card reads **3.7 percent** on the dial with the alert at `>3%` tripped at warn. Five things to notice:
 
-1. **Address correction is 49% of exceptions.** This is the most fixable bucket. Add address validation at checkout (Shopify Shop Pay native, or apps like Address Validator) to cut this in half within four weeks. Each prevented address correction saves $16+ in carrier fees alone, before CS time.
-2. **Recipient-not-home is 21%.** Less fixable, but partial mitigation via signature-required for high-value parcels (forces scheduled delivery), or pickup-point delivery options where carriers support it.
-3. **Weather is unavoidable but predictable.** When a major weather event hits a hub region, expect a 1 to 3 day exception spike followed by a late-delivery wave 3 to 5 days later. Use this card as the early-warning for [Late Shipments](/nerve-centre/kpi-cards/shippo/late-shipments).
-4. **The 3.7% rate predicts ~$3k to $13k of monthly recoverable cost.** A four-week project on address validation alone could halve the address-correction bucket and pay for itself in one month.
-5. **Same brand, December 2025 reading was 6.4%.** Q4 doubled the rate. The 30D window in early March is the right baseline; comparing March to December would double-count seasonality.
+1. **Address correction is 49 percent of exceptions and the most fixable bucket.** Add address validation at checkout (Shopify Shop Pay native, or an app such as Address Validator) and you can halve this bucket within four weeks. Each prevented correction saves $16+ in carrier fees before CS time. Shippo also exposes `POST /addresses/validate` for pre-label verification.
+2. **Recipient-not-home is 21 percent and only partly fixable.** Signature-required forces a scheduled redelivery on high-value parcels, and pickup-point delivery options remove the "nobody home" failure mode entirely where carriers support them.
+3. **Weather is unavoidable but predictable.** When a major weather event hits a hub region, expect a one to three day exception spike, then a late-delivery wave three to five days later. This card is your early warning for [Late Shipments](/nerve-centre/kpi-cards/shippo/late-shipments).
+4. **The 3.7 percent rate implies roughly $3k to $13k of monthly recoverable cost.** A focused four-week address-validation project could halve the largest bucket and pay for itself inside one month.
+5. **The same brand read 6.4 percent in Dec 25.** Q4 doubled the rate. The 30-day window in early March is the correct baseline; comparing March against December would double-count seasonality. Use the `vsP` period-over-period view, not a year-on-year jump across peak.
 {/* /HUMAN_AUTHORED:worked_example */}
 
 ## Sibling cards merchants should reference together
@@ -59,48 +60,49 @@ Exception rate is a leading indicator. Pair it with these to act ahead of the wa
 
 | Card | Why pair it with Exception Rate | What the combination tells you |
 | --- | --- | --- |
-| [Late Shipments](/nerve-centre/kpi-cards/shippo/late-shipments) | Downstream consequence, 2 to 5 day lag. | Exception spike today predicts late count spike in 3 to 5 days. Acting on exceptions first prevents the late wave. |
-| [On-Time Delivery Rate](/nerve-centre/kpi-cards/shippo/on-time-delivery-rate) | The percentage view of the late consequence. | Exception rate climbing precedes OTD drop with the same lag. |
-| [Returned to Sender](/nerve-centre/kpi-cards/shippo/returned-to-sender) | Subset of exceptions that escalate to RTO. | Address correction failures often escalate to RTO if the customer cannot be reached; track both. |
-| [Failed Deliveries](/nerve-centre/kpi-cards/shippo/failed-deliveries) | Terminal exceptions. | Failed = exceptions that did not recover. |
-| [Open Claims](/nerve-centre/kpi-cards/shippo/open-claims) | Damage exceptions feed claims. | Damage scans here precede claim filings by 1 to 3 days. |
+| [Failed Deliveries](/nerve-centre/kpi-cards/shippo/failed-deliveries) | The terminal tail: exceptions that never recovered. | A rising exception rate predicts a rising failed-delivery count at two to five days lag. Acting on exceptions first prevents the failures. |
+| [Late Shipments](/nerve-centre/kpi-cards/shippo/late-shipments) | The transit-delay consequence. | Exception spike today predicts a late-count spike in three to five days. |
+| [On-Time Delivery Rate](/nerve-centre/kpi-cards/shippo/on-time-delivery-rate) | The percentage view of the late consequence. | Exception rate climbing precedes an OTD drop with the same lag. |
+| [Returned to Sender](/nerve-centre/kpi-cards/shippo/returned-to-sender) | The subset of exceptions that escalate to RTO. | Address-correction failures often escalate to RTO when the customer cannot be reached; track both. |
+| [Open Claims](/nerve-centre/kpi-cards/shippo/open-claims) | Damage exceptions feed claims. | Damage scans here precede claim filings by one to three days. |
+| [First-Attempt Delivery Rate](/nerve-centre/kpi-cards/shippo/first-attempt-delivery-rate) | Recipient-not-home is a first-attempt failure. | A falling first-attempt rate explains much of the recipient-not-home exception bucket. |
+| [Shipments by Underlying Carrier](/nerve-centre/kpi-cards/shippo/shipments-by-underlying-carrier) | Which carrier is generating the exceptions. | If one carrier's exception share outruns its volume share, the problem is carrier-specific, not network-wide. |
 | Cross-connector: [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Two-step downstream impact. | Exceptions today drive late deliveries tomorrow drive refunds in 7 to 14 days. |
-| Cross-connector: customer NPS / post-purchase survey | Downstream sentiment. | Customers whose parcel hit any exception score 1 to 2 NPS points lower than no-exception customers. |
 {/* /HUMAN_AUTHORED:siblings */}
 
-## Reconciling against the vendor's own dashboard
+## Reconciling against the source
 
 {/* HUMAN_AUTHORED:reconcile */}
 **Where to look in Shippo's own dashboard:**
 
-[Shippo App](https://apps.goshippo.com/) → **Orders → Filter "Exception"**. The closest like-for-like view is *All Carriers, Last 30 Days, Status: Exception*. Shippo also exposes a per-shipment view at *Tracking → Filter by status*, where each tracking event is listed.
+[Shippo App](https://apps.goshippo.com/) → **Tracking → Filter by status: Exception**, or **Shipments → Filter "Exception"**. The closest like-for-like view is *All Carriers, Last 30 Days, Status: Exception*. Each tracking event is listed per shipment, so you can drill from the rate down to the individual scan codes. Because Shippo is a multi-carrier aggregator, the authoritative scan still lives in each underlying carrier's portal (USPS Informed Visibility, UPS Quantum View, FedEx tracking, DHL); Shippo's view is the normalised pool on top of those scans.
 
 **Why our number may legitimately differ from Shippo's report:**
 
 | Reason | Direction | Why |
 | --- | --- | --- |
-| **Exception-set definition** | Either | Shippo's report sometimes pools "delivery exception" only (excluding address correction events that resolve cleanly). The card pools the full normalised exception set including address-correction events. |
-| **Time zone** | Boundary days off | Shippo defaults to merchant zone; card uses UTC. |
-| **Carrier polling lag** | Ours lower for "today" | Shippo polls carriers every 1 to 4 hours; today's rate may understate by a few hours of unpolled events. |
-| **Multiple-event de-duplication** | Either | A shipment with three exception scans counts once in the card. Some Shippo reports count events not shipments, inflating the rate. |
-| **Customs holds (international)** | Either | DHL international parcels generate customs-hold events that some Shippo views exclude as "expected". The card includes them. |
+| **Exception-set definition** | Either | Shippo's report sometimes counts only "delivery exception", excluding address-correction events that resolve cleanly. The card pools the full normalised exception set including address corrections, so it can read higher. |
+| **Time zone** | Boundary days off | Carrier scan timestamps are in carrier-local time and Shippo defaults to merchant account zone; the card stores in UTC. Over a 30-day window this averages out, but a single boundary day can shift a handful of scans. |
+| **Tracking-event ingestion lag** | Ours lower for "today" | Shippo polls underlying carriers every one to four hours; today's reading can understate by a few hours of unpolled scans. The 30-day total agrees once polling catches up. |
+| **Multiple-event de-duplication** | Either | A shipment with three exception scans counts once in the card. Some Shippo report views count events, not shipments, which inflates their rate. |
+| **Customs holds (international)** | Either | DHL international parcels generate customs-hold scans that some Shippo views treat as "expected" and exclude. The card includes them as real exceptions. |
 
 **Cross-connector reconciliation:**
 
-| Card | Expected relationship | What causes legitimate divergence |
+| Card | Expected relationship | Causes of legitimate divergence |
 | --- | --- | --- |
-| Carrier-direct exception rates (USPS Informed Visibility, UPS Quantum View) | Same shipments, different lens. | Carrier-internal codes are richer; Shippo flattens to one normalised set. Counts differ but trends correlate. |
-| [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Two-step downstream. | Exception spike today predicts refund-rate climb in 7 to 14 days. |
+| Carrier-direct exception feeds (USPS Informed Visibility, UPS Quantum View) | Same shipments, richer lens. | Carrier-internal codes are more granular; Shippo flattens to one normalised set. Counts differ but trends correlate. |
+| [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Two-step downstream. | Refund rate has many drivers (sizing, quality, returns); exceptions are one input, surfacing 7 to 14 days earlier. |
 
 ---
 
 <details>
 <summary><em>Documentation cross-reference (for agencies running multiple shipping aggregators)</em></summary>
 
-Exception-rate metrics exist on peer shipping platforms with conceptually similar definitions:
+Exception-rate metrics exist on peer shipping platforms with conceptually similar definitions. These are not parallel measurements of the same shipments.
 
-- [`sendle.sen_exception_rate`](/nerve-centre/kpi-cards/sendle/exception-rate)
-- [`ship_theory.shi_exception_rate`](/nerve-centre/kpi-cards/ship-theory/exception-rate)
+- [`easypost.ep_exception_rate`](/nerve-centre/kpi-cards/easypost/exception-rate) (multi-carrier aggregator peer)
+- [`sendle.sen_exception_rate`](/nerve-centre/kpi-cards/sendle/exception-rate) (single-carrier peer)
 
 </details>
 {/* /HUMAN_AUTHORED:reconcile */}
@@ -108,38 +110,29 @@ Exception-rate metrics exist on peer shipping platforms with conceptually simila
 ## Known limitations / merchant FAQs
 
 {/* HUMAN_AUTHORED:faqs */}
-**My exception rate is at 4% but my OTD is fine. What is happening?**
-Exceptions can recover. A "weather delay" scan today may resolve into an on-time delivery 24 hours later if the carrier catches up. The card surfaces upstream risk, not downstream consequence. Watch the next 5 days; if late count climbs, the exception wave is converting to OTD damage. If late count stays flat, the carrier absorbed it.
+**My exception rate is at 4 percent but my OTD is fine. What is happening?**
+Exceptions can recover. A "weather delay" scan today may resolve into an on-time delivery 24 hours later if the carrier catches up. This card surfaces upstream risk, not confirmed damage. Watch the next five days: if the late count climbs, the exception wave is converting to OTD damage; if late count stays flat, the carrier absorbed it.
 
 **Address correction is half my exceptions. What is the cheapest fix?**
-Three actions, in order of cost:
-
-1. **Free.** Tighten Shopify checkout copy: "Verify your apartment / suite number before placing your order." Adds friction but cuts ~10 to 20% of address-correction events.
-2. **Low cost.** Install a checkout address-validation app (Address Validator, AddressCheck, or built-in Shopify Shop Pay). $20 to $80 per month. Cuts 30 to 50% of corrections.
-3. **Higher cost.** Pre-shipment address verification via USPS Address Verification API (Shippo exposes it at the `POST /addresses/validate` endpoint). Adds ~$0.005 per call but catches edge cases the consumer-facing app misses.
-
-The address-correction fee from carriers ($16+ on UPS, ~$11 on USPS) usually pays for the app within the first month at any reasonable volume.
+Three actions, in order of cost. (1) Free: tighten Shopify checkout copy ("verify your apartment or suite number before placing your order"), which cuts 10 to 20 percent of correction events. (2) Low cost: install a checkout address-validation app ($20 to $80 per month), which cuts 30 to 50 percent. (3) Higher cost: pre-shipment verification via Shippo's `POST /addresses/validate` endpoint, which catches the edge cases the consumer-facing app misses for a fraction of a cent per call. The carrier correction fee ($16+ on UPS, around $11 on USPS) usually pays for the app inside the first month at any reasonable volume.
 
 **International parcels generate customs-hold exceptions. Should I exclude those?**
-**No.** They are real exceptions and cost real money (transit delay, customer chasing the parcel, occasionally lost). Filter the [Shipments by Destination](/nerve-centre/kpi-cards/shippo/shipments-by-destination) card to view your international rate separately. Acceptable benchmark: international exception rate 3 to 8%, domestic 1 to 3%.
+No. They are real exceptions and cost real money: transit delay, the customer chasing the parcel, and occasionally a loss. Use [Shipments by Destination](/nerve-centre/kpi-cards/shippo/shipments-by-destination) to view your international rate separately. A reasonable benchmark is 3 to 8 percent international, 1 to 3 percent domestic.
 
 **Recipient-not-home retries are not really my fault. Can I exclude them?**
-You can mentally exclude them but the card includes them deliberately. The reason: your customer's experience is "the parcel did not arrive on the day promised", and they will contact your CS regardless of who is at fault. Track the rate of preventable recipient-not-home (signature-required parcels, weekend deliveries) separately by service.
+You can mentally set them aside, but the card includes them deliberately. Your customer's experience is "the parcel did not arrive on the day promised", and they will contact your CS team regardless of fault. Track preventable recipient-not-home separately (signature-required parcels, weekend deliveries) by service.
 
-**The good threshold of 1% feels aggressive. Is it realistic?**
-For domestic-only USPS Priority + UPS Ground, 1 to 1.5% is achievable with address validation in place. For international or USPS Ground Advantage-heavy shops, 2 to 3% is typical. Adjust the workspace threshold to match your service mix.
+**The good threshold of 1 percent feels aggressive. Is it realistic?**
+For domestic-only USPS Priority and UPS Ground, 1 to 1.5 percent is achievable with address validation in place. For international-heavy or USPS Ground Advantage shops, 2 to 3 percent is typical. Adjust the workspace threshold in the Sensitivity tab to match your service mix rather than relying on the generic default.
 
-**Q4 / BFCM, the rate doubled. Should I disable the alert?**
-Better: raise the threshold for the season. Recommend `>5%` warn / `>8%` critical for 25 Nov 25 to 5 Jan 26. Disabling silence the signal of a peak-on-peak event.
+**Q4 / BFCM doubled the rate. Should I disable the alert?**
+No, raise the threshold for the season instead. A reasonable seasonal setting is `>5%` warn and `>8%` critical for 25 Nov 25 to 5 Jan 26. Disabling the alert silences the signal of a genuine peak-on-peak event.
 
 **Damage exceptions, what do I do with them?**
-Two actions. (1) Check whether they cluster around a SKU (packaging issue) or a carrier hub (handling issue). [Cost Outliers](/nerve-centre/kpi-cards/shippo/high-cost-shipment-outliers) sometimes reveals re-ship cost spikes that align with a damage cluster. (2) File a Shippo Insurance claim within 30 days of ship date for any insured parcel. Shippo Insurance is roughly 1.5 to 3% of declared value and covers damage, loss, and theft.
+Two actions. (1) Check whether they cluster around a SKU (a packaging problem) or a carrier hub (a handling problem); [High-Cost Shipment Outliers](/nerve-centre/kpi-cards/shippo/high-cost-shipment-outliers) sometimes reveals re-ship cost spikes that line up with a damage cluster. (2) File a Shippo Insurance claim within 30 days of the ship date for any insured parcel. Shippo Insurance runs roughly 1.5 to 3 percent of declared value and covers damage, loss and theft.
 
-**Can I see exception rate by carrier?**
-Not in this card directly. Use [OTD by Route](/nerve-centre/kpi-cards/shippo/otd-by-route) and [Shipments by Service](/nerve-centre/kpi-cards/shippo/shipments-by-service) together to triangulate; a per-carrier exception rate card is on the roadmap.
-
-**My exception rate dropped to 0.5% suddenly. Is the data missing?**
-Possible. Two checks: (1) confirm Shippo tracking is still receiving carrier scans (look at last `tracking_history` event timestamp on a sample of recent shipments), (2) confirm Shippo API token has not expired ([Days to Token Expiry](/nerve-centre/kpi-cards/shippo/days-to-token-expiry)). A near-zero rate is more likely a feed problem than a real operational improvement.
+**My exception rate dropped to 0.5 percent suddenly. Is the data missing?**
+Possibly. Two checks. (1) Confirm Shippo tracking is still receiving carrier scans by looking at the last `tracking_history` event timestamp on a sample of recent shipments. (2) Confirm the Shippo API token has not expired, via [Days to Token Expiry](/nerve-centre/kpi-cards/shippo/days-to-token-expiry) and [API Error Rate](/nerve-centre/kpi-cards/shippo/api-error-rate). A near-zero rate is more often a feed problem than a real operational improvement.
 {/* /HUMAN_AUTHORED:faqs */}
 
 ---

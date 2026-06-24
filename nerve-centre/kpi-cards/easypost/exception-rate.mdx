@@ -4,120 +4,133 @@ sidebarTitle: "Exception Rate"
 description: "Exception Rate for EasyPost stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
 ---
 
-**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Shipping & Courier](/nerve-centre/connectors#connectors-by-type)
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Exceptions & Claims](/nerve-centre/connectors#connectors-by-type)
 
 ## At a glance
 
 {/* HUMAN_AUTHORED:tldr */}
-> Share of EasyPost-routed shipments that received an exception scan in transit (across all underlying carriers). EasyPost normalises carrier-specific exception event codes into a unified taxonomy: address_issue, recipient_unavailable, weather_delay, customs_hold (international), damaged, lost. Leading indicator for late deliveries; an exception precedes a late-or-failed delivery by 12 to 48 hours.
+> Share of EasyPost-routed parcels that hit a delivery exception in the period: a tracking status that signals the parcel is stuck, mis-routed, undeliverable, refused, damaged, or otherwise off the normal in-transit-to-delivered path. Because EasyPost rate-shops across many underlying carriers (USPS, FedEx, UPS, DHL, regional carriers such as OnTrac), this single dial aggregates the exception behaviour of every carrier your rules picked. It is the leading indicator for the despatch operation: a rising exception rate today predicts a falling on-time rate, a rising failed-delivery count and a rising claim volume over the next 24 to 72 hours.
 
 | | |
 | --- | --- |
-| **What it counts** | `COUNT(EasyPost shipments WHERE tracking events INCLUDE any exception code) / COUNT(shipments)` over the trailing 30 days. EasyPost's unified taxonomy covers exceptions across USPS, FedEx, UPS, DHL, OnTrac, regional carriers. |
-| **Exception types (EasyPost normalised)** | `delivery_exception_address_issue`, `delivery_exception_recipient_unavailable`, `weather_delay`, `customs_hold`, `damaged`, `lost`, `held_at_facility`, `forwarded`. |
-| **Lead-indicator semantics** | Each exception is a yellow flag, not a confirmed late. Roughly 50 to 70% of exceptions resolve on next-day attempt and deliver on time. |
-| **Service level scope** | All EasyPost-booked services pooled. To split by carrier (USPS exceptions vs FedEx exceptions), use [Shipments by Service](/nerve-centre/kpi-cards/easypost/shipments-by-service) cross-tab. |
-| **Returns / RTO** | Excluded. RTS shipments tracked separately. |
-| **Cross-carrier comparison** | Different carriers have different exception-rate baselines. USPS typically runs 1.5 to 3% (rural-route, address-quality driven); FedEx 0.8 to 1.5%; UPS 1 to 2%. EasyPost aggregate sits between weighted by volume mix. |
-| **Holiday/election surge** | Q4 spike is universal across carriers. Expect 1.5x to 2.5x normal exception rate. |
-| **Time window** | `30D vsP` (rolling 30 days, period-over-period comparison) |
-| **Alert trigger** | `>3%` (warn). Steady-state DTC merchants run 1 to 2.5%. |
-| **Sentiment key** | gauge with thresholds good=1, warn=3 (lower is better) |
+| **What it tracks** | `COUNT(shipments WHERE tracking status maps to "exception") / COUNT(shipments with any tracking activity)` over the trailing 30 days, compared with the prior 30 days. Each parcel scores once; a parcel that recovers (exception then delivered) still counts as having thrown an exception. |
+| **Data source** | Per the card's `detail` ("Exception Rate for the selected period."): EasyPost Tracker objects, read via the Tracking API (`GET /v2/trackers` and the `tracker.updated` webhook). EasyPost normalises every underlying carrier's raw scan codes into a small set of statuses (`pre_transit`, `in_transit`, `out_for_delivery`, `delivered`, `available_for_pickup`, `return_to_sender`, `failure`, `cancelled`, `error`, `unknown`). This card counts trackers whose current status is `failure`, `error`, or `return_to_sender`, plus `unknown` trackers that have gone stale past their estimated delivery date. |
+| **Carrier scope** | **All linked carriers, blended.** The headline is a single blended rate across USPS, FedEx, UPS, DHL and any regional carriers your rate-shop uses. Because carriers differ widely in baseline exception rate, always read this alongside [OTD by Underlying Carrier](/nerve-centre/kpi-cards/easypost/otd-by-underlying-carrier) and [Shipments by Underlying Carrier](/nerve-centre/kpi-cards/easypost/shipments-by-underlying-carrier) to see which carrier is driving the blend. |
+| **What counts as an exception** | Address-undeliverable, attempted-no-access, held at facility / available-for-pickup-too-long, refused by recipient, damaged in transit, lost / no-movement past estimate, customs hold (international), and return-to-sender. EasyPost surfaces a human-readable `status_detail` on each scan; the card buckets these into the exception set. |
+| **Return-leg inclusion** | **Outbound only.** Trackers created for inbound return labels are excluded; return-leg exceptions are on [Returned to Sender](/nerve-centre/kpi-cards/easypost/returned-to-sender). |
+| **Time window** | `30D vsP` (rolling 30 days, period-over-period). Daily readings exist but are noisy below roughly 200 parcels a day. |
+| **Alert trigger** | `>3%`. When the blended 30-day exception rate exceeds 3 percent the card turns amber and pages owner and operations. Healthy domestic ecommerce sits at 1 to 3 percent; international and residential-heavy mixes run higher. |
 | **Roles** | owner, operations |
 {/* /HUMAN_AUTHORED:tldr */}
 
 ## Calculation
 
-Calculated automatically from your EasyPost data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+{/* HUMAN_AUTHORED:calculation */}
+Calculated automatically from your EasyPost tracking data. The card divides parcels that hit an exception status by parcels with any tracking activity in the window:
+
+`exception_rate = COUNT(trackers WHERE status IN (failure, error, return_to_sender) OR stale-unknown) / COUNT(trackers WHERE status != pre_transit)` over the rolling 30 days.
+
+Two grounding points that follow from the `detail` and `time_window`:
+
+- **EasyPost is the normalisation layer, not the source of truth for the scan.** The underlying carrier produces the raw scan (for example USPS `21` "delivery exception" or a FedEx delivery-exception code); EasyPost maps it to a normalised status and `status_detail`. The card reads EasyPost's normalised status so a single threshold works across every carrier. To compare against a carrier's own portal, compare our blended number against that carrier's slice (see Reconciling below).
+- **The `vsP` comparison drives interpretation.** The dial value is the current 30-day rate; the period-over-period delta tells you whether it is moving. A steady 2.4 percent is unremarkable; 2.4 percent up from 1.6 percent last period is the signal, even though it has not crossed the 3 percent alert line yet.
+{/* /HUMAN_AUTHORED:calculation */}
 
 ## Worked example
 
 {/* HUMAN_AUTHORED:worked_example */}
-A US DTC mid-market apparel merchant via EasyPost. Reading taken at 09:00 ET on 12 Mar 26 for the trailing 30 days vs the prior 30 days.
+A US DTC supplements brand based in Austin, around 5,400 outbound parcels per week, all routed through EasyPost with a rate-shop rule that prefers USPS Ground Advantage for sub-1lb items, UPS Ground for heavier parcels, and FedEx Home Delivery as failover. Reading taken at 09:00 CT on 14 Apr 26 for the trailing 30 days (15 Mar 26 to 13 Apr 26), compared with the prior 30 days.
 
-| Exception type | Shipments affected | % of total | Vs prior 30D |
-| --- | --- | --- | --- |
-| Address issue | 168 | 1.1% | +0.4 ppt |
-| Recipient unavailable | 285 | 1.8% | +0.2 ppt |
-| Weather delay | 42 | 0.3% | +0.1 ppt |
-| Held at facility | 38 | 0.2% | flat |
-| Customs hold (international) | 28 | 0.2% | -0.1 ppt |
-| Forwarded | 32 | 0.2% | flat |
-| Damaged | 12 | 0.1% | flat |
-| **All exceptions (this card)** | **605** | **3.9%** | **+0.7 ppt vs 3.2%** |
+Blended across carriers:
 
-The card reads **3.9%** with sentiment red (above warn=3); alert tripped. Five things to notice:
+| Underlying carrier | Parcels (30D) | Exceptions | Exception rate | Prior period |
+| --- | --- | --- | --- | --- |
+| USPS Ground Advantage | 14,200 | 326 | 2.3% | 2.1% |
+| UPS Ground | 6,100 | 91 | 1.5% | 1.5% |
+| FedEx Home Delivery | 2,300 | 78 | 3.4% | 1.9% |
+| DHL eCommerce (intl) | 940 | 71 | 7.6% | 7.2% |
+| **Blended (this card)** | **23,540** | **566** | **2.4%** | **2.0%** |
 
-1. **Address-issue rate climbing 0.4 ppt is the headline.** Investigation: the merchant added a third-party address widget on Shopify in late February. EasyPost's pre-validation can catch some of these at booking; configure the EasyPost `verify` parameter to validate addresses before label generation. Expected drop: 0.3 to 0.5 ppt within 2 weeks.
-2. **Cross-carrier breakdown.** Splitting the 168 address-issue exceptions by carrier shows 124 USPS, 32 FedEx, 12 UPS. USPS has weaker address-correction tooling at delivery; FedEx and UPS catch more at booking. The merchant should configure stricter EasyPost address-validation rules.
-3. **Each exception predicts 0.5 to 0.7 late deliveries.** 605 exceptions ≈ 300 to 420 lates downstream. The card is the early-warning for the on-time number.
-4. **Customs hold at 0.2% is small but non-zero.** International parcels routed via EasyPost still hit customs holds; route through DHL Express for international where possible (better customs pre-clearance than USPS International or FedEx International Economy).
-5. **Damage at 0.1% is normal.** 12 damaged across 605 exceptions over 30 days is operational baseline; investigate only if it climbs above 0.3%.
+The dial reads **2.4 percent**, up from 2.0 percent last period. The `>3%` alert is **not** tripped at the blend, but it is moving the wrong way. Five things to notice:
+
+1. **The blend hides the carrier that broke.** FedEx Home Delivery jumped from 1.9 to 3.4 percent while everything else held. The blended dial only moved 0.4 points because FedEx is 10 percent of volume, but the FedEx slice nearly doubled. Open [OTD by Underlying Carrier](/nerve-centre/kpi-cards/easypost/otd-by-underlying-carrier) the moment this dial ticks up; the carrier breakdown is where the action is.
+2. **International is structurally worse and that is normal.** DHL eCommerce at 7.6 percent looks alarming next to USPS at 2.3 percent, but cross-border parcels carry customs holds, longer dwell and higher address-quality risk. Judge it against its own baseline (7.2 percent prior), not against the domestic carriers.
+3. **The exception rate leads the failed-delivery count.** Today's 566 exceptions become tomorrow's [Failed Deliveries](/nerve-centre/kpi-cards/easypost/failed-deliveries) and next week's [Open Claims](/nerve-centre/kpi-cards/easypost/open-claims). At a typical 25 to 40 percent exception-to-failure conversion, expect roughly 140 to 230 of these to end as a non-delivery. Staff the customer-service queue now, not when the failures land.
+4. **Read it next to the rate-shop decision.** If FedEx is failing more, the rate-shop rule sending failover volume to FedEx is now buying cheaper labels that cost more in exceptions and claims. The [Carrier-Mix Savings vs Single-Carrier Baseline](/nerve-centre/kpi-cards/easypost/carrier-mix-savings-vs-single-carrier-baseline) saving is real, but net of exception cost it may be smaller than the headline suggests.
+5. **A spike across all carriers at once is not a carrier problem.** If every slice rises together, suspect an upstream cause: bad address data from a recent checkout change, a weather event, or a national holiday backlog. A spike isolated to one carrier points at that carrier's network. The shape of the breakdown tells you which.
 {/* /HUMAN_AUTHORED:worked_example */}
 
 ## Sibling cards merchants should reference together
 
 {/* HUMAN_AUTHORED:siblings */}
+Exception rate is the leading indicator. Pair it with these to diagnose and quantify the downstream impact:
+
 | Card | Why pair it with Exception Rate | What the combination tells you |
 | --- | --- | --- |
-| [On-Time Delivery Rate](/nerve-centre/kpi-cards/easypost/on-time-delivery-rate) | Lagging confirmation. | Exception climbing 24 to 72 hours before on-time drops is the early-warning. |
-| [Late Shipments](/nerve-centre/kpi-cards/easypost/late-shipments) | Lagging count. | 50 to 70% of exceptions become late deliveries. |
-| [Returned to Sender](/nerve-centre/kpi-cards/easypost/returned-to-sender) | Worst-case outcome. | Address exceptions that fail correction become RTS within 5 to 15 days. |
-| [Failed Delivery Count](/nerve-centre/kpi-cards/easypost/failed-deliveries) | Severe-end of exception spectrum. | Failed delivery is the confirmed-cannot-deliver disposition. |
-| Cross-connector: [`fedex.fed_exception_rate`](/nerve-centre/kpi-cards/fedex/exception-rate) | Direct-FedEx subset. | EasyPost-FedEx and direct-FedEx exception rates should converge. |
-| Cross-connector: [`usps.usp_exception_rate`](/nerve-centre/kpi-cards/usps/exception-rate) | Same for USPS. | Same. |
-| Cross-connector: address-validation tools | Upstream root cause. | High address-exception suggests checkout-side validation isn't firing. |
+| [Failed Deliveries](/nerve-centre/kpi-cards/easypost/failed-deliveries) | The subset of exceptions that ended in non-delivery. | Conversion from exception to failure is typically 25 to 40 percent; a rising exception rate predicts the failed count 24 to 72 hours out. |
+| [On-Time Delivery Rate](/nerve-centre/kpi-cards/easypost/on-time-delivery-rate) | The customer-facing outcome the exceptions degrade. | A rising exception rate precedes a falling OTD rate at 24 to 48 hours lag. |
+| [OTD by Underlying Carrier](/nerve-centre/kpi-cards/easypost/otd-by-underlying-carrier) | Splits the blended dial by carrier. | This is where you find the carrier driving the blend; always open it when this dial ticks up. |
+| [Open Claims](/nerve-centre/kpi-cards/easypost/open-claims) | The financial tail of unrecovered exceptions. | Lost and damaged exceptions convert into insurance claims; this card tells you how many are still open and unresolved. |
+| [Returned to Sender](/nerve-centre/kpi-cards/easypost/returned-to-sender) | The return-leg exceptions excluded from this card. | RTS is its own exception flavour; reading the two together gives the full undeliverable picture. |
+| [Late Shipments](/nerve-centre/kpi-cards/easypost/late-shipments) | The count behind the time-based slice of exceptions. | Held and no-movement exceptions show up as late shipments first; the workload number for the CS team. |
+| Cross-connector: [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream impact. Exceptions drive "where is my order" tickets and refunds at 7 to 14 day lag. | An exception-rate spike of 1 to 2 points predicts a 0.5 to 1 point refund-rate rise the following fortnight. |
 {/* /HUMAN_AUTHORED:siblings */}
 
-## Reconciling against the vendor's own dashboard
+## Reconciling against the source
 
 {/* HUMAN_AUTHORED:reconcile */}
-**Where to look in EasyPost's own dashboard:**
+**Where to look in EasyPost's own tooling:**
 
-[EasyPost Dashboard](https://www.easypost.com/account) → **Tracking → Filter by status: Exception**. Lists every shipment with an active or recent exception event, broken out by exception type. The card aggregates this into a single percentage; the dashboard surface allows row-by-row triage.
+EasyPost is a multi-carrier aggregator, so there are two layers to reconcile against. First, the EasyPost dashboard under **Logs → Trackers** lists every Tracker with its current normalised status and `status_detail`; filter by status `failure`, `error` and `return_to_sender` over the same 30-day window to count exceptions. The Tracking API (`GET /v2/trackers?status=failure`) returns the same population programmatically. Second, the **underlying carrier's own portal** holds the authoritative scan: the USPS Business Customer Gateway, the FedEx tracking and reporting tools, the UPS dashboard, and so on. EasyPost is the normalisation layer over those scans; the carrier portal is the source of the scan itself.
 
-**Why our number may legitimately differ from EasyPost's portal:**
+The closest like-for-like EasyPost view is *Trackers, Last 30 Days, status in (failure, error, return_to_sender), outbound only*.
+
+**Why our number may legitimately differ from EasyPost's dashboard or the carrier portal:**
 
 | Reason | Direction | Why |
 | --- | --- | --- |
-| **Carrier event-code mapping** | Either | EasyPost normalises carrier-specific codes; some edge cases (e.g. UPS "Address Correction Required" code 11) can map to multiple normalised types. Both card and portal should agree most of the time. |
-| **Polling lag** | Ours lower for "today" | EasyPost polls every 30 to 60 minutes; today's reading may slightly differ. |
-| **Exception duration** | Either | Some merchants want only "still-active" exceptions counted; the card counts any exception event in the period regardless of resolution. |
+| **Status mapping** | Either | EasyPost collapses dozens of raw carrier scan codes into a handful of normalised statuses. A code one team reads as "exception" may map to `in_transit` with a `status_detail` note. The card uses EasyPost's normalised status so one threshold works across carriers; a carrier portal counting raw codes can land on a different number. |
+| **Tracking-event ingestion latency** | Ours can lag | Carrier scans reach EasyPost on a delay (the `tracker.updated` webhook push is near-real-time; polling fallback is slower), and EasyPost reaches our index on a further short delay. A parcel that threw an exception two hours ago may not yet show here. We classify conservatively: a stale `unknown` only becomes an exception after it passes its estimated delivery date. |
+| **Scan timestamps in carrier-local time** | Boundary days off | Each underlying carrier timestamps scans in the scan location's local time. EasyPost stores UTC; the card windows in UTC. For a 30-day window this averages out, but boundary-day parcels can fall in a different day than the carrier portal shows. |
+| **Recovered exceptions** | Ours higher than a "current status" view | A parcel that hit an exception then delivered still counts here (it threw an exception in the period). A carrier portal filtered on *current status = exception* will not show it, because it is now delivered. This is intentional: the card measures exception incidence, not standing exceptions. |
+| **Blended vs single-carrier** | Different population | The carrier portal only sees that carrier's parcels. Our dial is blended across every carrier the rate-shop used. Reconcile per carrier using [OTD by Underlying Carrier](/nerve-centre/kpi-cards/easypost/otd-by-underlying-carrier), not against the blend. |
 
-**Cross-connector reconciliation:**
+---
 
-| Card | Expected relationship | What causes legitimate divergence |
-| --- | --- | --- |
-| [`fedex.fed_exception_rate`](/nerve-centre/kpi-cards/fedex/exception-rate) | EasyPost-FedEx subset. | Direct-FedEx counts include non-EasyPost shipments. |
-| [`usps.usp_exception_rate`](/nerve-centre/kpi-cards/usps/exception-rate) | Same for USPS. | Same. |
+<details>
+<summary><em>Documentation cross-reference (for operations teams running multiple shippers)</em></summary>
+
+Exception-rate metrics exist with conceptually similar definitions across other shipping connectors. These are not parallel measurements of the same parcels.
+
+- [`shippo.exception_rate`](/nerve-centre/kpi-cards/shippo/exception-rate) (multi-carrier aggregator peer)
+- [`royal_mail.exception_rate`](/nerve-centre/kpi-cards/royal-mail/exception-rate) (single-carrier peer)
+
+</details>
 {/* /HUMAN_AUTHORED:reconcile */}
 
 ## Known limitations / merchant FAQs
 
 {/* HUMAN_AUTHORED:faqs */}
-**How do I cut address-issue exceptions specifically?**
-Enable EasyPost's address-verification feature. Pass `verify_strict: ["delivery"]` in the `Address` API call at booking; EasyPost validates against USPS database (and DHL/UPS data for international) and rejects undeliverable addresses before label generation. Reduces address-issue exceptions by 40 to 70%.
+**Why is one blended number useful if my carriers behave so differently?**
+The blend is the right number for "is my despatch operation healthy overall" and for setting a single alert that does not need per-carrier tuning. The moment it moves, you drop into [OTD by Underlying Carrier](/nerve-centre/kpi-cards/easypost/otd-by-underlying-carrier) and [Shipments by Underlying Carrier](/nerve-centre/kpi-cards/easypost/shipments-by-underlying-carrier) to find the carrier driving it. Think of the blend as the smoke alarm and the breakdown as the location of the fire.
 
-**My exception rate jumped from 2% to 4% overnight. Where do I look?**
-Three diagnostic steps. (1) Open the breakdown by carrier; if one carrier dominates the spike, the issue is carrier-specific. (2) Open by zone; if one region dominates (Mountain West winter storms, Northeast nor'easters), the cause is exogenous. (3) Open by exception type; address-issue spike often traces to a checkout-flow change.
+**My international exception rate is always high. Is that a problem?**
+Not on its own. Cross-border parcels carry customs holds, longer dwell, and higher address-quality risk, so 5 to 10 percent is common where domestic sits at 1 to 3 percent. Judge international against its own historical baseline. If it climbs above that baseline, suspect a customs or documentation change (HS codes, commercial invoice data) rather than carrier failure.
 
-**Why is "Recipient unavailable" so high?**
-Recipient-not-home is partially irreducible (1 to 2% baseline). Mitigations: (a) Configure EasyPost to use indirect signature where signature isn't required (avoids signature-required-recipient-not-home redeliveries). (b) Enable text/email tracking notifications that prompt customers to be home or set up Hold for Pickup. (c) For high-value parcels, use carrier-side schedules-on-account services (UPS My Choice, FedEx Delivery Manager).
+**What exactly converts an exception into a failed delivery or a claim?**
+Roughly a quarter to two-fifths of exceptions end in a genuine non-delivery; the rest recover (held parcels get collected, attempted-no-access succeeds on retry). Of the failures, lost and damaged parcels convert into insurance claims. So a 30-day exception count of 566 might yield 140 to 230 failures and a smaller number of claims. Track the chain via [Failed Deliveries](/nerve-centre/kpi-cards/easypost/failed-deliveries) then [Open Claims](/nerve-centre/kpi-cards/easypost/open-claims).
 
-**A shipment showed an exception but delivered on time. Why does the card count it?**
-Exceptions are events; delivery is an outcome. The card counts exception events because they're predictive of customer-experience risk even when ultimate delivery succeeds. Each exception is a yellow flag, not a confirmed late.
+**Why does a parcel that eventually delivered still count as an exception?**
+Because the card measures exception incidence, not standing exceptions. A parcel held at a facility for three days then delivered generated a customer-service ticket and a worse experience even though it arrived. Counting only currently-stuck parcels would understate the operational load. If you want a point-in-time "how many are stuck right now" view, filter EasyPost Trackers on current status instead.
 
-**Should I disable carriers with high exception rate to drop my number?**
-Usually no. The cost saving from rate-shopping (especially USPS for sub-1lb) typically outweighs the operational cost of a higher exception rate. Calculate: cost saving per shipment vs CS-cost-per-exception. Most merchants find rate-shopping net-positive.
+**The dashboard shows a parcel as an exception but the card does not. Why?**
+Two usual reasons. (1) **Ingestion latency:** the scan reached EasyPost but has not yet reached our index; it will appear within the normal refresh window. (2) **Status mapping:** EasyPost may classify that scan as `in_transit` with an exception note in `status_detail` rather than as a `failure` status, in which case the card does not count it. The card follows EasyPost's normalised status, which is deliberately conservative.
 
-**What's "Held at facility" mean for cross-carrier?**
-Carrier holds the parcel for recipient pickup (USPS Hold Mail, FedEx Hold at Location, UPS Access Point). Sometimes initiated by recipient (vacation hold), sometimes by carrier (delivery attempt failed, oversized for vehicle). The card counts as exception; resolution depends on recipient action.
+**Can I exclude weather and holiday backlogs from the rate?**
+No, and you should not want to. The card records actual exception incidence including weather and peak backlogs, because those still generate customer impact and CS load. What you can do is annotate known events and temporarily re-baseline the alert threshold for the affected window in Vortex IQ, then reset it when the network recovers. Do not permanently raise the threshold; the carriers should be held to baseline once the event passes.
 
-**Are EasyPost exceptions the same as carrier exceptions?**
-Conceptually similar but EasyPost normalises carrier-specific codes into a unified taxonomy. The aggregate rate should agree with the sum of per-carrier exception rates within ±0.5 ppt; granular event mapping has small edge cases.
-
-**During Q4, what exception types climb the most?**
-"Recipient unavailable" climbs because of holiday travel. "Weather delay" climbs in storm-prone regions. "Held at facility" climbs as carrier-side hold backlog grows. "Address issue" climbs if merchant's volume grows faster than checkout-validation maturity. All exception types climb; prepare for 1.5x to 2.5x the normal rate.
+**How does this differ from the same card on a single-carrier connector like Australia Post or Royal Mail?**
+A single-carrier connector reads one carrier's scans directly, so there is no blend and no normalisation layer to reconcile against. On EasyPost the dial is a weighted blend across every carrier your rate-shop used, which is more representative of total despatch health but means you must drop into the per-carrier breakdown to act. The threshold (`>3%`) and the exception definition are kept consistent so the cards read the same way side by side.
 {/* /HUMAN_AUTHORED:faqs */}
 
 ---

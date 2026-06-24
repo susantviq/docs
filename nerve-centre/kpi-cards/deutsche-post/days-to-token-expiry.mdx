@@ -4,134 +4,120 @@ sidebarTitle: "Days to Token Expiry"
 description: "Days to Token Expiry for Deutsche Post stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
 ---
 
-**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Shipping & Courier](/nerve-centre/connectors#connectors-by-type)
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** Operational Health
 
 ## At a glance
 
 {/* HUMAN_AUTHORED:tldr */}
-> Days remaining until the DHL Geschäftskundenportal API authentication token expires. When the token expires, every DHL booking, label-generation, tracking-event ingestion, and Reklamationsstelle claim-submission API call from Vortex IQ to DHL fails with HTTP 401. The Vortex IQ to Deutsche Post integration goes silent; bookings have to fall back to manual portal entry; the Nerve Centre dials read stale data. This card is the operational equivalent of the engine-warning light: green for months at a time, then a hard red with 14 days notice.
+> Days remaining until the DHL Geschaftskundenportal API credential behind your Deutsche Post connection stops authenticating. When the token expires every booking, label-generation, tracking-event ingestion and Reklamationsstelle claim call from Vortex IQ to DHL fails with HTTP 401 at once. Nothing is wrong with delivery itself; the connector simply goes dark. The hero placement exists because an expired credential takes the whole despatch operation offline with no gradual warning, only a 14-day countdown.
 
 | | |
 | --- | --- |
-| **What it counts** | `expiry_at - now()` in days, where `expiry_at` is the `expires_at` field on the active DHL credential stored in the integration secret manager. Negative values clamped to 0 ("expired"). |
-| **API endpoint** | The card does not call DHL directly; reads stored credential metadata. DHL Geschäftskundenportal uses an OAuth-style `client_id + client_secret + access_token + refresh_token` pattern; refresh-token has a 12-month lifetime, access-token rotates hourly automatically. |
-| **Token type** | OAuth refresh-token (typical for Vertragskunden setup). Older Online-Frankierung integrations may use a long-lived API key with 24-month rotation. The card surfaces whichever is active. |
-| **Auto-refresh** | Access-tokens auto-refresh hourly inside the access-token lifetime; refresh-tokens auto-refresh inside the 14-day warning window if the OAuth flow is still authorised. Manual rotation required if the merchant's Geschäftskundenportal user has changed passwords or had MFA reset, which invalidates the refresh-token chain. |
-| **Service-tier scope** | Token covers all DHL Geschäftskundenportal API surfaces: Shipping, Tracking, Reklamationsstelle, Billing. There is one token per integration; expiry hits everything at once. |
-| **Returns / RTO** | Not relevant. Card is about integration credential, not shipment data. |
-| **Currency** | Not relevant. |
-| **Time window** | `RT` (real-time, refreshed at integration sync). |
-| **Alert trigger** | `<14 days`. Window calibrated to allow time for the merchant to schedule rotation, log into Geschäftskundenportal, regenerate API credentials, paste into Vortex IQ, verify before old credential expires. |
+| **What it tracks** | `expiry_at - now()` in whole days, where `expiry_at` is the expiry stamped on the active DHL credential held in the integration secret store. Negative values clamp to 0 ("expired"). |
+| **Data source** | Stored credential metadata, not a live DHL call. The DHL Geschaftskundenportal uses an OAuth-style `client_id + client_secret + access_token + refresh_token` pattern; the access token rotates roughly hourly and refreshes automatically, the refresh token carries the multi-month horizon this card reports. Per `detail`: "Days to Token Expiry for the selected period." |
+| **Time window** | `RT` (real time). A live countdown, recomputed on each connector heartbeat, not a windowed aggregate. The figure is current to the last sync (typically within minutes). |
+| **Alert trigger** | `<14 days`. Fires when fewer than 14 days remain. Fourteen days covers a despatch team's two-week planning cadence and leaves room to find whoever holds the DHL portal login before the credential lapses. |
 | **Roles** | owner, operations |
+| **Why it is a hero** | Token expiry is the most common "the connector just stopped working" support ticket. Unlike a delivery dip it gives no gradual signal: the day the credential dies, every downstream card (label success, tracking ingestion, OTD) goes stale at the same moment. |
 {/* /HUMAN_AUTHORED:tldr */}
 
 ## Calculation
 
-Calculated automatically from your Deutsche Post data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+{/* HUMAN_AUTHORED:calculation */}
+Calculated automatically from your Deutsche Post connection metadata. The connector records the expiry returned by the DHL token endpoint each time it authenticates, subtracts the current time and floors to whole days.
+
+Three credential horizons can drive this number, and the card always shows the **nearest actionable** one:
+
+1. **Access token.** Short lived (roughly one hour for the DHL flow). The connector refreshes these automatically, so they self-heal and are never the headline.
+2. **Refresh token.** The medium horizon. For the standard Vertragskunden OAuth setup the refresh token carries a multi-month life (commonly around 12 months) and must be renewed by re-authorising the connection through the portal.
+3. **API key / app registration.** Older Online-Frankierung integrations may use a longer-lived API key on a fixed rotation. These do not expire on the OAuth clock but can be revoked or flagged for periodic review; the connector treats a known review date as an expiry horizon.
+
+The headline is `floor(min(refresh_expiry, key_review_date) - now)` in days. The auto-refreshing access token is deliberately excluded, because reporting it would peg the card near 0 and make it useless.
+{/* /HUMAN_AUTHORED:calculation */}
 
 ## Worked example
 
 {/* HUMAN_AUTHORED:worked_example */}
-The Düsseldorf-based DTC homeware merchant, integrated with Deutsche Post via DHL Geschäftskundenportal OAuth (the standard Vertragskunden setup). Refresh-token issued on 12 Mar 25 with 12-month rotation, set to expire on 12 Mar 26. Reading taken at 09:00 CET on 27 Feb 26.
+A Dusseldorf-based DTC homeware merchant, around 6,400 parcels per week, ships almost entirely on DHL Paket (Inland) with a DHL Paket International leg for AT and CH orders. They connected Deutsche Post to Vortex IQ via the standard Geschaftskundenportal OAuth flow. The refresh token was issued on 12 Mar 25 with a 12-month rotation, due to expire on 12 Mar 26.
 
-| Day | Card reading | Status | What happens |
-| --- | --- | --- | --- |
-| 12 Mar 25 | 365 | green | Refresh-token issued, full lifetime ahead |
-| 12 Sep 25 | 182 | green | Halfway through lifetime, dial informational only |
-| 11 Feb 26 | 29 | green | One month to go, still green |
-| 26 Feb 26 | 14 | warn | Alert fires, dashboard turns amber, integration owner emailed |
-| 04 Mar 26 | 8 | warn | Reminder email; calendar nudge to schedule rotation |
-| 11 Mar 26 | 1 | critical | Dashboard turns red; rotation must happen today |
-| 12 Mar 26 | 0 | expired | Refresh-token dead; bookings fail; bookings fall back to manual portal entry |
+Reading taken at 09:00 CET on 27 Feb 26:
 
-Card reads **14** today; alert is firing. Five things to notice:
+| Credential horizon | Expiry / review date | Days remaining |
+| --- | --- | --- |
+| Access token (auto-refresh) | 27 Feb 26, hourly | 0 (self-heals) |
+| Refresh token (OAuth) | 12 Mar 26 | 13 |
+| API key production review | n/a (OAuth setup) | n/a |
+| **Nearest actionable horizon (this card)** | **12 Mar 26** | **13** |
 
-1. **The 14-day window is calibrated to typical merchant scheduling.** Most German operations teams run 14-day sprint cadences. Smaller merchants without a dedicated ops team often wait until the alert hits 7 days; that is fine but tighter.
-2. **Rotation playbook is short.** (a) Log into [DHL Geschäftskundenportal](https://www.dhl.de/de/geschaeftskunden.html), (b) navigate to **Einstellungen → Entwickler → API-Zugang**, (c) trigger "Neue Zugangsdaten generieren", (d) copy the new `client_id + client_secret`, (e) paste into Vortex IQ → Integrations → Deutsche Post → Update Credentials, (f) test connection. Total time: 5 to 8 minutes for a familiar user.
-3. **Expiry without rotation cascades to every Deutsche Post dial.** [On-Time Delivery Rate](/nerve-centre/kpi-cards/deutsche-post/on-time-delivery-rate), [Late Shipments](/nerve-centre/kpi-cards/deutsche-post/late-shipments), [Exception Rate](/nerve-centre/kpi-cards/deutsche-post/exception-rate), [Avg Shipping Cost](/nerve-centre/kpi-cards/deutsche-post/avg-shipping-cost), [Open Claims](/nerve-centre/kpi-cards/deutsche-post/open-claims), every dial freezes at last successful sync.
-4. **Bookings fail-loudly, tracking fails-silently.** Failed bookings surface immediately with HTTP 401; tracking failure is silent until merchant notices missing event updates.
-5. **Pair with [API Error Rate](/nerve-centre/kpi-cards/deutsche-post/api-error-rate) for early signals.** Spike in error rate before expiry suggests credential revoked manually or de-permissioned, not natural expiry.
+The card reads **13 days**. The alert at `<14 days` is **tripped**: the dashboard turns amber and the integration owner is emailed. Four things to notice:
+
+1. **The access token does not drive the number.** It expires hourly and refreshes silently. If the card reported that it would always read 0. The card correctly reports the 13-day refresh-token horizon.
+2. **The rotation playbook is short, run it now.** Log into the [DHL Geschaftskundenportal](https://www.dhl.de/de/geschaeftskunden.html), open **Einstellungen, Entwickler, API-Zugang**, generate new access credentials, copy the `client_id` and `client_secret`, paste them into Vortex IQ under Integrations, Deutsche Post, Update Credentials, then test the connection. Five to eight minutes for a familiar user. The portal lets old and new credentials overlap briefly, so there is no hard cutover.
+3. **When this hits 0, these cards go stale, not red.** Label Generation Success, Retouren-Etikett Generation Failure Rate, On-Time Delivery Rate and every tracking-driven card stop receiving fresh data. They do not show a delivery problem; they show no new data. Bookings fail loudly with 401; tracking fails silently until someone notices missing scans.
+4. **Peak timing matters.** This token expires 12 Mar 26, clear of Q4. A merchant whose credential would lapse in late November should rotate in October rather than risk a re-consent during Black Friday week, when nobody has time to chase a portal login.
 {/* /HUMAN_AUTHORED:worked_example */}
 
 ## Sibling cards merchants should reference together
 
 {/* HUMAN_AUTHORED:siblings */}
-Token expiry is integration-health, not shipment dial. Pair with these to read the integration as a whole:
+Token expiry is an availability metric, not a performance one. Pair it with the other operational-health and label cards to understand blast radius:
 
 | Card | Why pair it with Days to Token Expiry | What the combination tells you |
 | --- | --- | --- |
-| [API Error Rate](/nerve-centre/kpi-cards/deutsche-post/api-error-rate) | Pre-expiry credential issues. | Rising error rate while expiry days are healthy suggests permission scope changed or rate-limit exceeded. |
-| [Label Generation Success](/nerve-centre/kpi-cards/deutsche-post/label-generation-success) | First dial to drop on token expiry. | Label generation requires Shipping API; first surface to fail with 401. |
-| [On-Time Delivery Rate](/nerve-centre/kpi-cards/deutsche-post/on-time-delivery-rate) | Stale-data signal. | If reads have not refreshed and expiry is at 0, dial shows pre-expiry data; integration broken not network. |
-| [Late Shipments](/nerve-centre/kpi-cards/deutsche-post/late-shipments) | Stale-data companion. | Counts may freeze rather than continue updating after expiry. |
-| Cross-connector: integration-health for adjacent connectors | Merchant's overall credential calendar. | Merchant with Deutsche Post, Hermes, Klaviyo, Shopify integrated has 4 calendars; consolidating prevents the "I forgot about the DHL one" failure mode. |
-| Cross-connector: [`vortex_iq.integration_health_summary`](/nerve-centre/vortex_iq/integration_health_summary) | Aggregated integration health. | This card is the per-Deutsche-Post detail behind the summary. |
+| [API Error Rate](/nerve-centre/kpi-cards/deutsche-post/api-error-rate) | A credential being throttled or partially revoked shows up as a rising 401 / 403 share first. | A creeping error rate while this card still reads positive days usually means the credential is being de-permissioned, not cleanly expiring. |
+| [Label Generation Success](/nerve-centre/kpi-cards/deutsche-post/label-generation-success) | Label creation is the first surface to break when auth fails. | If label success collapses to near zero at the same moment this card hits 0, the cause is the token, not the label payload. |
+| [On-Time Delivery Rate](/nerve-centre/kpi-cards/deutsche-post/on-time-delivery-rate) | OTD depends on fresh delivered scans, which stop arriving when the token dies. | OTD flat-lining at its last value while this card hits 0 is a data-availability artefact, not a delivery improvement. |
+| [Late Shipments](/nerve-centre/kpi-cards/deutsche-post/late-shipments) | Counts freeze rather than continue updating after expiry. | A frozen late count plus a token at 0 means you are looking at stale data, not a calm network. |
+| [Exception Rate](/nerve-centre/kpi-cards/deutsche-post/exception-rate) | Stale tracking ingestion from a dead token can masquerade as a sudden exception-rate change. | A frozen exception rate plus a token at 0 means stale data, not a real network event. |
+| [Open Claims](/nerve-centre/kpi-cards/deutsche-post/open-claims) | Reklamationsstelle claim sync shares the same credential. | An expired token stops new claims being filed and status changes being read; treat expiry as a finance-data event, not just an ops one. |
 {/* /HUMAN_AUTHORED:siblings */}
 
-## Reconciling against the vendor's own dashboard
+## Reconciling against the source
 
 {/* HUMAN_AUTHORED:reconcile */}
-**Where to look in Deutsche Post's own portal:**
+**Where to look in DHL's own tooling:**
 
-[DHL Geschäftskundenportal](https://www.dhl.de/de/geschaeftskunden.html) → **Einstellungen → Entwickler → API-Zugang** lists active and expired credentials with `Erstellt am` (created), `Gültig bis` (expires), `Letzte Nutzung` (last used). Card reading should match active credential's `Gültig bis` exactly. If they differ by more than 1 day, force a refresh in Vortex IQ → Integrations → Deutsche Post → Refresh Credentials.
+The authoritative record of credential validity is the [DHL Geschaftskundenportal](https://www.dhl.de/de/geschaeftskunden.html), under **Einstellungen, Entwickler, API-Zugang**, which lists active and expired credentials with `Erstellt am` (created), `Gultig bis` (valid until) and `Letzte Nutzung` (last used). The [DHL Developer Portal](https://developer.dhl.com/) holds the application registration and consumer key for the underlying API app. The card reading should match the active credential's `Gultig bis` to within a day; if it differs by more than a day, force a refresh under Integrations, Deutsche Post, Refresh Credentials.
 
-**Why our number may legitimately differ from the DHL portal:**
+There is no aggregator layer here: Deutsche Post / DHL is a single national carrier, not an EasyPost or Shippo style multi-carrier API, so the only two sources of truth are the two DHL portals above. If you run DHL behind an aggregator, reconcile against the aggregator's connection-health page as well.
+
+**Why our number may legitimately differ from DHL's portal:**
 
 | Reason | Direction | Why |
 | --- | --- | --- |
-| **Timezone (CET / CEST vs UTC)** | Off by 1 day at boundary | Portal shows expiry in Berlin local time; card uses UTC. Card always rounds down to "days remaining"; alert fires correctly regardless. |
-| **Multiple active credentials** | Either | A merchant may have multiple API credential pairs (production, sandbox); card reads the credential active in the integration. |
-| **Manually revoked credentials** | Ours higher | If credential revoked manually before natural expiry, card may continue to read original expiry-days until next sync. First 401 forces re-read. |
-| **Refresh-token vs API-key** | Either | OAuth integrations refresh automatically inside the alert window; long-lived API-keys do not. |
-
-**Cross-connector reconciliation:**
-
-| Card | Expected relationship | Causes of legitimate divergence |
-| --- | --- | --- |
-| Adjacent connector token expiry cards | Different connectors, different credential calendars. | No expected relationship; cards are independent. |
-| [`vortex_iq.integration_health_summary`](/nerve-centre/vortex_iq/integration_health_summary) | Summary view should always include this card's value. | If summary shows green and card shows warn, summary refresh is stale; force-refresh. |
-
----
-
-<details>
-<summary><em>Documentation cross-reference (for agencies running multiple shippers)</em></summary>
-
-- [`hermes_germany.her_auth_token_expiry_days`](/nerve-centre/hermes_germany/her_auth_token_expiry_days) (German parcel peer)
-- [`bring.bri_auth_token_expiry_days`](/nerve-centre/kpi-cards/bring/days-to-token-expiry) (Nordic national-postal peer)
-- [`royal_mail.roy_auth_token_expiry_days`](/nerve-centre/kpi-cards/royal-mail/days-to-token-expiry) (UK national-postal peer)
-
-</details>
+| **Timezone (CET/CEST vs UTC)** | Boundary day off by one | The portal shows expiry in Berlin local time; the card computes against UTC and floors to whole days. Near a midnight boundary the two can differ by one day. Scan and event timestamps elsewhere in the connector are likewise in carrier-local time. |
+| **Credential-event ingestion latency** | Ours can lag briefly | The card refreshes its horizon only on a successful authentication. If an external system rotates the credential, our cached expiry stays stale until our next authentication picks up the new value. Credential metadata arrives in the same batched cadence as tracking events. |
+| **Manually revoked credential** | Ours higher until first 401 | If the credential is revoked early in the portal, the card may keep reading the original horizon until the next sync; the first 401 forces a re-read. |
+| **Multiple active credentials** | Either | A merchant may hold separate production and sandbox pairs; the card reads whichever is bound to the live integration. Confirm you are comparing the production credential. |
+| **Refresh token vs API key** | Different horizons | The portal may show an API key with no fixed expiry while the card reports the OAuth refresh-token horizon, which is the one that actually breaks despatch. |
 {/* /HUMAN_AUTHORED:reconcile */}
 
 ## Known limitations / merchant FAQs
 
 {/* HUMAN_AUTHORED:faqs */}
 **My token rotates every 12 months. Why does the alert fire 14 days early?**
-The 14-day window is the safe buffer for human-led rotation. Forgetting until the day before leaves less than 24 hours to log in, generate, paste, test, and verify; too tight for a Friday afternoon. The 14-day window allows scheduling and recovery from a failed test. If your operations cadence supports tighter scheduling, threshold can be set to 7 days at integration level; below 7 days is operationally risky.
+The 14-day window is the safe buffer for a human-led rotation. Leaving it to the day before gives under 24 hours to log in, generate, paste, test and verify, which is too tight for a Friday afternoon. Fourteen days lets you schedule the work and recover from a failed test. If your operations cadence supports it, the threshold can be tightened to 7 days per store; below 7 is operationally risky.
 
-**The card reads "expired" but my Deutsche Post integration still works. Why?**
-Three possibilities. (1) **Sync lag.** Card reads cached expiry value; force a refresh. (2) **Multiple active credentials.** DHL sometimes allows old + new credentials to overlap for 24 to 48 hours after rotation. (3) **Wrong credential record.** If a previous integration was disconnected and a new one connected, the dead record may still be read; reconnect to be safe.
+**The card says "expired" but my Deutsche Post integration still works. Why?**
+Three possibilities. (1) Sync lag: the card is reading a cached expiry, so force a refresh. (2) Overlapping credentials: the portal often lets an old and new pair co-exist for 24 to 48 hours after rotation. (3) Wrong credential record: if an integration was disconnected and reconnected, a dead record may still be read, so reconnect to be safe.
+
+**What exactly stops working when this hits 0?**
+Everything that calls DHL: new shipping labels, Retouren-Etikett (return label) generation, rate quotes, tracking-event ingestion and Reklamationsstelle claim sync. Parcels already in the DHL network keep moving physically; you simply stop getting scans and cannot create new labels. The visible symptom is several cards freezing at their last-known values at once.
 
 **Can I rotate the credential before the alert fires?**
-Yes, the preferred operations pattern. Set a 90-day calendar reminder ("rotate Deutsche Post API credentials") regardless of natural expiry; rotate proactively. The Geschäftskundenportal generates new credentials without invalidating old ones immediately.
+Yes, and that is the preferred pattern. Set a recurring reminder (for example every quarter, aligned to a quiet trading week) and rotate proactively. The Geschaftskundenportal generates new credentials without invalidating the old ones immediately, so there is no outage during rotation.
 
 **My API credentials were generated by a colleague who has left. Should I rotate?**
-Yes, immediately. Generation is bound to a Geschäftskundenportal user; if the user's account is deactivated, generated credentials may stop working without notice. Best practice: generate against a service-account user (non-personal account owned by operations function), rotate when the binding user changes role.
+Yes, immediately. Generation is bound to a Geschaftskundenportal user; if that account is deactivated the credentials can stop working without notice. Best practice is to generate against a shared operations service account rather than a personal login, and rotate whenever the binding user changes role.
 
-**What happens to my Open Claims data if the token expires?**
-Card reads stop refreshing; existing data remains visible but stale. New claims filed in Reklamationsstelle not picked up; status changes on existing claims not reflected. Treat token-expiry as finance-data-integrity event, not just operations event.
+**Does the alert fire on access-token or refresh-token expiry?**
+Refresh-token. Access tokens expire roughly hourly and refresh automatically, so the card does not surface them. The refresh token carries the multi-month horizon and requires re-authorisation when it lapses. For most Deutsche Post merchants this is a once-a-year, structural event per integration.
 
-**OAuth-style integration: does the alert fire on access-token or refresh-token expiry?**
-Refresh-token. Access tokens for OAuth integrations expire hourly and refresh automatically; card does not surface them. Refresh-tokens have 12-month rotation and require OAuth flow re-authorisation when they expire. For Deutsche Post merchants the alert is structural; expect once a year per integration.
+**The portal shows my credential as "Aktiv" but the card says expired. Who is right?**
+The card. It reads the `expiry_at` stamped on the credential; if DHL has not yet run its housekeeping at the expiry moment the portal may still show "Aktiv", but every API call after that point fails with 401. Trust the card and rotate.
 
-**The Geschäftskundenportal shows my credential as "Aktiv" but the card says expired. Who is right?**
-The card. Alert reads `expires_at` field on credential record; if DHL has not yet revoked the credential at midnight UTC on expiry date, portal may continue to show "Aktiv" until next housekeeping cycle, but every API call after midnight UTC will fail with 401. Trust the card; rotate immediately.
-
-**Can I get a webhook notification instead of in-dashboard alert?**
-Yes. Integration-health alert framework supports webhook delivery to Slack, Teams, email. Configure once at integration level; same trigger that lights up this card fires the webhook. Most German operations teams configure Slack alerts to a dedicated `#integration-health` channel.
-
-**The card just turned green again from "expired". What happened?**
-Someone rotated the credential. Check integration audit log for who and when; card flips to green within 1 sync cycle (5 to 15 minutes) of new credential being saved. If unauthorised, treat as security event and audit the operation.
+**Can I get a webhook instead of an in-dashboard alert?**
+Yes. The integration-health alert framework delivers to Slack, Teams or email. Configure it once at integration level; the same trigger that lights this card fires the webhook. Many German operations teams route these to a dedicated integration-health channel.
 {/* /HUMAN_AUTHORED:faqs */}
 
 ---

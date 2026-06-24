@@ -4,24 +4,25 @@ sidebarTitle: "Exception Rate"
 description: "Exception Rate for Sendle stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
 ---
 
-**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Shipping & Courier](/nerve-centre/connectors#connectors-by-type)
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Exceptions & Claims](/nerve-centre/connectors#connectors-by-type)
 
 ## At a glance
 
 {/* HUMAN_AUTHORED:tldr */}
-> Share of Sendle parcels that recorded any non-progress tracking event during transit: address invalid, attempted-no-answer, held at depot, redirected, damaged, lost. The early-warning signal that predicts a falling [OTD Rate](/nerve-centre/kpi-cards/sendle/on-time-delivery-rate) at 24 to 72 hours.
+> Share of Sendle parcels that recorded any non-progress tracking event in the trailing 30 days, compared period-over-period. An exception is any tracking state that diverges from the normal pickup-to-delivery path: failed pickup, address problem, held at depot, recipient unavailable, damaged, lost, or returned to sender. This is the early-warning signal that predicts a falling [On-Time Delivery Rate](/nerve-centre/kpi-cards/sendle/on-time-delivery-rate) 24 to 72 hours before it shows, and the customer-service ticket wave that follows.
 
 | | |
 | --- | --- |
-| **What it counts** | `COUNT(parcels WHERE EXISTS(tracking_event WHERE event_type IN exception_set)) / COUNT(parcels)` over the trailing 30 days. Each parcel scores once even if it threw multiple exceptions in transit. |
-| **Delivery success criterion** | Not directly applicable. Exceptions surface during transit, not at terminal status. A parcel can throw an exception (e.g. attempted-no-answer Day 3) and still deliver on time (Day 4); it still counts as an exception here. |
-| **On-time threshold** | Not applicable. The OTD card answers "did it arrive on time"; this card answers "did anything go wrong on the way". |
-| **Returns / RTO** | Outbound only by default. RTS exceptions on the return leg are tracked separately in [Returned to Sender](/nerve-centre/kpi-cards/sendle/returned-to-sender). Returns from customer back to merchant via Sendle (less common; most AU/US Sendle merchants use AusPost or USPS for returns) carry their own exception count which can be filtered in. |
-| **Service level scope** | All Sendle services pooled (Standard, Pro, Saver). Exception types are normalised across the contracted couriers (Couriers Please metro and regional, Aramex partners, USPS partnered routes); the tracking webhook surfaces a single Sendle event-code regardless of underlying courier. |
-| **Exception-event categories** | (1) **Address** (invalid postcode, incomplete address line, business closed) ~32 percent of typical exceptions. (2) **Recipient** (attempted-no-answer, refused at door, requested redirect) ~28 percent. (3) **Depot/network** (held at depot for capacity, missed cutoff, weather hold) ~24 percent. (4) **Damage / lost** (parcel damaged in handling, lost-in-transit) ~10 percent. (5) **Customs / border** (US international only) ~6 percent. The mix moves slowly. |
-| **Currency** | Not applicable, this is a rate. |
-| **Time window** | `30D vsP` (rolling 30 days vs prior 30 days). Daily readings exist but are noisy below 200 parcels per day. |
-| **Alert trigger** | `>3%` critical, `>1%` warn, driven by `sentiment_key: exception_rate`. AU/US Sendle benchmark is 0.8 to 1.5 percent; above 2 percent typically signals upstream label-data quality issue, above 3 percent typically signals a courier-network event. |
+| **What it counts** | `COUNT(parcels WHERE EXISTS(tracking_event IN exception_set)) / COUNT(parcels shipped)` over the rolling 30-day window. Each parcel scores once even if it threw several exceptions in transit. |
+| **Data source** | Sendle public API. The card reads the parcel list from `GET /api/orders` and the per-parcel event stream from `GET /api/tracking/{sendle_reference}`, classifying each scan's `status` / `description` field into the exception set. |
+| **Exception set** | `Pickup Attempted`, `Pickup Failed`, `Address Issue` / `Unable to Locate`, `Delivery Attempted` (card left), `Held at Depot`, `Damaged`, `Lost`, `Return to Sender`, `Cancelled in Transit`. Normal-path states (`Booking Created`, `Info Received`, `In Transit`, `Out for Delivery`, `Delivered`, `Left in a Safe Place`) are excluded. |
+| **Pickup vs drop-off** | Both included. Pickup parcels (a Sendle driver collects from the merchant) can throw a `Pickup Failed` exception that drop-off parcels cannot; this is the single biggest driver of Sendle exception rate and the reason it can read higher than a pure drop-off carrier. |
+| **Return-leg inclusion** | **Outbound only.** Return parcels booked through Sendle carry `direction = return` and are filtered out. Return-leg exceptions are surfaced on [Returned to Sender](/nerve-centre/kpi-cards/sendle/returned-to-sender). |
+| **Service-tier scope** | All Sendle products pooled: AU domestic (metro and regional zones) and US domestic (5-zone tier). The Sendle tracking event model is single-vendor, so every parcel reports against one taxonomy regardless of the partner courier (Couriers Please, Aramex partners, USPS-partnered routes). |
+| **Geographic scope** | All Sendle lanes. Scan timestamps are recorded in carrier-local time (AEST/AEDT for AU, recipient-local for US), normalised to UTC on ingest. |
+| **In-flight and recovered handling** | A parcel still in transit with no exception scan is excluded from the numerator but stays in the denominator. A parcel that threw an exception and later delivered still counts: the customer felt the friction even though it arrived. |
+| **Time window** | `30D vsP` (rolling 30 days, compared to the previous 30 days). Daily readings are noisy below 150 parcels per day. |
+| **Alert trigger** | `>3%` of total parcels in the period. For a merchant shipping 2,000 Sendle parcels a month, that is 60+ exceptioned parcels. |
 | **Roles** | owner, operations |
 {/* /HUMAN_AUTHORED:tldr */}
 
@@ -32,87 +33,81 @@ Calculated automatically from your Sendle data. See the At a glance summary abov
 ## Worked example
 
 {/* HUMAN_AUTHORED:worked_example */}
-The same Australian DTC home-goods brand using Sendle Standard for nationwide delivery. Reading taken at 09:00 AEDT on 12 Mar 26 for the trailing 30 days (10 Feb 26 to 11 Mar 26).
+An Australian DTC skincare brand based in Brunswick, Melbourne, shipping around 2,100 parcels a month, all on Sendle. Roughly 70 percent pickup (the Sendle driver collects from the studio each afternoon) and 30 percent drop-off at the local newsagent partner point on overflow days. Reading taken at 09:00 AEST on 14 Apr 26 for the trailing 30 days (15 Mar 26 to 14 Apr 26).
 
-| Exception category | Parcels affected | % of total |
+Exception breakdown:
+
+| Exception state | Parcels (30D) | Share of shipped |
 | --- | --- | --- |
-| Address (invalid postcode, missing unit number, business closed) | 78 | 0.77% |
-| Recipient (attempted-no-answer, refused, redirect requested) | 64 | 0.63% |
-| Depot / network (held at Couriers Please depot, missed cutoff, weather hold) | 41 | 0.40% |
-| Damage / lost (handling damage, lost-in-transit, parcel-not-found) | 14 | 0.14% |
-| **All exceptions (this card)** | **197** | **1.94%** |
+| Pickup Failed | 31 | 1.5% |
+| Address Issue / Unable to Locate | 14 | 0.7% |
+| Delivery Attempted (card left) | 9 | 0.4% |
+| Held at Depot | 6 | 0.3% |
+| Damaged | 2 | 0.1% |
+| Return to Sender | 4 | 0.2% |
+| **Total exceptioned parcels (this card)** | **66** | **3.1%** |
 
-Total parcels in window: 10,160. Exception rate: **1.94 percent**. The card reads **1.9 percent** on the dial; the alert at `>3%` is **not tripped** but the rate is above the 1 percent green floor so the dial is amber. Five things to notice that are specific to Sendle and the AU/US flat-rate model:
+Total shipped in the window: 2,130 parcels. The card reads **3.1 percent** on the gauge and the alert at `>3%` is **just** tripped. Five things to notice:
 
-1. **Address exceptions dominate, and the fix is at checkout, not Sendle.** 78 of 197 exceptions are address-quality issues; almost all are caused upstream of Sendle by missing unit numbers, mistyped postcodes, or business addresses delivered after-hours. Install an address validator at checkout (Loqate, AddressFinder for AU, SmartyStreets for US); typical lift after install is 50 to 70 percent reduction in address exceptions within 30 days.
-2. **Recipient-attempted-no-answer is unavoidable but usually recoverable.** 64 cases is roughly the natural rate for a daytime-delivery network on home addresses; Couriers Please will leave a card and re-attempt, or redirect to a Parcel Locker. Most resolve within 48 hours. Track via [Failed Deliveries](/nerve-centre/kpi-cards/sendle/failed-deliveries) and [First-Attempt Delivery](/nerve-centre/kpi-cards/sendle/first-attempt-delivery-rate).
-3. **The 14 damage / lost cases are claim-eligible.** Each one is an [Open Claim](/nerve-centre/kpi-cards/sendle/open-claims) opportunity if filed within Sendle's window. Default cover is AUD 100 / USD 100; extended cover up to AUD 1,500 / USD 1,500 if purchased at booking. The financial exposure is in [Claim Value](/nerve-centre/kpi-cards/sendle/claim-value), not here.
-4. **Depot-held exceptions cluster at the start of the working week.** Friday-afternoon bookings that miss the courier collection window sit in the merchant's outbox until Monday; Sendle records this as a `depot_hold` event. The fix is shifting the merchant's despatch cutoff to 13:00 Friday, which gives Couriers Please the Friday afternoon collection window. Most accounts that do this see 30 to 50 percent reduction in depot-hold exceptions.
-5. **Sendle's exception coverage is single-vendor, so the data is cleaner than multi-carrier connectors.** Unlike ShippyPro or ShipTheory where exception coverage depends on which carrier handled the parcel and how completely it implemented Sendle's normalised event model, Sendle controls the entire pipeline. Every parcel reports against the same event taxonomy. Read this card as authoritative; do not "calibrate" against carrier-portal counts.
+1. **Pickup Failed is half the problem.** 31 of the 66 exceptions are failed pickups, and pickup-driven exceptions are the signature of the Sendle network: when driver coverage in a postcode is thin, the driver does not arrive, the parcels sit, and the whole afternoon's queue slips a day. This is a collection failure upstream of delivery, not a delivery failure. Pair this card with [Pickup Booking Success Rate](/nerve-centre/kpi-cards/sendle/pickup-booking-success-rate) to confirm whether the failed pickups cluster on specific days or postcodes.
+2. **The vsP comparison is what makes 3.1 percent actionable.** If last period read 2.4 percent, a jump to 3.1 percent is a 0.7-point deterioration and worth investigating now. If last period read 3.0 percent, this is flat and the alert is noise. Always read the gauge against its own previous-period number, not against an absolute target.
+3. **66 exceptions is roughly 66 customer-service contacts in flight.** At an estimated 7 minutes per WISMO contact, that is about 8 staff-hours of work generated this month by exceptions alone. The count, not the percentage, is the operational workload: see [Failed Deliveries](/nerve-centre/kpi-cards/sendle/failed-deliveries) for the deliverability-specific subset.
+4. **The damaged and lost tail converts to claims.** The 2 damaged parcels and any lost parcels are the population that becomes a Sendle cover claim. Sendle includes cover (the standard tier carries cover up to AUD 1,500 per parcel, higher on Premium); check [Open Claims](/nerve-centre/kpi-cards/sendle/open-claims) and [Claim Value (open)](/nerve-centre/kpi-cards/sendle/claim-value-open) to see how much of the exception tail has escalated.
+5. **Triage by cost-of-exception, not raw count.** A failed pickup costs the merchant a re-book and a day; a damaged parcel costs a replacement plus a claim plus a review. Address Issue exceptions are often self-inflicted (bad checkout address data) and the cheapest to fix at source, so they are the highest-return lever even though they are not the highest count here.
 {/* /HUMAN_AUTHORED:worked_example */}
 
 ## Sibling cards merchants should reference together
 
 {/* HUMAN_AUTHORED:siblings */}
-Exception rate is the leading indicator. Pair with these to predict, prevent, and quantify downstream OTD damage:
+Exception rate is the leading indicator. Pair it with these to diagnose and cost the friction:
 
 | Card | Why pair it with Exception Rate | What the combination tells you |
 | --- | --- | --- |
-| [On-Time Delivery Rate](/nerve-centre/kpi-cards/sendle/on-time-delivery-rate) | The downstream outcome. | Exception rate leads OTD by 24 to 72 hours. A 1-point exception rise predicts a 2 to 4 point OTD dip 2 to 3 days later. |
-| [Late Shipments](/nerve-centre/kpi-cards/sendle/late-shipments) | The volumetric workload that follows exceptions. | Use the exception count to forecast next week's customer-service ticket load. |
-| [Failed Deliveries](/nerve-centre/kpi-cards/sendle/failed-deliveries) | The subset of exceptions that ended in non-delivery. | High exception rate + low failed-delivery rate = most exceptions self-resolve; high failed-delivery rate = exceptions are escalating into terminal failures. |
-| [Open Claims](/nerve-centre/kpi-cards/sendle/open-claims) | Damage and lost-in-transit exceptions feed the claims pipeline. | Damage / lost exception count + 7 to 14 days of lag = future open-claim count. |
-| [First-Attempt Delivery](/nerve-centre/kpi-cards/sendle/first-attempt-delivery-rate) | Recipient-availability exceptions show up here as second-attempt deliveries. | Falling first-attempt rate with rising exception rate = recipient/availability mix shift. |
-| [OTD by Route](/nerve-centre/kpi-cards/sendle/otd-by-route) | Where the exceptions are concentrated geographically. | Remote zones generate more depot-hold and address exceptions; metro generates more recipient exceptions. |
-| Cross-connector: [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Upstream label-data origin. | Shopify-captured addresses that fail Sendle validation produce the address-exception cluster. Install a Shopify checkout address validator. |
-| Cross-connector: [`bigcommerce.unfulfilled_orders`](/nerve-centre/kpi-cards/bigcommerce/unfulfilled-orders) | Same upstream relationship for BC merchants. | Same fix path. |
-| Cross-connector: [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream financial impact. | Sustained exception spikes typically precede refund-rate climbs at 7 to 14 days. |
+| [On-Time Delivery Rate](/nerve-centre/kpi-cards/sendle/on-time-delivery-rate) | The downstream outcome the exception predicts. | Exception rate leads OTD by 24 to 72 hours. A rising exception rate predicts an OTD dip 2 to 3 days later. |
+| [Failed Deliveries](/nerve-centre/kpi-cards/sendle/failed-deliveries) | The deliverability subset of the exception set. | Exception Rate includes pickup and depot states; Failed Deliveries isolates the last-mile failures the recipient actually felt. |
+| [Pickup Booking Success Rate](/nerve-centre/kpi-cards/sendle/pickup-booking-success-rate) | The single biggest exception driver on the Sendle network. | If exception rate rises and pickup success falls in lockstep, the problem is driver coverage, not delivery. |
+| [Open Claims](/nerve-centre/kpi-cards/sendle/open-claims) | How many exceptions escalated into cover claims. | Typical conversion is 5 to 15 percent: 60 exceptions produces 3 to 9 claims, mostly from the damaged / lost tail. |
+| [Claim Value (open)](/nerve-centre/kpi-cards/sendle/claim-value-open) | The dollar value sitting in those claims. | Converts the exception count into money at risk under Sendle cover. |
+| [Returned to Sender](/nerve-centre/kpi-cards/sendle/returned-to-sender) | The Return to Sender slice of the exception set. | RTS parcels are exceptions that consumed full outbound and return cost for zero delivery. |
+| [First-Attempt Delivery Rate](/nerve-centre/kpi-cards/sendle/first-attempt-delivery-rate) | The inverse signal: parcels delivered cleanly first time. | A falling first-attempt rate and a rising exception rate are two views of the same deterioration. |
+| Cross-connector: [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream financial impact. | A multi-point exception spike typically precedes a refund-rate rise 7 to 14 days later. |
 {/* /HUMAN_AUTHORED:siblings */}
 
-## Reconciling against the vendor's own dashboard
+## Reconciling against the source
 
 {/* HUMAN_AUTHORED:reconcile */}
-**Where to look in Sendle's own dashboard:**
+**Where to look in Sendle's own tooling:**
 
-[Sendle Dashboard](https://www.sendle.com/dashboard) → **Reports → Tracking Events**. The page lists all parcels with at least one non-progress tracking event over the chosen window, with category, event timestamp, and resolution status. Closest like-for-like view: *Last 30 Days, All Services, All Exception Categories*. Sendle also exposes a CSV export of every exception event with `event_code`, `event_timestamp`, `tracking_id`, useful for spot-audits.
+The [Sendle Dashboard](https://www.sendle.com/) → **Orders** view is the merchant's source of record. Filter the order list by status (Sendle exposes `Pickup Failed`, `Delivery Attempted`, `Held`, `Damaged`, `Lost`, `Cancelled` as filterable states) and set the range to *Last 30 Days*. The per-parcel **Tracking** page shows the full scan history for any single parcel, which is the same event stream the card classifies. The Sendle Tracking API (`GET /api/tracking/{sendle_reference}`) returns the identical events programmatically.
 
-**Why our number may legitimately differ from Sendle's portal:**
+The closest like-for-like view is *All Orders, Last 30 Days, status in the exception set, outbound only*.
+
+**Why our number may legitimately differ from Sendle's dashboard:**
 
 | Reason | Direction | Why |
 | --- | --- | --- |
-| **Event taxonomy normalisation** | Tiny | Sendle's portal sometimes shows raw courier event codes (Couriers Please native codes for AU, USPS native codes for US partnered routes); the card normalises to Sendle's unified event taxonomy. ~95 percent of events map cleanly; the residual 5 percent can shift the count by 0.1 to 0.3 points. |
-| **Auto-resolved exceptions** | Either | A `held_at_depot` event that resolves within 4 hours when the courier truck arrives may not appear in the portal's default view (Sendle hides "transient" exceptions there); the card includes them by default because they still represent operational signal. Toggle *Include transient* to match. |
-| **Sync timing on most recent 1 to 6h** | Ours lower briefly | Tracking webhooks land in real time but the card aggregates on a 4-hour cycle; the portal recomputes overnight. Same-day readings can drift by up to 0.2 points; resolved by 06:00 next day. |
-| **Time zone** | Boundary days | Sendle uses workspace timezone for daily aggregation; we use UTC for cross-connector arithmetic. The 30-day window absorbs this. |
-| **Cancelled bookings** | Tiny | Cancelled-before-collection bookings that nonetheless threw an event (e.g. label printed and then cancelled) are excluded by us, included by some portal views. Drift typically &lt;0.1 points. |
-| **Returns leg** | Either | Returns-via-Sendle exception events are excluded by default here; the portal includes them in the unfiltered view. Filter "Outbound only" in the portal to match. |
+| **Tracking-event latency** | Ours can lag | Sendle pushes scans into the Tracking API in batches; latency from a driver's handheld scan to API visibility ranges from a few minutes to several hours, longer during peak. A parcel that threw an exception 20 minutes ago may not be classified yet. The dashboard sometimes sees it first because it reads Sendle's internal event bus directly. |
+| **Carrier-local scan timestamps** | Boundary days off | Scan timestamps are recorded in carrier-local time (AEST/AEDT in Australia, recipient-local for US lanes). The card normalises to UTC. For a 30-day window, boundary-day shifts move a handful of parcels between days; the period total agrees within about 1 percent. |
+| **Recovered-exception counting** | Ours higher | The card counts a parcel that threw an exception and later delivered as an exception (the customer felt the friction). Sendle's order list defaults to current status, so a recovered parcel reads as `Delivered` and is easy to miss when eyeballing the dashboard. |
+| **Exception-set definition** | Either | The card's exception set is an explicit allow-list of states. If Sendle introduces or renames a tracking state, the card may classify it differently from the dashboard's own grouping until the mapping is updated. |
+| **Pickup vs delivery scope** | Ours higher | The card includes `Pickup Failed` in the exception set. A merchant filtering the Sendle dashboard for delivery exceptions only will see a lower number. |
 
-**Internal identity (within Sendle):**
+**Cross-connector reconciliation:**
 
-This card relates to [OTD Rate](/nerve-centre/kpi-cards/sendle/on-time-delivery-rate) by a leading-indicator relationship rather than a strict identity. Empirically, on this connector:
-
-`sen.otd_rate(t) ≈ baseline_otd - 1.8 × Δ(sen.exception_rate(t-2d))`
-
-That is, a 1-point exception-rate rise typically translates to roughly 1.8 points of OTD drop two days later. The relationship is monitor-grade not contractual; use it as a forecast input, not as a hard equation.
-
-**Cross-connector reconciliation. Australia Post / USPS / StarTrack vs Sendle:**
-
-Other carrier connectors expose their own exception rates with different event taxonomies. Do **not** average them; each carrier defines exceptions differently:
-
-- AusPost categorises "delivered to neighbour" as `delivered_alternate`, not an exception. Sendle treats it as `recipient_redirect` and counts it.
-- USPS categorises depot-overflow holds as `delayed_in_transit` exceptions. Sendle's US partnered routes inherit this.
-- Cross-carrier comparisons should normalise the taxonomy first, or compare each carrier to its own historical baseline.
+| Card | Expected relationship | Causes of legitimate divergence |
+| --- | --- | --- |
+| [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream sentiment proxy. Exceptions drive refunds at 7 to 14 day lag. | Refund rate has many drivers (sizing, quality, change of mind); shipping exceptions are one input. |
+| [`shopify.unfulfilled_orders`](/nerve-centre/kpi-cards/shopify/unfulfilled-orders) | Upstream input. Orders that sit unfulfilled cannot throw a carrier exception yet. | Webhook delays, manual fulfilment, pre-orders. |
 
 ---
 
 <details>
-<summary><em>Documentation cross-reference (for agencies running multiple courier connectors)</em></summary>
+<summary><em>Documentation cross-reference (for agencies running multiple carriers)</em></summary>
 
-The Exception Rate metric exists with the same structural definition on every shipping connector in Vortex IQ, but the underlying event taxonomy differs per carrier. Use these for navigation, not for cross-carrier reconciliation.
+Exception-rate metrics exist with conceptually similar definitions across other shipping connectors, but the underlying event taxonomy differs per carrier. These are not parallel measurements of the same parcels; use them for navigation, not for cross-carrier reconciliation.
 
-- [`royal_mail.roy_exception_rate`](/nerve-centre/kpi-cards/royal-mail/exception-rate)
-- [`ship_theory.shi_exception_rate`](/nerve-centre/kpi-cards/ship-theory/exception-rate)
-- [`shipbob.sb_health_score`](/nerve-centre/kpi-cards/shipbob/operational-health-score) (composite peer for 3PL operations)
+- [`auspost.exception_rate`](/nerve-centre/kpi-cards/auspost/exception-rate) (AU national carrier peer)
+- [`easypost.exception_rate`](/nerve-centre/kpi-cards/easypost/exception-rate) (multi-carrier aggregator peer)
 
 </details>
 {/* /HUMAN_AUTHORED:reconcile */}
@@ -120,44 +115,26 @@ The Exception Rate metric exists with the same structural definition on every sh
 ## Known limitations / merchant FAQs
 
 {/* HUMAN_AUTHORED:faqs */}
-**Why is my Sendle exception rate spiking?**
-Three usual causes, in order of likelihood:
+**Why is my Sendle exception rate higher than the courier I used before?**
+Pickup. Sendle's model leans on driver pickup from the merchant, and a failed pickup counts as an exception here even though no delivery has been attempted. A drop-off-only carrier never throws a `Pickup Failed` state. If you compare like-for-like by filtering to delivery exceptions only, the gap usually narrows. The right comparison is exception rate against your own historical Sendle baseline, not against a carrier with a different collection model.
 
-1. **Address-quality regression at checkout.** A recent storefront change (new theme, new checkout app, removed address validator) often produces a step-change in address exceptions within 7 to 14 days. Open the address-category breakdown; if address exceptions jumped while other categories held, the cause is upstream.
-2. **Seasonal courier capacity stress.** AU Q4 (mid-November to mid-December) and US holiday peak (Black Friday through New Year) routinely lift depot-hold exceptions by 2 to 4x. Couriers Please regional and Aramex partners hit capacity and start holding parcels at depots.
-3. **A specific lane event.** Industrial action at a single depot, a regional weather event (cyclone in QLD/NT, ice storm in US Midwest), or a courier-fleet outage will spike exceptions on a specific lane. The aggregate jumps; the per-lane breakdown identifies the source.
+**A parcel threw an exception but it arrived fine. Why does it still count?**
+Because the customer felt the friction. A `Delivery Attempted` card-left exception means the recipient had to arrange redelivery or visit a collection point, even if the parcel arrived a day later. The card measures friction, not just final-state failure. If you only care about parcels that never arrived, read [Failed Deliveries](/nerve-centre/kpi-cards/sendle/failed-deliveries) and [Returned to Sender](/nerve-centre/kpi-cards/sendle/returned-to-sender) instead.
 
-**Action:** before reacting, identify which category is driving the spike. Address = fix at checkout; depot/recipient = monitor and communicate; damage/lost = open Claim Value tracking immediately.
+**What is the playbook when the gauge crosses 3 percent?**
+In order: (1) check [Pickup Booking Success Rate](/nerve-centre/kpi-cards/sendle/pickup-booking-success-rate), failed pickups are the most common Sendle exception driver and the first thing to rule out; (2) check whether the exceptions cluster on specific postcodes or zones via [OTD by Route](/nerve-centre/kpi-cards/sendle/otd-by-route), a regional driver-coverage gap is local, a network-wide rise is systemic; (3) check [Open Claims](/nerve-centre/kpi-cards/sendle/open-claims) to see how much of the tail is damaged or lost; (4) if pickup and route are clean, raise a ticket with Sendle support and attach the Orders export for the affected window.
 
-**My exception rate is 1.9 percent. Is that high?**
-Marginal. AU/US Sendle benchmark is 0.8 to 1.5 percent for steady-state operations. 1.9 percent is amber: not an emergency but worth investigating before it crosses 3 percent. Most accounts that hit 1.9 percent and ignore it find themselves at 2.8 to 3.5 percent within 30 days because exception causes compound (one address-quality regression generates a cluster of similar exceptions over the following weeks).
+**How much tracking latency should I expect before this card is accurate?**
+Treat anything inside the last 2 to 3 hours as provisional. Sendle's scan-to-API latency is usually minutes but stretches to several hours at peak. The 30-day rolling window absorbs this; the "today" slice does not. Do not act on a single intra-day reading.
 
-**How can I reduce Sendle exceptions?**
-Five practical levers, in rough order of impact:
+**Does a cancelled-in-transit parcel count as an exception?**
+Yes, if Sendle records a `Cancelled in Transit` scan. A parcel cancelled before any pickup scan (still `Booking Created`) is not an exception, it never entered the network. The distinction matters: pre-pickup cancellations are merchant-side admin, in-transit cancellations are network events.
 
-1. **Install address validation at checkout.** Loqate, AddressFinder for AU, SmartyStreets for US. Typical lift: 50 to 70 percent reduction in address-category exceptions within 30 days. Single highest-leverage change for most Sendle accounts.
-2. **Shift Friday despatch cutoffs to 13:00.** Catches the Friday courier collection window; reduces depot-hold exceptions over the weekend by 30 to 50 percent.
-3. **Add unit-number prompts to your address form.** Apartment-block deliveries fail at 3 to 5x the rate of house deliveries when unit numbers are missing. A simple "Apt/Unit/Suite" required field on apartment postcodes fixes most.
-4. **Use Parcel Locker / PUDO redirect on attempted-no-answer.** Sendle's Couriers Please integration supports automatic Parcel Locker redirect for AU, USPS PO Box for US. Adds 1 to 2 days but eliminates re-attempt cycles.
-5. **Audit your top-10 problem lanes monthly.** A handful of postcode pairs typically generate 30 to 40 percent of all exceptions. Either widen ETA on those at checkout, surcharge them, or move them to AusPost / USPS Express.
+**Why does the count bounce day to day even when the rate is steady?**
+Volume seasonality. A DTC merchant ships 30 to 50 percent more on the two days after a campaign send, so a steady 3 percent exception rate produces a visibly higher count on those days. Use the 30-day rolling reading for trend and the daily slice only for outage detection.
 
-**Why does my daily exception rate swing so much?**
-Small-number noise. Exceptions cluster in batches (one delivery truck breaks down = 30 to 50 simultaneous depot-hold events on the same route). If your daily volume is below 200 parcels, a single batch event can move daily exception rate by 5 to 10 points. **Look at the rolling 7-day or 30-day rate, not the daily figure.** The alert window defaults to 30D vsP for this reason.
-
-**Are exceptions counted on the carbon-neutral promise?**
-No. Sendle's carbon offsetting is per-parcel-booked, applied at booking. An exceptioned parcel is still offset; a re-attempted parcel is not double-offset (Sendle absorbs the cost). The carbon promise and the exception reading are independent metrics.
-
-**My Sendle exception rate is higher than my Australia Post rate. Is that real?**
-Often yes, on certain lanes. AusPost's exception taxonomy is narrower (some events Sendle codes as `recipient_redirect` AusPost codes as `delivered`, even though the original recipient was not the one who took the parcel). The exception-rate gap usually closes when you normalise definitions. Compare each carrier to its own historical baseline; do not cross-compare exception rates as-is.
-
-**Does the exception rate predict refund-rate spikes?**
-Yes, with 7 to 14 day lag for sustained spikes. Transient exception spikes (one-off batch events) usually do not propagate; sustained spikes (>1.5 percent for 7+ days) typically lift Shopify or BC refund rate by 0.3 to 0.8 points. The card is a useful early-warning input for finance forecasting.
-
-**My US Sendle account shows higher exceptions than my AU. Is that expected?**
-Yes, marginally. US Sendle's USPS-partnered routes inherit USPS's exception model, which tags depot-overflow holds as `delayed_in_transit` more aggressively than Couriers Please does in AU. Typical US Sendle baseline is 1.2 to 1.8 percent vs AU 0.8 to 1.5 percent. The gap is structural, not a quality issue.
-
-**When does my exception rate read most accurately?**
-After the daily 06:00 UTC re-aggregation. Same-day readings before 06:00 may drift by up to 0.2 percentage points because tracking webhooks for the previous day are still settling. Use 24-hour-old readings for board-grade decisions; same-day readings for triage only.
+**Can I exclude pickup failures from this card?**
+Not on this card; the exception set is fixed so the number is comparable across merchants. To see deliverability without the pickup leg, read [Failed Deliveries](/nerve-centre/kpi-cards/sendle/failed-deliveries) (delivery-side only) and [Pickup Booking Success Rate](/nerve-centre/kpi-cards/sendle/pickup-booking-success-rate) (collection-side only) side by side.
 {/* /HUMAN_AUTHORED:faqs */}
 
 ---

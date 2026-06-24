@@ -1,0 +1,136 @@
+---
+title: "AusPost Tracking API Unavailable / 5xx, Australia Post"
+sidebarTitle: "AusPost Tracking API Unavailable / 5xx"
+description: "AusPost Tracking API Unavailable / 5xx for Australia Post stores. Tracked live in Vortex IQ Nerve Centre. How to read it, why it matters, and how to act on it."
+---
+
+**Card class:** [Hero](/nerve-centre/overview#card-classes-explained)  •  **Category:** [Nerve Centre](/nerve-centre/overview#card-classes-explained)
+
+## At a glance
+
+{/* HUMAN_AUTHORED:tldr */}
+> A real-time alert that fires when the Australia Post Tracking API error rate exceeds 5 percent over the last hour. When the tracking endpoint is unavailable or returning server errors, tracking events stop flowing into Nerve Centre: delivery scans go stale, OTD and exception readings freeze, and every delivery-performance card that depends on scan data drifts away from reality. This card tells you the silence on your other cards is the carrier API being down, not your parcels stopping.
+
+| | |
+| --- | --- |
+| **What it counts** | `COUNT(tracking_api_calls WHERE status_class = 5xx OR timeout OR connection_error) / COUNT(tracking_api_calls)` over the trailing 1 hour. The alert fires above 5 percent. The list shows recent failing calls with status code and endpoint. |
+| **API endpoint** | The Australia Post Tracking API `GET /shipping/v1/track/items/{trackingNumber}` and the bulk track endpoints. A failure is any 5xx response (500, 502, 503, 504), a request timeout, or a connection-level error. 4xx responses (bad tracking number, auth) are excluded here because they are not endpoint-availability problems; auth failures surface on [Days to Token Expiry](/nerve-centre/kpi-cards/australia-post/days-to-token-expiry) and bad-request rates on [API Error Rate](/nerve-centre/kpi-cards/australia-post/api-error-rate). |
+| **What goes stale when it fires** | Every card fed by tracking scans: [On-Time Delivery Rate](/nerve-centre/kpi-cards/australia-post/on-time-delivery-rate), [Late Shipments](/nerve-centre/kpi-cards/australia-post/late-shipments), [Exception Rate](/nerve-centre/kpi-cards/australia-post/exception-rate), [Failed Deliveries](/nerve-centre/kpi-cards/australia-post/failed-deliveries), and the Express Post breach list. Those readings keep their last-known values and grow progressively less trustworthy the longer the outage runs. |
+| **Scope** | Tracking (read) endpoints only. Label creation has its own failure card ([Label Print Failures Spike](/nerve-centre/kpi-cards/australia-post/label-print-failures-spike)); a broad Australia Post incident often trips both at once. |
+| **Retry behaviour** | The ingestion layer retries failed tracking calls with exponential backoff. The error rate on this card is measured before give-up, so a transient blip that succeeds on retry still registers as an error in the window. Persistent 5xx means the retries are also failing. |
+| **Why one hour** | Short enough to catch an outage as it starts, long enough for a stable denominator. A handful of 5xx in a quiet hour can trip a low-volume account, so read alongside [API Error Rate](/nerve-centre/kpi-cards/australia-post/api-error-rate) for context. |
+| **Time window** | `RT` (real time), evaluated on a rolling 1-hour basis. |
+| **Alert trigger** | `API error rate >5% in last 1h`. |
+| **Roles** | owner, operations |
+{/* /HUMAN_AUTHORED:tldr */}
+
+## Calculation
+
+Calculated automatically from your Australia Post data. See the At a glance summary above for what the metric tracks and the worked example below for a typical reading.
+
+## Worked example
+
+{/* HUMAN_AUTHORED:worked_example */}
+A national Australian DTC brand polls Australia Post tracking for roughly 9,000 in-flight consignments. The ingestion layer makes around 2,200 tracking calls in a typical hour. Reading taken at 14:25 AEST on 14 Apr 26, covering 13:25 to 14:25.
+
+| Outcome | Calls | Share |
+| --- | --- | --- |
+| 200 OK | 1,946 | 88.5% |
+| 503 Service Unavailable | 178 | 8.1% |
+| 504 Gateway Timeout | 41 | 1.9% |
+| Connection timeout (no response) | 35 | 1.6% |
+| **All errors (this card)** | **254** | **11.6%** |
+
+Error rate **11.6 percent**, well above the 5 percent floor, so the alert fires. Four things to notice:
+
+1. **The dominant code tells you the failure mode.** 503s dominate, which means the Australia Post endpoint is up but shedding load (overloaded or in maintenance), not hard-down. The right response is to back off and let the retry layer ride it out, not to escalate to your own engineering team as if it were your bug.
+2. **Your delivery cards are now drifting, not broken.** While this is firing, OTD, exception rate, and the breach list are holding stale values. A parcel that delivered at 13:50 will not show as delivered until scans flow again. Do not action a "late" parcel off a frozen card during an outage; wait for ingestion to catch up, then re-read.
+3. **Check whether labelling is also affected.** A platform-wide Australia Post incident usually hits both read and write paths. Glance at [Label Print Failures Spike](/nerve-centre/kpi-cards/australia-post/label-print-failures-spike): if it is also firing with 5xx, this is an Australia Post outage and the action is to monitor their status page, not to debug your integration. If only tracking is affected, it may be a tracking-service-specific issue.
+4. **Rule out the silent local causes first.** If the errors were 401 / 403 rather than 5xx, this card would not fire (those are excluded), but it is worth confirming the credential is healthy on [Days to Token Expiry](/nerve-centre/kpi-cards/australia-post/days-to-token-expiry) and that your own outbound network is not the bottleneck before concluding it is Australia Post. Connection timeouts can be your side as easily as theirs.
+{/* /HUMAN_AUTHORED:worked_example */}
+
+## Sibling cards merchants should reference together
+
+{/* HUMAN_AUTHORED:siblings */}
+Tracking API availability is the trust layer under every delivery card. Pair it with these when scans go quiet:
+
+| Card | Why pair it with Tracking API Unavailable | What the combination tells you |
+| --- | --- | --- |
+| [API Error Rate](/nerve-centre/kpi-cards/australia-post/api-error-rate) | The whole-integration error view including 4xx. | This card is 5xx / availability only; the error-rate gauge shows the full picture including auth and bad-request errors. |
+| [Label Print Failures Spike](/nerve-centre/kpi-cards/australia-post/label-print-failures-spike) | The write-path equivalent. | Both firing = platform-wide Australia Post incident; only this one = tracking-service issue. |
+| [Days to Token Expiry](/nerve-centre/kpi-cards/australia-post/days-to-token-expiry) | Rules out the auth cause. | An expired token produces 401/403, not 5xx; if errors are auth-class this card will be quiet and the token card will explain it. |
+| [On-Time Delivery Rate](/nerve-centre/kpi-cards/australia-post/on-time-delivery-rate) | The headline card that goes stale. | When this fires, treat the OTD reading as last-known, not current. |
+| [Exception Rate](/nerve-centre/kpi-cards/australia-post/exception-rate) | Also fed by scans. | Exception rate freezes during an outage; a sudden flat-line is the tell. |
+| [Late Shipments](/nerve-centre/kpi-cards/australia-post/late-shipments) | Can over-count during an outage. | With no fresh delivered scans, in-transit parcels age past their aim and look late; recheck once scans resume. |
+| Cross-connector: [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream impact during prolonged outages. | If tracking is dark for hours, "where is my order" tickets and refund requests rise because customers cannot self-serve tracking. |
+{/* /HUMAN_AUTHORED:siblings */}
+
+## Reconciling against the carrier's own status page
+
+{/* HUMAN_AUTHORED:reconcile */}
+**Where to look in Australia Post's own tooling:**
+
+Endpoint availability is confirmed against Australia Post's own service status, not the tracking portal. Check the [Australia Post Developer Centre](https://developers.auspost.com.au/) for API status and any maintenance notices, and the [Australia Post important updates](https://auspost.com.au/about-us/news-media/important-updates) page for declared platform incidents. If you can still load a parcel in [MyPost Business](https://auspost.com.au/business) → **Tracking** while our API calls are failing, the consumer-facing portal and the API are served differently and the issue is API-side specifically.
+
+The closest like-for-like check is to run a manual tracking call against a known-good article number; a 5xx confirms the endpoint, a 200 suggests the problem is in your own ingestion path or network.
+
+**Why our number may legitimately differ from Australia Post's reported availability:**
+
+| Reason | Direction | Why |
+| --- | --- | --- |
+| **Vantage point** | Ours can be higher | We measure errors from our ingestion network's vantage point. A regional network or peering issue between us and Australia Post can produce 5xx and timeouts that Australia Post's own monitoring (measuring from inside their network) does not see. |
+| **Retry counting** | Ours higher than "incidents" | We count every failed attempt in the window, including transient blips that succeed on retry. Australia Post's status page reports declared incidents, not per-call error rates, so a brief elevated error rate may show here without a corresponding status-page incident. |
+| **Timeout threshold** | Either | A slow-but-eventually-successful response that exceeds our client timeout is counted as a timeout error here; Australia Post would count it as a (slow) success. During heavy load the two views diverge most. |
+| **4xx exclusion** | Ours lower than raw error logs | We exclude 4xx (auth, bad tracking number) from this card. A raw error log that lumps all non-2xx together will show a higher rate than this availability-specific card. |
+| **Scan timestamp timezone** | Not an availability factor | Worth noting for downstream cards: once scans resume, their timestamps are in carrier-local time at the scan location, so a backlog of scans ingested after an outage can appear bunched on the wrong local day until normalised. |
+
+**Cross-connector reconciliation:**
+
+| Card | Expected relationship | Causes of legitimate divergence |
+| --- | --- | --- |
+| [`shopify.refund_rate`](/nerve-centre/kpi-cards/shopify/refund-rate) | Downstream during long outages. | Refund rate has many drivers; tracking darkness is an indirect, lagging one. |
+
+---
+
+<details>
+<summary><em>Documentation cross-reference (for agencies running multiple shippers)</em></summary>
+
+Tracking-API availability alerts exist with conceptually similar definitions across other carriers and across multi-carrier aggregators (EasyPost, Shippo). For an aggregator, a 5xx may originate at the aggregator's own API or be passed through from the underlying carrier's tracking feed, so reconcile against both the aggregator dashboard and the underlying carrier scans.
+
+- [`royal_mail.roy_api_error_rate`](/nerve-centre/kpi-cards/royal-mail/late-shipments) (UK national-postal peer)
+
+</details>
+{/* /HUMAN_AUTHORED:reconcile */}
+
+## Known limitations / merchant FAQs
+
+{/* HUMAN_AUTHORED:faqs */}
+**My delivery cards stopped moving. Is that this alert?**
+Very likely. When the tracking API is unavailable, no fresh scans flow, so OTD, exception rate, late count, and the Express Post breach list freeze on their last values. A sudden flat-line across all your delivery cards at once, with this alert firing, is the carrier API being down, not your parcels stopping. Wait for the alert to clear, then re-read the delivery cards once scans catch up.
+
+**Is a 5xx my problem or Australia Post's?**
+Almost always Australia Post's. A 5xx is a server-side error class: the request was valid but the endpoint could not serve it. The exception is a connection-level timeout, which can be a network problem between you and Australia Post. Confirm with a manual tracking call and the [Australia Post Developer Centre](https://developers.auspost.com.au/) status; if the portal works but the API does not, it is an API-side issue and you wait it out.
+
+**Why are 401 / 403 errors not on this card?**
+Those are authentication failures, not availability failures, so they are deliberately excluded. An expired or revoked credential produces 401/403 and is surfaced on [Days to Token Expiry](/nerve-centre/kpi-cards/australia-post/days-to-token-expiry); a malformed request produces 4xx and feeds [API Error Rate](/nerve-centre/kpi-cards/australia-post/api-error-rate). Keeping this card to 5xx and timeouts means that when it fires, the cause is genuinely endpoint availability.
+
+**Should I do anything during the outage, or just wait?**
+Mostly wait, but with two actions. First, do not action stale delivery cards: a parcel showing "late" during the outage may have delivered already. Second, if the outage runs for hours during a despatch peak, pre-empt the customer impact by widening delivery-expectation messaging, because customers cannot self-serve tracking either while the feed is dark. The retry layer handles re-ingestion automatically once the endpoint recovers.
+
+**The alert cleared but my late count jumped afterwards. Why?**
+Catch-up. During the outage, in-transit parcels kept ageing past their aim with no delivered scan to clear them, so they accumulated as apparent lates. When scans resume in a batch, some clear immediately (they had actually delivered) and the count corrects down, while genuine lates remain. Re-read [Late Shipments](/nerve-centre/kpi-cards/australia-post/late-shipments) about an hour after the alert clears for a trustworthy figure.
+
+**We saw 5xx but Australia Post's status page showed no incident. Who is right?**
+Both can be. We measure from our ingestion vantage point and count every failed attempt including transient ones; Australia Post's status page reports declared incidents from inside their network. A brief regional or peering blip can show as elevated 5xx here without ever becoming a declared incident. If the rate is low and clears quickly, it was a transient; if it is sustained and the portal also struggles, it is a real outage regardless of the status page.
+
+**Does this affect international tracking differently?**
+International parcels rely on partner-carrier scans relayed through Australia Post, so even when the Australia Post tracking API itself is healthy, international scan latency is structurally higher (days, not hours). This card measures the Australia Post API availability, not the upstream partner feed, so a healthy reading here does not guarantee timely international scans. Use [Exception Rate](/nerve-centre/kpi-cards/australia-post/exception-rate) and the international cards for that.
+{/* /HUMAN_AUTHORED:faqs */}
+
+---
+
+### Tracked live in Vortex IQ Nerve Centre
+
+*AusPost Tracking API Unavailable / 5xx* is one of hundreds of KPI pulses Vortex IQ tracks across Australia Post and 70+ other ecommerce connectors. Nerve Centre runs the detection layer; Vortex Mind investigates the cause when something moves; Ask Viq lets you interrogate any number in plain English.
+
+[Start for free](https://app.vortexiq.ai/login) or [book a demo](https://www.vortexiq.ai/contact-us) to see this metric running on your own data.
