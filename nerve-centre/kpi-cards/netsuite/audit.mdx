@@ -1,0 +1,68 @@
+---
+title: "NetSuite ERP audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ NetSuite ERP health audit checks: NetSuite ERP: ecom postings settle, AR is collectible, inventory and period close reconcile"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/netsuite) · [Audit Profile](/nerve-centre/kpi-cards/netsuite/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/netsuite/sentiment)**
+
+NetSuite ERP back-office health audit. Answers six questions: (1) does auth resolve against the per-merchant account-segmented host with the right flow (TBA vs OAuth2) and rest_webservices scope; (2) is the GL healthy (no transactions stuck PENDING_APPROVAL/REJECTED, no SuiteScript save errors, manual JE creep contained); (3) is the AP/AR cycle collectible (AR aging, DSO, credit holds); (4) does NetSuite location-level on-hand reconcile with ecom availability; (5) is the accounting period close on track for OneWorld consolidation; (6) do ecom orders reconcile to NetSuite Cash Sales / Invoices and customer + inventory masters across channels. The cross-channel area joins NetSuite transactions, customers and items to commerce-sibling records to size unbilled revenue and credit risk.
+
+## What this audit checks
+
+### Authentication & access
+- Token URL resolves against the per-merchant account-segmented host https://{accountid}.suitetalk.api.netsuite.com (production accountid, not a _SB1 sandbox)
+- Auth flow confirmed at onboarding - TBA (HMAC-SHA256 over consumer_key + consumer_secret + token_id + token_secret) OR OAuth2 refresh-token flow - and the matching credential fields are populated
+- rest_webservices scope granted on the Integration record and the role tied to the token has REST permission
+- Concurrent-request budget respected (typically 5 concurrent per Integration record) so high-volume record pulls do not 429
+
+### GL health
+- Open transactions in PENDING_APPROVAL or REJECTED status below 50 (spike = SuiteScript integration error or broken approval-routing rule)
+- Zero imbalanced transactions persisting (NetSuite rejects imbalanced postings; persistence = calling-side integration logic broken)
+- SuiteScript execution errors below 10 in the last 24h (record-save failures block transactions silently inside background scripts)
+- Manual JournalEntry transactions under 25% of total postings over 30d (controls gap if higher)
+
+### AP/AR cycle
+- AR aging 60+ days below 15% of open receivables, segmented by Subsidiary on OneWorld accounts
+- DSO under 60 days and not rising more than 10 days vsP
+- AP aging 60+ days below 30% of open payables
+- Customers on credit hold (onCreditHold ON or AUTO) reviewed; sudden growth flags collection or terms breakdown
+
+### Inventory reconciliation
+- NetSuite locationquantityavailable vs ecom availability variance below 5% on top-velocity SKUs (itemid = sku)
+- No InventoryItem locationquantityavailable gone negative in any Location (double-posting or fulfilment-sync error)
+- Items below reorder point flagged so reorder happens before stockout
+- Slow-moving inventory (no movement >90d) under 10% of on-hand inventory value
+
+### Period close
+- Accounting period close not past deadline (more than 5 days overdue blocks OneWorld consolidation)
+- Open reconciliation items cleared before the close date
+- Accrual reversals from the last close within expected range (>10 signals manual close churn)
+- Period close on-time rate at or above 90% over the trailing 12 months
+
+### Cross-channel: revenue reconciliation
+- Ecom orders have a matching NetSuite transaction (Cash Sale / Invoice) with externalid set within 7d (sibling = bigcommerce/shopify/adobe_commerce.order); unmatched = silently failing order-import SuiteScript
+- Ecom customers with completed orders present in NetSuite CustomerMaster by email (no Cash Sale / Invoice posting gap), with Subsidiary set on OneWorld accounts
+- AR aging on customers with active ecom orders (credit-control gap: ordering while past due; should auto-flag onCreditHold)
+- SKUs with NetSuite-vs-ecom location-level inventory drift >5% surfaced to prevent multi-channel overselling
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `open_journal_count` | 25 | 50 |
+| `ar_aging_60d_pct` | 10 | 15 |
+| `dso_days` | 45 | 60 |
+| `inventory_variance_pct` | 3 | 5 |
+| `period_close_overdue_days` | 2 | 5 |
+
+## Data sources
+
+- `GET https://{accountid}.suitetalk.api.netsuite.com/services/rest/record/v1/account` - Chart of accounts: number, name, type, currency for GL structure
+- `GET https://{accountid}.suitetalk.api.netsuite.com/services/rest/record/v1/transaction` - Transactions: type, status, total, subsidiary, externalid for GL health + order reconciliation
+- `GET https://{accountid}.suitetalk.api.netsuite.com/services/rest/record/v1/customer` - Customer master: terms, credit limit, onCreditHold, subsidiary, email for AR + drift checks
+- `GET https://{accountid}.suitetalk.api.netsuite.com/services/rest/record/v1/vendor` - Vendor master: terms, subsidiary for AP cycle
+- `GET https://{accountid}.suitetalk.api.netsuite.com/services/rest/record/v1/inventoryitem` - Inventory items: location-level available / on-order, cost for reconciliation
+- `POST https://{accountid}.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token` - OAuth2 token exchange (OAuth2 accounts only; TBA signs per-request in engine code)
+
+{/* Generated from netsuite_audit.yaml. Edit the audit module, not this page. */}

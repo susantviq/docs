@@ -1,0 +1,69 @@
+---
+title: "MongoDB audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ MongoDB health audit checks: MongoDB: keep auth scoped, replicas in sync, queries indexed, storage durable"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/mongodb) · [Audit Profile](/nerve-centre/kpi-cards/mongodb/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/mongodb/sentiment)**
+
+MongoDB-specific health audit for self-managed and Atlas clusters. Answers six questions: (1) is the monitoring user scoped to clusterMonitor and is SCRAM-SHA-256 / TLS auth correct for the connection string; (2) is the instance reachable and are connection errors and pool saturation under control; (3) is query latency (p95 / p99) within band and are slow ops + COLLSCAN operations climbing; (4) is the replica set healthy with secondaries keeping up and elections quiet; (5) is disk and WiredTiger cache capacity within safe headroom; (6) is a recent successful backup or snapshot in place for durability. Signals are read from serverStatus, db.stats, the profiler, rs.status, and sh.status.
+
+## What this audit checks
+
+### Authentication & access
+- Connection string uses mongodb+srv:// (Atlas) or mongodb:// with replica set seed list, not a single bare host
+- Monitoring user holds the clusterMonitor built-in role plus read on the monitored DBs (slow-op KPIs unusable otherwise)
+- SCRAM-SHA-256 auth in effect (MongoDB 4.0+ default) and TLS enforced for Atlas connections
+- Atlas Admin API key (key ID + private key) present and project-scoped when cluster is Atlas-managed
+
+### Connection & availability
+- db.serverStatus() reachable and instance uptime present (no recent unexpected restart)
+- Connection errors over 24h below threshold (connections refused / network resets)
+- Connection pool saturation under 90% - connections.current / (connections.current + connections.available)
+- Active reader / writer queue (globalLock.activeClients) not backing up under load
+
+### Query performance
+- Query latency p95 under 200ms from serverStatus latencies.reads.latency / ops
+- Query latency p99 under 500ms (tail latency not masking p95)
+- Slow ops in trailing 15m under 10 - profiler entries with millis above slowms (default 100ms)
+- COLLSCAN operations over 24h under 10 - full collection scans signal missing indexes or an unindexed code path
+
+### Replication & lag
+- Every secondary replica lag under 10s from rs.status() optimeDate delta vs primary
+- No member stuck in RECOVERING / STARTUP2 / DOWN state (stateStr healthy across the set)
+- Elections over 24h at most 1 - frequent elections indicate primary flapping from network or hardware instability
+- Sharded clusters: chunk-balance skew under 20% and pending chunk migrations bounded (sh.status())
+
+### Storage & capacity
+- Database disk usage under 90% from db.stats() storage and Atlas capacity surface
+- WiredTiger cache hit rate at or above 95% - 1 - (bytes-read-into-cache / bytes-currently-in-cache)
+- WiredTiger dirty cache under 20% of configured maximum (above triggers eviction pressure)
+- Resident memory (mem.resident) within tier headroom for the Atlas instance class
+
+### Backups & durability
+- Last successful backup under 72h - mongodump, Atlas continuous backup, or snapshot
+- Atlas Cloud Backup enabled with a retention policy when cluster is Atlas-managed
+- Oplog window long enough to cover the backup cadence plus restore lead time
+- Write concern w:majority in effect for durability-critical writes (per connection string and app defaults)
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `connection_error_rate` | 1 | 5 |
+| `query_p95_ms` | 200 | 500 |
+| `replication_lag_sec` | 10 | 30 |
+| `disk_usage_pct` | 80 | 90 |
+| `slow_query_count` | 10 | 25 |
+
+## Data sources
+
+- `GET mongodb://{host}:{port}/{database}` - Base connection - replica set or Atlas srv seed list
+- `GET db.serverStatus()` - opcounters, connections, latencies, globalLock, mem, WiredTiger cache
+- `GET db.stats()` - Storage size, data size, index size for disk usage
+- `GET db.system.profile.find()` - Slow-op profiler entries - requires setProfilingLevel(2) or slowms threshold
+- `GET rs.status()` - Replica set member states, optimeDate lag, election history
+- `GET sh.status()` - Shard balance, pending chunk migrations (sharded clusters only)
+- `GET db.currentOp()` - In-flight long-running operations and collection scans
+
+{/* Generated from mongodb_audit.yaml. Edit the audit module, not this page. */}

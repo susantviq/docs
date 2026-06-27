@@ -1,0 +1,80 @@
+---
+title: "Costco SIP audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Costco SIP health audit checks: Costco SIP: Feed Reliability, ASN Compliance & Cross-Channel Margin"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/costco-sip) · [Audit Profile](/nerve-centre/kpi-cards/costco-sip/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/costco-sip/sentiment)**
+
+Costco SIP is the SFTP-based EDI feed channel suppliers use to manage their Costco wholesale relationship. The audit covers SFTP connectivity (the AIOS-IP-allowlist prerequisite is the most common day-1 blocker), order feed reliability (did the daily PO drop land overnight?), ASN compliance (every missed ASN is a chargeback under Costco's supplier rules), item- master sync drift (the source of "delisted" surprises), and cross-channel comparisons against DTC + 3PL + Jira siblings to surface pricing-parity risks, 3PL SLA isolation, and chargeback-dispute escalation queues.
+
+## What this audit checks
+
+### Authentication & access
+- SFTP connection succeeds within 30s (timeout = AIOS egress IP not on Costco allowlist - file allowlist request with supplier-portal admin)
+- Auth method present (password OR private_key) - both empty = config error
+- known_hosts_fingerprint matches server (production hardening - defeats MITM)
+- base_path/inbox is readable AND base_path/outbox is writable
+- Username + base_path resolve to the merchant's expected drop folder (no cross-tenant leakage)
+
+### Feed reliability
+- Last successful inbound parse within 36h on a working day (>36h = either Costco stopped dropping OR our pickup stopped)
+- Daily PO drop lands by 7am UK (Costco's typical cadence is 2am UK)
+- Inbound parse-error rate &lt;2% rolling 7d (per-file errors signal a Costco envelope-format change)
+- Outbound files ACKed within 6h of drop (un-ACKed = Costco can't read our envelope)
+- File-volume anomaly: daily count within 2σ of 30d baseline
+
+### ASN compliance
+- On-time ASN rate >=95% (below = scorecard penalty)
+- POs missing ASN past ship_by (any open count = active chargeback risk)
+- Late ASN burst: >2 in 24h (fulfilment-side breakage)
+- ASN ACK rejection rate &lt;1% (rejected ASNs don't count as on-time)
+- ASN-PO mismatch: ASN sent for a PO Costco didn't drop (envelope error)
+
+### Item-master sync
+- Items delisted this week (any > 0 = direct shelf-loss; chase reasons within 24h)
+- Items pending review >0 (case-pack mismatch / GTIN error / label issue)
+- Sync error count 7d (each rejection blocks the related items from updating)
+- Field drift: description / case-pack / cost-per-unit divergent between supplier system and Costco catalogue
+- Item-master file last sent within rolling cadence (typically weekly; gap risks staleness)
+
+### Financial reconciliation
+- Chargeback risk 30d > $5K (recoverable margin if disputed in window)
+- Payments overdue past Costco's 30-day net term
+- Invoice-to-PO gap (un-invoiced fulfilled POs)
+- Top deduction reason codes (systemic vs one-off)
+
+### Cross-channel: pricing, 3PL & escalation (the killer area)
+- Costco unit-cost &lt;70% of DTC list price for matched SKUs (MAP-compliance + margin signal)
+- Costco PO ship-by SLA via ShipBob (isolates 3PL performance from internal warehouse)
+- Open Jira tickets referencing Costco POs or chargebacks (ageing escalation queue = unrecovered margin)
+- DTC stockout AND open Costco PO for the same SKU (allocation conflict)
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `sftp_consecutive_failures` | 1 | 3 |
+| `hours_since_last_inbound_workday` | 24 | 36 |
+| `hours_since_last_outbound_ack` | 12 | 24 |
+| `on_time_asn_rate_pct` | 97 | 95 |
+| `pos_missing_asn_count` | 1 | 5 |
+| `late_asn_burst_24h_count` | 1 | 3 |
+| `fill_rate_pct` | 99 | 98 |
+| `items_delisted_7d_count` | 1 | 3 |
+| `items_pending_review_count` | 1 | 5 |
+| `sync_error_count_7d` | 1 | 5 |
+| `field_drift_count` | 5 | 15 |
+| `chargeback_value_30d_usd` | 1000 | 5000 |
+| `pricing_parity_violation_count` | 1 | 5 |
+| `shipbob_costco_on_time_pct` | 96 | 95 |
+| `costco_jira_aged_open_count` | 1 | 3 |
+
+## Data sources
+
+- `GET sftp://{host}{base_path}/inbox` - List inbound feed files (POs, item-master, return-auths, ACKs)
+- `GET sftp://{host}{base_path}/outbox` - List pending/un-ACKed outbound files (resilience: re-send on transient failure)
+- `PUT sftp://{host}{base_path}/outbox/{filename}` - Drop outbound ASN / invoice / item-master-update
+- `GET sftp://{host}{base_path}/archive` - Historical files for reconciliation + audit replay
+
+{/* Generated from costco_sip_health.yaml. Edit the audit module, not this page. */}

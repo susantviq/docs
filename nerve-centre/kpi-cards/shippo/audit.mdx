@@ -1,0 +1,73 @@
+---
+title: "Shippo audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Shippo health audit checks: Shippo: Orca ETA Accuracy, Returns-Label Health & Cross-Channel Dispatch Leak"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/shippo) · [Audit Profile](/nerve-centre/kpi-cards/shippo/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/shippo/sentiment)**
+
+Shippo is a multi-carrier shipping aggregator skewed to SMB / mid-market DTC merchants. Its distinguishing strengths are Orca predictive ETA (the checkout delivery promise) and a first-class Returns API. Findings either cost a customer (over-promised Orca ETA, stale rate cache showing wrong checkout cost) or stall reverse logistics (returns-label generation failures). Auth is a single ShippoToken header, so credential health and per-underlying-carrier failure attribution dominate. Cross-references commerce siblings via order_ref / tracking_number and Klaviyo via customer_email.
+
+## What this audit checks
+
+### Authentication & access
+- ShippoToken header still authenticates against GET /accounts/ (no 401)
+- Live token prefix 'shippo_live_' in use for production org (not a 'shippo_test_' sandbox key)
+- Inactive carrier_accounts (active=false) on previously-used carriers via GET /carrier_accounts/
+- Auth failures over rolling 24h above threshold (token revoked or rotated)
+
+### On-time delivery & transit
+- Orca predicted-ETA accuracy &lt; 85% (actual delivery vs orca_estimated_delivery within +/- 1 day)
+- On-time delivery rate &lt; 96% rolling 30D (tracking_status=DELIVERED before expected window)
+- Avg transit days up > 10% vs prior period (object_created -> DELIVERED status_date)
+- Dispatch SLA breached: NOW - object_created > sla_days while tracking_status not DELIVERED
+
+### Exceptions & failed deliveries
+- Exception rate > 3% rolling 30D (tracking_status=FAILURE via GET /tracks/)
+- Shipments stuck in PRE_TRANSIT > 48h (carrier never scanned label)
+- Label generation success &lt; 95% in last 1h (Nerve Centre alert parity)
+- Per-underlying-carrier label-creation failure rate > 2% (surface which credential needs refresh)
+
+### Damaged / lost parcels
+- Damaged-parcel rate > 0.5% (RETURNED or FAILURE with damage status_details)
+- Lost-in-transit rate: shipments with no tracking event > 7 days after PRE_TRANSIT
+- Returns label generation failure rate > 2% (status=ERROR / INVALID on /shipments/?metadata=return)
+- Return rate by underlying carrier > 8% (tracking_status=RETURNED / total by carrier_account)
+
+### Tracking data completeness
+- Tracking-event gap > 24h since last status_date while not in DELIVERED / RETURNED / FAILURE
+- Shipments missing tracking_number after label creation (tracking gap pct above threshold)
+- TrackingEvent records missing location json (poor downstream customer comms)
+- Rates cache staleness > 24h (wrong shipping cost shown at checkout)
+
+### Cross-channel fulfilment SLA
+- Cross-channel: ecom order has no matching Shippo shipment after 48h -> revenue at risk per channel
+- Cross-channel: actual delivery > Orca-predicted ETA by > 24h -> over-promised at checkout, CS escalation candidate
+- Cross-channel: tracking-event gap > 24h joined to commerce_sibling order -> proactive Klaviyo email candidate
+- Cross-channel: cost per parcel by zone > 10% above direct-carrier sibling (Shippo aggregation premium)
+- Cross-channel: late-delivery refund-propensity * sibling.order.total -> revenue exposure
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `on_time_delivery_rate` | 96 | 95 |
+| `orca_eta_accuracy_pct` | 90 | 85 |
+| `exception_rate` | 2 | 3 |
+| `avg_transit_days_change_pct` | 5 | 10 |
+| `damaged_rate` | 0.3 | 0.5 |
+| `tracking_gap_pct` | 3 | 5 |
+| `returns_label_failure_pct` | 1 | 2 |
+| `per_carrier_label_failure_pct` | 1 | 2 |
+| `return_rate_by_carrier_pct` | 6 | 8 |
+| `rates_cache_staleness_hours` | 12 | 24 |
+| `auth_token_failures_24h` | 1 | 5 |
+
+## Data sources
+
+- `GET https://api.goshippo.com/accounts/` - Account / auth validation (ShippoToken header)
+- `GET https://api.goshippo.com/shipments/` - Shipments + Orca ETA + returns (metadata=return filter)
+- `GET https://api.goshippo.com/tracks/` - Tracking events / status / exception detection
+- `GET https://api.goshippo.com/carrier_accounts/` - Underlying carrier account health + active flag
+
+{/* Generated from shippo_audit.yaml. Edit the audit module, not this page. */}

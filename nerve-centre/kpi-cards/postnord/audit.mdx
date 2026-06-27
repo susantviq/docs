@@ -1,0 +1,71 @@
+---
+title: "PostNord audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ PostNord health audit checks: PostNord: Pan-Nordic OTD, SE-to-NO Non-EU Customs & Cross-Channel Fulfilment Leak"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/postnord) · [Audit Profile](/nerve-centre/kpi-cards/postnord/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/postnord/sentiment)**
+
+PostNord is the pan-Nordic carrier of record for merchants shipping across SE / NO / DK / FI on a single contract. The distinctive complication: Norway is not in the EU, so SE-to-NO (and DK/FI-to-NO) parcels require customs declarations even though both ends are Nordic. Findings either cost a customer (OTD slip in one of four markets, SE-NO border hold) or surface cost arbitrage (pan-Nordic pricing vs Bring NO / DPD DK per corridor). Auth is the unusual 'apikey' query-string parameter (not a header). Cross-references commerce siblings via order_ref, carrier siblings (Bring / DPD) via zone, and tracking continuity via tracking_number.
+
+## What this audit checks
+
+### Authentication & access
+- apikey query-string parameter still authorises requests (no 401/403 on /restapi/shipment/v2/track)
+- Consignor number maps to an active PostNord business contract (no 'unknown consignor')
+- country_of_origin enum value (SE/NO/DK/FI) matches the live contract pricing tier
+- Sandbox vs production apikey not crossed (probe returns real shipments, not sandbox stubs)
+
+### On-time delivery & transit
+- Pan-Nordic OTD &lt; 90% rolling 30D (actual_delivery vs expected_delivery)
+- Per-country OTD divergence: any of SE/NO/DK/FI more than 5pp below the pan-Nordic average
+- Avg transit days breach: intra-EU corridor > 3d or SE-NO border corridor > 5d
+- Sunday-delivery success rate &lt; 85% where the service is offered by postcode
+
+### Exceptions & failed deliveries
+- Exception rate > 3% rolling 30D (status Exception across shipments)
+- AttemptedDelivery without subsequent Delivered within 48h (first-attempt failure)
+- MyPack Collect parcels uncollected past the pickup-point hold window
+- Refused / ReturnedToSender rate spike vs prior period
+
+### Damaged / lost parcels
+- Lost-parcel rate (status Lost) > 0.3% rolling 90D
+- Damaged-parcel claim rate > 0.5% rolling 90D
+- Return-label (RMA) parcels stuck InTransit and never Received
+- Claim value as % of PostNord shipping spend > 1% rolling 90D
+
+### Tracking data completeness
+- Tracking-event gap > 24h intra-EU (SE/DK/FI) on in-transit shipments
+- Tracking-event gap > 3d on SE-NO non-EU border (AwaitingCustoms stall)
+- Shipments with a tracking_number but zero tracking_event rows (silent parcels)
+- Delivered status with no recorded actual_delivery timestamp (OTD-uncomputable)
+
+### Cross-channel fulfilment SLA (the kill-shot area)
+- Cross-channel: shipments past expected_delivery joined to commerce_sibling orders -> revenue at risk per Nordic channel
+- Cross-channel: Nordic commerce order with no PostNord shipment after 48h -> dispatch SLA breach
+- Cross-channel: SE-NO parcels stuck AwaitingCustoms > 3d -> proactive commercial-invoice / IOSS fix candidates
+- Cross-channel: PostNord cost_sek per to_country_code more than 10% above Bring / DPD sibling on the same corridor -> pan-Nordic pricing arbitrage
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `on_time_delivery_rate` | 92 | 90 |
+| `exception_rate` | 2 | 3 |
+| `avg_transit_days` | 3 | 5 |
+| `damaged_rate` | 0.3 | 0.5 |
+| `tracking_gap_pct` | 5 | 10 |
+| `se_no_customs_clearance_pct` | 85 | 80 |
+| `lost_parcel_rate_pct` | 0.2 | 0.3 |
+| `sunday_success_rate` | 90 | 85 |
+| `claim_value_pct_of_spend` | 0.5 | 1 |
+| `auth_token_failures_24h` | 1 | 5 |
+
+## Data sources
+
+- `GET https://atapi2.postnord.com/restapi/shipment/v2/shipments` - Shipment list (status / OTD / cost / customs flag)
+- `GET https://atapi2.postnord.com/restapi/shipment/v2/track` - Tracking events (continuity + border stalls)
+- `POST https://atapi2.postnord.com/restapi/shipment/v2/shipments` - Label generation (write-side, print-failure probe)
+- `POST https://atapi2.postnord.com/restapi/shipment/v2/returns` - Return-label (RMA) creation and status
+
+{/* Generated from postnord_audit.yaml. Edit the audit module, not this page. */}

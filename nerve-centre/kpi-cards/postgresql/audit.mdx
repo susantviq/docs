@@ -1,0 +1,73 @@
+---
+title: "PostgreSQL audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ PostgreSQL health audit checks: PostgreSQL: keep queries fast, replicas current, capacity ahead of demand"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/postgresql) · [Audit Profile](/nerve-centre/kpi-cards/postgresql/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/postgresql/sentiment)**
+
+PostgreSQL-specific health audit for production database instances. Answers six questions: (1) is stats access correctly provisioned (read-only role, pg_stat_statements installed, SSL on managed endpoints); (2) is the instance up and reachable with connection errors bounded; (3) is query latency within the p95 / p99 bands and is the slow-query population trending up; (4) are streaming standbys keeping up and is WAL shipping faster than it accumulates; (5) is the instance ahead on disk, memory, and connection-pool capacity; (6) are backups current and durable enough to meet the recovery objective. Cross-channel area joins query and pool signals to commerce-sibling checkout funnel to size live revenue at risk.
+
+## What this audit checks
+
+### Authentication & access
+- Connection string resolves and the monitoring role can read pg_catalog (USAGE granted, pg_read_all_stats present)
+- pg_stat_statements extension is installed and present in shared_preload_libraries (slow-query KPIs depend on it)
+- sslmode=require is set on managed endpoints (RDS / Aurora / Crunchy / Heroku); plaintext flagged
+- Monitoring role is read-only - no write or superuser privileges beyond stats access
+
+### Connection & availability
+- Instance is reachable and pg_postmaster_start_time() returns a recent, stable uptime (no unplanned restart)
+- Connection error count over 24h below the alert band (transient auth / network failures bounded)
+- PostgreSQL major version is supported and not past end-of-life from pg_settings server_version
+- max_connections from pg_settings sized with headroom against observed peak backend count
+
+### Query performance
+- Query latency p95 within band - mean_exec_time aggregate from pg_stat_statements under threshold
+- Query latency p99 tail not diverging from p95 (no long-tail lock contention)
+- Slow-query rate (mean_exec_time > 100ms as share of total calls) under threshold
+- Buffer cache hit rate (blks_hit / blks_hit + blks_read from pg_stat_database) above 95% on OLTP
+
+### Replication & lag
+- Streaming replication lag in seconds (replay_lag from pg_stat_replication) under threshold
+- WAL bytes pending (pg_wal_lsn_diff primary vs replay_lsn) not growing sustained - standby keeping up
+- Every configured standby has state=streaming - none in catchup, broken, or stopped
+- At least one healthy standby with sub-second lag exists for a safe promotion path
+
+### Storage & capacity
+- Database disk usage percent under threshold with growth-rate runway before exhaustion
+- Connection-pool saturation (active + idle-in-tx / max_connections) under threshold
+- Idle-in-transaction backend count bounded - stuck transactions hold locks and bloat the pool
+- Autovacuum current on hot tables - oldest n_dead_tup table not unvacuumed past threshold (wraparound risk)
+
+### Backups & durability
+- Last successful base backup / WAL archive age within the recovery-point objective
+- WAL archiving is active and not failing (archive_command succeeding, no pile-up)
+- Point-in-time recovery window covers the required retention horizon
+
+### Cross-channel: revenue protection
+- QPS spike with no concurrent ecom order spike (sibling = shopify / bigcommerce / adobe order rate flat) flagged as bot / scraper load
+- Pool saturation > 90% during a commerce-sibling traffic burst (pool exhaustion = lost checkouts)
+- Slow-query spike co-occurring with a sibling checkout-completion drop in the same 5-min window
+- Inventory-table row drift vs sibling product_inventory count (oversell risk when DB is source of truth)
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `connection_error_rate` | 1 | 5 |
+| `query_p95_ms` | 200 | 500 |
+| `replication_lag_sec` | 10 | 30 |
+| `disk_usage_pct` | 80 | 90 |
+| `slow_query_count` | 5 | 15 |
+
+## Data sources
+
+- `GET postgresql://{host}:{port}/{database}#pg_settings` - Instance config - version, max_connections, shared_buffers, server_version
+- `GET postgresql://{host}:{port}/{database}#pg_stat_activity` - Live backends, states, idle-in-transaction, application_name for pool saturation
+- `GET postgresql://{host}:{port}/{database}#pg_stat_statements` - Normalised query stats - mean_exec_time, calls, total_exec_time for slow-query + p95/p99
+- `GET postgresql://{host}:{port}/{database}#pg_stat_replication` - Standby state, replay_lag, WAL pending bytes for replication health
+- `GET postgresql://{host}:{port}/{database}#pg_stat_database` - Cache hit rate, deadlocks, connection errors per database
+- `GET postgresql://{host}:{port}/{database}#pg_stat_user_tables` - Dead tuples + last autovacuum per table for bloat / starvation checks
+
+{/* Generated from postgresql_audit.yaml. Edit the audit module, not this page. */}
