@@ -1,0 +1,74 @@
+---
+title: "MySQL audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ MySQL health audit checks: MySQL: keep queries fast, replicas honest, and storage safe"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/mysql) · [Audit Profile](/nerve-centre/kpi-cards/mysql/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/mysql/sentiment)**
+
+MySQL-specific health audit for production 5.7 / 8.0 instances. Answers six questions: (1) is access correctly scoped and is performance_schema actually readable; (2) is the instance reachable with a healthy connection pool and low aborted-connect noise; (3) is query latency within band and is the slow-query digest list under control; (4) are replicas streaming with both threads running and Seconds_Behind_Source inside threshold; (5) is disk and buffer-pool capacity healthy; (6) is a recent durable backup in place. Cross-channel area joins query and pool pressure to commerce-sibling checkout traffic to size live revenue at risk.
+
+## What this audit checks
+
+### Authentication & access
+- Connection succeeds over the configured connection_string with SSL mode honoured on managed endpoints (RDS / Aurora / PlanetScale / Cloud SQL)
+- Audit user holds SELECT on performance_schema plus REPLICATION CLIENT and PROCESS (else replication and digest checks degrade to skipped)
+- performance_schema is enabled (SHOW VARIABLES LIKE 'performance_schema') so events_statements_summary_by_digest returns rows
+- sys schema installed for friendlier digest labels; warn when absent
+
+### Connection & availability
+- Instance reachable and SHOW GLOBAL STATUS returns within timeout; Uptime > 0 confirms no recent unplanned restart
+- Connection pool saturation (Threads_connected / max_connections) below threshold with headroom for traffic bursts
+- Aborted_connects over 24h below threshold (spikes signal wrong creds, network drops, or max_connect_errors hit)
+- Threads_running not pinned high relative to Threads_connected (sign of query pile-up / stalls)
+
+### Query performance
+- Query latency p95 (derived from events_statements_summary_by_digest AVG_TIMER_WAIT) within threshold
+- Slow-query rate (Slow_queries delta / Questions delta from SHOW GLOBAL STATUS) below threshold over a 15m window
+- Top-10 slow digests reviewed; no new digest entering the list with high rows_examined / rows_returned ratio
+- InnoDB deadlocks (SHOW ENGINE INNODB STATUS) at zero over the last 5m
+
+### Replication & lag
+- Both Replica_IO_Running and Replica_SQL_Running are Yes on every replica (SHOW REPLICA STATUS / SHOW SLAVE STATUS on &lt; 8.0.22)
+- Seconds_Behind_Source within lag threshold and not null on any active replica
+- Active replica count matches expected topology; no replica in BROKEN or STOPPED state
+- Binlog backlog ahead of the slowest replica position below threshold (growing backlog = replica falling behind)
+
+### Storage & capacity
+- Database disk usage percent below threshold with runway before the volume fills
+- InnoDB buffer pool hit rate (1 - Innodb_buffer_pool_reads / Innodb_buffer_pool_read_requests) above threshold
+- InnoDB dirty pages percent below threshold to avoid checkpoint pressure and write storms
+- InnoDB free pages above the floor (> 1% of total pages) so the pool is not starved
+
+### Backups & durability
+- Last successful backup age (mysqldump / Percona XtraBackup / RDS snapshot) within freshness threshold
+- binlog_expire_logs_seconds / expire_logs_days set so point-in-time recovery has a usable window
+- Binary logging enabled (log_bin = ON) where PITR or replication is required
+- innodb_flush_log_at_trx_commit = 1 and sync_binlog = 1 for durable-by-default writes (warn on relaxed settings)
+
+### Cross-channel: revenue protection
+- QPS spike with no matching order spike (sibling = bigcommerce/shopify/adobe orders_per_15m flat while mysql.qps surges = bot / scraper load)
+- Pool saturation during traffic burst (sibling = commerce checkout volume rising while Threads_connected / max_connections crosses threshold = lost orders)
+- Slow queries co-occurring with checkout drop (mysql.slow_query in same 5m window as sibling.checkout_step_completion_rate falling > 5pp)
+- Inventory-table row drift vs ecom inventory count (mysql merchant-owned schema row count vs sibling.product_inventory by sku = oversell risk)
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `connection_error_rate` | 0.5 | 1 |
+| `query_p95_ms` | 200 | 500 |
+| `replication_lag_sec` | 10 | 30 |
+| `disk_usage_pct` | 80 | 90 |
+| `slow_query_count` | 5 | 20 |
+
+## Data sources
+
+- `GET mysql://{host}:{port}/{database} :: SHOW VARIABLES` - Instance config: version, max_connections, performance_schema, buffer-pool size, binlog settings
+- `GET mysql://{host}:{port}/{database} :: SHOW GLOBAL STATUS` - Live counters: Questions, Slow_queries, Threads_connected/running, Aborted_connects, Uptime, InnoDB buffer-pool reads
+- `GET mysql://{host}:{port}/{database} :: performance_schema.events_statements_summary_by_digest` - Per-digest latency (p50/p95/p99), rows_examined, rows_returned for slow-query analysis
+- `GET mysql://{host}:{port}/{database} :: performance_schema.processlist` - Live connection / thread inventory and pool occupancy by app_name
+- `GET mysql://{host}:{port}/{database} :: SHOW REPLICA STATUS` - Replica thread state and Seconds_Behind_Source (SHOW SLAVE STATUS on &lt; 8.0.22)
+- `GET mysql://{host}:{port}/{database} :: SHOW ENGINE INNODB STATUS` - InnoDB deadlocks, buffer-pool dirty/free pages, checkpoint pressure
+
+{/* Generated from mysql_audit.yaml. Edit the audit module, not this page. */}

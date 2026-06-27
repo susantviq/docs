@@ -1,0 +1,64 @@
+---
+title: "Odoo audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Odoo health audit checks: Odoo: GL Recognition, Stock Integrity, Catalogue Health & Revenue-at-Risk"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/odoo) · [Audit Profile](/nerve-centre/kpi-cards/odoo/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/odoo/sentiment)**
+
+Odoo merchants run storefront, stock, and books in one database, so the health questions span commerce AND finance. This audit answers: (1) is the XML-RPC / JSON-RPC credential healthy and scoped to Sales + Inventory + Accounting, (2) is revenue recognised - confirmed sale.order rows actually becoming posted account.move customer invoices, (3) is stock integrity holding - no negative on-hand, no published out-of-stock leaking sales, catalogue rows complete, and (4) where does revenue leak when Odoo is joined to ads / marketplace / email / ecom siblings (single-DB joins are unusually clean because Odoo is the source of record).
+
+## What this audit checks
+
+### Authentication & access
+- API key / password authenticates against the configured database (authenticate→uid on /xmlrpc/2/common; version() probe succeeds)
+- host_url resolves and serves the expected Odoo major version (16 / 17 / 18 in scope)
+- Integration user has read access to sale.order, product.product, account.move, res.partner, stock.quant
+- Edition matches configured value - Accounting (account.move analytics) requires Enterprise; finance checks no-op on Community
+
+### Revenue recognition & GL health
+- Confirmed sale.order (state=sale/done) with no posted account.move out_invoice after 7d - revenue not recognised in the books
+- Posted customer invoices overdue (invoice_date_due &lt; today AND payment_state != paid) above receivables threshold
+- Draft account.move (out_invoice) older than the close cadence - invoicing backlog stuck before posting
+- Refund / credit-note value (out_refund) as a share of out_invoice value above threshold - returns or fulfilment quality problem
+
+### Stock integrity
+- stock.quant rows with quantity &lt; 0 (negative on-hand) - oversell / stock-move integrity failure
+- Published products with available_quantity &lt;= 0 - out-of-stock leaking onto the live storefront
+- Products below configured reorder point and falling - restock before stockout
+- Slow-moving inventory value (no stock-move in 90d) above share-of-inventory threshold - tied-up working capital
+
+### Catalogue & merchandising quality
+- Published product.product missing image_1920 (no image) - conversion + SEO leak
+- Published products with empty description_sale - thin content, weak organic ranking
+- product.product with empty default_code (internal reference / SKU) - breaks cross-channel SKU joins
+- Published products with list_price = 0 or null - unsellable or mis-priced storefront rows
+
+### Cross-channel: revenue-at-risk (the killer area)
+- Active ad spend (google_ads / amazon_ads product_ad) on products whose Odoo available_quantity &lt;= 0 (sibling = ad_platform)
+- Price / title drift between Odoo product (source of record) and marketplace/ecom listing on default_code=sku (sibling = marketplace / ecommerce_platform)
+- Repeat ecom customers absent from Odoo res.partner after 7d, by email (sibling = ecommerce_platform)
+- Confirmed ecom-channel orders with no matching Odoo sale.order, or B2B partner VAT mismatch vs ecom (sibling = ecommerce_platform)
+- Email-attributed share of confirmed Odoo revenue dropping > 25% vsP (sibling = email_marketing)
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `unrecognised_revenue_orders_count` | 1 | 10 |
+| `overdue_receivables_pct` | 5 | 15 |
+| `refund_credit_rate_pct` | 3 | 5 |
+| `negative_onhand_count` | 1 | 5 |
+| `published_out_of_stock_count` | 1 | 10 |
+| `catalogue_incomplete_pct` | 5 | 15 |
+| `slow_mover_inventory_pct` | 10 | 20 |
+| `cancellation_rate_pct` | 5 | 8 |
+| `ads_spend_on_oos_amount` | 1 | 100 |
+
+## Data sources
+
+- `POST https://{host_url}/xmlrpc/2/common` - authenticate (uid) + version() auth/identity probe
+- `POST https://{host_url}/xmlrpc/2/object` - execute_kw search_read / read_group / search_count over sale.order, product.product, account.move, res.partner, stock.quant
+- `POST https://{host_url}/jsonrpc` - JSON-RPC equivalent of execute_kw (service=object) - same models/fields
+
+{/* Generated from odoo_health.yaml. Edit the audit module, not this page. */}

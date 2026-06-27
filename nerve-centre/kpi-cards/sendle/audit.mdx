@@ -1,0 +1,68 @@
+---
+title: "Sendle audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Sendle health audit checks: Sendle: Flat-Rate Zone OTD, Pickup-Network Coverage & Cross-Channel Leak"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/sendle) · [Audit Profile](/nerve-centre/kpi-cards/sendle/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/sendle/sentiment)**
+
+Sendle is an AU/US SMB-focused courier - flat-rate-by-zone pricing (3 zones AU, 5 zones US) and 100% carbon-offset shipping. Tier-3 footprint, small but loyal user base. Findings either cost a customer (missed dispatch SLA, stalled pickup, tracking blackout) or erode the cost case that justifies Sendle over AusPost / USPS (flat-rate arbitrage gap). Cross-references commerce siblings via order_ref and rival carriers (australia_post / easypost / shippo) via zone for rate-shop comparison.
+
+## What this audit checks
+
+### Authentication & access
+- HTTP Basic auth (sender_id + api_key) still authenticates against GET /api/orders (no 401)
+- sender_id maps to an active Sendle account in the correct region (AU vs US - zone pricing differs)
+- api_key prefix matches environment (production prefix-free; sandbox prefixed 'sandbox_') - no cross-environment credential drift
+- Auth failures in last 24h below threshold (per-sender_id 300/min rate limit not exhausting tokens)
+
+### On-time delivery & transit
+- On-time delivery rate &lt; 96% rolling 30D (actual_delivery vs expected_delivery on /api/orders)
+- Avg transit days (created_at -> actual_delivery) above zone baseline
+- Pickup booking success rate &lt; 95% first attempt (driver-network coverage signal)
+- Pickup_Attempt_Failed status count rising by postcode / from_zone
+
+### Exceptions & failed deliveries
+- Exception rate > 3% rolling 30D (status = Exception on /api/orders or /api/tracking)
+- Shipments stuck in Pickup_Booked > 48h with no In_Transit event
+- Card_Left / Customer_Pickup events not converting to Delivered within SLA
+- Returned-shipment rate by product_code (STANDARD vs EXPRESS vs INTERNATIONAL)
+
+### Damaged / lost parcels
+- Damaged-parcel rate > 0.5% rolling 90D
+- Lost-in-transit rate (last tracking event > 7 days stale, never Delivered)
+- Return-label issuance spike on /api/returns correlated to damage claims
+- High-value parcels (price_total top decile) with damage / loss exposure
+
+### Tracking data completeness
+- Tracking-event gap > 24h on in-flight shipments (status NOT IN Delivered, Returned, Cancelled)
+- Shipments on /api/orders with no matching event on /api/tracking (tracking blackout)
+- Missing tracking_url or sendle_reference on dispatched shipments
+- Pickup_Attempted events that never progress to In_Transit
+
+### Cross-channel fulfilment SLA (the kill-shot area)
+- Cross-channel: commerce_sibling AU/US order with no Sendle shipment after 48h -> dispatch leak
+- Cross-channel: late shipments joined to order_ref -> revenue at risk per channel * sibling.order.total
+- Cross-channel: flat-rate arbitrage - Sendle price_total > AusPost / EasyPost cost by zone (renegotiate or switch)
+- Cross-channel: carbon_offset_grams reporting drift vs shipment volume (sustainability-badge certification risk)
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `on_time_delivery_rate` | 96 | 95 |
+| `exception_rate` | 2 | 3 |
+| `avg_transit_days` | 4 | 6 |
+| `damaged_rate` | 0.5 | 1 |
+| `tracking_gap_pct` | 5 | 10 |
+| `pickup_success_rate_pct` | 95 | 92 |
+| `auth_token_failures_24h` | 1 | 5 |
+
+## Data sources
+
+- `GET https://api.sendle.com/api/orders` - Shipment list - OTD, status, zone, price_total, carbon_offset (validate_endpoint)
+- `POST https://api.sendle.com/api/orders` - Label / order creation (write-side)
+- `GET https://api.sendle.com/api/tracking` - Tracking events - gap detection, exception flow
+- `POST https://api.sendle.com/api/returns` - Return-label issuance (damage / lost flow)
+
+{/* Generated from sendle_audit.yaml. Edit the audit module, not this page. */}

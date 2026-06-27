@@ -1,0 +1,70 @@
+---
+title: "Acumatica audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Acumatica health audit checks: Acumatica: Order-to-Cash Sync, Inventory Parity, AR Aging & GL Health"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/acumatica) · [Audit Profile](/nerve-centre/kpi-cards/acumatica/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/acumatica/sentiment)**
+
+The questions an SMB-to-mid-market finance + operations lead asks at 9am on Monday: did yesterday's storefront orders all land in Acumatica as sales orders + invoices, is multi-warehouse stock-on-hand drifting from the storefront, is AR aging concentrating on customers still placing new ecom orders, and are GL batches posting cleanly so the period can close. Cross-references the ecommerce platforms (BigCommerce / Adobe Commerce / Shopify) - an order with no matching Acumatica invoice, inventory variance on active-order SKUs, or overdue AR on a still-shipping customer are the killer reconciliation findings no single tool can see.
+
+## What this audit checks
+
+### Authentication & access
+- OAuth2 token refresh against /identity/connect/token succeeds (client_id + client_secret + refresh_token, scope `api offline_access`)
+- Connected Application has the `api` scope and the integration user's role grants read access to SalesOrder / Invoice / Customer / StockItem / JournalTransaction entities
+- Contract API version resolves - GET /entity/Default/{contract_version}/Company returns the tenant without a 404 (wrong version) or 401 (bad token)
+- License-tier concurrent-request limit headroom - sustained 429 / 'License limit exceeded' indicates the API seat is saturated by other integrations
+
+### Order-to-cash health
+- Sales orders stuck in Hold / PendingApproval >48h (approval-routing rule broken - blocks fulfilment + invoicing)
+- Order-to-cash velocity (storefront order → invoice paid) regressing >20% vs trailing 30d
+- Invoices in Hold / PendingApproval blocking AR recognition
+- Sales orders Completed but with no corresponding AR invoice after the sync window (revenue not recognised)
+
+### Inventory & distribution health
+- Any warehouse QtyOnHand negative (receipt / shipment posting error or oversell)
+- Stock days-on-hand >120d on >10% of SKUs (slow movers tying up working capital)
+- Warehouse-level stockout (QtyAvailable = 0) on a SKU with open sales orders
+- Inventory turns annualised &lt;4 (distribution-edition efficiency floor)
+
+### AR & GL economics
+- AR aged 60+ days above 15% of total AR balance
+- Days Sales Outstanding (DSO) above 60 days
+- GL journal batches Unposted / OnHold above 50 (close-cycle backlog)
+- GL batch with DebitTotal != CreditTotal (imbalanced - blocks period close)
+- Financial period open past its scheduled close date by >5 days
+
+### Cross-channel: Acumatica vs ecommerce reconciliation
+- Storefront order has no matching Acumatica sales order/invoice after the sync window (sibling = bigcommerce.order / shopify.order / adobe_commerce.order, by external_ref)
+- Acumatica aggregate QtyAvailable drifts >5% from storefront available qty on SKUs with active orders (sibling = bigcommerce.product / shopify.product / adobe_commerce.product, by InventoryID=sku)
+- Ecom customer with completed orders absent from Acumatica customer master after 7d (sibling = bigcommerce.customer / shopify.customer, by email)
+- Customer with AR aged 60+ days still placing new ecom orders (credit risk compounding, sibling = ecommerce customer by email)
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `erp_open_journal_count` | 25 | 50 |
+| `erp_journal_imbalance_count` | 1 | 5 |
+| `erp_inventory_variance_pct` | 1 | 5 |
+| `erp_ar_aging_60d_pct` | 5 | 15 |
+| `erp_customer_master_drift` | 5 | 10 |
+| `erp_period_close_overdue_days` | 1 | 5 |
+| `erp_dso_days` | 45 | 60 |
+| `stock_days_on_hand` | 90 | 120 |
+| `orders_on_hold_count` | 5 | 10 |
+
+## Data sources
+
+- `POST /identity/connect/token` - OAuth2 token refresh on the per-tenant Identity Server
+- `GET /entity/Default/{version}/Company` - Auth / tenant validation probe
+- `GET /entity/Default/{version}/SalesOrder` - Sales orders - order-to-cash, backlog, hold status
+- `GET /entity/Default/{version}/Invoice` - AR invoices - balance, aging buckets, DSO
+- `GET /entity/Default/{version}/Customer` - Customer master - credit hold, B2B tax reg, master drift
+- `GET /entity/Default/{version}/StockItem` - Stock items - cost, status, inventory value
+- `PUT /entity/Default/{version}/InventorySummaryInquiry` - Per-warehouse QtyOnHand / QtyAvailable allocation inquiry
+- `GET /entity/Default/{version}/Project` - Projects - margin, milestone billing (Project Accounting module)
+- `GET /entity/Default/{version}/JournalTransaction` - GL batches - unposted count, debit/credit balance
+
+{/* Generated from acumatica_health.yaml. Edit the audit module, not this page. */}

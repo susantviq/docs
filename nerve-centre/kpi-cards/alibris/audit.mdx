@@ -1,0 +1,77 @@
+---
+title: "Alibris audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Alibris health audit checks: Alibris: FTP Feed Health, Listing Visibility & Cross-Channel ISBN Leak"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/alibris) · [Audit Profile](/nerve-centre/kpi-cards/alibris/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/alibris/sentiment)**
+
+Alibris is a used / rare-book reseller marketplace served entirely over plain FTP (Pure-FTPd at pub.alibris.com - AUTH TLS supported but not required, and the existing CloudHub bridge connects without it). Audits cover FTP connectivity + feed-cycle health, listing visibility (suspended, pending, stale, missing-ISBN), order fulfilment SLA (the seller-rating signal that drives Alibris account standing), pricing / margin watch on rare titles, and cross-channel ISBN comparisons against AbeBooks + Amazon book listings to surface drift, missing-on-Alibris ISBNs, and channel-mix imbalance for book-trade merchants.
+
+## What this audit checks
+
+### Authentication & connectivity
+- Plain FTP login on pub.alibris.com:21 succeeds (220 -> 331 -> 230)
+- Optional AUTH TLS upgrade, when configured, negotiates cleanly (no fallback to plain after merchant opted in)
+- Passive-mode data channel opens on the merchant's egress
+- download/ + upload/ folders readable / writable for the merchant's username
+- Time skew between merchant clock and Alibris server &lt;5 min
+
+### Listing-feed health
+- Last successful /upload/listings drop &lt;48h (any older = feed blind)
+- Failed batches in /download/acks (any > 0 = rows Alibris rejected)
+- Top error patterns clustered from inbound ack files (drives 'fix once' bug list)
+- ISBN coverage &lt;90% (untracked listings can't cross-reference AbeBooks / Amazon)
+- Stale listings >180d no update >10% of catalogue
+- Suspended / pending listings >0 (direct revenue blocker)
+
+### Order-feed health
+- Inbound /download/orders file lag >12h (probable upstream incident)
+- Pending dispatch >2x 30D average (back-office backlog)
+- Avg time to process >24h
+- Late dispatches past dispatch_due_by >5% of 30D orders (account-standing risk)
+- Cancellation rate >3%
+- Return rate >5% (book-trade tolerates some, watch for grading drift on used stock)
+
+### Cost & efficiency
+- Commission paid % of revenue drift vs prior 90D
+- Avg dispatch hours rising trend (fulfilment cost creep)
+- Per-condition margin: like_new / very_good vs acceptable mix shift
+- AOV drop with no volume drop (mix shift to lower-condition stock)
+
+### Cross-channel: leak vs AbeBooks + Amazon (the killer area)
+- ISBN drift - same ISBN, Alibris vs AbeBooks vs Amazon price delta >15%
+- Top-50 AbeBooks / Amazon book-revenue ISBNs not listed on Alibris (cheapest revenue lift)
+- Alibris price >15% below merchant's own DTC list on like_new / very_good first editions (margin erosion)
+- Channel mix anomaly: Alibris share of book-trade revenue dropping >25% WoW vs sibling book marketplaces
+- Outbound feed cycle desync: same SKU updated on AbeBooks but no Alibris /upload/listings drop in 7d
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `hours_since_last_successful_upload` | 24 | 48 |
+| `failed_batch_count_7d` | 1 | 5 |
+| `isbn_coverage_pct` | 90 | 80 |
+| `suspended_listings_count` | 1 | 5 |
+| `stale_listings_pct` | 5 | 10 |
+| `inbound_orders_file_lag_hours` | 6 | 12 |
+| `pending_dispatch_multiplier` | 1.5 | 2 |
+| `avg_time_to_process_hours` | 18 | 24 |
+| `late_dispatch_pct` | 3 | 5 |
+| `cancellation_rate_pct` | 2 | 3 |
+| `return_rate_pct` | 4 | 5 |
+| `isbn_drift_count` | 5 | 10 |
+| `missing_on_alibris_count` | 3 | 5 |
+| `rare_book_floor_violation_count` | 1 | 5 |
+
+## Data sources
+
+- `GET ftp://pub.alibris.com:21/download/orders/` - Download daily order files for SLA + revenue audits.
+- `GET ftp://pub.alibris.com:21/download/acks/` - Read upload acks + processed-with-errors reports for feed-health audit.
+- `GET ftp://pub.alibris.com:21/download/returns/` - Return + refund notifications for return-rate audit.
+- `PUT ftp://pub.alibris.com:21/upload/listings/` - Upload-cycle telemetry source - confirmed-vs-rejected counts drive feed health.
+- `PUT ftp://pub.alibris.com:21/upload/price/` - Price delta uploads - per-batch ack timing.
+- `PUT ftp://pub.alibris.com:21/upload/quantity/` - Quantity-only uploads - fast availability updates.
+
+{/* Generated from alibris_health.yaml. Edit the audit module, not this page. */}

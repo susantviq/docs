@@ -1,0 +1,73 @@
+---
+title: "Supabase audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Supabase health audit checks: Supabase: keep the API layer fast, the pool unsaturated, and Postgres durable"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/supabase) · [Audit Profile](/nerve-centre/kpi-cards/supabase/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/supabase/sentiment)**
+
+Supabase-specific database health audit. Answers six questions: (1) is project access correctly keyed - service_role kept server-side, Management API PAT scoped, RLS in force on the anon key; (2) is the project reachable and the PostgREST / Realtime layer up; (3) is query performance within band - PostgREST p95, Postgres p95, and the pg_stat_statements slow-query tail; (4) are read replicas streaming and is lag bounded; (5) is the Supavisor pool and disk under their tier caps; (6) are daily backups / PITR current and recoverable. Cross-channel area joins pool saturation and slow PostgREST queries to commerce-sibling checkout traffic to size live revenue at risk.
+
+## What this audit checks
+
+### Authentication & access
+- service_role JWT present and handled server-side only (never shipped to client / anon contexts)
+- Management API PAT scoped to the org and able to read /v1/projects/{ref}
+- Row-Level Security enabled on tables exposed through the anon (public) key
+- Supavisor pooler connection string valid (transaction mode 6543 / session mode 5432) and reachable
+
+### Connection & availability
+- Project /v1/projects/{ref} returns ACTIVE_HEALTHY (not paused / restricted / read-only)
+- PostgREST /rest/v1 reachable and returning 2xx on a probe request
+- Realtime tenant health endpoint /realtime/v1/api/tenants/{ref}/health reports connected
+- Project not in disk-full read-only mode (tier disk cap not breached)
+
+### Query performance
+- PostgREST API latency p95 below 200ms and p99 below 500ms
+- Underlying Postgres query latency p95 below 200ms
+- Slow-query rate below 5% over a 15m window (pg_stat_statements mean_exec_time)
+- Buffer cache hit rate at or above 95% (low hit rate signals undersized cache / missing indexes)
+
+### Replication & lag
+- Every read replica in STREAMING state via pg_stat_replication (no RECOVERING / BROKEN / STOPPED)
+- Read-replica lag below 10s so read-routed PostgREST queries stay current
+- Replica region set is intentional and each regional replica is reporting last_check_at recently
+
+### Storage & capacity
+- Database disk usage below 90% of the tier cap (cap breach forces read-only mode)
+- Supavisor pool saturation below 90% of the tier connection cap
+- Connections in use below max_connections with a non-growing Supavisor wait_queue
+- Memory usage below 85% and deadlock count zero over the last 5m
+
+### Backups & durability
+- Last daily backup age below 72h (Pro+; Free tier has no managed backup - flag the gap)
+- Point-in-Time Recovery enabled on tiers that support it and within retention window
+- Edge Function error rate below 2% so backed write paths are not silently failing
+
+### Cross-channel: revenue at risk
+- Supavisor pool saturation > 90% concurrent with a commerce-sibling traffic burst (shopify/bigcommerce/adobe.order rate)
+- Slow PostgREST queries co-occurring with a sibling checkout-completion drop in the same 5m bucket
+- Supabase QPS spike with no matching ecom order spike (signals retries / runaway client, not real demand)
+- Products-table row count drifting from the sibling ecom catalog SKU count when Supabase is the source of truth
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `connection_error_rate` | 1 | 5 |
+| `query_p95_ms` | 200 | 500 |
+| `replication_lag_sec` | 10 | 60 |
+| `disk_usage_pct` | 80 | 90 |
+| `slow_query_count` | 5 | 20 |
+
+## Data sources
+
+- `GET https://{project_ref}.supabase.co/rest/v1/rpc/pg_stat_statements` - pg_stat_statements via service_role RPC - slow-query tail, mean_exec_time
+- `GET https://{project_ref}.supabase.co/realtime/v1/api/tenants/{ref}/health` - Realtime tenant health - channel / connection status
+- `GET https://{project_ref}.supabase.co/rest/v1/` - PostgREST availability + latency probe
+- `GET https://api.supabase.com/v1/projects/{ref}` - Management API (PAT) - project status, tier, region, max_connections
+- `GET https://api.supabase.com/v1/projects/{ref}/analytics/endpoints/logs.all` - Project log analytics - error rates, PostgREST 5xx, request volume
+- `GET pg_stat_activity` - Direct Postgres via Supavisor - connections in use, wait queue, pool state
+- `GET pg_stat_replication` - Direct Postgres via Supavisor - replica role, state, lag_seconds
+
+{/* Generated from supabase_audit.yaml. Edit the audit module, not this page. */}
