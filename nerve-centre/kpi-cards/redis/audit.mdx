@@ -1,0 +1,76 @@
+---
+title: "Redis audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Redis health audit checks: Redis: keep the cache earning its keep, memory bounded, replication safe"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/redis) · [Audit Profile](/nerve-centre/kpi-cards/redis/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/redis/sentiment)**
+
+Redis-specific health audit. Answers six questions: (1) is access locked down to an ACL user with least-privilege stats permissions and is TLS on for cloud-managed instances; (2) is the instance reachable and accepting connections, or are clients being rejected at maxclients; (3) is command latency healthy and is the SLOWLOG quiet, or are large keys / slow Lua scripts dragging p95; (4) are replicas connected and caught up, and in Cluster mode are all 16384 slots covered with master plus replica; (5) is memory pressure under control - used_memory clear of maxmemory and eviction not storming; (6) is persistence healthy and an offsite backup recent enough to meet recovery objectives. Cross-channel area joins Redis load and slow commands to commerce-sibling checkout windows to size live revenue at risk.
+
+## What this audit checks
+
+### Authentication & access
+- AUTH succeeds with the configured ACL user (Redis 6+); 'default' user not relied on in production
+- Stats user has only +info +client +cluster +readonly - no write or admin grants
+- TLS enabled (rediss://) for cloud-managed instances (ElastiCache / Redis Cloud / Upstash)
+- Sentinel / Cluster endpoint reachable so shards can be enumerated via CLUSTER NODES
+
+### Connection & availability
+- INFO server responds and uptime_in_seconds confirms no recent unplanned restart
+- rejected_connections from INFO stats is 0 over 24h - no clients refused at maxclients
+- connected_clients / maxclients (pool saturation) below 90%
+- blocked_clients on BLPOP / BRPOP / WAIT not sustained above the alert band
+
+### Query performance (p95 / slow queries)
+- Command latency p95 below 10ms (Redis commands are typically sub-ms)
+- Command latency p99 below 50ms - spikes point to large keys, slow Lua, or swap
+- SLOWLOG GET 128 entries under the 15m alert band (default slowlog-log-slower-than 10ms)
+- Top SLOWLOG command patterns reviewed - no O(N) KEYS / SMEMBERS / HGETALL on hot keys
+
+### Replication & lag
+- connected_slaves from INFO replication is at least 1 (failover target available)
+- Replica master_last_io_seconds_ago (lag) below 10s on every replica
+- Replica state STREAMING - not RECOVERING, BROKEN, or STOPPED
+- Cluster mode: cluster_slots_ok = 16384 from CLUSTER INFO - no slot left uncovered
+
+### Storage & capacity
+- used_memory / maxmemory below 90% - clear of the eviction threshold
+- evicted_keys delta below 100/min sustained (maxmemory pressure indicator)
+- mem_fragmentation_ratio between 1.0 and 1.5 - below 1.0 means swap in progress (bad)
+- Total keys per db growing in line with expectation - no silent key explosion
+
+### Backups & durability
+- rdb_last_save_time from INFO persistence within the last 60 minutes
+- aof_last_bgrewrite_status from INFO persistence is 'ok', not 'err'
+- Last successful RDB / AOF backup shipped offsite within 72h (ElastiCache: CloudWatch backup events)
+
+### Cross-channel: revenue protection
+- Redis ops/sec spike with no matching ecom order spike (sibling = bigcommerce/shopify.orders_per_15m) - cache stampede or bot
+- Connected-clients saturation above 90% maxclients during a sibling traffic burst (drops downstream services)
+- Session-key count drift vs active ecom sessions (redis.keyspace prefix='session:*' vs sibling.checkout active sessions)
+- SLOWLOG entries co-occurring with a sibling checkout-completion drop within a 5m window
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `connection_error_rate` | 1 | 5 |
+| `query_p95_ms` | 10 | 50 |
+| `replication_lag_sec` | 10 | 30 |
+| `disk_usage_pct` | 80 | 90 |
+| `slow_query_count` | 10 | 50 |
+
+## Data sources
+
+- `GET redis://{host}:{port}/{db} INFO server` - Instance identity, version, uptime_in_seconds
+- `GET redis://{host}:{port}/{db} INFO clients` - connected_clients, blocked_clients, maxclients
+- `GET redis://{host}:{port}/{db} INFO stats` - ops/sec, keyspace_hits/misses, evicted_keys, rejected_connections
+- `GET redis://{host}:{port}/{db} INFO memory` - used_memory, maxmemory, mem_fragmentation_ratio
+- `GET redis://{host}:{port}/{db} INFO replication` - connected_slaves, master_last_io_seconds_ago, role
+- `GET redis://{host}:{port}/{db} INFO persistence` - rdb_last_save_time, aof_last_bgrewrite_status
+- `GET redis://{host}:{port}/{db} SLOWLOG GET 128` - Recent slow commands with duration and pattern
+- `GET redis://{host}:{port}/{db} CLUSTER INFO` - cluster_slots_ok / cluster_state (Cluster only)
+- `GET redis://{host}:{port}/{db} CLUSTER NODES` - Per-node role and slot ownership (Cluster only)
+
+{/* Generated from redis_audit.yaml. Edit the audit module, not this page. */}

@@ -1,0 +1,74 @@
+---
+title: "EasyPost audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ EasyPost health audit checks: EasyPost: Multi-Carrier OTD, Rate-Shop Integrity & Cross-Channel Fulfilment SLA"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/easypost) · [Audit Profile](/nerve-centre/kpi-cards/easypost/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/easypost/sentiment)**
+
+EasyPost is a multi-carrier abstraction layer - one unified API over 100+ carriers (USPS, FedEx, UPS, DHL, Canada Post and more). The audit value is not a single carrier's promise but the rate-shop choices and the per- underlying-carrier OTD that EasyPost surfaces. Findings either cost a customer (tracking-event gap, exception, lost or damaged parcel) or expose rate-shop drift (a carrier that EasyPost keeps picking but that underperforms its cost prediction). Cross-references commerce siblings via order_ref / tracking_code, sibling carrier manifests (royal_mail, fedex, dpd) via tracking_number for rate-shop validation, and klaviyo profiles via customer_email for proactive CS outreach.
+
+## What this audit checks
+
+### Authentication & access
+- GET /v2/users returns 200 with the api_key as HTTP Basic username (no 401 - key not revoked)
+- Production key (EZAK prefix) in use where expected, not a test key (EZTK) leaking into live rate shops
+- GET /v2/carrier_accounts shows >0 accounts with credentials_complete=true (rate shop has carriers to choose from)
+- Per-key rate-limit headroom healthy - no sustained 429s against the 600/min default quota
+
+### On-time delivery & transit
+- Overall OTD &lt; 95% across delivered shipments rolling 30D
+- Per-underlying-carrier OTD &lt; 90% on any carrier (renegotiation / deprioritise signal)
+- Avg transit days drifting up >1 day vs prior period on any carrier/zone lane
+- Tracker reaching status=delivered later than expected_delivery on >5% of shipments
+
+### Exceptions & failed deliveries
+- Tracker exception rate > 3% rolling 30D (status in failure / error / return_to_sender)
+- return_to_sender rate > 2% on any underlying carrier
+- Carrier failover events (rate-shop rejection by primary carrier) spiking >5 in 24h - usually credential expiry
+- available_for_pickup shipments not collected within carrier hold window (silent failed delivery)
+
+### Damaged / lost parcels
+- Refund (POST /v2/refunds) rate as proxy for lost/undeliverable > 1% rolling 30D
+- Shipments stuck in_transit with no terminal event > 10 days (presumed-lost signal)
+- Damaged-parcel claim rate (return_to_sender + refund cluster) > 0.5% on any carrier
+- Refund status=rejected rate > 20% (claims not being honoured by underlying carrier)
+
+### Tracking data completeness
+- Shipments with tracking_code=null after label creation > 0 (untrackable parcel)
+- Trackers with tracking-event gap >24h while status not in (delivered, return_to_sender, failure)
+- tracking_event.source (underlying carrier) missing on >2% of events (attribution gap)
+- Webhook tracker updates lagging GET /v2/trackers poll by >6h (stale dashboard signal)
+
+### Cross-channel fulfilment SLA (the kill-shot area)
+- Cross-channel: ecom order (bigcommerce / shopify / adobe_commerce) has no matching EasyPost shipment after 48h via order_ref -> dispatch leak
+- Cross-channel: shipment actual_delivery > expected_delivery joined to sibling.order.total -> revenue at risk per channel
+- Cross-channel: cost-per-parcel by zone >10% above direct-carrier sibling (royal_mail / fedex / dpd) -> rate-shop drift
+- Cross-channel: return_to_sender shipments joined to customer_email -> klaviyo proactive CS outreach candidates
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `on_time_delivery_rate` | 95 | 90 |
+| `exception_rate` | 2 | 3 |
+| `avg_transit_days` | 5 | 7 |
+| `damaged_rate` | 0.5 | 1 |
+| `tracking_gap_pct` | 5 | 10 |
+| `carrier_failover_24h` | 3 | 5 |
+| `rate_shop_latency_p95_ms` | 1500 | 2000 |
+| `return_to_sender_pct` | 1 | 2 |
+| `refund_rejected_pct` | 10 | 20 |
+| `credentials_incomplete_count` | 0 | 1 |
+| `auth_token_failures_24h` | 1 | 5 |
+
+## Data sources
+
+- `GET https://api.easypost.com/v2/users` - Auth probe + account validation (api_key as Basic username)
+- `GET https://api.easypost.com/v2/shipments` - Shipment list - carrier, service, rate_amount, status, zone
+- `POST https://api.easypost.com/v2/shipments` - Rate-shop call (rate latency p95, carrier failover, label generation)
+- `GET https://api.easypost.com/v2/trackers` - Tracking events - OTD, exceptions, event-gap, source carrier
+- `GET https://api.easypost.com/v2/carrier_accounts` - Linked carriers + credentials_complete flag
+- `POST https://api.easypost.com/v2/refunds` - Refund/lost-parcel proxy signal
+
+{/* Generated from easypost_audit.yaml. Edit the audit module, not this page. */}

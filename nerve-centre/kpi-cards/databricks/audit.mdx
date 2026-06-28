@@ -1,0 +1,68 @@
+---
+title: "Databricks audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Databricks health audit checks: Databricks: keep lakehouse jobs landing, queries fast, DBU burn sane"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/databricks) · [Audit Profile](/nerve-centre/kpi-cards/databricks/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/databricks/sentiment)**
+
+Databricks-specific health audit for the lakehouse database archetype. Answers six questions: (1) is workspace authentication valid and is the service principal / PAT scoped to read warehouses, clusters and jobs; (2) are the workspace, SQL warehouses and clusters reachable and active; (3) is SQL warehouse query latency (p95 / p99) and slow-query rate within band; (4) are DLT / Workflows data pipelines streaming without lag (the operational stand-in for replication); (5) are clusters and SQL sessions right-sized against capacity, with idle DBU burn bounded; (6) is Delta Lake durability covered via Time Travel retention and recent OPTIMIZE / VACUUM runs. Designed to surface the three top audits from the manifest: failed-job spikes, DBU burn anomalies, and clusters that never auto-terminate.
+
+## What this audit checks
+
+### Authentication & access
+- Workspace URL host resolves to a valid Databricks region (.cloud.databricks.com / .azuredatabricks.net / .gcp.databricks.com)
+- Personal Access Token authenticates and is not expired against /api/2.0/clusters/list
+- Token / service principal has READ permission on warehouses, clusters and jobs (no 403 on probe calls)
+- HTTP Path resolves to a real warehouse (/sql/1.0/warehouses/<id>) or clusters endpoint
+
+### Connection & availability
+- Workspace responds and at least one cluster or SQL warehouse is in a RUNNING state
+- Active SQL warehouses reachable via /api/2.0/sql/warehouses with no STOPPED warehouse expected to be serving
+- SQL query error rate over the last 5m below 1% (no widespread query failures)
+- Rate-limit headroom healthy - not hitting 429 on /api/2.1/jobs/runs/list against the 600/min workspace ceiling
+
+### Query performance
+- SQL warehouse query latency p95 below 5000ms over the rolling 5m window
+- SQL warehouse query latency p99 below 30000ms over the rolling 5m window
+- Slow-query rate below 5% from /api/2.0/sql/history/queries (duration over the slow threshold)
+- Top 10 slowest queries identified by query_id with duration_ms and rows_examined for tuning
+
+### Replication & lag
+- DLT / Workflows pipeline lag (time since last successful run) below the pipeline's expected_interval
+- No data pipeline in BROKEN or STOPPED state from /api/2.0/pipelines status distribution
+- Scheduled job success rate over the last 24h at or above 95% from /api/2.1/jobs/runs/list
+- No failed-job burst - fewer than 5 runs with result_state FAILED or TIMEDOUT in the last 1h
+
+### Storage & capacity
+- SQL warehouse saturation below 90% (active sessions vs max_num_clusters x concurrency)
+- Avg cluster CPU utilisation between 30% and 90% - flag under-utilised (right-size down) or saturated (scale up)
+- Idle cluster DBU wasted over 24h below 10% of total DBU (auto-termination firing on idle clusters)
+- DBU burned over 24h within band - not +50% week-over-week without proportional workload growth
+
+### Backups & durability
+- Last Delta Lake OPTIMIZE / VACUUM on the largest tables ran within 72h
+- Delta Time Travel retention at or above the default 7 days for recovery coverage
+- Long-running jobs (over 1h past expected duration) flagged as cost-runaway / stuck-write risk
+- Cross-channel: SQL slow-query or pipeline-lag burst correlated with sibling commerce checkout drop (revenue at risk)
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `connection_error_rate` | 0.5 | 1 |
+| `query_p95_ms` | 5000 | 15000 |
+| `replication_lag_sec` | 300 | 900 |
+| `disk_usage_pct` | 80 | 90 |
+| `slow_query_count` | 5 | 15 |
+
+## Data sources
+
+- `GET https://{workspace}.cloud.databricks.com/api/2.0/clusters/list` - Cluster inventory, state, DBR version, region - auth probe + capacity
+- `GET https://{workspace}.cloud.databricks.com/api/2.0/sql/warehouses` - SQL warehouse list, size, sessions, max concurrency - saturation
+- `GET https://{workspace}.cloud.databricks.com/api/2.0/sql/history/queries` - Query history with duration, read_rows, error state - latency + slow-query rate
+- `GET https://{workspace}.cloud.databricks.com/api/2.1/jobs/runs/list` - Job / workflow runs - success rate, failures, pipeline lag (replication)
+- `GET https://{workspace}.cloud.databricks.com/api/2.0/pipelines` - Delta Live Tables pipeline status distribution + lag
+- `GET https://{workspace}.cloud.databricks.com/api/2.0/billable-usage/download` - DBU burn by cluster / user / workflow - cost anomaly (account-level auth)
+
+{/* Generated from databricks_audit.yaml. Edit the audit module, not this page. */}

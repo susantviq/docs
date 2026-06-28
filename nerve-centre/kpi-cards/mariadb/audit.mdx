@@ -1,0 +1,77 @@
+---
+title: "MariaDB audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ MariaDB health audit checks: MariaDB: keep the cluster quorate, queries fast, and data durable"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/mariadb) · [Audit Profile](/nerve-centre/kpi-cards/mariadb/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/mariadb/sentiment)**
+
+MariaDB-specific health audit for MySQL-stack teams running 10.6 / 10.11 / 11.x, often clustered via Galera for synchronous multi-master replication. Answers six questions: (1) is access scoped correctly and is the stats path (performance_schema + REPLICATION CLIENT) actually readable; (2) is the instance up, are connections being accepted, and is the Galera cluster in a Primary component; (3) is p95 query latency in band and which digests entered the top-10 slow list; (4) are async replicas caught up and is Galera flow-control quiet; (5) is disk and buffer-pool headroom sufficient; (6) is a recent restorable backup present. Cross-channel area joins query-volume and pool-saturation signals to commerce-sibling order and checkout funnels to size live revenue at risk.
+
+## What this audit checks
+
+### Authentication & access
+- Connection succeeds with the supplied connection_string + credentials (SSL-mode REQUIRED honoured on managed endpoints)
+- Bound user holds SELECT on performance_schema and information_schema (stats KPIs return rows, not access-denied)
+- Bound user holds REPLICATION CLIENT + PROCESS so SHOW REPLICA STATUS and processlist are readable
+- performance_schema is enabled (events_statements_summary_by_digest populated, not empty)
+
+### Connection & availability
+- Instance reachable and uptime_seconds advancing (no recent unplanned restart within the window)
+- Galera cluster: wsrep_cluster_status is Primary on every node (non-Primary = split-brain, node refuses writes)
+- Galera cluster: wsrep_cluster_size equals the expected node count (node loss = quorum risk)
+- Aborted_connects over 24h within band - spikes signal auth churn or TLS handshake failures
+
+### Query performance
+- Query latency p95 under the 200ms threshold; p99 under 500ms
+- Slow-query rate (15m) under 5% of statements
+- Top-10 slow digests from events_statements_summary_by_digest captured with rows_examined vs rows_returned ratio for index review
+- InnoDB deadlocks in the last 5m are zero (any deadlock is flagged)
+
+### Replication & lag
+- Async replication lag (Seconds_Behind_Master) under 10s on each active replica
+- Every replica is STREAMING (state not in RECOVERING / BROKEN / STOPPED)
+- Galera flow-control paused fraction under 10% over 5m (high = one slow node throttling the cluster)
+- At least one healthy standby / SYNCED node is failover-ready
+
+### Storage & capacity
+- Database disk usage under the 90% threshold with projected days-to-full headroom
+- InnoDB / XtraDB buffer pool hit rate at or above 95% (low = pool starved, reads hitting disk)
+- Connection pool saturation (Threads_connected vs max_connections) under 90%
+- Instance memory usage under 85%
+
+### Backups & durability
+- Last successful mariabackup / Percona XtraBackup run under 72h old
+- Backup is restorable (non-zero size, completion marker present, not a partial / interrupted run)
+- Binlog retention covers the gap between full backups for point-in-time recovery
+
+### Cross-channel: revenue at risk
+- QPS spike with no matching order spike (sibling = bigcommerce/shopify/adobe.orders_per_15m flat while mariadb.qps_15m surges = bot / scraper load)
+- Pool saturation across Galera nodes >90% sustained during an ecom traffic burst (= capacity exhausted cluster-wide at checkout)
+- Slow queries co-occurring within a 5m checkout window where sibling checkout_completion dropped >5pp
+- Inventory-table row drift vs sibling product_inventory count (SKUs out of sync between MariaDB and the storefront)
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `connection_error_rate` | 0.5 | 1 |
+| `query_p95_ms` | 200 | 500 |
+| `replication_lag_sec` | 10 | 30 |
+| `disk_usage_pct` | 80 | 90 |
+| `slow_query_count` | 5 | 20 |
+| `galera_flow_control_paused_pct` | 10 | 25 |
+| `buffer_pool_hit_rate_pct` | 95 | - |
+| `backup_age_hours` | 48 | 72 |
+
+## Data sources
+
+- `GET mariadb://{host}:{port}/{database}` - Native MariaDB protocol connection (MySQL wire-compatible) - base for all stats queries
+- `GET SHOW VARIABLES` - Instance identity, version, max_connections, configuration baseline
+- `GET SHOW GLOBAL STATUS` - Uptime, Threads_connected/running, Aborted_connects, QPS, buffer-pool counters, deadlocks
+- `GET performance_schema.events_statements_summary_by_digest` - Slow-query digests, p50/p95/p99 latency, rows_examined vs rows_returned
+- `GET performance_schema.processlist` - Live connection pool: size, in_use, idle, wait queue, app origin
+- `GET SHOW REPLICA STATUS` - Async replica role, Seconds_Behind_Master, IO/SQL thread state
+- `GET information_schema.GLOBAL_STATUS WHERE LIKE 'wsrep_%'` - Galera quorum: wsrep_cluster_size, wsrep_cluster_status, wsrep_local_state, wsrep_flow_control_paused
+
+{/* Generated from mariadb_audit.yaml. Edit the audit module, not this page. */}

@@ -1,0 +1,75 @@
+---
+title: "Elasticsearch audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Elasticsearch health audit checks: Elasticsearch: cluster green, search fast, shards balanced, snapshots fresh"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/elasticsearch) · [Audit Profile](/nerve-centre/kpi-cards/elasticsearch/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/elasticsearch/sentiment)**
+
+Elasticsearch-specific health audit. Answers six questions: (1) is auth scoped correctly and reachable over TLS; (2) is the cluster reachable and is its status green rather than yellow or red; (3) is search latency p95 within budget and are slow searches contained; (4) are replicas assigned and sync lag bounded with no unassigned or stuck-relocating shards; (5) is storage below the flood-stage watermark and JVM heap below GC pressure; (6) are snapshots running and recent enough to restore from. Cross-channel area joins search QPS, pool saturation and product-index doc counts to commerce-sibling traffic and catalog to size revenue at risk.
+
+## What this audit checks
+
+### Authentication & access
+- Cluster URL uses HTTPS (port 9243 Elastic Cloud or TLS-fronted 9200) - no plaintext credentials in transit
+- Credentials authenticate via basic auth or API key; if API key present it is preferred over user+password for service access
+- Monitoring role grants cluster:monitor/* and indices:monitor/* so stats endpoints return without 403
+- Default index pattern (database_name) scopes index-level stats correctly; fork detected (Elasticsearch vs OpenSearch / AWS IAM signing)
+
+### Connection & availability
+- GET /_cluster/health responds within timeout from the coordinating node
+- Cluster status is green (yellow = replicas missing, red = primary unallocated and data unavailable)
+- Active node count matches expected (a drop signals a lost node)
+- Pending cluster tasks from /_cluster/pending_tasks not backing up (master overload)
+
+### Query performance
+- Search latency p95 below 200ms baseline (from indices.search.query_time_in_millis / query_total delta)
+- Search latency p99 below 500ms
+- Slow-query rate below 5% of total searches against the slowlog threshold (default 1s)
+- Top 10 slow searches captured with normalised query DSL shape and target index for tuning
+
+### Replication & shards
+- Unassigned shards from /_cluster/health is 0 (any unassigned = replica data-loss risk)
+- Initializing / relocating shards not stuck above 5 sustained over 10m
+- Replica sync lag below 10s
+- Shard size skew below 25% across nodes (no hot shard); total primary+replica shard count within plan
+
+### Storage & capacity
+- Disk usage below the flood-stage watermark (default 95%; warn approaching 90%) - hitting it makes indexes read-only
+- JVM heap used below 75% (above triggers GC pressure and circuit breakers; >90% risks node OOM)
+- GC pause time below 1000ms in a 5m window; circuit breaker trips over 24h is 0
+- Bulk write rejections (thread_pool.write.rejected) over 24h is 0 and HTTP connection pool saturation below 90%
+
+### Backups & durability
+- A snapshot repository is registered and reachable
+- Last successful _snapshot run is under 72h old (from /_snapshot/_status)
+- Most recent snapshot completed with state SUCCESS (no PARTIAL / FAILED shards)
+
+### Cross-channel: revenue at risk
+- Search QPS spike with no matching ecom traffic spike (sibling = bigcommerce/shopify.sessions_per_15m) flags bot crawler load
+- Search-thread pool saturation > 90% during an ecom order burst (sibling = bigcommerce/shopify.order time-bucketed to 15m)
+- Product-index doc count drift > 100 vs sibling catalog (bigcommerce/shopify.product COUNT) signals broken product-sync to search
+- Slow searches co-occurring with a checkout-completion drop > 5pp in the same 5m window (sibling = bigcommerce/shopify.checkout)
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `connection_error_rate` | 1 | 5 |
+| `query_p95_ms` | 200 | 500 |
+| `replication_lag_sec` | 10 | 30 |
+| `disk_usage_pct` | 85 | 90 |
+| `slow_query_count` | 5 | 20 |
+
+## Data sources
+
+- `GET https://{cluster}.es.region.aws.elastic.cloud:9243/_cluster/health` - Cluster status (green/yellow/red), unassigned + relocating shards, node count
+- `GET https://{cluster}.es.region.aws.elastic.cloud:9243/_cluster/stats` - Cluster-wide indices, store size, doc counts, shard totals
+- `GET https://{cluster}.es.region.aws.elastic.cloud:9243/_cluster/pending_tasks` - Backlog of cluster-state updates (master overload signal)
+- `GET https://{cluster}.es.region.aws.elastic.cloud:9243/_nodes/stats` - Per-node JVM heap, GC, thread pools, breakers, indexing + search timers
+- `GET https://{cluster}.es.region.aws.elastic.cloud:9243/_nodes/stats/http` - HTTP current_open vs max_open for connection-pool saturation
+- `GET https://{cluster}.es.region.aws.elastic.cloud:9243/_cat/shards` - Per-shard state, node placement and size for skew + unassigned detection
+- `GET https://{cluster}.es.region.aws.elastic.cloud:9243/_cat/indices` - Per-index doc counts and store size for product-index drift
+- `GET https://{cluster}.es.region.aws.elastic.cloud:9243/_snapshot/_status` - In-progress + last snapshot state, age and per-shard success
+
+{/* Generated from elasticsearch_audit.yaml. Edit the audit module, not this page. */}

@@ -1,0 +1,69 @@
+---
+title: "ClickHouse audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ ClickHouse health audit checks: ClickHouse: keep ingest flowing, queries fast, replicas in sync, storage safe"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/clickhouse) · [Audit Profile](/nerve-centre/kpi-cards/clickhouse/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/clickhouse/sentiment)**
+
+ClickHouse-specific health audit for OLAP / clickstream instances. Answers six questions: (1) can the collector authenticate and does it have SELECT on the system.* tables it needs; (2) is the instance reachable and is the connection pool below saturation; (3) is query latency (p95 / p99) and the slow-query rate inside band, with no failed-query spike; (4) are replicas in sync - absolute_delay bounded and replication queues draining; (5) is disk and memory headroom safe and are MergeTree parts collapsing fast enough to avoid Too Many Parts; (6) are backups recent and durable. Pulls from system.metrics, system.events, system.query_log, system.parts, system.replicas and system.backups over the HTTP interface.
+
+## What this audit checks
+
+### Authentication & access
+- Connection URL / username / password authenticate against the HTTP interface (8123 self-hosted, 8443 Cloud)
+- User has SELECT on system.metrics, system.events, system.query_log, system.parts, system.replicas and system.backups
+- TLS enforced on the endpoint for ClickHouse Cloud (no plaintext 8123 to a Cloud service)
+- SELECT version() and SELECT uptime() resolve - instance identity and build options readable
+
+### Connection & availability
+- Instance answers a SELECT 1 ping within the collector poll window (30-60s)
+- Connection pool saturation below 90% - HTTPConnection in-use vs max_connections (system.metrics)
+- Connections in use trending within band - no creeping leak toward max_connections
+- Uptime stable - no unexplained restart resetting system.events counters mid-window
+
+### Query performance (p95 / slow queries)
+- Query latency p95 below 200ms and p99 below 500ms from system.query_log percentile aggregation
+- Slow-query rate below 5% - query_log entries with query_duration_ms > 1000 as share of total
+- Failed queries in 24h below 100 - query_log type='ExceptionWhileProcessing'
+- Top-10 slowest query patterns (normalized_query_hash) identified for an optimisation playbook
+
+### Replication & lag
+- Replication lag (absolute_delay) below 10s on every entry in system.replicas
+- Replication queue_size draining - not stuck above 100 sustained on any table
+- future_parts bounded - no replica accumulating un-replicated parts
+- All expected replicas active and no replica in BROKEN / session-expired state
+
+### Storage & capacity
+- Database disk usage below 90% against the storage policy capacity
+- Memory usage below 85% - MemoryTracking vs max_server_memory (system.metrics)
+- Active parts below 1000 on every table (system.parts WHERE active) - guards Too Many Parts (code 252)
+- Too Many Parts errors in 24h equal to 0 and merges keeping pace with ingest (Merge metric)
+
+### Backups & durability
+- Last successful BACKUP run under 72h ago (system.backups status='BACKUP_CREATED')
+- No backup entry in BACKUP_FAILED state within the retention window
+- ClickHouse Cloud managed snapshots present and recent for Cloud services
+- Backup destination (S3 / Disk) reachable and last write verifiable
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `connection_error_rate` | 1 | 5 |
+| `query_p95_ms` | 200 | 500 |
+| `replication_lag_sec` | 10 | 60 |
+| `disk_usage_pct` | 85 | 90 |
+| `slow_query_count` | 50 | 100 |
+
+## Data sources
+
+- `GET https://{host}:8443/?query=SELECT%20*%20FROM%20system.build_options` - Instance identity, version, build options
+- `GET https://{host}:8443/?query=SELECT%20*%20FROM%20system.metrics` - Live gauges - HTTPConnection, Merge, MemoryTracking, in-flight queries
+- `GET https://{host}:8443/?query=SELECT%20*%20FROM%20system.events` - Cumulative counters - InsertedRows, cache hits/misses, error codes
+- `GET https://{host}:8443/?query=SELECT%20*%20FROM%20system.query_log` - Query latency percentiles, slow queries, exceptions
+- `GET https://{host}:8443/?query=SELECT%20*%20FROM%20system.parts` - Active parts and partition counts per table
+- `GET https://{host}:8443/?query=SELECT%20*%20FROM%20system.replicas` - absolute_delay, queue_size, future_parts, replica state
+- `GET https://{host}:8443/?query=SELECT%20*%20FROM%20system.backups` - Last backup status and age for durability checks
+
+{/* Generated from clickhouse_audit.yaml. Edit the audit module, not this page. */}

@@ -1,0 +1,74 @@
+---
+title: "CockroachDB audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ CockroachDB health audit checks: CockroachDB: keep the cluster healthy, replicated, and fast"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/cockroachdb) · [Audit Profile](/nerve-centre/kpi-cards/cockroachdb/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/cockroachdb/sentiment)**
+
+CockroachDB-specific health audit for distributed-SQL clusters (Self-Hosted / Dedicated / Serverless). Answers six questions: (1) is SQL + Admin HTTP API access correctly provisioned (VIEWACTIVITY privilege, TLS verify-full, cluster routing); (2) are all nodes live and is the cluster reachable; (3) is statement performance within band (p95 / p99 latency, slow-query rate, distributed-transaction contention); (4) are ranges fully replicated with leases balanced and Raft lag low; (5) is storage and connection capacity within safe headroom; and (6) are managed / scheduled backups recent and durable. Cross-channel area joins statement volume and pool saturation to a commerce sibling to size live revenue at risk.
+
+## What this audit checks
+
+### Authentication & access
+- Connection string uses sslmode=verify-full with a valid sslrootcert (not disable / require)
+- SQL user holds the VIEWACTIVITY system privilege so crdb_internal stats tables are readable
+- For CockroachDB Cloud, the options=--cluster=<name> routing param is present and resolves
+- Admin HTTP API URL (port 8080) reachable with its own basic + TLS cert for node + range KPIs
+
+### Connection & availability
+- SHOW NODES returns and every node reports status=live (no DEAD / SUSPECT / DRAINING)
+- node_count matches the expected cluster size (a drop = node lost)
+- crdb_internal.gossip_nodes confirms all nodes gossiping and reachable
+- Statement error rate over the last 5m below 1% (connection refusals, retries surfacing as errors)
+
+### Query performance (p95 / slow queries)
+- Statement latency p95 below 200ms from crdb_internal.node_statement_statistics
+- Statement latency p99 below 500ms (tail latency from distributed fan-out)
+- Slow-query rate below 5% over a 15m window
+- Contended statements below 10 contention events / 24h via crdb_internal.cluster_contention_events
+
+### Replication & lag
+- Unavailable ranges = 0 (any >0 means a range lacks quorum and data is unreadable)
+- Under-replicated ranges = 0 sustained over 5m (below configured replication factor)
+- Range lease balance skew below 25% across nodes (no single hot leaseholder)
+- Raft quiescent lag below 10s; no decommissioning node stuck draining beyond 1h
+
+### Storage & capacity
+- Database disk usage below 90% from the /_status/vars Prometheus metrics
+- Memory usage below 85% per node
+- Connection pool saturation below 90% (in_use vs max_connections)
+- Transaction retries below 1000 / 24h (high retries = contention hotspot eating capacity)
+
+### Backups & durability
+- Last successful BACKUP TO S3 / GCS (or Cloud managed backup) within 72h
+- A scheduled backup job exists and its most recent run did not fail
+- Backup target is a durable off-cluster store, not a node-local path
+
+### Cross-channel: revenue protection
+- Statement-volume spike with no matching ecom order spike (sibling = bigcommerce/shopify.orders_per_15m) signalling runaway or anomalous load
+- Connection pool >90% saturation during a commerce traffic burst (sibling = checkout/order rate) risking dropped sessions
+- Slow statements co-occurring with a checkout-completion drop in the same 5m window (sibling = shopify/bigcommerce.checkout)
+- Inventory-table row drift vs ecom inventory by SKU (sibling = product_inventory) flagging stale stock writes
+
+## Severity thresholds
+
+| Signal | Warn | Critical |
+| --- | --- | --- |
+| `connection_error_rate` | 0.5 | 1 |
+| `query_p95_ms` | 200 | 500 |
+| `replication_lag_sec` | 10 | 30 |
+| `disk_usage_pct` | 80 | 90 |
+| `slow_query_count` | 5 | 10 |
+
+## Data sources
+
+- `GET postgresql://{host}:26257/{database} :: crdb_internal.cluster_settings` - Cluster id, version, and configured settings for the DatabaseInstance entity
+- `GET postgresql://{host}:26257/{database} :: crdb_internal.node_statement_statistics` - Per-statement latency (p50/p95/p99), rows read, slow-query detection
+- `GET postgresql://{host}:26257/{database} :: crdb_internal.cluster_contention_events` - Distributed-transaction contention events for contended-statement checks
+- `GET postgresql://{host}:26257/{database} :: crdb_internal.ranges` - Range replication state, unavailable + under-replicated counts, lease distribution
+- `GET postgresql://{host}:26257/{database} :: crdb_internal.gossip_nodes` - Live node gossip state and reachability
+- `GET postgresql://{host}:26257/{database} :: SHOW NODES` - Node status (live / dead / draining), leaseholder counts, replica balance
+- `GET https://{host}:8080/_status/vars` - Admin HTTP API Prometheus metrics - disk, memory, qps, node + range gauges
+
+{/* Generated from cockroachdb_audit.yaml. Edit the audit module, not this page. */}
