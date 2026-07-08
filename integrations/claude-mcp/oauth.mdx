@@ -1,0 +1,119 @@
+---
+title: "Vortex IQ MCP OAuth: connect any client with OAuth 2.1 + PKCE"
+sidebarTitle: "OAuth for Developers"
+description: "The full OAuth 2.1 Authorization Code + PKCE flow for authenticating any MCP client or agent against Vortex IQ — registration, authorize, token exchange, refresh and gotchas."
+---
+
+This guide is for developers connecting a custom MCP client or agent to Vortex IQ — the same flow Claude connectors use under the hood. If you just want to use the connector in Claude, follow the [connection guide](/integrations/claude-mcp/connect-claude) instead.
+
+The flow is standard **OAuth 2.1 Authorization Code + PKCE (S256)** with a **public client** — no client secret. Access tokens are audience-bound (RFC 8707) to `https://app.vortexiq.ai`.
+
+| | |
+|---|---|
+| **Base URL** | `https://app.vortexiq.ai` |
+| **MCP endpoint** | `POST /mcp` (Streamable HTTP, JSON-RPC 2.0) |
+| **Register client** | `POST /oauth/mcp/register` |
+| **Authorize** | `GET /oauth/mcp/authorize` (browser) |
+| **Token / refresh** | `POST /oauth/mcp/token` |
+| **Whoami / token check** | `GET /oauth/mcp/userinfo` |
+
+## Discovery
+
+Everything below is machine-discoverable — MCP clients that support discovery need nothing more than the server URL:
+
+```
+GET https://app.vortexiq.ai/.well-known/oauth-authorization-server
+GET https://app.vortexiq.ai/.well-known/oauth-protected-resource
+```
+
+## The flow
+
+<Steps>
+  <Step title="Register a client (one time)">
+    Dynamic Client Registration (RFC 7591) is public and self-service. Store the returned `client_id` — there is no secret.
+
+    ```bash
+    curl -X POST https://app.vortexiq.ai/oauth/mcp/register \
+      -H "Content-Type: application/json" \
+      -d '{
+            "redirect_uris": ["https://YOUR-APP/callback"],
+            "client_name": "My Agent",
+            "token_endpoint_auth_method": "none"
+          }'
+    ```
+
+    Returns `{"client_id":"mcp_xxx", ...}`. `redirect_uris` must be **https** (`localhost` allowed for development). Only public clients (`"token_endpoint_auth_method": "none"`) are accepted.
+  </Step>
+  <Step title="Generate a PKCE verifier and challenge (per authorization)">
+    ```
+    code_verifier  = random 43-128 char string
+    code_challenge = BASE64URL( SHA256(code_verifier) )   // no padding
+    ```
+
+    Keep `code_verifier` in memory tied to the `state`. **S256 is mandatory** — `plain` is rejected.
+  </Step>
+  <Step title="Send the user to authorize">
+    Open in a browser:
+
+    ```
+    GET https://app.vortexiq.ai/oauth/mcp/authorize
+          ?response_type=code
+          &client_id=<CLIENT_ID>
+          &redirect_uri=<REGISTERED_URI>
+          &state=<RANDOM>
+          &code_challenge=<CHALLENGE>
+          &code_challenge_method=S256
+          &resource=https://app.vortexiq.ai
+    ```
+
+    The user signs in with their existing Vortex IQ (Google) login and clicks **Allow**. Vortex IQ redirects back to `<REDIRECT_URI>?code=<AUTH_CODE>&state=<RANDOM>`. Verify `state` matches — the `code` is single-use and expires in about 5 minutes.
+  </Step>
+  <Step title="Exchange the code for tokens">
+    ```bash
+    curl -X POST https://app.vortexiq.ai/oauth/mcp/token \
+      -H "Content-Type: application/x-www-form-urlencoded" \
+      --data-urlencode "grant_type=authorization_code" \
+      --data-urlencode "code=<AUTH_CODE>" \
+      --data-urlencode "client_id=<CLIENT_ID>" \
+      --data-urlencode "redirect_uri=<REGISTERED_URI>" \
+      --data-urlencode "code_verifier=<VERIFIER>"
+    ```
+
+    Returns:
+
+    ```json
+    {
+      "access_token": "<JWT>",
+      "token_type": "Bearer",
+      "expires_in": 3600,
+      "refresh_token": "<opaque>",
+      "scope": ""
+    }
+    ```
+  </Step>
+  <Step title="Call the MCP endpoint">
+    Send `Authorization: Bearer <access_token>` on every request to `POST https://app.vortexiq.ai/mcp`. The endpoint speaks `initialize`, `tools/list`, `tools/call` and `ping`, and exposes the [30 read-only tools](/integrations/claude-mcp/tools) scoped to the signed-in user. `GET` and `DELETE` return 405 — there is no server-initiated stream.
+
+    `GET /oauth/mcp/userinfo` works as a lightweight token health check: 200 means the token is valid, 401 means re-authenticate.
+  </Step>
+  <Step title="Refresh (access token expires in 1 hour)">
+    Refresh tokens **rotate** — each refresh returns a new refresh token and invalidates the old one. Always store the newest.
+
+    ```bash
+    curl -X POST https://app.vortexiq.ai/oauth/mcp/token \
+      -H "Content-Type: application/x-www-form-urlencoded" \
+      --data-urlencode "grant_type=refresh_token" \
+      --data-urlencode "refresh_token=<REFRESH_TOKEN>" \
+      --data-urlencode "client_id=<CLIENT_ID>"
+    ```
+  </Step>
+</Steps>
+
+## Rules and gotchas
+
+- **HTTPS only.** `redirect_uris` must be https; `localhost` is allowed only in development.
+- **PKCE S256 required.** No client secret is used or accepted.
+- **Audience binding.** Always send `resource=https://app.vortexiq.ai` (RFC 8707). Tokens minted for a different audience are rejected.
+- **On 401** the response carries `WWW-Authenticate: Bearer resource_metadata="https://app.vortexiq.ai/.well-known/oauth-protected-resource"` — follow it to re-discover endpoints and re-authenticate.
+- **Token lifetimes:** access token about 1 hour, refresh token about 30 days, authorization code about 5 minutes.
+- **Permissions.** The token acts as the signed-in user, with the same organisation and role permissions that user already has in Vortex IQ.
