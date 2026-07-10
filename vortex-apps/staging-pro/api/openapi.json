@@ -1,0 +1,1496 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "StagingPro V2 Migration API (BigCommerce)",
+    "version": "2.0.0",
+    "description": "Control-plane REST API for the StagingPro V2 BC Migration engine. Register stores, map storefront channels, launch and control migrations, read live progress, and query the cross-migration knowledge base.\n\n> **Placeholder notice** — this reference is scaffolded from the V2 control-plane routes. Base URLs, examples, and field notes will be finalised as the public surface is confirmed.",
+    "contact": {
+      "name": "Vortex IQ Support",
+      "url": "https://www.vortexiq.ai/contact-us"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://{host}",
+      "description": "StagingPro V2 control plane (behind the VortexIQ platform proxy)",
+      "variables": {
+        "host": {
+          "default": "stagingpro-v2.vortexiq.ai",
+          "description": "Placeholder host — replace with your StagingPro V2 deployment host."
+        }
+      }
+    },
+    {
+      "url": "http://localhost:3001",
+      "description": "Local development (docker compose up)"
+    }
+  ],
+  "security": [{ "proxyKey": [] }],
+  "tags": [
+    { "name": "Health", "description": "Service liveness." },
+    { "name": "Stores", "description": "Connected Stores registry — saved BigCommerce store credentials (tokens are held server-side and never returned)." },
+    { "name": "Channel Mapping", "description": "Per store-pair source→destination storefront (channel) mapping, saved and reused across migrations." },
+    { "name": "Migrations", "description": "Create migrations, list history, and read live run detail." },
+    { "name": "Migration Controls", "description": "Pause, resume, cancel, and verify-only re-runs." },
+    { "name": "Counts & Forecast", "description": "Fast source-store entity counts and pre-launch sizing/ETA forecasts. No run is created." },
+    { "name": "Fix Runs", "description": "VortexSpace Track B — two-phase (plan → approve → execute) fix runs dispatched from audit findings." },
+    { "name": "Ask Viq", "description": "Streamed migration-support assistant scoped to this host's runs." },
+    { "name": "Knowledge Base", "description": "Support-only: learned failure patterns, structural known issues, and manual learning notes. Requires X-Support-Key." },
+    { "name": "Support Diagnostics", "description": "Support-only: full run state, watchdog oversight, and progress logs. Requires X-Support-Key." }
+  ],
+  "paths": {
+    "/api/health": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Health check",
+        "description": "Liveness probe. The only endpoint that does not require `X-Proxy-Key`.",
+        "operationId": "getHealth",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Service is up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": { "type": "boolean" },
+                    "runnerMode": { "type": "string", "enum": ["engine", "engine-docker", "docker", "local"], "description": "Active execution mode for migration runs." }
+                  }
+                },
+                "example": { "ok": true, "runnerMode": "engine-docker" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/stores": {
+      "get": {
+        "tags": ["Stores"],
+        "summary": "List stores",
+        "description": "Returns every saved store in the Connected Stores registry. API tokens are never included — `tokenSet` indicates whether one is held server-side.",
+        "operationId": "listStores",
+        "responses": {
+          "200": {
+            "description": "Registered stores.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "stores": { "type": "array", "items": { "$ref": "#/components/schemas/Store" } } }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "post": {
+        "tags": ["Stores"],
+        "summary": "Add store",
+        "description": "Registers a BigCommerce store with its API token. The store's real name is pulled from BigCommerce automatically (best-effort). Optional WebDAV credentials enable Page Builder widget-image migration.",
+        "operationId": "addStore",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateStoreRequest" },
+              "example": {
+                "environment_type": "Staging",
+                "nickname": "acme-staging",
+                "store_hash": "abc123xyz",
+                "token": "<bc-api-token>",
+                "b2b": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Store registered.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Store" } } }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/stores/{id}": {
+      "patch": {
+        "tags": ["Stores"],
+        "summary": "Update store",
+        "description": "Partially updates a saved store. Supplying a new `token` re-fetches the store name from BigCommerce.",
+        "operationId": "updateStore",
+        "parameters": [{ "$ref": "#/components/parameters/StoreId" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateStoreRequest" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated store.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Store" } } }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "tags": ["Stores"],
+        "summary": "Delete store",
+        "description": "Removes a store from the registry. Idempotent — deleting an unknown id still returns `ok`.",
+        "operationId": "deleteStore",
+        "parameters": [{ "$ref": "#/components/parameters/StoreId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Ok" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/stores/{id}/channels": {
+      "get": {
+        "tags": ["Stores"],
+        "summary": "List store channels",
+        "description": "Fetches the storefront channels of a saved store live from BigCommerce (used by the V2 channel dropdowns and multi-storefront mapping).",
+        "operationId": "listStoreChannels",
+        "parameters": [{ "$ref": "#/components/parameters/StoreId" }],
+        "responses": {
+          "200": {
+            "description": "Storefront channels.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "channels": { "type": "array", "items": { "$ref": "#/components/schemas/Channel" } } }
+                },
+                "example": { "channels": [{ "id": 1, "name": "Default Storefront", "type": "storefront", "platform": "bigcommerce", "status": "active" }] }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/channel-mapping": {
+      "get": {
+        "tags": ["Channel Mapping"],
+        "summary": "Get channel mapping",
+        "description": "Returns the saved source→destination storefront (channel) mapping for a store pair. Empty when no mapping has been saved yet.",
+        "operationId": "getChannelMapping",
+        "parameters": [
+          { "name": "source_store_id", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Saved source store id." },
+          { "name": "destination_store_id", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Saved destination store id." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Saved mapping pairs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "pairs": { "type": "array", "items": { "$ref": "#/components/schemas/ChannelMapPair" } } }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "put": {
+        "tags": ["Channel Mapping"],
+        "summary": "Save channel mapping",
+        "description": "Saves (replaces) the channel mapping for a store pair. A pair with `destination_channel_id: null` is unmapped — its channel assignments are dropped during migration. Migrating **all storefronts** requires a saved mapping.",
+        "operationId": "saveChannelMapping",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ChannelMappingRequest" },
+              "example": {
+                "source_store_id": "st_src123",
+                "destination_store_id": "st_dst456",
+                "pairs": [
+                  { "source_channel_id": 1, "destination_channel_id": 1 },
+                  { "source_channel_id": 2, "destination_channel_id": null }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Mapping saved.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": { "type": "boolean" },
+                    "pairs": { "type": "array", "items": { "$ref": "#/components/schemas/ChannelMapPair" } }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/migrations": {
+      "post": {
+        "tags": ["Migrations"],
+        "summary": "Create migration",
+        "description": "Queues a migration. Two request forms are accepted:\n\n- **By saved stores** — reference registry store ids; credentials are resolved server-side. This is the form the StagingPro UI uses.\n- **By raw credentials** — pass `store_hash` + `token` per side directly (programmatic/legacy path).\n\nGuards enforced at this boundary:\n- source and destination must be different stores\n- a store labelled **Production** in the registry can never be a destination\n- migrating **all storefronts** requires a saved channel mapping\n- selecting `orders`, `customers`, or `gift_certificates` requires `anonymise_customer_data: true`",
+        "operationId": "createMigration",
+        "parameters": [{ "$ref": "#/components/parameters/OrgId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  { "$ref": "#/components/schemas/CreateMigrationByStores" },
+                  { "$ref": "#/components/schemas/CreateMigrationRaw" }
+                ]
+              },
+              "examples": {
+                "bySavedStores": {
+                  "summary": "By saved stores (UI path)",
+                  "value": {
+                    "source_store_id": "st_src123",
+                    "destination_store_id": "st_dst456",
+                    "source_channel_id": 1,
+                    "destination_channel_id": 1,
+                    "selected_entities": ["products", "categories", "brands"],
+                    "mode": "full",
+                    "conflict_strategy": "skip"
+                  }
+                },
+                "byRawCredentials": {
+                  "summary": "By raw credentials (programmatic path)",
+                  "value": {
+                    "source": { "store_hash": "abc123", "token": "<token>", "label": "acme-prod" },
+                    "destination": { "store_hash": "xyz789", "token": "<token>", "label": "acme-staging" },
+                    "selected_entities": ["products", "categories"],
+                    "mode": "dry-run",
+                    "channel_map": { "1": 1 }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Migration queued.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreateMigrationResponse" },
+                "example": {
+                  "requestId": "5A3C1B2E-7F4D-4E6A-9B8C-0D1E2F3A4B5C",
+                  "status": "queued",
+                  "mode": "full",
+                  "forecast": { "products": 1200, "variants": 5400, "brands": 40, "categories": 210, "memMB": 2048, "cpus": 2, "etaSeconds": 5400, "tier": "medium", "basis": "forecast", "at": "2026-07-10T09:00:00.000Z" }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation or guard failure. `error` is one of `invalid_request`, `store_not_found`, `channel_mapping_required`, `production_destination_refused`, `anonymise_required`.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "get": {
+        "tags": ["Migrations"],
+        "summary": "List migrations",
+        "description": "Migration history, newest first. Fix runs (Track B) are excluded by default — pass `task_kind=fix` to query the fix lane.",
+        "operationId": "listMigrations",
+        "parameters": [
+          { "$ref": "#/components/parameters/OrgId" },
+          { "name": "from", "in": "query", "schema": { "type": "string", "format": "date" }, "description": "Only runs created on/after this date (ISO)." },
+          { "name": "to", "in": "query", "schema": { "type": "string", "format": "date" }, "description": "Only runs created on/before this date (ISO)." },
+          { "name": "requestId", "in": "query", "schema": { "type": "string" }, "description": "Filter to one request id." },
+          { "name": "limit", "in": "query", "schema": { "type": "integer" }, "description": "Maximum rows to return." },
+          { "name": "task_kind", "in": "query", "schema": { "type": "string", "enum": ["migration", "fix"], "default": "migration" }, "description": "Which task lane to list." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Migration summaries.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "migrations": { "type": "array", "items": { "$ref": "#/components/schemas/MigrationSummary" } } }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/migrations/{id}": {
+      "get": {
+        "tags": ["Migrations"],
+        "summary": "Get migration",
+        "description": "Customer-facing run detail. While the run directory exists this is the **live** engine state; after teardown it is served from the durable final-state snapshot.",
+        "operationId": "getMigration",
+        "parameters": [{ "$ref": "#/components/parameters/MigrationId" }, { "$ref": "#/components/parameters/OrgId" }],
+        "responses": {
+          "200": {
+            "description": "Run detail.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MigrationDetail" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/migrations/{id}/issues": {
+      "get": {
+        "tags": ["Migrations"],
+        "summary": "Get migration issues",
+        "description": "Per-item issue log: failed items and intentionally skipped items (with the human-readable reason). Sanitised — entity/name/status/reason only, never request bodies or credentials. Capped at the most recent 500 per list.",
+        "operationId": "getMigrationIssues",
+        "parameters": [{ "$ref": "#/components/parameters/MigrationId" }, { "$ref": "#/components/parameters/OrgId" }],
+        "responses": {
+          "200": {
+            "description": "Failures and skipped items.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/IssuesResponse" },
+                "example": {
+                  "failures": [{ "entity": "products", "name": "Smith Journal 13", "status": 422, "reason": "duplicate SKU SM-13 on destination" }],
+                  "skipped": [{ "entity": "pages", "name": "Legacy landing", "status": null, "reason": "page type not supported by destination theme" }]
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/migrations/{id}/fidelity": {
+      "get": {
+        "tags": ["Migrations"],
+        "summary": "Get fidelity report",
+        "description": "Content-fidelity comparison report for the run. Served from the run directory while it exists; returns `no_report` after teardown.",
+        "operationId": "getMigrationFidelity",
+        "parameters": [{ "$ref": "#/components/parameters/MigrationId" }, { "$ref": "#/components/parameters/OrgId" }],
+        "responses": {
+          "200": {
+            "description": "Fidelity report (shape defined by the engine's fidelity module).",
+            "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": {
+            "description": "Run not found, or no fidelity report exists for this run (`no_report`).",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/migrations/{id}/stream": {
+      "get": {
+        "tags": ["Migrations"],
+        "summary": "Stream migration events (SSE)",
+        "description": "Server-Sent Events stream of live run state. Emits an initial `state` event immediately, `state` events on every engine update, and a final one-shot `end` event when the run reaches a terminal status (already-terminal runs receive `end` immediately). Keep-alive comment pings are sent every 15 seconds.",
+        "operationId": "streamMigration",
+        "parameters": [{ "$ref": "#/components/parameters/MigrationId" }, { "$ref": "#/components/parameters/OrgId" }],
+        "responses": {
+          "200": {
+            "description": "SSE stream (`text/event-stream`). `state` events carry a `MigrationDetail` JSON payload.",
+            "content": {
+              "text/event-stream": {
+                "schema": { "type": "string" },
+                "example": "event: state\ndata: {\"requestId\":\"5A3C…\",\"status\":\"in_progress\",…}\n\nevent: end\ndata: {}\n\n"
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/migrations/{id}/pause": {
+      "post": {
+        "tags": ["Migration Controls"],
+        "summary": "Pause migration",
+        "description": "Pauses an active run. The engine checkpoints its state; a paused run can be resumed at any time.",
+        "operationId": "pauseMigration",
+        "parameters": [{ "$ref": "#/components/parameters/MigrationId" }, { "$ref": "#/components/parameters/OrgId" }],
+        "responses": {
+          "200": {
+            "description": "Pause requested.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ControlResponse" },
+                "example": { "ok": true, "status": "paused" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/migrations/{id}/resume": {
+      "post": {
+        "tags": ["Migration Controls"],
+        "summary": "Resume migration",
+        "description": "Re-queues a paused or interrupted run. The run resumes from its checkpoint (the id-map in the run directory), which also makes resume the only guard-safe way to re-run against an already-populated destination.\n\nIf run tokens were wiped after completion, they are re-injected from the stores registry; when the stores are no longer registered the call fails with `tokens_unavailable`.",
+        "operationId": "resumeMigration",
+        "parameters": [{ "$ref": "#/components/parameters/MigrationId" }, { "$ref": "#/components/parameters/OrgId" }],
+        "responses": {
+          "200": {
+            "description": "Run re-queued.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ControlResponse" },
+                "example": { "ok": true, "status": "queued" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": {
+            "description": "Run tokens were wiped and the stores are not in the registry (`tokens_unavailable`).",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/migrations/{id}/cancel": {
+      "post": {
+        "tags": ["Migration Controls"],
+        "summary": "Cancel migration",
+        "description": "Cancels a queued or active run. Cancellation is a control-plane decision and is authoritative over the engine's last written state.",
+        "operationId": "cancelMigration",
+        "parameters": [{ "$ref": "#/components/parameters/MigrationId" }, { "$ref": "#/components/parameters/OrgId" }],
+        "responses": {
+          "200": {
+            "description": "Cancel requested.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ControlResponse" },
+                "example": { "ok": true, "status": "cancelled" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/migrations/{id}/verify": {
+      "post": {
+        "tags": ["Migration Controls"],
+        "summary": "Verify migration",
+        "description": "Re-runs a completed migration in **verify** mode: read-only source/destination comparison, no writes. Requires the run directory (and its config) to still exist, and valid tokens (re-injected from the registry when wiped).",
+        "operationId": "verifyMigration",
+        "parameters": [{ "$ref": "#/components/parameters/MigrationId" }, { "$ref": "#/components/parameters/OrgId" }],
+        "responses": {
+          "200": {
+            "description": "Verify run queued.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": { "type": "boolean" },
+                    "status": { "type": "string" },
+                    "mode": { "type": "string", "enum": ["verify"] }
+                  }
+                },
+                "example": { "ok": true, "status": "queued", "mode": "verify" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": {
+            "description": "`config_unavailable` (run dir cleaned up) or `tokens_unavailable` (tokens wiped and stores unregistered).",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/entity-counts": {
+      "post": {
+        "tags": ["Counts & Forecast"],
+        "summary": "Get entity counts",
+        "description": "Fast, direct, parallel reads of the **source** store's entity totals for the selected entity keys. No engine container is launched, no run is recorded. Accepts a saved source store id or raw source credentials — the destination is never touched.",
+        "operationId": "getEntityCounts",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  { "$ref": "#/components/schemas/CountsByStoresRequest" },
+                  { "$ref": "#/components/schemas/CountsByCredsRequest" }
+                ]
+              },
+              "example": { "source_store_id": "st_src123", "selected_entities": ["products", "categories", "brands"] }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Entity counts. Keys listed in `estimated` are sample/probe estimates rather than exact totals.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/EntityCounts" },
+                "example": { "counts": { "products": 1200, "categories": 210, "brands": 40 }, "estimated": [], "at": "2026-07-10T09:00:00.000Z" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "502": {
+            "description": "Counts could not be fetched from BigCommerce (`counts_failed`).",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/forecast": {
+      "post": {
+        "tags": ["Counts & Forecast"],
+        "summary": "Get forecast",
+        "description": "Pre-launch sizing and ETA forecast for the selected entities: recommended container memory/CPU tier plus estimated total wall-clock. Uses the same `computeForecast` as migration kickoff, so the numbers match what a real run would be sized with.",
+        "operationId": "getForecast",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  { "$ref": "#/components/schemas/CountsByStoresRequest" },
+                  { "$ref": "#/components/schemas/CountsByCredsRequest" }
+                ]
+              },
+              "example": { "source_store_id": "st_src123", "selected_entities": ["products", "categories"] }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Sizing and ETA forecast.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Forecast" } } }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "502": {
+            "description": "Forecast could not be computed from BigCommerce (`forecast_failed`).",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/fix": {
+      "post": {
+        "tags": ["Fix Runs"],
+        "summary": "Dispatch fix run",
+        "description": "VortexSpace Track B. Dispatches a **fix run** for an audit finding, in two phases:\n\n- `phase: \"plan\"` (default) — provisions a fresh run sized by `affected_count` and returns `201` with the new `request_id`.\n- `phase: \"execute\"` — re-arms the **same** run directory after merchant approval and returns `202`. Fails with `run_dir_expired` when the plan run dir was reclaimed.\n\nResults flow back to the platform via the fix mirror callback.",
+        "operationId": "dispatchFixRun",
+        "parameters": [{ "$ref": "#/components/parameters/OrgId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/FixRequest" },
+              "examples": {
+                "plan": {
+                  "summary": "Plan phase",
+                  "value": { "phase": "plan", "fix": { "finding_id": "PAY-AUTH-001", "platform": "bigcommerce", "store_hash": "abc123", "affected_count": 42 } }
+                },
+                "execute": {
+                  "summary": "Execute phase (after approval)",
+                  "value": { "phase": "execute", "request_id": "5A3C1B2E-7F4D-4E6A-9B8C-0D1E2F3A4B5C", "fix": { "finding_id": "PAY-AUTH-001" } }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Plan run queued.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FixPlanResponse" },
+                "example": { "request_id": "5A3C1B2E-7F4D-4E6A-9B8C-0D1E2F3A4B5C", "status": "queued", "phase": "plan", "forecast": { "memMB": 1024, "cpus": 1, "tier": "small", "basis": "fix", "affected": 42, "at": "2026-07-10T09:00:00.000Z" } }
+              }
+            }
+          },
+          "202": {
+            "description": "Execute phase re-queued on the existing run.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FixExecuteResponse" },
+                "example": { "request_id": "5A3C1B2E-7F4D-4E6A-9B8C-0D1E2F3A4B5C", "status": "queued", "phase": "execute" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": {
+            "description": "Plan run dir was reclaimed — re-run plan (`run_dir_expired`).",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/ask/stream": {
+      "get": {
+        "tags": ["Ask Viq"],
+        "summary": "Ask Viq stream (SSE)",
+        "description": "Streams a Viq migration-support session as Server-Sent Events. Viq answers with live host context (run history, active engine containers) and is read-only by policy — it diagnoses, it never mutates.\n\nPass `new=1` on the first call of a session, then reuse the same `session` id to continue it.",
+        "operationId": "askViqStream",
+        "parameters": [
+          { "name": "prompt", "in": "query", "required": true, "schema": { "type": "string", "maxLength": 4000 }, "description": "The operator's question." },
+          { "name": "session", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Session id (alphanumeric and dashes). Reuse to continue a conversation." },
+          { "name": "new", "in": "query", "schema": { "type": "string", "enum": ["1"] }, "description": "Set to `1` to start a new session with the support system prompt." }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream of assistant output lines (`data:` events), followed by a final `done` event.",
+            "content": { "text/event-stream": { "schema": { "type": "string" } } }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/knowledge": {
+      "get": {
+        "tags": ["Knowledge Base"],
+        "summary": "Get knowledge patterns",
+        "description": "The folded cross-migration knowledge base: every learned error fingerprint with its best-known resolution and success rate.",
+        "operationId": "getKnowledge",
+        "security": [{ "proxyKey": [], "supportKey": [] }],
+        "responses": {
+          "200": {
+            "description": "Folded knowledge entries.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "patterns": { "type": "array", "items": { "$ref": "#/components/schemas/KbEntry" } } }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/SupportOnly" }
+        }
+      }
+    },
+    "/api/knowledge/issues": {
+      "get": {
+        "tags": ["Knowledge Base"],
+        "summary": "List known issues",
+        "description": "The engineering queue: structural engine bugs auto-heal can't fix (they need a code change). Open issues only by default; pass `all=1` to include resolved ones.",
+        "operationId": "listKnownIssues",
+        "security": [{ "proxyKey": [], "supportKey": [] }],
+        "parameters": [
+          { "name": "all", "in": "query", "schema": { "type": "string", "enum": ["1"] }, "description": "Include resolved issues." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Known structural issues.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "issues": { "type": "array", "items": { "$ref": "#/components/schemas/KnownIssue" } } }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/SupportOnly" }
+        }
+      }
+    },
+    "/api/knowledge/note": {
+      "post": {
+        "tags": ["Knowledge Base"],
+        "summary": "Add knowledge note",
+        "description": "Records a manual diagnosis into the knowledge base (same vocabulary as automatic auto-heal diagnoses) and mirrors it to the shared learning store immediately. Use `resolution` for heal advice and `known_issue` only for structural engine bugs.",
+        "operationId": "addKnowledgeNote",
+        "security": [{ "proxyKey": [], "supportKey": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/KnowledgeNoteRequest" },
+              "example": { "type": "resolution", "entity": "products", "status": 429, "reason": "rate limited during variant fan-out", "action": "wait", "requestId": "5A3C1B2E-7F4D-4E6A-9B8C-0D1E2F3A4B5C" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Note recorded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": { "type": "boolean" },
+                    "fp": { "type": "string", "description": "The error fingerprint the note was filed under." },
+                    "type": { "type": "string", "enum": ["resolution", "known_issue"] }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/SupportOnly" }
+        }
+      }
+    },
+    "/api/knowledge/issues/{fp}/resolve": {
+      "post": {
+        "tags": ["Knowledge Base"],
+        "summary": "Resolve known issue",
+        "description": "Marks a structural known issue resolved once its engine fix has shipped, which stops the recognition short-circuit on future runs.",
+        "operationId": "resolveKnownIssue",
+        "security": [{ "proxyKey": [], "supportKey": [] }],
+        "parameters": [
+          { "name": "fp", "in": "path", "required": true, "schema": { "type": "string" }, "description": "The error fingerprint of the known issue." }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": { "note": { "type": "string", "description": "Optional resolution note (e.g. the fixing commit)." } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Issue marked resolved.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": { "type": "boolean" },
+                    "fp": { "type": "string" },
+                    "resolved": { "type": "boolean" }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/SupportOnly" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/engineer/fix": {
+      "post": {
+        "tags": ["Knowledge Base"],
+        "summary": "Dispatch AI engineer fix",
+        "description": "**Internal.** Dispatches the on-host AI engineer against a structural engine bug: it clones the platform repo (sparse), produces a minimal fix, verifies it compiles, and opens a pull request on a `viq-fix/*` branch. It can never push to the base branch. Fire-and-forget — the PR appearing on GitHub is the success signal.",
+        "operationId": "dispatchEngineerFix",
+        "security": [{ "proxyKey": [], "supportKey": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/EngineerFixRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Job accepted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": { "type": "boolean" },
+                    "job": { "type": "string", "description": "Job id." },
+                    "branch": { "type": "string", "description": "The `viq-fix/*` branch the fix will be pushed to." },
+                    "log": { "type": "string", "description": "Server-side job log path." }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/SupportOnly" }
+        }
+      }
+    },
+    "/api/migrations/{id}/support": {
+      "get": {
+        "tags": ["Support Diagnostics"],
+        "summary": "Get support view",
+        "description": "Combined support view for one run: full engine state **including load telemetry**, watchdog oversight (escalation + diagnosis decision), and the progress-log tail.",
+        "operationId": "getMigrationSupport",
+        "security": [{ "proxyKey": [], "supportKey": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/MigrationId" }],
+        "responses": {
+          "200": {
+            "description": "Support view.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "state": { "$ref": "#/components/schemas/MigrationState" },
+                    "oversight": { "$ref": "#/components/schemas/OversightInfo" },
+                    "logTail": { "type": "string", "description": "Tail of progress.log." }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/SupportOnly" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/migrations/{id}/oversight": {
+      "get": {
+        "tags": ["Support Diagnostics"],
+        "summary": "Get oversight",
+        "description": "Watchdog escalation and the auto-heal diagnosis decision for one run, when present.",
+        "operationId": "getMigrationOversight",
+        "security": [{ "proxyKey": [], "supportKey": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/MigrationId" }],
+        "responses": {
+          "200": {
+            "description": "Oversight info.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OversightInfo" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/SupportOnly" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/migrations/{id}/logs": {
+      "get": {
+        "tags": ["Support Diagnostics"],
+        "summary": "Get progress logs",
+        "description": "Tail of the run's `progress.log` as plain text.",
+        "operationId": "getMigrationLogs",
+        "security": [{ "proxyKey": [], "supportKey": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/MigrationId" }],
+        "responses": {
+          "200": {
+            "description": "Log tail.",
+            "content": { "text/plain": { "schema": { "type": "string" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/SupportOnly" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "proxyKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Proxy-Key",
+        "description": "Edge key required on every `/api/*` call except `/api/health`. Injected automatically by the VortexIQ platform proxy; required explicitly when calling the control plane directly."
+      },
+      "supportKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Support-Key",
+        "description": "Support key required on Knowledge Base and Support Diagnostics endpoints (may also be passed as `?key=`)."
+      }
+    },
+    "parameters": {
+      "MigrationId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string" },
+        "description": "The migration request id (uppercase UUID) returned by Create migration.",
+        "example": "5A3C1B2E-7F4D-4E6A-9B8C-0D1E2F3A4B5C"
+      },
+      "StoreId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string" },
+        "description": "The saved store id from the Connected Stores registry."
+      },
+      "OrgId": {
+        "name": "X-Org-Id",
+        "in": "header",
+        "required": false,
+        "schema": { "type": "string" },
+        "description": "Organisation context, injected by the VortexIQ platform proxy. When present, runs are scoped to that org — a run belonging to another org returns 404."
+      }
+    },
+    "responses": {
+      "Ok": {
+        "description": "Success.",
+        "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } }, "example": { "ok": true } } }
+      },
+      "InvalidRequest": {
+        "description": "Request failed validation (`invalid_request`). `details` carries field-level errors.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Unauthorized": {
+        "description": "Missing or invalid `X-Proxy-Key` (`unauthorized`).",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "SupportOnly": {
+        "description": "Missing or invalid support key (`support_only`).",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "NotFound": {
+        "description": "Resource not found — or belongs to a different organisation (`not_found`).",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": { "type": "string", "description": "Machine-readable error code (e.g. `invalid_request`, `not_found`, `anonymise_required`, `tokens_unavailable`)." },
+          "message": { "type": "string", "description": "Human-readable explanation." },
+          "details": { "description": "Field-level validation details, present when `error` is `invalid_request`." }
+        }
+      },
+      "Store": {
+        "type": "object",
+        "description": "A saved store in the Connected Stores registry. Tokens are held server-side and never returned.",
+        "properties": {
+          "id": { "type": "string" },
+          "platform": { "type": "string", "enum": ["BC"] },
+          "environmentType": { "type": "string", "description": "Label such as `Production`, `Staging`, `UAT-1`. Empty when unlabelled. A store labelled Production can never be a migration destination." },
+          "nickname": { "type": "string", "description": "Optional internal name." },
+          "storeHash": { "type": "string" },
+          "storeName": { "type": ["string", "null"], "description": "Real store name pulled from BigCommerce." },
+          "panelUrl": { "type": ["string", "null"], "description": "Optional custom control-panel URL." },
+          "b2b": { "type": "boolean", "description": "B2B Edition store." },
+          "tokenSet": { "type": "boolean", "description": "Whether an API token is held server-side." },
+          "webdavSet": { "type": "boolean", "description": "Whether WebDAV credentials are present (needed for widget-image migration)." },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "CreateStoreRequest": {
+        "type": "object",
+        "required": ["store_hash", "token"],
+        "properties": {
+          "environment_type": { "type": "string", "description": "Label such as `Production`, `Staging`, `UAT-1`." },
+          "nickname": { "type": "string", "description": "Optional internal name." },
+          "store_hash": { "type": "string", "description": "The BigCommerce store hash." },
+          "token": { "type": "string", "description": "BigCommerce API account token. Stored server-side, never returned." },
+          "panel_url": { "type": "string", "description": "Optional custom control-panel URL." },
+          "b2b": { "type": "boolean", "description": "Mark as a B2B Edition store." },
+          "webdav_username": { "type": "string", "description": "Optional WebDAV username (Settings → File Access) — needed only to migrate Page Builder widget images." },
+          "webdav_password": { "type": "string", "description": "Optional WebDAV password." }
+        }
+      },
+      "UpdateStoreRequest": {
+        "type": "object",
+        "description": "Partial update — all fields optional.",
+        "properties": {
+          "environment_type": { "type": "string" },
+          "nickname": { "type": "string" },
+          "store_hash": { "type": "string" },
+          "token": { "type": "string", "description": "Supplying a new token re-fetches the store name from BigCommerce." },
+          "panel_url": { "type": "string" },
+          "b2b": { "type": "boolean" },
+          "webdav_username": { "type": "string" },
+          "webdav_password": { "type": "string" }
+        }
+      },
+      "Channel": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "name": { "type": "string" },
+          "type": { "type": "string" },
+          "platform": { "type": "string" },
+          "status": { "type": "string" }
+        }
+      },
+      "ChannelMapPair": {
+        "type": "object",
+        "required": ["source_channel_id"],
+        "properties": {
+          "source_channel_id": { "type": "integer" },
+          "destination_channel_id": { "type": ["integer", "null"], "description": "`null` = unmapped; the source channel's assignments are dropped." }
+        }
+      },
+      "ChannelMappingRequest": {
+        "type": "object",
+        "required": ["source_store_id", "destination_store_id", "pairs"],
+        "properties": {
+          "source_store_id": { "type": "string" },
+          "destination_store_id": { "type": "string" },
+          "pairs": { "type": "array", "items": { "$ref": "#/components/schemas/ChannelMapPair" } }
+        }
+      },
+      "Selection": {
+        "type": "object",
+        "description": "Selective migration: per-entity source-id picks. Parents/ancestors are auto-included; products auto-pull their brands and categories.",
+        "properties": {
+          "products": { "type": "array", "items": { "type": "integer" }, "maxItems": 5000 },
+          "categories": { "type": "array", "items": { "type": "integer" }, "maxItems": 5000 },
+          "pages": { "type": "array", "items": { "type": "integer" }, "maxItems": 2000 },
+          "promotions": { "type": "array", "items": { "type": "integer" }, "maxItems": 2000 }
+        }
+      },
+      "CreateMigrationByStores": {
+        "type": "object",
+        "title": "By saved stores",
+        "required": ["source_store_id", "destination_store_id", "selected_entities"],
+        "properties": {
+          "source_store_id": { "type": "string", "description": "Saved source store id." },
+          "destination_store_id": { "type": "string", "description": "Saved destination store id. Must not be labelled Production." },
+          "source_channel_id": { "type": ["integer", "null"], "description": "Channel-specific mode: the one source storefront to migrate from. Omit (with `destination_channel_id`) for all-storefronts mode, which requires a saved channel mapping." },
+          "destination_channel_id": { "type": ["integer", "null"], "description": "Channel-specific mode: the destination storefront to map onto." },
+          "selected_entities": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Engine entity keys to migrate (e.g. `products`, `categories`, `brands`, `pages`, `themes`, `promotions`, `orders`, `customers`)." },
+          "mode": { "type": "string", "enum": ["full", "dry-run", "verify", "counts"], "default": "full" },
+          "auto_heal": { "type": "boolean", "description": "Allow the watchdog + diagnoser to auto-recover failed items. Default true." },
+          "anonymise_customer_data": { "type": "boolean", "description": "Required `true` when `orders`, `customers`, or `gift_certificates` are selected." },
+          "channel_scoped_products": { "type": "boolean", "description": "Migrate only products assigned to `source_channel_id` (else migrate all products and assign them to the mapped destination channel)." },
+          "activate_theme": { "type": "boolean", "description": "Activate the migrated theme on the destination (else upload only)." },
+          "conflict_strategy": { "type": "string", "enum": ["skip", "update", "replace"], "description": "How an entity that already exists on the destination is handled: `skip` = leave as-is (default), `update` = diff-gated additive update, `replace` = update plus prune destination-only items." }
+        }
+      },
+      "CreateMigrationRaw": {
+        "type": "object",
+        "title": "By raw credentials",
+        "required": ["source", "destination", "selected_entities"],
+        "properties": {
+          "source": {
+            "type": "object",
+            "required": ["store_hash", "token"],
+            "properties": {
+              "store_hash": { "type": "string" },
+              "token": { "type": "string" },
+              "label": { "type": "string", "description": "Display label; defaults to `store-<hash>.mybigcommerce.com`." }
+            }
+          },
+          "destination": {
+            "type": "object",
+            "required": ["store_hash", "token"],
+            "description": "Must be a different store than the source.",
+            "properties": {
+              "store_hash": { "type": "string" },
+              "token": { "type": "string" },
+              "label": { "type": "string" },
+              "webdav_username": { "type": "string" },
+              "webdav_password": { "type": "string" }
+            }
+          },
+          "selected_entities": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+          "mode": { "type": "string", "enum": ["full", "dry-run", "verify", "counts"], "default": "full" },
+          "auto_heal": { "type": "boolean" },
+          "anonymise_customer_data": { "type": "boolean" },
+          "activate_theme": { "type": "boolean" },
+          "conflict_strategy": { "type": "string", "enum": ["skip", "update", "replace"] },
+          "source_storefront": { "type": "string", "description": "Source storefront (channel) name, for history display." },
+          "destination_storefront": { "type": "string", "description": "Destination storefront (channel) name, for history display." },
+          "channel_map": { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Source channel id → destination channel id map." },
+          "channel_scope": { "type": ["integer", "null"], "description": "Restrict the whole run to this one source channel (set together with a single-pair `channel_map`)." },
+          "selection": { "$ref": "#/components/schemas/Selection" }
+        }
+      },
+      "CreateMigrationResponse": {
+        "type": "object",
+        "properties": {
+          "requestId": { "type": "string", "description": "Uppercase UUID identifying the run." },
+          "status": { "type": "string", "enum": ["queued"] },
+          "mode": { "type": "string", "enum": ["full", "dry-run", "verify", "counts"] },
+          "forecast": {
+            "oneOf": [{ "$ref": "#/components/schemas/Forecast" }, { "type": "null" }],
+            "description": "Pre-launch sizing forecast (engine-docker mode with forecasting enabled); `null` otherwise."
+          }
+        }
+      },
+      "MigrationSummary": {
+        "type": "object",
+        "description": "One row in the migration history list.",
+        "properties": {
+          "requestId": { "type": "string" },
+          "platform": { "type": "string" },
+          "taskKind": { "type": "string", "enum": ["migration", "fix"] },
+          "source": { "$ref": "#/components/schemas/StoreRefOut" },
+          "destination": { "$ref": "#/components/schemas/StoreRefOut" },
+          "mode": { "type": "string", "enum": ["full", "dry-run", "verify", "counts"] },
+          "status": { "$ref": "#/components/schemas/MigrationStatus" },
+          "autoHeal": { "type": "boolean" },
+          "selective": { "type": "boolean", "description": "True when the run used a specific-id selection (Selective vs Bulk)." },
+          "sourceStorefront": { "type": ["string", "null"] },
+          "destStorefront": { "type": ["string", "null"] },
+          "selectedEntities": { "type": "array", "items": { "type": "string" } },
+          "summary": { "type": ["string", "null"] },
+          "startedAt": { "type": ["string", "null"], "format": "date-time" },
+          "completedAt": { "type": ["string", "null"], "format": "date-time" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "updatedAt": { "type": "string", "format": "date-time" },
+          "forecast": { "oneOf": [{ "$ref": "#/components/schemas/Forecast" }, { "type": "null" }] }
+        }
+      },
+      "StoreRefOut": {
+        "type": "object",
+        "properties": {
+          "hash": { "type": "string" },
+          "label": { "type": "string" }
+        }
+      },
+      "MigrationStatus": {
+        "type": "string",
+        "enum": ["queued", "in_progress", "paused", "completed", "failed", "cancelled", "pending_approval", "partial_completed"],
+        "description": "`pending_approval` is a fix-run-only resting status after the plan phase."
+      },
+      "ComponentResult": {
+        "type": "object",
+        "properties": {
+          "key": { "type": "string" },
+          "label": { "type": "string" },
+          "discovered": { "type": "integer" },
+          "success": { "type": "integer" },
+          "matched": { "type": "integer", "description": "Already in sync with the source — examined, no write needed (update/replace)." },
+          "failed": { "type": "integer" },
+          "skipped": { "type": "integer" },
+          "pruned": { "type": "integer", "description": "Destination-only children deleted under `conflict_strategy: replace`." },
+          "errors": { "type": ["integer", "null"] },
+          "total": { "type": "integer" }
+        }
+      },
+      "PhaseResult": {
+        "type": "object",
+        "properties": {
+          "key": { "type": "string" },
+          "label": { "type": "string" },
+          "created": { "type": "integer" },
+          "updated": { "type": "integer" },
+          "skipped": { "type": "integer" },
+          "matched": { "type": "integer" },
+          "failed": { "type": "integer" },
+          "pruned": { "type": "integer" },
+          "total": { "type": "integer" },
+          "components": { "type": "array", "items": { "$ref": "#/components/schemas/ComponentResult" } }
+        }
+      },
+      "MigrationState": {
+        "type": "object",
+        "description": "The live run state the engine keeps continuously updated.",
+        "properties": {
+          "requestId": { "type": "string" },
+          "platform": { "type": "string", "enum": ["BC"] },
+          "source": { "$ref": "#/components/schemas/StoreRefOut" },
+          "destination": { "$ref": "#/components/schemas/StoreRefOut" },
+          "status": { "$ref": "#/components/schemas/MigrationStatus" },
+          "autoHeal": { "type": "boolean" },
+          "mode": { "type": "string", "enum": ["full", "dry-run", "verify", "counts"] },
+          "conflictStrategy": { "type": "string", "enum": ["skip", "update", "replace"] },
+          "timestamps": {
+            "type": "object",
+            "properties": {
+              "created": { "type": "string", "format": "date-time" },
+              "started": { "type": "string", "format": "date-time" },
+              "updated": { "type": "string", "format": "date-time" }
+            }
+          },
+          "progress": {
+            "type": "object",
+            "properties": {
+              "phase": { "type": "string", "description": "The entity phase currently running." },
+              "done": { "type": "integer" },
+              "discovered": { "type": "integer" },
+              "percent": { "type": "number" },
+              "ratePerSec": { "type": "number" },
+              "etaSeconds": { "type": "integer", "description": "Per-phase remaining estimate written by the engine." },
+              "overallEtaSeconds": { "type": "integer", "description": "Whole-run ETA from the forecast, live-calibrated by observed destination latency." },
+              "lastProgressAt": { "type": "string", "format": "date-time" }
+            }
+          },
+          "counters": {
+            "type": "object",
+            "properties": {
+              "done": { "type": "integer" },
+              "inProgress": { "type": "integer" },
+              "failed": { "type": "integer" },
+              "skipped": { "type": "integer" },
+              "cancelled": { "type": "integer" },
+              "exceptions": { "type": "integer" },
+              "warnings": { "type": "integer", "description": "Non-blocking issues (e.g. unrecoverable 404 source images) — they do not fail the run." }
+            }
+          },
+          "phases": { "type": "array", "items": { "$ref": "#/components/schemas/PhaseResult" } },
+          "summaryLine": { "type": "string" },
+          "failuresOpen": { "type": "integer" }
+        }
+      },
+      "MigrationDetail": {
+        "allOf": [
+          { "$ref": "#/components/schemas/MigrationState" },
+          {
+            "type": "object",
+            "properties": {
+              "forecast": { "oneOf": [{ "$ref": "#/components/schemas/Forecast" }, { "type": "null" }] },
+              "selective": { "type": "boolean" },
+              "sourceStorefront": { "type": ["string", "null"] },
+              "destStorefront": { "type": ["string", "null"] }
+            }
+          }
+        ]
+      },
+      "Forecast": {
+        "type": "object",
+        "description": "Pre-launch sizing estimate derived from the source store's entity counts.",
+        "properties": {
+          "products": { "type": "integer" },
+          "variants": { "type": "integer" },
+          "brands": { "type": "integer" },
+          "categories": { "type": "integer" },
+          "counts": { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Per-selected-entity counts (the basis for sizing and ETA)." },
+          "estimated": { "type": "array", "items": { "type": "string" }, "description": "Count keys that are sample/probe estimates rather than exact totals." },
+          "memMB": { "type": "integer", "description": "Recommended container memory (MiB)." },
+          "cpus": { "type": "number", "description": "Recommended container CPUs." },
+          "etaSeconds": { "type": "integer", "description": "Estimated total migration wall-clock (pre-launch)." },
+          "etaBreakdown": { "type": "object", "additionalProperties": { "type": "number" }, "description": "Per-phase seconds (sums to ≈ etaSeconds)." },
+          "etaAssumedRttMs": { "type": "number", "description": "The destination op-latency the ETA assumed — the live ETA is calibrated against this." },
+          "tier": { "type": "string", "enum": ["small", "medium", "large", "xlarge", "xxlarge", "xxxlarge"] },
+          "basis": { "type": "string", "enum": ["forecast", "fallback", "fix"], "description": "`fallback` = counts unavailable; `fix` = sized by affected-item count." },
+          "affected": { "type": "integer", "description": "Fix runs only: the affected-item count sizing was derived from." },
+          "at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "IssueItem": {
+        "type": "object",
+        "properties": {
+          "entity": { "type": "string" },
+          "name": { "type": "string", "description": "Item name, code, or `#<source-id>`." },
+          "status": { "type": ["integer", "null"], "description": "HTTP status of the failing call, when applicable." },
+          "reason": { "type": "string", "description": "Truncated error body or human-readable skip reason." }
+        }
+      },
+      "IssuesResponse": {
+        "type": "object",
+        "properties": {
+          "failures": { "type": "array", "items": { "$ref": "#/components/schemas/IssueItem" } },
+          "skipped": { "type": "array", "items": { "$ref": "#/components/schemas/IssueItem" } }
+        }
+      },
+      "CountsByStoresRequest": {
+        "type": "object",
+        "title": "By saved store",
+        "required": ["source_store_id", "selected_entities"],
+        "properties": {
+          "source_store_id": { "type": "string", "description": "Saved source store id. Counts read only the source store." },
+          "selected_entities": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+        }
+      },
+      "CountsByCredsRequest": {
+        "type": "object",
+        "title": "By raw credentials",
+        "required": ["source", "selected_entities"],
+        "properties": {
+          "source": {
+            "type": "object",
+            "required": ["store_hash", "token"],
+            "properties": {
+              "store_hash": { "type": "string" },
+              "token": { "type": "string" }
+            }
+          },
+          "selected_entities": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+          "channel_map": { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Optional channel map (used by the forecast's per-channel sizing)." }
+        }
+      },
+      "EntityCounts": {
+        "type": "object",
+        "properties": {
+          "counts": { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Entity key → total on the source store." },
+          "estimated": { "type": "array", "items": { "type": "string" }, "description": "Keys whose value is a sample/probe estimate (not an exact count)." },
+          "at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "FixRequest": {
+        "type": "object",
+        "required": ["fix"],
+        "properties": {
+          "phase": { "type": "string", "enum": ["plan", "execute"], "default": "plan" },
+          "request_id": { "type": "string", "description": "Execute phase only: the plan run's request id to re-arm." },
+          "fix": {
+            "type": "object",
+            "required": ["finding_id"],
+            "description": "The fix block for the finding being remediated. Forward-compatible — the fix engine defines additional fields.",
+            "properties": {
+              "finding_id": { "description": "The audit finding being remediated.", "oneOf": [{ "type": "string" }, { "type": "integer" }] },
+              "execution_id": { "type": "string", "description": "Platform audit execution id (correlates the result callback)." },
+              "affected_count": { "type": "integer", "description": "Affected item count — sizes the fix container." },
+              "platform": { "type": "string", "description": "Which write API the fix targets (e.g. `bigcommerce`)." },
+              "store_hash": { "type": "string", "description": "Store the fix writes to." },
+              "token": { "type": "string", "description": "Platform write token — lives only in the run directory." }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "FixPlanResponse": {
+        "type": "object",
+        "properties": {
+          "request_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["queued"] },
+          "phase": { "type": "string", "enum": ["plan"] },
+          "forecast": { "$ref": "#/components/schemas/Forecast" }
+        }
+      },
+      "FixExecuteResponse": {
+        "type": "object",
+        "properties": {
+          "request_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["queued"] },
+          "phase": { "type": "string", "enum": ["execute"] }
+        }
+      },
+      "ControlResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "description": "Whether the runner accepted the control action." },
+          "status": { "type": "string", "description": "The resulting run status." }
+        }
+      },
+      "ErrSig": {
+        "type": "object",
+        "properties": {
+          "entity": { "type": "string" },
+          "status": { "type": "integer" },
+          "pattern": { "type": "string", "description": "Normalised error pattern." }
+        }
+      },
+      "KbResolution": {
+        "type": "object",
+        "properties": {
+          "action": { "type": "string", "description": "`wait`, `resume`, `remediate`, …" },
+          "params": { "type": ["object", "null"], "additionalProperties": true },
+          "attempts": { "type": "integer" },
+          "successes": { "type": "integer" },
+          "successRate": { "type": "number" },
+          "suggestedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "KbEntry": {
+        "type": "object",
+        "description": "Folded knowledge for one error fingerprint, aggregated across all migrations.",
+        "properties": {
+          "fp": { "type": "string", "description": "Error fingerprint." },
+          "sig": { "$ref": "#/components/schemas/ErrSig" },
+          "count": { "type": "integer" },
+          "stores": { "type": "array", "items": { "type": "string" } },
+          "firstSeen": { "type": "string", "format": "date-time" },
+          "lastSeen": { "type": "string", "format": "date-time" },
+          "resolutions": { "type": "array", "items": { "$ref": "#/components/schemas/KbResolution" } },
+          "bestResolution": { "oneOf": [{ "$ref": "#/components/schemas/KbResolution" }, { "type": "null" }] },
+          "knownIssue": { "type": ["object", "null"], "description": "Present when classed as a structural engine bug.", "additionalProperties": true }
+        }
+      },
+      "KnownIssue": {
+        "type": "object",
+        "description": "A structural engine bug needing a code fix (not auto-healable).",
+        "properties": {
+          "fp": { "type": "string" },
+          "sig": { "$ref": "#/components/schemas/ErrSig" },
+          "class": { "type": "string", "enum": ["structural", "infrastructure", "transient", "data"] },
+          "reason": { "type": "string" },
+          "report": { "type": "string" },
+          "suggestedFix": { "type": "string", "description": "One line naming the engine code change that would fix it." },
+          "firstSeen": { "type": "string", "format": "date-time" },
+          "lastSeen": { "type": "string", "format": "date-time" },
+          "seenCount": { "type": "integer" },
+          "stores": { "type": "array", "items": { "type": "string" } },
+          "requestIds": { "type": "array", "items": { "type": "string" } },
+          "resolved": { "type": "boolean" },
+          "resolvedAt": { "type": "string", "format": "date-time" },
+          "resolvedNote": { "type": "string" }
+        }
+      },
+      "KnowledgeNoteRequest": {
+        "type": "object",
+        "required": ["entity", "reason"],
+        "properties": {
+          "type": { "type": "string", "enum": ["resolution", "known_issue"], "default": "resolution", "description": "`resolution` = heal advice; `known_issue` = structural engine bug only." },
+          "entity": { "type": "string", "description": "Entity key the failure occurred on." },
+          "status": { "type": "integer", "description": "HTTP status of the failure." },
+          "reason": { "type": "string", "description": "Normalised error reason." },
+          "action": { "type": "string", "description": "Resolutions: `wait`, `resume`, or `remediate`." },
+          "params": { "type": ["object", "null"], "additionalProperties": true },
+          "suggestedFix": { "type": "string", "description": "Known issues: one-line suggested engine fix." },
+          "requestId": { "type": "string", "description": "The run this was observed on." }
+        }
+      },
+      "EngineerFixRequest": {
+        "type": "object",
+        "required": ["title", "body", "github_token", "repo"],
+        "properties": {
+          "title": { "type": "string", "description": "Fix title (becomes the PR title)." },
+          "body": { "type": "string", "description": "The fix brief the AI engineer works from." },
+          "fp": { "type": "string", "description": "The knowledge-base fingerprint being fixed." },
+          "github_token": { "type": "string", "description": "Short-lived GitHub token passed per-call; never stored." },
+          "repo": { "type": "string", "description": "`owner/repo` to open the PR against." },
+          "base_branch": { "type": "string", "description": "Base branch for the PR." },
+          "issue_number": { "type": "integer", "description": "Optional GitHub issue to reference." }
+        }
+      },
+      "Escalation": {
+        "type": "object",
+        "properties": {
+          "requestId": { "type": "string" },
+          "reason": { "type": "string" },
+          "at": { "type": "string", "format": "date-time" },
+          "resumes": { "type": "integer", "description": "Auto-resume attempts so far." },
+          "progress": { "type": "object", "additionalProperties": true },
+          "load": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "ClaudeDecision": {
+        "type": "object",
+        "description": "The auto-heal diagnoser's decision on an escalated run.",
+        "properties": {
+          "action": { "type": "string", "enum": ["resume", "retune", "wait", "abort", "remediate"] },
+          "retune": { "type": ["object", "null"], "properties": { "target_utilization": { "type": "number" }, "max_concurrency": { "type": "integer" } } },
+          "waitSeconds": { "type": ["integer", "null"] },
+          "remediate": { "type": ["array", "null"], "items": { "type": "object", "additionalProperties": true }, "description": "Declarative payload transforms the engine validates and applies on retry." },
+          "failureClass": { "type": ["string", "null"], "enum": ["structural", "infrastructure", "transient", "data", null] },
+          "suggestedFix": { "type": ["string", "null"] },
+          "reason": { "type": "string" },
+          "report": { "type": "string" }
+        }
+      },
+      "OversightInfo": {
+        "type": "object",
+        "properties": {
+          "escalation": { "oneOf": [{ "$ref": "#/components/schemas/Escalation" }, { "type": "null" }] },
+          "decision": { "oneOf": [{ "$ref": "#/components/schemas/ClaudeDecision" }, { "type": "null" }] }
+        }
+      }
+    }
+  }
+}
