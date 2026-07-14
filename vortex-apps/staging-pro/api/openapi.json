@@ -244,7 +244,7 @@
       "post": {
         "tags": ["Migrations"],
         "summary": "Create migration",
-        "description": "Queues a migration. Two request forms are accepted:\n\n- **By saved stores** — reference registry store ids; credentials are resolved server-side. This is the form the StagingPro UI uses.\n- **By raw credentials** — pass `store_hash` + `token` per side directly (programmatic/legacy path).\n\nGuards enforced at this boundary:\n- source and destination must be different stores\n- a store labelled **Production** in the registry can never be a destination\n- migrating **all storefronts** requires a saved channel mapping\n- selecting `orders`, `customers`, or `gift_certificates` requires `anonymise_customer_data: true`",
+        "description": "Queues a migration. Two request forms are accepted:\n\n- **By saved stores** — reference registry store ids; credentials are resolved server-side. This is the form the StagingPro UI uses.\n- **By raw credentials** — pass `store_hash` + `token` per side directly (programmatic/legacy path). Only this form supports `selection` and `theme_activation`.\n\nGuards enforced at this boundary:\n- source and destination must be different stores\n- a store labelled **Production** in the registry can never be a destination\n- migrating **all storefronts** requires a saved channel mapping\n- selecting `orders`, `customers`, or `gift_certificates` requires `anonymise_customer_data: true`\n- every `theme_activation` key must appear in `selection.themes`, and no destination channel may be targeted twice\n- every `selection.page_template_globals` entry must appear in `selection.page_templates`",
         "operationId": "createMigration",
         "parameters": [{ "$ref": "#/components/parameters/OrgId" }],
         "requestBody": {
@@ -278,6 +278,22 @@
                     "selected_entities": ["products", "categories"],
                     "mode": "dry-run",
                     "channel_map": { "1": 1 }
+                  }
+                },
+                "selectivePicks": {
+                  "summary": "Selective migration (picked ids, themes, page templates)",
+                  "value": {
+                    "source": { "store_hash": "abc123", "token": "<token>" },
+                    "destination": { "store_hash": "xyz789", "token": "<token>" },
+                    "selected_entities": ["products", "themes", "page_templates"],
+                    "selection": {
+                      "products": [101, 102, 103],
+                      "themes": ["3f2b8c14-9d5e-4a71-b0c6-2e8f7a1d4b93"],
+                      "page_templates": ["pages/home", "pages/category"],
+                      "page_template_globals": ["pages/home"]
+                    },
+                    "theme_activation": { "3f2b8c14-9d5e-4a71-b0c6-2e8f7a1d4b93": [1] },
+                    "conflict_strategy": "update"
                   }
                 }
               }
@@ -526,7 +542,7 @@
       "post": {
         "tags": ["Counts & Forecast"],
         "summary": "Get entity counts",
-        "description": "Fast, direct, parallel reads of the **source** store's entity totals for the selected entity keys. No engine container is launched, no run is recorded. Accepts a saved source store id or raw source credentials — the destination is never touched.",
+        "description": "Fast, direct, parallel reads of the **source** store's entity totals for the selected entity keys. No engine container is launched, no run is recorded. Accepts a saved source store id or raw source credentials — the destination is never touched.\n\nPass a `selection` to scope the counts to a selective run's real picks (products, categories, pages, promotions), so the returned badges match what that run would actually migrate rather than the whole store. Orders are counted per selected `order_status_{id}` when those keys are requested.",
         "operationId": "getEntityCounts",
         "requestBody": {
           "required": true,
@@ -565,7 +581,7 @@
       "post": {
         "tags": ["Counts & Forecast"],
         "summary": "Get forecast",
-        "description": "Pre-launch sizing and ETA forecast for the selected entities: recommended container memory/CPU tier plus estimated total wall-clock. Uses the same `computeForecast` as migration kickoff, so the numbers match what a real run would be sized with.",
+        "description": "Pre-launch sizing and ETA forecast for the selected entities: recommended container memory/CPU tier plus estimated total wall-clock. Uses the same forecaster as migration kickoff, so the numbers match what a real run would be sized with.\n\nThe forecast is **run-scoped**:\n- `selection` scopes the counts the ETA is priced from - a 10-of-10,000 product pick is no longer forecast as a whole-store run\n- `conflict_strategy` prices the extra work `update`/`replace` imply (destination prefetch, per-matched reconcile, and for `replace` a prune pass)\n- orders are priced on the selected `order_status_{id}` counts rather than the all-statuses total\n\nMemory sizing stays pinned to store scale regardless of the picks - see the `memMB` note on the response schema. Calling this with source credentials only (no destination) means `update`/`replace` degrade to an assume-all-matched basis.",
         "operationId": "getForecast",
         "requestBody": {
           "required": true,
@@ -906,6 +922,30 @@
           "404": { "$ref": "#/components/responses/NotFound" }
         }
       }
+    },
+    "/api/migrations/{id}/fix-activity": {
+      "get": {
+        "tags": ["Support Diagnostics"],
+        "summary": "Get fix activity",
+        "description": "VortexSpace Track B: the live **crew activity** log for a fix run, served as newline-delimited JSON (`fix_activity.jsonl`, one JSON object per line). Each line is an event emitted by the fix crew as the run proceeds, so polling this endpoint gives a per-event view of what the fix is doing.\n\nReturns an empty body for runs that produced no activity log (any migration run, or a fix run whose directory was reclaimed).",
+        "operationId": "getMigrationFixActivity",
+        "security": [{ "proxyKey": [], "supportKey": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/MigrationId" }],
+        "responses": {
+          "200": {
+            "description": "Newline-delimited JSON activity events.",
+            "content": {
+              "text/plain": {
+                "schema": { "type": "string" },
+                "example": "{\"at\":\"2026-07-13T09:00:01.000Z\",\"event\":\"plan.started\",\"finding_id\":\"PAY-AUTH-001\"}\n{\"at\":\"2026-07-13T09:00:07.000Z\",\"event\":\"item.fixed\",\"entity\":\"products\",\"id\":101}\n"
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/SupportOnly" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
     }
   },
   "components": {
@@ -1054,13 +1094,37 @@
       },
       "Selection": {
         "type": "object",
-        "description": "Selective migration: per-entity source-id picks. Parents/ancestors are auto-included; products auto-pull their brands and categories.",
+        "description": "Selective migration: per-entity source picks. Parents/ancestors are auto-included; products auto-pull their brands and categories. A selection also scopes [entity counts](/vortex-apps/staging-pro/api/get-entity-counts) and the [forecast](/vortex-apps/staging-pro/api/get-forecast), so a 10-of-10,000 pick is not sized as a whole-store run.",
         "properties": {
           "products": { "type": "array", "items": { "type": "integer" }, "maxItems": 5000 },
           "categories": { "type": "array", "items": { "type": "integer" }, "maxItems": 5000 },
           "pages": { "type": "array", "items": { "type": "integer" }, "maxItems": 2000 },
-          "promotions": { "type": "array", "items": { "type": "integer" }, "maxItems": 2000 }
+          "promotions": { "type": "array", "items": { "type": "integer" }, "maxItems": 2000 },
+          "themes": {
+            "type": "array",
+            "items": { "type": "string", "format": "uuid" },
+            "maxItems": 20,
+            "description": "Selective theme migration. Themes are picked by **UUID** (BigCommerce theme ids are uuids, not integers). When present, the bulk `activate_theme` boolean is ignored in favour of `theme_activation`."
+          },
+          "page_templates": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^pages/" },
+            "maxItems": 50,
+            "description": "Selective page templates: `template_file` values (all begin `pages/`, e.g. `pages/home`). Template-LEVEL Page Builder content only - entity-scoped contexts (a specific product/category/page) are not included."
+          },
+          "page_template_globals": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^pages/" },
+            "maxItems": 50,
+            "description": "Page templates whose **global** widget content also migrates. Must be a subset of `page_templates` - an entry not present there is rejected."
+          }
         }
+      },
+      "ThemeActivation": {
+        "type": "object",
+        "additionalProperties": { "type": "array", "items": { "type": "integer" }, "minItems": 1 },
+        "description": "Selective themes only: destination channel ids to **activate** each picked theme on, keyed by source theme uuid. Absent or empty = migrate-only (upload without activating).\n\nTwo rules are enforced:\n- every key must appear in `selection.themes`\n- a destination channel may be targeted by **at most one** theme activation (a storefront channel has exactly one active theme)",
+        "example": { "3f2b8c14-9d5e-4a71-b0c6-2e8f7a1d4b93": [1, 2] }
       },
       "CreateMigrationByStores": {
         "type": "object",
@@ -1116,7 +1180,8 @@
           "destination_storefront": { "type": "string", "description": "Destination storefront (channel) name, for history display." },
           "channel_map": { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Source channel id → destination channel id map." },
           "channel_scope": { "type": ["integer", "null"], "description": "Restrict the whole run to this one source channel (set together with a single-pair `channel_map`)." },
-          "selection": { "$ref": "#/components/schemas/Selection" }
+          "selection": { "$ref": "#/components/schemas/Selection" },
+          "theme_activation": { "$ref": "#/components/schemas/ThemeActivation" }
         }
       },
       "CreateMigrationResponse": {
@@ -1179,7 +1244,8 @@
           "skipped": { "type": "integer" },
           "pruned": { "type": "integer", "description": "Destination-only children deleted under `conflict_strategy: replace`." },
           "errors": { "type": ["integer", "null"] },
-          "total": { "type": "integer" }
+          "total": { "type": "integer" },
+          "widgets": { "type": "integer", "description": "Page widgets only: widget nodes landed on the destination (inside published trees plus classic placements created). Contexts are the work unit; widgets are the content unit." }
         }
       },
       "PhaseResult": {
@@ -1263,19 +1329,34 @@
       },
       "Forecast": {
         "type": "object",
-        "description": "Pre-launch sizing estimate derived from the source store's entity counts.",
+        "description": "Pre-launch sizing and ETA estimate derived from the source store's entity counts.\n\nSizing and ETA are priced from **different bases on purpose**: the ETA follows the run's real scope (selective picks, conflict strategy, selected order statuses), while memory is pinned to **store scale** - the engine's variant and id-map residents do not shrink with a small pick, so sizing on picked counts alone would under-provision the container.",
         "properties": {
           "products": { "type": "integer" },
           "variants": { "type": "integer" },
           "brands": { "type": "integer" },
           "categories": { "type": "integer" },
-          "counts": { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Per-selected-entity counts (the basis for sizing and ETA)." },
+          "counts": { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Per-selected-entity counts (the basis for sizing and ETA). Scoped by `selection` when one was supplied." },
           "estimated": { "type": "array", "items": { "type": "string" }, "description": "Count keys that are sample/probe estimates rather than exact totals." },
-          "memMB": { "type": "integer", "description": "Recommended container memory (MiB)." },
+          "memMB": { "type": "integer", "description": "Recommended container memory (MiB). Pinned to store scale, not to the picked subset." },
           "cpus": { "type": "number", "description": "Recommended container CPUs." },
           "etaSeconds": { "type": "integer", "description": "Estimated total migration wall-clock (pre-launch)." },
           "etaBreakdown": { "type": "object", "additionalProperties": { "type": "number" }, "description": "Per-phase seconds (sums to ≈ etaSeconds)." },
-          "etaAssumedRttMs": { "type": "number", "description": "The destination op-latency the ETA assumed — the live ETA is calibrated against this." },
+          "etaAssumedRttMs": { "type": "number", "description": "The blended destination op-latency the ETA assumed - the live ETA is calibrated against this." },
+          "etaAssumedMs": {
+            "type": "object",
+            "description": "Per-op-class latencies (ms) the ETA assumed. The engine compares read-against-read and write-against-write, so heavy creates are not judged against a blended baseline.",
+            "properties": {
+              "read": { "type": "number" },
+              "write": { "type": "number" },
+              "heavy": { "type": "number" }
+            }
+          },
+          "strategy": {
+            "type": "string",
+            "enum": ["skip", "update", "replace"],
+            "description": "The conflict strategy the ETA was priced with (absent = create-only). `update` and `replace` add destination-prefetch and per-matched reconcile terms; `replace` adds a prune term."
+          },
+          "destProducts": { "type": "integer", "description": "Destination catalogue size at kickoff. Absent or `0` when unknown - the source-only forecast button has no destination credentials, so it assumes all-matched." },
           "tier": { "type": "string", "enum": ["small", "medium", "large", "xlarge", "xxlarge", "xxxlarge"] },
           "basis": { "type": "string", "enum": ["forecast", "fallback", "fix"], "description": "`fallback` = counts unavailable; `fix` = sized by affected-item count." },
           "affected": { "type": "integer", "description": "Fix runs only: the affected-item count sizing was derived from." },
@@ -1304,7 +1385,9 @@
         "required": ["source_store_id", "selected_entities"],
         "properties": {
           "source_store_id": { "type": "string", "description": "Saved source store id. Counts read only the source store." },
-          "selected_entities": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+          "selected_entities": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+          "selection": { "$ref": "#/components/schemas/Selection" },
+          "conflict_strategy": { "type": "string", "enum": ["skip", "update", "replace"], "description": "Forecast only: price the ETA for this destination conflict strategy. Ignored by entity counts." }
         }
       },
       "CountsByCredsRequest": {
@@ -1321,7 +1404,9 @@
             }
           },
           "selected_entities": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-          "channel_map": { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Optional channel map (used by the forecast's per-channel sizing)." }
+          "channel_map": { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Optional channel map (used by the forecast's per-channel sizing)." },
+          "selection": { "$ref": "#/components/schemas/Selection" },
+          "conflict_strategy": { "type": "string", "enum": ["skip", "update", "replace"], "description": "Forecast only: price the ETA for this destination conflict strategy. Ignored by entity counts." }
         }
       },
       "EntityCounts": {
