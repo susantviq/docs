@@ -1,69 +1,105 @@
 ---
 title: "Authentication"
-description: "How requests to the StagingPro V2 Migration API are authenticated - the X-Proxy-Key edge key, the X-Support-Key for diagnostics, and X-Org-Id organisation scoping."
+description: "How to authenticate against the StagingPro V2 Migration API - organisation scoping today, and the planned OAuth token endpoint."
 ---
 
-The StagingPro V2 Migration API uses header-based keys at two levels. All keys travel over HTTPS
-only.
+The StagingPro V2 Migration API is served from `https://app.vortexiq.ai/v2/api/bc-migration`. Every
+request is authenticated as a Vortex IQ user and scoped to a single organisation.
 
-## X-Proxy-Key (all endpoints)
+## Today: your signed-in session
 
-Every `/api/*` call except [Health check](/vortex-apps/staging-pro/api/health) must carry the edge
-key:
+Requests are authorised using your Vortex IQ session, the same one the StagingPro UI uses. If you
+are signed in to `app.vortexiq.ai` in the browser, calls from that page are already authenticated:
 
-```bash
-curl https://stagingpro-v2.vortexiq.ai/api/stores \
-  -H "X-Proxy-Key: <your-proxy-key>"
+```js
+// From a signed-in app.vortexiq.ai page - the session cookie travels automatically.
+const res = await fetch('/v2/api/bc-migration/migrations');
+const { migrations } = await res.json();
 ```
 
-When you use StagingPro through the Vortex IQ platform, the platform proxy injects this header for
-you - you never handle it directly. It is required explicitly only when calling the control plane
-directly (self-hosted or programmatic access).
+Two conditions must hold for any call to succeed:
 
-A missing or invalid key returns `401`:
+<Steps>
+  <Step title="You are signed in">
+    Requests without a valid session are rejected.
+  </Step>
+  <Step title="Store Migration is enabled for your organisation">
+    The app is enabled per organisation. If yours is not on the list, every endpoint returns `403`:
 
-```json
-{ "error": "unauthorized", "message": "valid X-Proxy-Key required" }
-```
+    ```json
+    { "message": "Store Migration is not enabled for this organization." }
+    ```
 
-## X-Support-Key (diagnostics endpoints)
+    Contact [support](https://www.vortexiq.ai/contact-us) to have it enabled.
+  </Step>
+</Steps>
 
-The [Knowledge Base](/vortex-apps/staging-pro/api/get-knowledge) and
-[Support Diagnostics](/vortex-apps/staging-pro/api/get-migration-support) endpoints are gated by an
-additional support key, passed as a header or query parameter:
-
-```bash
-curl https://stagingpro-v2.vortexiq.ai/api/knowledge \
-  -H "X-Proxy-Key: <your-proxy-key>" \
-  -H "X-Support-Key: <your-support-key>"
-```
-
-A missing or invalid support key returns `403`:
-
-```json
-{ "error": "support_only", "message": "valid support key required" }
-```
-
-## X-Org-Id (organisation scoping)
-
-When calls arrive through the Vortex IQ platform, the proxy also injects `X-Org-Id`. Runs created
-with an org context belong to that organisation; reading or controlling a run that belongs to a
-different organisation returns `404` (not `403`), so run ids are never confirmed across tenants.
-
-Direct calls without `X-Org-Id` operate unscoped - intended for single-tenant, self-hosted
-deployments and support tooling.
-
-## BigCommerce store tokens
-
-Store API tokens are supplied once when [registering a store](/vortex-apps/staging-pro/api/add-store)
-and are held server-side:
-
-- Tokens are **never returned** by any endpoint - store objects expose only a `tokenSet` boolean.
-- Migration run credentials live only in the run directory for the lifetime of the run and can be
-  wiped on completion; resume and verify re-inject them from the registry when needed.
+Everything you read or start is scoped to your organisation. Migration history shows only your
+organisation's runs, and a store must be connected to your organisation before you can migrate it -
+otherwise you get `422 store_not_found`.
 
 <Note>
-  **Placeholder** - key issuance and rotation for direct (non-platform) access will be documented
-  here once the public onboarding flow is confirmed. Contact
-  [support](https://www.vortexiq.ai/contact-us) if you need direct API access today.
+  **Server-to-server calls are not supported yet.** Session authentication is designed for calls
+  made from a signed-in browser context. If you need to drive migrations from CI or a backend
+  service, the OAuth flow below is the supported path once it ships - please wait for it rather
+  than automating a browser session.
 </Note>
+
+## Coming soon: OAuth tokens
+
+<Warning>
+  **Planned - not yet available.** The `/login` endpoint described here is not live. The shape below
+  is indicative and may change before release; this section will be updated with the final contract
+  when it ships.
+</Warning>
+
+A dedicated token endpoint is planned so that scripts and backend services can call the API without
+a browser session:
+
+```
+POST https://app.vortexiq.ai/v2/api/bc-migration/login
+```
+
+It will exchange your **user**, **organisation id**, and an issued **key** for an OAuth token, which
+you then send as a bearer token on subsequent requests:
+
+```bash
+# Planned - illustrative only.
+curl -X POST https://app.vortexiq.ai/v2/api/bc-migration/login \
+  -H "Content-Type: application/json" \
+  -d '{ "user": "<user>", "org_id": "<organisation-id>", "key": "<issued-key>" }'
+
+# Then, on every call:
+curl https://app.vortexiq.ai/v2/api/bc-migration/migrations \
+  -H "Authorization: Bearer <token>"
+```
+
+The same organisation gate applies: a token is only ever valid for the organisation it was issued
+for, and only if Store Migration is enabled for it.
+
+## Store credentials
+
+You never send BigCommerce API tokens to this API.
+
+Stores are referenced by **store hash** - for example `"source_store_hash": "abc123xyz"`. Vortex IQ
+resolves each store's BigCommerce credentials server-side from your organisation's connected
+StagingPro integrations, and authorises the store against your organisation on every call. Tokens
+never travel through the browser, your scripts, or this API's request bodies.
+
+This is why connecting a store in StagingPro is a prerequisite for migrating it, and why a hash your
+organisation has not connected returns:
+
+```json
+{
+  "error": "store_not_found",
+  "message": "source or destination store not found / not authorized for this organization"
+}
+```
+
+## Errors you may hit
+
+| Status | Meaning |
+| --- | --- |
+| `403` | Not signed in, or Store Migration is not enabled for your organisation. |
+| `422` | A store hash is unknown or not connected to your organisation, or the request failed validation. |
+| `502` | The migration service or BigCommerce could not be reached. |
