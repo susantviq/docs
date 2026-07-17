@@ -1,15 +1,94 @@
 ---
 title: "Authentication"
-description: "How to authenticate against the StagingPro V2 Migration API - organisation scoping today, and the planned OAuth token endpoint."
+description: "How to authenticate against the StagingPro V2 Migration API - bearer tokens for scripts and services, or your signed-in session from the browser."
 ---
 
 The StagingPro V2 Migration API is served from `https://app.vortexiq.ai/v2/api/bc-migration`. Every
-request is authenticated as a Vortex IQ user and scoped to a single organisation.
+request is authenticated as a Vortex IQ user and scoped to a single organisation. Two authentication
+methods are supported, and every endpoint accepts either:
 
-## Today: your signed-in session
+| Method | Best for | How it travels |
+| --- | --- | --- |
+| **Bearer token** | Scripts, CI, backend services | `Authorization: Bearer <token>` header |
+| **Session** | Calls from a signed-in `app.vortexiq.ai` page | Session cookie, automatically |
 
-Requests are authorised using your Vortex IQ session, the same one the StagingPro UI uses. If you
-are signed in to `app.vortexiq.ai` in the browser, calls from that page are already authenticated:
+## Bearer tokens (server-to-server)
+
+Exchange your identity and your organisation's API credential for a token on the
+[Login](/vortex-apps/staging-pro/api/login) endpoint:
+
+```bash
+curl -X POST https://app.vortexiq.ai/v2/api/bc-migration/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "Jane Merchant",
+    "email": "jane@example.com",
+    "organization_name": "Example Retail Ltd",
+    "client_id": "viq_bcmig_Ab12Cd34Ef56Gh78Ij90Kl12",
+    "client_secret": "<client-secret>"
+  }'
+```
+
+A successful login returns your user and organisation details, the BigCommerce stores connected to
+your organisation (source material for every other endpoint), and the token itself:
+
+```json
+{
+  "user": { "email": "jane@example.com", "first_name": "Jane", "last_name": "Merchant" },
+  "organization": { "id": 42, "name": "Example Retail Ltd" },
+  "stores": [
+    { "integration_id": 101, "store_hash": "abc123xyz", "name": "Production Store", "environment_type": "production", "is_production": true },
+    { "integration_id": 102, "store_hash": "def456uvw", "name": "Staging Store", "environment_type": "staging", "is_production": false }
+  ],
+  "token_type": "Bearer",
+  "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...",
+  "expires_in": 864000,
+  "expires_at": "2026-07-27T14:46:16+00:00"
+}
+```
+
+Send the token on every subsequent call:
+
+```bash
+curl https://app.vortexiq.ai/v2/api/bc-migration/migrations \
+  -H "Authorization: Bearer <access_token>"
+```
+
+### What you need before you can log in
+
+<Steps>
+  <Step title="An API credential for your organisation">
+    The `client_id` / `client_secret` pair is issued per organisation by Vortex IQ. The secret is
+    shown once at issue time - store it in a secret manager, never in client-side code. Contact
+    [support](https://www.vortexiq.ai/contact-us) to have a credential provisioned or rotated.
+  </Step>
+  <Step title="Store Migration enabled for your organisation">
+    The app is enabled per organisation; without it every endpoint returns `403`.
+  </Step>
+  <Step title="At least 2 connected BigCommerce stores">
+    A migration needs a source and a destination, so login refuses organisations with fewer than 2
+    connected stores (`403 insufficient_stores`).
+  </Step>
+</Steps>
+
+### Token lifetime and revocation
+
+- Tokens live for **10 days** (`expires_in: 864000`). Log in again to get a fresh one - there is no
+  refresh endpoint.
+- **Rotating or disabling** your organisation's API credential immediately invalidates every
+  outstanding token for the organisation, not just future logins. Rotation keeps the same
+  `client_id`; only the secret changes.
+- A token is bound to the user and organisation it was issued for. If the user leaves the
+  organisation, the token stops working.
+- The token is a signed JWT: its claims are readable (no secrets inside), but any modification
+  invalidates it. Treat the whole token as a secret - it authenticates as you.
+- Login is rate limited to **10 attempts per minute** (`429` beyond that), and failed logins return
+  a deliberately generic `401 invalid_credentials` that does not reveal which field was wrong.
+
+## Sessions (from the browser)
+
+Requests from a signed-in `app.vortexiq.ai` page are authorised by your Vortex IQ session, the same
+one the StagingPro UI uses - no token needed:
 
 ```js
 // From a signed-in app.vortexiq.ai page - the session cookie travels automatically.
@@ -17,71 +96,23 @@ const res = await fetch('/v2/api/bc-migration/migrations');
 const { migrations } = await res.json();
 ```
 
-Two conditions must hold for any call to succeed:
+The same organisation gate applies: if Store Migration is not enabled for your organisation, every
+endpoint returns `403`:
 
-<Steps>
-  <Step title="You are signed in">
-    Requests without a valid session are rejected.
-  </Step>
-  <Step title="Store Migration is enabled for your organisation">
-    The app is enabled per organisation. If yours is not on the list, every endpoint returns `403`:
-
-    ```json
-    { "message": "Store Migration is not enabled for this organization." }
-    ```
-
-    Contact [support](https://www.vortexiq.ai/contact-us) to have it enabled.
-  </Step>
-</Steps>
+```json
+{ "message": "Store Migration is not enabled for this organization." }
+```
 
 Everything you read or start is scoped to your organisation. Migration history shows only your
 organisation's runs, and a store must be connected to your organisation before you can migrate it -
 otherwise you get `422 store_not_found`.
 
-<Note>
-  **Server-to-server calls are not supported yet.** Session authentication is designed for calls
-  made from a signed-in browser context. If you need to drive migrations from CI or a backend
-  service, the OAuth flow below is the supported path once it ships - please wait for it rather
-  than automating a browser session.
-</Note>
-
-## Coming soon: OAuth tokens
-
-<Warning>
-  **Planned - not yet available.** The `/login` endpoint described here is not live. The shape below
-  is indicative and may change before release; this section will be updated with the final contract
-  when it ships.
-</Warning>
-
-A dedicated token endpoint is planned so that scripts and backend services can call the API without
-a browser session:
-
-```
-POST https://app.vortexiq.ai/v2/api/bc-migration/login
-```
-
-It will exchange your **user**, **organisation id**, and an issued **key** for an OAuth token, which
-you then send as a bearer token on subsequent requests:
-
-```bash
-# Planned - illustrative only.
-curl -X POST https://app.vortexiq.ai/v2/api/bc-migration/login \
-  -H "Content-Type: application/json" \
-  -d '{ "user": "<user>", "org_id": "<organisation-id>", "key": "<issued-key>" }'
-
-# Then, on every call:
-curl https://app.vortexiq.ai/v2/api/bc-migration/migrations \
-  -H "Authorization: Bearer <token>"
-```
-
-The same organisation gate applies: a token is only ever valid for the organisation it was issued
-for, and only if Store Migration is enabled for it.
-
 ## Store credentials
 
 You never send BigCommerce API tokens to this API.
 
-Stores are referenced by **store hash** - for example `"source_store_hash": "abc123xyz"`. Vortex IQ
+Stores are referenced by **store hash** - for example `"source_store_hash": "abc123xyz"`. The hashes
+for your organisation's stores are returned by [Login](/vortex-apps/staging-pro/api/login). Vortex IQ
 resolves each store's BigCommerce credentials server-side from your organisation's connected
 StagingPro integrations, and authorises the store against your organisation on every call. Tokens
 never travel through the browser, your scripts, or this API's request bodies.
@@ -100,6 +131,9 @@ organisation has not connected returns:
 
 | Status | Meaning |
 | --- | --- |
-| `403` | Not signed in, or Store Migration is not enabled for your organisation. |
+| `401` | Login: one of the provided values could not be validated (deliberately unspecific). Other endpoints: missing, expired, tampered, or revoked bearer token, and no valid session. |
+| `403` | Store Migration is not enabled for your organisation, or (on login) fewer than 2 connected stores. |
 | `422` | A store hash is unknown or not connected to your organisation, or the request failed validation. |
+| `429` | Login rate limit exceeded (10 per minute). |
 | `502` | The migration service or BigCommerce could not be reached. |
+| `503` | API access is not configured on this environment. |
