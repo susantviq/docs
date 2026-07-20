@@ -367,18 +367,25 @@
       "get": {
         "tags": ["Migrations"],
         "summary": "Get migration issues",
-        "description": "The per-item issue log: items that failed, and items intentionally skipped with the reason why.\n\nUse this to answer \"which products didn't make it, and why?\". The log is embedded into the durable snapshot before a run's working files are reclaimed, so it stays readable for finished runs. Entries are sanitised — entity, name, status, and reason only; never request bodies or credentials.",
+        "description": "The per-item issue log in three lists: items that **failed**, items intentionally **skipped** with the reason why, and non-blocking **warnings** (things the engine worked around without failing the run).\n\nUse this to answer \"which products didn't make it, and why?\". The log is embedded into the durable snapshot before a run's working files are reclaimed, so it stays readable for finished runs. Entries are sanitised — entity, name, status, and reason only; never request bodies or credentials.",
         "operationId": "getMigrationIssues",
         "parameters": [{ "$ref": "#/components/parameters/MigrationId" }],
         "responses": {
           "200": {
-            "description": "Failures and skipped items.",
+            "description": "Failures, skipped items, and warnings.",
+            "headers": {
+              "X-Read-Source": {
+                "description": "Which store served this read: `opensearch`, `mysql`, or `engine`. Observability only.",
+                "schema": { "type": "string", "enum": ["opensearch", "mysql", "engine"] }
+              }
+            },
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/IssuesResponse" },
                 "example": {
                   "failures": [{ "entity": "products", "name": "Smith Journal 13", "status": 422, "reason": "duplicate SKU SM-13 on destination" }],
-                  "skipped": [{ "entity": "pages", "name": "Legacy landing", "status": null, "reason": "page type not supported by destination theme" }]
+                  "skipped": [{ "entity": "pages", "name": "Legacy landing", "status": null, "reason": "page type not supported by destination theme" }],
+                  "warnings": [{ "entity": "images", "name": "#101", "reason": "source image returned 404 — product migrated without it" }]
                 }
               }
             }
@@ -755,6 +762,11 @@
           "status": { "$ref": "#/components/schemas/MigrationStatus" },
           "autoHeal": { "type": "boolean" },
           "selective": { "type": "boolean", "description": "True when the run used a selection — shown as Selective rather than Bulk." },
+          "behaviour": {
+            "type": ["string", "null"],
+            "enum": ["add_new_only", "update_existing", "make_exact_copy", null],
+            "description": "The run's data-treatment behaviour, recorded once the run finishes. `null` while the run is still in progress (and for runs from before this field existed)."
+          },
           "sourceStorefront": { "type": ["string", "null"] },
           "destStorefront": { "type": ["string", "null"] },
           "selectedEntities": { "type": "array", "items": { "type": "string" } },
@@ -845,6 +857,15 @@
           "phases": { "type": "array", "items": { "$ref": "#/components/schemas/PhaseResult" } },
           "summaryLine": { "type": "string" },
           "failuresOpen": { "type": "integer", "description": "Items still needing review." },
+          "pageTemplates": {
+            "type": "object",
+            "description": "Present on selective page-template runs only: what was picked and how the channel-wide global content fared.",
+            "properties": {
+              "picked": { "type": "array", "items": { "type": "string" }, "description": "The picked template files (e.g. `pages/home`)." },
+              "globalsRequested": { "type": "boolean", "description": "Whether any pick opted in to global widget content." },
+              "globalContextsPublished": { "type": "integer", "description": "Channel global contexts actually migrated — `0` with `globalsRequested: true` means requested but empty or failed." }
+            }
+          },
           "forecast": { "oneOf": [{ "$ref": "#/components/schemas/Forecast" }, { "type": "null" }] },
           "selective": { "type": "boolean" },
           "sourceStorefront": { "type": ["string", "null"] },
@@ -899,7 +920,20 @@
         "type": "object",
         "properties": {
           "failures": { "type": "array", "items": { "$ref": "#/components/schemas/IssueItem" } },
-          "skipped": { "type": "array", "items": { "$ref": "#/components/schemas/IssueItem" } }
+          "skipped": { "type": "array", "items": { "$ref": "#/components/schemas/IssueItem" } },
+          "warnings": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/WarningItem" },
+            "description": "Non-blocking issues (for example an unrecoverable 404 source image, or a dropped filter context). They do not fail the run."
+          }
+        }
+      },
+      "WarningItem": {
+        "type": "object",
+        "properties": {
+          "entity": { "type": "string" },
+          "name": { "type": "string", "description": "Item name, `channel <id>`, or `#<product-id>` depending on context." },
+          "reason": { "type": "string", "description": "What was skipped or altered, and why." }
         }
       },
       "ControlResponse": {
