@@ -159,13 +159,15 @@ def main():
     else:
         print("ok   no hardcoded catalogue totals")
 
-    # Dash debt predates this guard (roughly 900 lines as of 24 Jul 26), so it
-    # warns rather than fails. Flip this to a failure once the backlog sweep
-    # lands, so new dashes cannot creep back in.
+    # The pre-existing backlog (915 lines across 185 files as of 24 Jul 26)
+    # was swept clean in bin/dash-sweep.py. This now gates, so nothing new
+    # can creep back in.
     if dash_hits:
+        failures.append(f"{len(dash_hits)} em/en dashes")
         files = sorted({r for r, _ in dash_hits})
-        print(f"WARN {len(dash_hits)} lines contain an em dash or en dash, across {len(files)} files")
-        print(f"       backlog, not gating. First few: {', '.join(files[:4])}")
+        print(f"FAIL {len(dash_hits)} lines contain an em dash or en dash, across {len(files)} files:")
+        for rel, i in dash_hits[:15]:
+            print(f"       {rel}:{i}")
     else:
         print("ok   no em dashes or en dashes")
 
