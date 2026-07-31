@@ -84,9 +84,21 @@ These are not stale, they are the same connector under a different slug. Renamin
 
 Each rename needs its `docs.json` entries updated and a redirect from the old path.
 
-### A3. Keep but annotate
+### A3. `amazon`: resolved, merged into `amazon-seller`
 
-- [ ] `amazon` has no manifest but **is** a real catalog row. It is a catalog-layer connector with no engine yet. Keep the page and state plainly that KPI cards are not available for it yet, rather than leaving an index page that implies a card set exists.
+Settled on evidence rather than judgement. Both directories were matched against the 60 compiled `amazon_seller` cards, allowing for the two different slug conventions (`amazon` drops the parenthetical, `amazon-seller` keeps it, so `negative-feedback` and `negative-feedback-30d` are the same card):
+
+| Directory | Pages | Real cards covered | Pages with no card behind them |
+|---|---|---|---|
+| `amazon` | 71 | 60 of 60 | **12** |
+| `amazon-seller` | 59 | 60 of 60 | **0** |
+
+Both covered every real card, so nothing was lost by choosing. `amazon-seller` is the exact set; `amazon` carried 12 pages for metrics the connector never produces (`avg-review-rating`, `buyer-messages-unread`, `dispute-rate`, `fees-as-of-revenue`, `listing-quality-score`, `listings-expiring-soon`, `marketplace-fees-paid`, `out-of-stock-listings`, `pending-payouts`, `seller-feedback-score`, `top-listings-by-revenue`, `total-transactions`).
+
+Corroborated in code: the live integration type is `amazon_sp`, and every resolution site normalises it to the `amazon_seller` manifest (`AuditOrchestrator.php:1225`, `ManifestDrivenGraphBuilder.php:799`).
+
+- [x] Deleted `amazon` (72 pages) and redirected it to `amazon-seller`.
+- [x] Carried the human-authored positioning prose across, dropping its incorrect "77 KPI pulses" claim (the real figure is 60).
 
 ---
 

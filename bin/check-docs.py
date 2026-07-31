@@ -38,7 +38,6 @@ CARDS_DIR = ROOT / "nerve-centre" / "kpi-cards"
 # short and justified; it is not a dumping ground for drift.
 ALLOWED_NO_MANIFEST = {
     "concepts": "shared concept pages, not a connector",
-    "amazon": "catalog-layer connector, engine not built yet; being merged into amazon-seller",
 }
 
 # Connectors with a manifest that deliberately have no docs yet. Empty on
