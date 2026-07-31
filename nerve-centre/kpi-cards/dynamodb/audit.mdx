@@ -1,0 +1,62 @@
+---
+title: "Amazon DynamoDB audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Amazon DynamoDB health audit checks: DynamoDB: Throttling, Capacity & Cost, Latency, Global-Table Replication & PITR Recency"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/dynamodb) · [Audit Profile](/nerve-centre/kpi-cards/dynamodb/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/dynamodb/sentiment)**
+
+The questions every DynamoDB operator asks at 9am on Monday: are we throttling and on which tables / GSIs, is provisioned capacity utilisation creeping toward the cap (or is on-demand spend spiking with no traffic to justify it), is request latency regressing on the hot operations, are global-table replicas synchronised, and is point-in-time recovery actually enabled on the production tables. Cross- references ecommerce platforms - throttling on the cart / session / inventory table co-occurring with a checkout drop, or a consumed-capacity spike with no matching order spike, indicates a database bottleneck costing revenue.
+
+
+## What this audit checks
+
+### Authentication & access
+- IAM principal authenticates SigV4 against the regional DynamoDB endpoint without AccessDenied
+- Principal has dynamodb:ListTables + dynamodb:DescribeTable - control-plane metadata returns, not permission errors
+- Principal has cloudwatch:GetMetricData + cloudwatch:ListMetrics in the AWS/DynamoDB namespace
+- Principal is read-only - no mutating actions (PutItem / DeleteTable / UpdateTable) present on the policy
+
+### Throttling
+- ReadThrottleEvents > 0 sustained on any table or GSI (under-provisioned reads or a hot partition key)
+- WriteThrottleEvents > 0 sustained on any table or GSI (writes throttle faster than reads on hot partitions)
+- Throttle rate > 1% of total requests in a 5m window (customers seeing ProvisionedThroughputExceededException)
+- Throttling concentrated on a single GSI (index-scoped hot key - candidate for re-keying or on-demand)
+
+### Capacity & Cost
+- Provisioned read OR write utilisation > 80% sustained 15m (throttle risk - auto-scaling not keeping pace)
+- Account provisioned-capacity utilisation > 90% of the DescribeLimits quota (cannot scale further without a limit increase)
+- On-demand consumed units spike > 2 sigma vs 7-day baseline without a matching traffic justification (runaway scan / job overrun)
+- PROVISIONED table sitting at < 20% utilisation for > 7 days (over-provisioned - downsize or switch to on-demand)
+
+### Performance & Errors
+- SuccessfulRequestLatency p95 > 200ms (or p99 > 500ms) sustained 15m on GetItem / Query (regression vs single-digit-ms target)
+- SystemErrors > 0 sustained 5m (DynamoDB-side 5xx / InternalServerError - AWS incident)
+- UserErrors spike > 2 sigma vs 30-day baseline (client-side 4xx - bad deploy hitting the table wrong)
+- ConditionalCheckFailedRequests spike (optimistic-locking contention storm on a hot item)
+
+### Replication & Backup
+- Global-table ReplicationLatency > 10s to any replica region (stale cross-region reads)
+- Any global-table replica ReplicaStatus != ACTIVE (CREATING / UPDATING / DELETING - replication degraded)
+- Any production table with PointInTimeRecoveryStatus != ENABLED (data-loss risk - no continuous recovery)
+- Newest on-demand backup older than 72h on tables relying on explicit snapshots
+
+### Cross-channel: database vs ecommerce reconciliation
+- Throttling on the cart / session / inventory table co-occurs with an ecom checkout drop in the same 5m window (sibling = bigcommerce.checkout / shopify.checkout)
+- Consumed-capacity spike with no matching ecom order spike (= bot / scraper / runaway job, sibling = bigcommerce.order / shopify.order)
+- Provisioned capacity saturated > 80% during an ecom traffic burst (app gets ProvisionedThroughputExceededException at checkout)
+- Products-table item count drifts vs ecom catalog product count (sync failure, sibling = bigcommerce.product / shopify.product)
+
+## Data sources
+
+- `POST ListTables` - Enumerate tables in the region
+- `POST DescribeTable` - Item count, table size, billing mode, provisioned throughput, GSIs, status
+- `POST DescribeLimits` - Account-level provisioned-capacity quotas for utilisation headroom
+- `POST DescribeContinuousBackups` - PointInTimeRecoveryStatus per table
+- `POST ListBackups` - On-demand backup recency - newest CreationDateTime per table
+- `POST ListGlobalTables` - Global-table membership for replication checks
+- `POST DescribeGlobalTableSettings` - Per-replica region + ReplicaStatus for global tables
+- `POST cloudwatch:GetMetricData` - AWS/DynamoDB - ConsumedRead/WriteCapacityUnits, Read/WriteThrottleEvents, ThrottledRequests, SuccessfulRequestLatency, SystemErrors, UserErrors, ConditionalCheckFailedRequests, ReplicationLatency, Account*CapacityUtilization
+- `POST cloudwatch:ListMetrics` - Enumerate available per-table / per-GSI metrics + dimensions
+
+{/* Generated from dynamodb_health.yaml. Edit the audit module, not this page. */}

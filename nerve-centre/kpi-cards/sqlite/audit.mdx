@@ -1,0 +1,75 @@
+---
+title: "SQLite audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ SQLite health audit checks: SQLite: File Health, Integrity, Index Coverage, WAL & Vacuum Recency"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/sqlite) · [Audit Profile](/nerve-centre/kpi-cards/sqlite/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/sqlite/sentiment)**
+
+SQLite is a serverless, embedded, single-file database - there is no daemon, no network protocol, no replication, and no connection pool. The questions that matter are different from a client/server engine: is the database file growing or fragmented (freelist bloat), does PRAGMA integrity_check pass, is the WAL file checkpointing or has it ballooned, are foreign keys consistent, which hot queries still do full table SCANs (missing index), and how stale is the last VACUUM / file-level backup snapshot. Cross-references ecommerce platforms - a product / inventory table row count drifting vs the ecom catalog on a merchant-owned SQLite file indicates a sync failure, and a long-running write transaction holding the single writer lock that co-occurs with a checkout drop indicates a database bottleneck costing revenue.
+
+
+## What this audit checks
+
+### Authentication & access
+- Database file path is readable and a connection opens without SQLITE_CANTOPEN
+- Connection is not held read-only when write-health checks are requested (PRAGMA query_only reflects intended mode)
+- PRAGMA compile_options confirms required features (DBSTAT_VTAB for page stats, FTS / JSON1 where cards depend on them) are present in the linked library
+- SQLite library version (sqlite_version()) is supported - pre-3.7 lacks WAL, pre-3.8 lacks partial indexes
+
+### File health & fragmentation
+- Free-page ratio > 25% (PRAGMA freelist_count / PRAGMA page_count - fragmentation, file should be VACUUMed)
+- Database file size (page_count × page_size) growing > 20% week-over-week without a matching row-count rise
+- auto_vacuum mode is NONE on a write-heavy file with a large freelist (manual VACUUM required to reclaim space)
+- Page size is the platform default and not pathologically small for the workload (PRAGMA page_size)
+
+### Integrity & consistency
+- PRAGMA integrity_check returns anything other than the single row 'ok' (B-tree / page corruption)
+- PRAGMA quick_check fails (lighter-weight corruption probe for large files)
+- PRAGMA foreign_key_check returns rows (orphaned child rows / FK violations) when foreign_keys are enforced
+- Schema cookie (PRAGMA schema_version) changed unexpectedly between audit runs (uncoordinated DDL)
+
+### WAL & locking
+- WAL file size > 4MB / 1000 pages and not checkpointing (PRAGMA wal_checkpoint(PASSIVE) frames not reset - reader holding back the checkpoint)
+- journal_mode is unexpectedly DELETE / TRUNCATE on a concurrent-read workload that should be WAL (PRAGMA journal_mode)
+- Repeated SQLITE_BUSY / SQLITE_LOCKED on the single writer lock (long write txn starving readers - busy_timeout too low)
+- Checkpoint starvation - wal_checkpoint(RESTART) cannot complete because a reader never releases
+
+### Index coverage & query plans
+- Hot query in the sampled set runs a full table SCAN where a SEARCH using an index is possible (EXPLAIN QUERY PLAN shows SCAN TABLE)
+- Table > 10k rows has no usable index for its common WHERE / JOIN columns (sqlite_schema index inventory)
+- ANALYZE has never been run or is stale - sqlite_stat1 empty / missing so the planner is guessing (cardinality misestimates)
+- Redundant / duplicate indexes inflating write cost (overlapping column prefixes in sqlite_schema)
+
+### Backup & durability
+- Last file-level backup / snapshot (Online Backup API copy, VACUUM INTO, or filesystem snapshot) older than 72h
+- synchronous pragma set to OFF on a durability-sensitive file (PRAGMA synchronous - power-loss corruption risk)
+- No recent VACUUM INTO or .backup snapshot recorded while the file is actively written
+
+### Cross-channel: database vs ecommerce reconciliation
+- Product / inventory table row count drifts vs the ecom catalog product count (sync failure, sibling = bigcommerce.product / shopify.product)
+- A long-running write transaction holding the single writer lock co-occurs with an ecom checkout drop in the same 5-min window (sibling = bigcommerce.checkout / shopify.checkout)
+- Database file write-burst (page_count growth) with no matching ecom order spike (= runaway import / scraper job, sibling = bigcommerce.order / shopify.order)
+- Customer table row count drifts vs ecom customer master (merchant-owned schema sync gap)
+
+## Data sources
+
+- `GET sqlite_version()` - Linked library version - feature gating (WAL, partial indexes)
+- `GET PRAGMA compile_options` - Confirm DBSTAT_VTAB / FTS / JSON1 availability in the linked build
+- `GET PRAGMA page_count` - Total pages - file size = page_count × page_size
+- `GET PRAGMA page_size` - Bytes per page
+- `GET PRAGMA freelist_count` - Free (unused) pages - fragmentation / freelist bloat
+- `GET PRAGMA integrity_check` - Full corruption scan - expects single 'ok' row
+- `GET PRAGMA quick_check` - Lighter corruption probe for large files
+- `GET PRAGMA foreign_key_check` - Orphaned child rows / FK violations
+- `GET PRAGMA journal_mode` - DELETE / TRUNCATE / WAL / MEMORY journalling mode
+- `GET PRAGMA wal_checkpoint` - WAL frame count + checkpoint result (busy / log / checkpointed)
+- `GET PRAGMA auto_vacuum` - NONE / FULL / INCREMENTAL - space reclamation mode
+- `GET PRAGMA synchronous` - Durability fsync level (OFF / NORMAL / FULL / EXTRA)
+- `GET PRAGMA schema_version` - Schema cookie - detects uncoordinated DDL between runs
+- `GET sqlite_schema` - Tables + indexes inventory (a.k.a. sqlite_master)
+- `GET sqlite_stat1` - ANALYZE planner statistics - staleness / absence detection
+- `GET EXPLAIN QUERY PLAN` - SCAN vs SEARCH per hot query - missing-index detection
+- `GET dbstat` - Per-table page usage (requires DBSTAT_VTAB build option)
+
+{/* Generated from sqlite_health.yaml. Edit the audit module, not this page. */}

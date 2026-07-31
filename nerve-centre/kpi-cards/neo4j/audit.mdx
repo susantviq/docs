@@ -1,0 +1,56 @@
+---
+title: "Neo4j audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Neo4j health audit checks: Neo4j: Query Performance, Long Transactions, Cluster Health & Backup Recency"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/neo4j) · [Audit Profile](/nerve-centre/kpi-cards/neo4j/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/neo4j/sentiment)**
+
+The questions every Neo4j operator asks at 9am on Monday: which Cypher queries regressed and is the p95 latency drifting, is any transaction running away and holding locks, is the page cache still warm or has the store outgrown RAM, are the cluster FOLLOWERs caught up with the LEADER and were there any leader elections, and how stale is the last backup / Aura snapshot. Cross-references ecommerce platforms - a slow graph op or driver-pool exhaustion co-occurring with a checkout drop, or a graph query spike with no matching order spike (bot / scraper on a recommendation endpoint), indicates graph latency costing revenue.
+
+
+## What this audit checks
+
+### Authentication & access
+- Monitoring user authenticates over the Query API (HTTP Basic, TLS enforced on Aura) without error
+- User holds SHOW TRANSACTION (ALL) and procedure access - SHOW TRANSACTIONS and dbms.cluster.overview() return rows, not permission errors
+- dbms.* / db.stats procedures executable (read/monitor role granted, not just PUBLIC)
+- Aura API client credentials valid when present - OAuth2 client-credentials token mints and /v1/instances returns the instance
+
+### Query Performance & Transactions
+- Query latency p95 >200ms sustained 15m (elapsedTime distribution from SHOW TRANSACTIONS samples)
+- Any transaction open >30s holding locks (SHOW TRANSACTIONS elapsedTime - runaway Cypher or un-terminated session)
+- Transaction rollback rate >1% in 5m (rolled-back / committed from db.stats - deadlocks, constraint violations, retry storms)
+- Slow-query rate >5% of transactions over the 200ms threshold (SHOW TRANSACTIONS deltas)
+
+### Capacity & Memory
+- Page cache hit ratio <95% (hits / (hits + faults) from db.stats - store no longer fits page cache, IO climbing)
+- JVM heap usage >85% of committed sustained (dbms.queryJmx java.lang:type=Memory - GC pressure, OOM risk)
+- Bolt connection / thread pool saturation >90% (dbms.listConnections() vs configured max - new sessions queue / time out)
+- Store size growth anomaly - sudden jump vs 7-day baseline (bulk import or runaway write filling disk)
+
+### Cluster Health & Backup
+- Any cluster member not LEADER or FOLLOWER, or in an unhealthy state (dbms.cluster.overview())
+- FOLLOWER replication lag >10s vs LEADER (last-applied-tx age - secondary falling behind)
+- Repeated leader elections >1 in 24h (primary flapping from network / GC pause / hardware instability)
+- Last successful backup / Aura snapshot older than 72h (Aura /v1/snapshots, or neo4j-admin backup recency self-managed)
+
+### Cross-channel: database vs ecommerce reconciliation
+- Slow graph op or long transaction co-occurs with an ecom checkout drop in the same 5-min window (sibling = bigcommerce.checkout / shopify.checkout)
+- Graph query volume spikes with no matching ecom order spike (= bot / scraper on a recommendation endpoint, sibling = bigcommerce.order / shopify.order)
+- Bolt pool saturation >90% during an ecom traffic burst (recommendation calls dropped, conversion at risk)
+- Graph node count for a product / customer label drifts vs ecom catalog / customer count (sync failure, sibling = bigcommerce.product / shopify.product)
+
+## Data sources
+
+- `POST /db/{database}/query/v2` - Neo4j HTTP Query API - runs all read-only Cypher monitoring commands below
+- `GET SHOW DATABASES` - Database list + currentStatus (ONLINE / OFFLINE / STORE_COPYING)
+- `GET SHOW TRANSACTIONS` - Active transactions, elapsedTime, currentQuery - long-running / slow-op surface
+- `GET dbms.cluster.overview()` - Enterprise cluster - member id, address, role (LEADER / FOLLOWER / READ_REPLICA)
+- `GET dbms.listConnections()` - Active bolt / http connections for pool saturation
+- `GET db.stats` - Counters - committed/rolled-back transactions, page-cache hits/faults, throughput
+- `GET dbms.queryJmx` - JMX beans - JVM heap usage, kernel uptime
+- `GET /v1/instances` - Aura management API - instance memory / storage / status (OAuth2, gated)
+- `GET /v1/snapshots` - Aura management API - backup snapshot recency (gated)
+
+{/* Generated from neo4j_health.yaml. Edit the audit module, not this page. */}

@@ -1,0 +1,64 @@
+---
+title: "Apache Cassandra audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Apache Cassandra health audit checks: Apache Cassandra: Node State, Latency, Compaction Backlog, Replication Convergence & Backup Recency"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/cassandra) · [Audit Profile](/nerve-centre/kpi-cards/cassandra/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/cassandra/sentiment)**
+
+The questions every Cassandra operator asks at 9am on Monday: are all nodes UN (Up/Normal) or is anything DN / gossip-flapping, are coordinator read and write latency percentiles drifting up on the hot keyspaces, is the compaction + pending-task backlog growing while tombstones pile up, are replicas converging (hinted handoffs draining, repairs inside gc_grace), and how stale is the last snapshot. Cross-references ecommerce platforms - a slow CQL read or write timeout co-occurring with a checkout drop, a write spike with no matching order spike, or product-table row-count drift vs the ecom catalog, each indicates a database bottleneck or sync gap costing revenue.
+
+
+## What this audit checks
+
+### Authentication & access
+- Monitoring role authenticates over the native CQL protocol (TLS enforced where configured) without error
+- Role has SELECT on system, system_views and the monitored keyspaces - virtual-table + system.local queries return rows, not Unauthorized errors
+- JMX / nodetool reachable on the management port where virtual tables are unavailable (pre-4.0 or JMX-only clusters)
+- DataStax Astra: secure-connect bundle + client-id / client-secret token valid (managed clusters have no host+password path)
+
+### Cluster & node state
+- Any endpoint not UN in nodetool status (DN = down, UJ/UL = joining/leaving) - reduced replica availability
+- Gossip marks a peer DOWN or the node is flapping between UP/DOWN (network partition or GC pause)
+- Schema disagreement across nodes (multiple schema versions in system.peers - migration stuck)
+- Node count below expected for the keyspace replication factor in any datacenter
+
+### Query latency & tombstones
+- Coordinator read latency p95 >200ms OR p99 >500ms sustained 15m (ClientRequest Read percentiles)
+- Coordinator write latency p99 climbing >baseline (commitlog / GC pressure, not normal for Cassandra writes)
+- Tombstones scanned per read above tombstone_warn_threshold (default 1000) - reads approaching the 100k failure threshold
+- SSTables-per-read average climbing >4 (compaction falling behind, read amplification rising)
+
+### Compaction, capacity & memory
+- Pending compactions >100 sustained (nodetool compactionstats - SSTables stacking up)
+- Native-Transport-Requests pending queue saturated OR connection saturation >90% (login / request timeouts imminent)
+- JVM heap >75% sustained OR long GC pause time growing (node instability precursor)
+- Disk / data-directory usage >90% (Load column vs capacity - compaction needs free headroom)
+
+### Replication, repair & backup
+- Hinted handoffs pending >0 sustained 10m (a replica is down/slow; data not yet converged)
+- Dropped mutations >0 in 24h (coordinator shed a write under load - data-loss risk if hints also dropped)
+- Last repair older than gc_grace_seconds (default 10d) on any keyspace - zombie data / resurrected-delete risk
+- Last snapshot / Medusa backup older than 72h (gated on snapshot directory or Medusa visibility)
+
+### Cross-channel: database vs ecommerce reconciliation
+- Slow CQL read or read timeout co-occurs with an ecom checkout drop in the same 5-min window (sibling = bigcommerce.checkout / shopify.checkout)
+- Write rate spikes with no matching ecom order spike (= bot / scraper / runaway job, sibling = bigcommerce.order / shopify.order)
+- Native-Transport-Requests saturation >90% during an ecom traffic burst (app gets request / connection timeouts)
+- Product-table row count drifts vs ecom catalog product count (sync failure, sibling = bigcommerce.product / shopify.product)
+
+## Data sources
+
+- `GET SELECT * FROM system.local` - Cluster name, release version, host_id, datacenter, rack
+- `GET SELECT * FROM system.peers` - Peer endpoints, host_ids, schema versions - node count + schema agreement
+- `GET SELECT * FROM system_views.thread_pools` - Native-Transport-Requests + compaction pool active/pending/blocked, dropped counts
+- `GET SELECT * FROM system_views.clients` - Connected client count + driver name (connection origin)
+- `GET SELECT * FROM system_views.local_read_latency` - Local + coordinator read/write latency percentiles (4.0+ virtual tables)
+- `GET nodetool status` - Per-node UN/DN/UJ/UL state, Load (disk usage), ownership per datacenter
+- `GET nodetool tpstats` - Thread-pool active/pending/blocked + dropped messages (mutations, reads)
+- `GET nodetool compactionstats` - Pending compactions + active compaction progress
+- `GET nodetool netstats` - Hinted-handoff backlog + streaming state per peer
+- `GET nodetool tablestats` - Per-table SSTable count, tombstone histograms, read/write counts, row count
+- `GET nodetool gossipinfo` - Gossip state per endpoint - UP/DOWN, generation, heartbeat (flapping detection)
+
+{/* Generated from cassandra_health.yaml. Edit the audit module, not this page. */}

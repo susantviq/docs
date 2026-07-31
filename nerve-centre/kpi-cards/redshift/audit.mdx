@@ -1,0 +1,59 @@
+---
+title: "Amazon Redshift audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Amazon Redshift health audit checks: Amazon Redshift: Disk Headroom, WLM Queueing, Query Performance, Table Maintenance & Backup Recency"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/redshift) · [Audit Profile](/nerve-centre/kpi-cards/redshift/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/redshift/sentiment)**
+
+The questions every Redshift data-platform team asks at 9am on Monday: how much disk headroom is left and is any node skewed, are queries queueing in WLM (do we resize or add concurrency scaling), which queries are running long or spilling to disk, which tables need VACUUM / ANALYZE, and how stale is the last snapshot. Cross-references ecommerce platforms - a query / RPU spike with no matching order spike (dashboard storm / runaway job / scraper), a slow analytics query co-occurring with a checkout drop, or product-table row-count drift vs the ecom catalog, all point to a warehouse problem costing money or revenue visibility.
+
+
+## What this audit checks
+
+### Authentication & access
+- IAM principal signs CloudWatch GetMetricData and redshift-data calls (SigV4) without AccessDenied
+- redshift-data:ExecuteStatement / DescribeStatement / GetStatementResult permitted against the cluster / workgroup
+- Database user (GetClusterCredentials / Serverless GetCredentials) has SELECT on SYS_*/STV_*/SVV_*/STL_* monitoring views
+- cloudwatch:GetMetricData scoped to the AWS/Redshift namespace returns datapoints, not empty / throttled
+
+### Disk & Capacity
+- PercentageDiskSpaceUsed >90% (writes, vacuums and sorts fail when the cluster fills - the #1 Redshift outage cause)
+- Connection saturation >90% - DatabaseConnections / max_connections (default 500; app login timeouts imminent)
+- CPUUtilization sustained >90% across compute nodes (workload outgrowing node count / size)
+- Largest table approaching node disk allocation (single table dominating SVV_TABLE_INFO.size)
+
+### WLM & Query Performance
+- WLM queue length >5 sustained 5m (WLMQueueLength - queue under-provisioned; resize or enable concurrency scaling)
+- Query latency p95 >5s sustained (SYS_QUERY_HISTORY.elapsed_time percentiles)
+- Slow-query rate >5% of executions over the 5s threshold (SYS_QUERY_HISTORY)
+- Queries spilling to disk >10 in 24h (SVL_QUERY_SUMMARY is_diskbased - undersized memory / bad joins)
+- Queries blocked on locks >0 sustained (STV_LOCKS / SVV_TRANSACTIONS blocking chains)
+
+### Table Maintenance & Health
+- Tables with >10% unsorted rows (SVV_TABLE_INFO.unsorted - VACUUM candidates; full scans + wasted disk)
+- Tables with stale statistics >10% stats_off (SVV_TABLE_INFO.stats_off - bad planner join orders)
+- Table distribution skew >4.0 (SVV_TABLE_INFO.skew_rows - one slice doing all the work; bad DISTKEY)
+- Query error rate >1% in 5m (SYS_QUERY_HISTORY.status = 'failed' - aborts, resource exhaustion, permission errors)
+
+### Backup & Replication
+- Last automated/manual snapshot older than 72h (DescribeClusterSnapshots - recovery window shrinking)
+- Cross-region snapshot copy lag >10s (disaster-recovery replica freshness)
+- Automated snapshot schedule disabled or retention <1 day (RPO violation)
+
+### Cross-channel: database vs ecommerce reconciliation
+- Query / RPU spike with no matching ecom order spike (= dashboard storm / runaway job / scraper, sibling = bigcommerce.order / shopify.order)
+- Slow analytics query co-occurs with an ecom checkout drop in the same 5-min window (sibling = bigcommerce.checkout / shopify.checkout)
+- Connection saturation >90% during an ecom traffic burst (app gets connection / login timeouts)
+- Product / orders table row count drifts vs ecom catalog count (ETL sync failure, sibling = bigcommerce.product / shopify.product)
+
+## Data sources
+
+- `POST cloudwatch:GetMetricData` - CPUUtilization, PercentageDiskSpaceUsed, DatabaseConnections, QueriesCompletedPerSecond, WLMQueueLength, ReadLatency, HealthStatus
+- `POST redshift-data:ExecuteStatement` - Submit read-only SQL against SYS_*/STV_*/SVV_*/STL_* monitoring views (query history, WLM state, table info, locks)
+- `POST redshift-data:DescribeStatement` - Poll async statement status
+- `POST redshift-data:GetStatementResult` - Fetch system-view result rows once the statement FINISHED
+- `POST redshift:DescribeClusters` - Cluster version, node type, node count, status
+- `POST redshift:DescribeClusterSnapshots` - Snapshot recency for backup-age and cross-region copy lag
+
+{/* Generated from redshift_health.yaml. Edit the audit module, not this page. */}

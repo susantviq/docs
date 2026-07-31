@@ -1,0 +1,58 @@
+---
+title: "Xero (API) audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Xero (API) health audit checks: Xero: Order-to-Books Sync, Bank Reconciliation, AR Aging & VAT/GST Health"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/xero-api) · [Audit Profile](/nerve-centre/kpi-cards/xero-api/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/xero-api/sentiment)**
+
+The questions an SMB founder / finance lead asks at 9am on Monday: did yesterday's storefront orders and PSP payouts land in Xero as sales invoices + bank transactions, is the bank reconciliation current enough that the books are trustworthy, is AR aging concentrating on customers still placing new ecom orders, and is the VAT (UK MTD) / GST (AU/NZ) return on track. Cross-references the ecommerce platforms (BigCommerce / Adobe Commerce / Shopify) and the PSPs (Stripe / PayPal) - an order with no matching Xero invoice, a payout with no matching bank transaction, or overdue AR on a still-shipping customer are the killer reconciliation findings no single tool can see.
+
+
+## What this audit checks
+
+### Authentication & access
+- OAuth2 refresh-token grant against https://identity.xero.com/connect/token succeeds (Xero rotates the refresh token every cycle - persist the new value)
+- GET https://api.xero.com/connections returns >=1 tenantId, and the configured tenant_id is still in the connected set (org not disconnected)
+- Granted scopes cover accounting.transactions + accounting.contacts + accounting.settings + accounting.reports.read (missing scope = silent empty reads)
+- GET /api.xro/2.0/Organisation returns the tenant without 401 (bad token) or 403 (tenant header missing / wrong) - confirms base currency + tax period config
+
+### Order-to-books & revenue recognition
+- ACCREC (sales) invoices stuck in DRAFT / SUBMITTED beyond the close cadence - invoicing backlog before authorisation
+- Storefront orders with no matching Xero ACCREC invoice after the sync window (revenue not recognised in the books)
+- Sales invoices missing TotalTax on VAT/GST-eligible lines - return base understated, MTD/GST non-compliant
+- Credit-note (ACCRECCREDIT) value as a share of sales-invoice value above threshold - returns / fulfilment quality problem
+
+### Bank reconciliation & cash integrity
+- BankTransaction rows with IsReconciled=false above the unreconciled-count threshold (books drift from cash)
+- Oldest unreconciled bank line older than the recon cadence (default 14d) - VAT/GST return base unreliable
+- PSP payout (Stripe / PayPal settlement) with no matching Xero bank transaction after the sync window
+- Bank-account feed stale - no new BankTransaction in N days on an account with expected daily activity
+
+### AR aging & receivables economics
+- AR aged 60+ days above 15% of total AR balance (from Reports/AgedReceivablesByContact)
+- Days Sales Outstanding (DSO) above 60 days
+- Overdue ACCREC invoice value (past DueDate, AmountDue > 0) above threshold
+- Single contact concentration - one customer above N% of total outstanding AR (credit concentration risk)
+
+### Cross-channel: Xero vs ecommerce / payments reconciliation
+- Storefront order has no matching Xero ACCREC invoice after the sync window (sibling = bigcommerce.order / shopify.order / adobe_commerce.order, by Reference / order_reference)
+- PSP payout has no matching Xero bank transaction, or the matched line stays IsReconciled=false (sibling = stripe.payout / paypal.payout, by Reference=payout_id)
+- Ecom customer with completed orders absent from Xero contacts after 7d (sibling = bigcommerce.customer / shopify.customer, by EmailAddress)
+- Contact with AR aged 60+ days still placing new ecom orders (credit risk compounding, sibling = ecommerce customer by EmailAddress)
+- Xero tracked-inventory QuantityOnHand drifts >5% from storefront available qty on items with active orders (sibling = ecommerce product, by Code=sku; tracked inventory only)
+
+## Data sources
+
+- `GET https://identity.xero.com/connect/token` - OAuth2 refresh-token grant (rotating refresh token)
+- `GET https://api.xero.com/connections` - List connected tenants - tenantId for the Xero-tenant-id header
+- `GET /api.xro/2.0/Organisation` - Auth / tenant validation probe + tax period config
+- `GET /api.xro/2.0/Invoices` - ACCREC/ACCPAY invoices - revenue, AR balance, overdue, order-to-books match
+- `GET /api.xro/2.0/Contacts` - Contact master - customers/suppliers, tax number, master drift
+- `GET /api.xro/2.0/BankTransactions` - Bank transactions - reconciliation status, payout matching
+- `GET /api.xro/2.0/Accounts` - Chart of accounts - bank balances, tax types
+- `GET /api.xro/2.0/Items` - Products & services - Code (SKU), tracked-inventory QuantityOnHand
+- `GET /api.xro/2.0/Reports/AgedReceivablesByContact` - Aged receivables - AR aging buckets, DSO basis
+- `GET /api.xro/2.0/Reports/BalanceSheet` - Balance sheet - cash / receivables / payables snapshot for health score
+
+{/* Generated from xero_api_health.yaml. Edit the audit module, not this page. */}

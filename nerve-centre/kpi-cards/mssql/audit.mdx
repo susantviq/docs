@@ -1,0 +1,63 @@
+---
+title: "Microsoft SQL Server audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Microsoft SQL Server health audit checks: SQL Server: Query Performance, Concurrency, AG Health & Backup Recency"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/mssql) · [Audit Profile](/nerve-centre/kpi-cards/mssql/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/mssql/sentiment)**
+
+The questions every SQL Server DBA asks at 9am on Monday: which wait types are climbing and which query plans regressed in Query Store, is anything blocked or deadlocking, are the Always On AG secondaries synchronised and failover-ready, is tempdb / the transaction log filling, and how stale is the last backup. Cross-references ecommerce platforms - a blocking chain or slow DMV query co-occurring with a checkout drop, or product-table row-count drift vs the ecom catalog, indicates a database bottleneck costing revenue.
+
+
+## What this audit checks
+
+### Authentication & access
+- Monitoring login authenticates over TDS (TLS / Encrypt enforced) without error
+- Login has VIEW SERVER STATE (on-prem / Managed Instance) or VIEW DATABASE STATE (Azure SQL Database) - DMVs return rows, not permission errors
+- VIEW ANY DEFINITION granted so plan / index / missing-index metadata is readable
+- Failed-login spike >100 in 24h (msg 18456 / Logins Failed/sec - brute force or stale app credentials)
+
+### Query Performance & Plans
+- Avg query duration >200ms sustained 15m (total_elapsed_time / execution_count from sys.dm_exec_query_stats)
+- Slow-query rate >5% of executions over the 200ms threshold (query-stats deltas)
+- High-impact missing-index recommendation present (sys.dm_db_missing_index_details with large avg_user_impact × seeks)
+- Top wait type is a resource wait (PAGEIOLATCH_* / CXPACKET / RESOURCE_SEMAPHORE) climbing >baseline in sys.dm_os_wait_stats
+
+### Concurrency & Contention
+- Any session blocked >30s (sys.dm_exec_requests.blocking_session_id chain)
+- Deadlocks >0 in last 5m (Number of Deadlocks/sec counter + system_health XEvent ring buffer)
+- Lock Waits/sec climbing sustained >baseline (contention building before deadlocks surface)
+
+### Capacity & Memory
+- Connection saturation >90% - active sessions / @@MAX_CONNECTIONS (login timeouts imminent)
+- TempDB space used >85% (sys.dm_db_file_space_usage - full tempdb stalls every sort / hash / version-store op)
+- Buffer cache hit ratio <95% OR Page Life Expectancy dropping <300s (memory pressure flushing the buffer pool)
+- Data / log file usage >90% of allocated (sys.dm_db_file_space_usage / sys.master_files)
+
+### Always On AG & Backup
+- Any AG replica synchronization_health != HEALTHY OR synchronization_state != SYNCHRONIZED (sys.dm_hadr_database_replica_states)
+- AG secondary lag >10s OR redo queue >100MB sustained (redo_queue_size / redo_rate - secondary falling behind)
+- Last successful full backup older than 72h (MAX(backup_finish_date) from msdb.dbo.backupset per database)
+- Log backup gap >30m on FULL / BULK_LOGGED recovery DBs (transaction log growing, RPO window shrinking)
+
+### Cross-channel: database vs ecommerce reconciliation
+- Blocking chain or slow query co-occurs with an ecom checkout drop in the same 5-min window (sibling = bigcommerce.checkout / shopify.checkout)
+- Batch-requests spike with no matching ecom order spike (= bot / scraper / runaway job, sibling = bigcommerce.order / shopify.order)
+- Connection saturation >90% during an ecom traffic burst (app gets login / connection timeouts)
+- Product-table row count drifts vs ecom catalog product count (sync failure, sibling = bigcommerce.product / shopify.product)
+
+## Data sources
+
+- `GET sys.dm_os_sys_info` - Instance uptime, scheduler / CPU count, server start time
+- `GET sys.dm_os_performance_counters` - Batch Requests/sec, Buffer cache hit ratio, Page Life Expectancy, Deadlocks/sec, Lock Waits/sec, Errors/sec, Logins Failed/sec
+- `GET sys.dm_os_wait_stats` - Cumulative wait-type breakdown - signal vs resource waits
+- `GET sys.dm_exec_query_stats` - Per-plan execution count, elapsed time, logical reads, worker time - slow-query surface
+- `GET sys.dm_exec_requests` - Live requests, blocking_session_id chains, wait state
+- `GET sys.dm_exec_sessions` - Session count, status, program_name (app connection origin)
+- `GET sys.dm_db_file_space_usage` - TempDB + user DB space usage
+- `GET sys.dm_db_resource_stats` - Azure SQL Database - CPU / IO / memory % of service objective
+- `GET sys.dm_db_missing_index_details` - Missing-index recommendations with impact estimates
+- `GET sys.dm_hadr_database_replica_states` - Always On AG - sync state, redo_queue_size, last_commit_time per replica
+- `GET msdb.dbo.backupset` - Backup recency - backup_finish_date per database (on-prem / Managed Instance)
+
+{/* Generated from mssql_health.yaml. Edit the audit module, not this page. */}

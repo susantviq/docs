@@ -1,0 +1,57 @@
+---
+title: "Google Firestore audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Google Firestore health audit checks: Google Firestore: Op Volume & Cost, Request Health, Realtime Connections, Index Integrity"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/firestore) · [Audit Profile](/nerve-centre/kpi-cards/firestore/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/firestore/sentiment)**
+
+The questions every Firestore-backed team asks at 9am on Monday: is the read/write/delete op volume climbing (the bill is per-operation), is API request latency holding and the error rate clean, how many realtime connections and snapshot listeners are live, and are any composite indexes stuck building or in NEEDS_REPAIR. Cross-references ecommerce platforms - an op-volume spike with no matching order spike (bot / scraper / runaway client), a realtime listener storm during a traffic burst, a high-latency request shape co-occurring with a checkout drop, or product-collection document-count drift vs the ecom catalog all point at a database problem costing money or revenue.
+
+
+## What this audit checks
+
+### Authentication & access
+- Service-account key authenticates and the Firestore Admin API returns the database resource (not a 401 / 403)
+- roles/datastore.viewer granted - databases.get, indexes.list, fields.list, operations.list return data not PERMISSION_DENIED
+- roles/monitoring.viewer granted - projects.timeSeries.list returns firestore.googleapis.com/* series (op-volume / latency KPIs unusable without it)
+- project_id + database_id resolve to a real Native-mode database (type = FIRESTORE_NATIVE)
+
+### Operation volume & cost
+- Document read op rate spikes >2σ vs 7-day baseline (read amplification - unindexed query fan-out, listener re-resolve, or runaway client; Firestore bills per read)
+- Read:write op ratio jumps sharply vs baseline (reads dominating = inefficient query pattern or hot listener)
+- Delete op spike vs baseline (TTL or managed-delete burst - billable managed-delete write units)
+- Document count / stored bytes growth rate exceeds plan headroom (storage cost trending up)
+
+### Request health & latency
+- api/request_latencies p95 >200ms sustained 15m (receive → finish-send including storage layer)
+- api/request_latencies p99 >500ms sustained 15m
+- API request error rate >1% over 5m (api/request_count with response_code != OK)
+- A single api_method / collection-group shape dominates the latency distribution (hot path to optimise)
+
+### Realtime connections & listeners
+- network/active_connections climbs sharply vs baseline (connection leak or burst - approaching per-database concurrency limits)
+- network/snapshot_listeners spikes (listener storm - each onSnapshot re-resolve costs reads)
+- Snapshot-listener count high relative to active orders (over-broad realtime queries fanning out reads)
+
+### Index integrity
+- Any composite index in NEEDS_REPAIR or ERROR state (queries depending on it fail at runtime - FAILED_PRECONDITION)
+- Any CREATE_INDEX long-running operation in CREATING state >6h (stuck build blocking its queries)
+- Collection group with a frequently-queried field lacking an index or exemption (full-collection fan-out reads)
+- Single-field index exemptions present that disable indexing on a queried field (silent query failures)
+
+### Cross-channel: database vs ecommerce reconciliation
+- Document op spike with no matching ecom order spike in the same 15-min window (= bot / scraper / runaway client; sibling = bigcommerce.order / shopify.order)
+- Realtime active-connections / snapshot-listeners storm during an ecom traffic burst (sibling = bigcommerce.order / shopify.order)
+- High-latency request shape co-occurs with an ecom checkout drop in the same 5-min window (sibling = bigcommerce.checkout / shopify.checkout)
+- Products-collection document count drifts vs ecom catalog product count (sync failure; sibling = bigcommerce.product / shopify.product)
+
+## Data sources
+
+- `GET /v1/projects/{project_id}/databases/{database_id}` - Database metadata - type, location, concurrencyMode, PITR, edition; auth probe
+- `GET /v1/projects/{project_id}/databases/{database_id}/collectionGroups/{collection_group}/indexes` - Composite index list + state (READY / CREATING / NEEDS_REPAIR / ERROR)
+- `GET /v1/projects/{project_id}/databases/{database_id}/collectionGroups/{collection_group}/fields` - Per-field index config, single-field exemptions, TTL policy
+- `GET /v1/projects/{project_id}/databases/{database_id}/operations` - Long-running operations - CREATE_INDEX / IMPORT / EXPORT done flag + error
+- `GET /v3/projects/{project_id}/timeSeries` - Cloud Monitoring - document/{read,write,delete}_ops_count, document/count, api/request_count, api/request_latencies, network/active_connections, network/snapshot_listeners
+
+{/* Generated from firestore_health.yaml. Edit the audit module, not this page. */}

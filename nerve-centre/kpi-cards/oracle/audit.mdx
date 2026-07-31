@@ -1,0 +1,69 @@
+---
+title: "Oracle Database audit profile, Vortex IQ"
+sidebarTitle: "Audit"
+description: "What the Vortex IQ Oracle Database health audit checks: Oracle Database: Top SQL & Wait Events, Concurrency, Data Guard Health & Backup Recency"
+---
+
+**[Nerve Centre KPIs](/nerve-centre/kpi-cards/oracle) · [Audit Profile](/nerve-centre/kpi-cards/oracle/audit) · [Sentiment Settings](/nerve-centre/kpi-cards/oracle/sentiment)**
+
+The questions every Oracle DBA asks at 9am on Monday: which wait classes are climbing and which SQL_IDs regressed in elapsed time, is anything blocked or in a long lock chain, are the Data Guard standbys applying redo and failover-ready, is a tablespace / the PGA / temp filling, and how stale is the last RMAN backup. Cross-references ecommerce platforms - a blocking-lock chain or slow Top SQL co-occurring with a checkout drop, or product-table row-count drift vs the ecom catalog, indicates a database bottleneck costing revenue.
+
+
+## What this audit checks
+
+### Authentication & access
+- Monitoring user authenticates over Oracle Net (TLS / TCPS enforced where required) without ORA- error
+- User has SELECT_CATALOG_ROLE (or SELECT ANY DICTIONARY) - V$ / GV$ and DBA_* views return rows, not ORA-00942 / insufficient-privilege errors
+- Connection target resolves correctly (CDB root for instance-wide GV$ vs a specific PDB service) - GV$ scope matches intent
+- Failed-logon spike >100 in 24h ('logon failures' from V$SYSSTAT / DBA_AUDIT_SESSION - brute force or stale app credentials)
+
+### Top SQL & Wait Events
+- Avg SQL elapsed-time-per-exec >200ms sustained 15m (ELAPSED_TIME / EXECUTIONS from V$SQLSTATS)
+- Slow-SQL rate >5% of executions over the 200ms threshold (V$SQLSTATS deltas between polls)
+- Top wait class is a resource wait climbing >baseline (db file sequential read / log file sync / enq waits in V$SYSTEM_EVENT / V$ACTIVE_SESSION_HISTORY)
+- High hard-parse ratio / library-cache GETHITRATIO <95% (V$LIBRARYCACHE - missing bind variables thrashing the shared pool)
+
+### Concurrency & Contention
+- Any session blocked >30s (V$SESSION.BLOCKING_SESSION chain / V$LOCK blocker-waiter)
+- Enqueue waits ('enq: TX - row lock contention' / 'enq: TM') climbing sustained >baseline (V$SYSTEM_EVENT)
+- Long-running active session holding a TX lock past its expected window (V$SESSION + V$TRANSACTION)
+
+### Capacity & Memory
+- Session saturation >90% - CURRENT_UTILIZATION / LIMIT_VALUE for 'sessions' in V$RESOURCE_LIMIT (ORA-00018 imminent)
+- Any permanent tablespace >90% used (DBA_TABLESPACE_USAGE_METRICS - autoextend MAXSIZE exhaustion stalls writes / ORA-01653)
+- Buffer cache hit ratio <95% OR PGA allocated over aggregate target (V$SYSSTAT / V$PGASTAT - memory pressure, work areas spilling to temp)
+- Temp tablespace usage high during sort / hash-heavy windows (DBA_TEMP_FREE_SPACE / V$TEMP_SPACE_HEADER)
+
+### Data Guard & Backup
+- Data Guard apply lag >10s OR standby not in APPLYING / managed-recovery state (V$DATAGUARD_STATS / V$ARCHIVE_DEST_STATUS)
+- Transport lag >30s sustained OR archive-log apply gap >0 sequences behind (V$DATAGUARD_STATS / V$ARCHIVED_LOG - redo not shipping)
+- Last successful RMAN full / L0 backup older than 72h (MAX(COMPLETION_TIME) from V$RMAN_BACKUP_JOB_DETAILS WHERE STATUS='COMPLETED')
+- Flash Recovery Area usage >85% (V$RECOVERY_AREA_USAGE - archived redo / backups filling the FRA stalls archiving)
+
+### Cross-channel: database vs ecommerce reconciliation
+- Blocking-lock chain or slow Top SQL co-occurs with an ecom checkout drop in the same 5-min window (sibling = bigcommerce.checkout / shopify.checkout)
+- SQL-execution spike with no matching ecom order spike (= bot / scraper / runaway job, sibling = bigcommerce.order / shopify.order)
+- Session saturation >90% during an ecom traffic burst (app gets ORA-00018 / connection timeouts)
+- Product-table row count drifts vs ecom catalog product count (sync failure / oversell risk, sibling = bigcommerce.product / shopify.product)
+
+## Data sources
+
+- `GET V$INSTANCE` - Instance name, version, startup time / uptime, status
+- `GET V$DATABASE` - Open mode, database role (PRIMARY / STANDBY), protection mode
+- `GET V$SYSSTAT` - execute count, logon failures, user errors, physical reads, db block gets / consistent gets (cumulative)
+- `GET V$SYSTEM_EVENT` - Wait-event totals by event / wait class - enqueue and I/O waits
+- `GET V$ACTIVE_SESSION_HISTORY` - Sampled active sessions for wait-class breakdown and Top SQL attribution (Diagnostics Pack)
+- `GET V$SESSION` - Active / inactive sessions, BLOCKING_SESSION chains, MODULE / PROGRAM (app origin)
+- `GET V$RESOURCE_LIMIT` - sessions / processes current vs limit - session saturation
+- `GET V$SQLSTATS` - Per-SQL_ID elapsed time, executions, buffer gets, rows processed - slow-SQL surface
+- `GET V$LIBRARYCACHE` - Library cache GETHITRATIO - hard-parse / shared-pool health
+- `GET V$LOCK` - Blocker / waiter lock detection (corroborates V$SESSION.BLOCKING_SESSION)
+- `GET V$PGASTAT` - PGA allocated vs aggregate target
+- `GET DBA_TABLESPACE_USAGE_METRICS` - used_percent per tablespace - disk / autoextend pressure
+- `GET V$DATAGUARD_STATS` - Data Guard apply lag / transport lag (empty when no standby)
+- `GET V$ARCHIVE_DEST_STATUS` - Data Guard per-destination redo transport / recovery state
+- `GET V$ARCHIVED_LOG` - Archived vs applied sequence gap (Data Guard)
+- `GET V$RMAN_BACKUP_JOB_DETAILS` - RMAN backup recency - completion time + status of last backup job
+- `GET V$RECOVERY_AREA_USAGE` - Flash Recovery Area space usage - archiving stall risk
+
+{/* Generated from oracle_health.yaml. Edit the audit module, not this page. */}
