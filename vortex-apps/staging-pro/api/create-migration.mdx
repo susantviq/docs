@@ -53,8 +53,9 @@ exists (see [Dependencies](#dependencies-and-automatic-includes)).
   ["products"]` migrates only the product **record** (name, price, SKU, description). It does **not**
   bring variants, images, options, modifiers, custom fields, metafields, bulk pricing, reviews, or
   channel assignments, you must list each of those keys explicitly. To migrate a complete catalogue,
-  include the child keys (see the "Complete catalogue" request example above). The one exception:
-  `custom_fields` travel automatically on a **selective** product run.
+  include the child keys (see the "Complete catalogue" request example above). The one exception,
+  for API-token callers: `custom_fields` are automatically included on a **selective** product run
+  (a compatibility behaviour of this API - the UI sends an explicit choice).
 </Warning>
 
 <AccordionGroup>
@@ -84,6 +85,7 @@ exists (see [Dependencies](#dependencies-and-automatic-includes)).
     | `scripts` | Script Manager scripts (API-visible only) | - |
     | `content_assets` | Mirrors content **images and links** referenced by pages, blog posts, banners, and Page Builder widgets | - |
     | `page_widget_images` | Mirrors Page Builder **widget images** only (a narrower `content_assets`) | - |
+    | `webdav_files` | **File Storage sync** - copies the source store's WebDAV file storage (the `content/`, `product_images/` and template files themselves) to the destination, additively, before the other phases run | - |
 
     <Note>The theme key is `page_templates`, not `theme`. `theme` is accepted by the counts badge only and does **not** trigger a migration.</Note>
 
@@ -92,6 +94,14 @@ exists (see [Dependencies](#dependencies-and-automatic-includes)).
       something when (a) the destination store has WebDAV credentials configured, and (b) the run also
       migrates the content that references them (pages, blog posts, banners, or `page_widgets`).
       Otherwise they are skipped with a note.
+    </Note>
+
+    <Note>
+      `webdav_files` copies files using both stores' WebDAV credentials, but only the **source**
+      credentials are enforced up front: a run that selects it without them is refused with
+      `422 source_webdav_required` rather than silently skipped - the sync reads the files straight
+      from the source store's file storage. Destination credentials are used when on file. The
+      engine only ever reads from the source (never writes to it).
     </Note>
 
     <Warning>
@@ -134,6 +144,19 @@ exists (see [Dependencies](#dependencies-and-automatic-includes)).
     | Key | Migrates | Notes |
     | --- | --- | --- |
     | `inventory_locations` | Inventory locations and their per-location stock | Requires the Inventory token scope on the store. |
+  </Accordion>
+
+  <Accordion title="B2B Edition" icon="building">
+    Both stores must be on B2B Edition, with store API tokens created with the **B2B Edition** scope.
+
+    | Key | Migrates | Notes |
+    | --- | --- | --- |
+    | `b2b_roles` | Company roles & permissions | No personal data — no anonymisation needed. |
+    | `b2b_companies` | Companies (status, payment configuration, hierarchy, price-list links) | **PII — requires `anonymise_customer_data: true`.** Select `customer_groups` and `price_lists` in the same run or companies are created without their pricing link. |
+    | `b2b_addresses` | Company addresses | **PII — requires anonymisation.** |
+    | `b2b_users` | Company users (buyers) | **PII — requires anonymisation.** |
+    | `b2b_super_admins` | Super admins and their company assignments | **PII — requires anonymisation.** |
+    | `b2b_sales_staff` | Sales-rep-to-company assignments | The rep's account must already exist on the destination (accounts are not API-creatable). |
   </Accordion>
 
   <Accordion title="Store settings" icon="settings">
@@ -190,8 +213,9 @@ you want (see the warning under [Supported entities](#supported-entities)).
 
 **Selecting products auto-pulls the brands and categories they reference.** On a selective product
 run, the engine reads each picked product's `brand_id` and category ids and migrates only those
-brands and categories (plus category **ancestors**, so the tree is intact). A product's custom
-fields also travel automatically on a selective product run, even if `custom_fields` isn't listed.
+brands and categories (plus category **ancestors**, so the tree is intact). For API-token callers, a
+product's custom fields also travel automatically on a selective product run, even if
+`custom_fields` isn't listed.
 
 **Hierarchies auto-include ancestors.** Selective category picks pull in their parent categories;
 selective page picks pull in their parent pages.
@@ -267,8 +291,9 @@ an entity is never created before the ids it points at exist on the destination.
 
 <AccordionGroup>
   <Accordion title="Customer data must be anonymised" icon="user-lock">
-    Selecting `orders`, `customers`, or `gift_certificates` requires `anonymise_customer_data: true`.
-    Without it the request is rejected:
+    Selecting `orders`, `customers`, `gift_certificates`, or any of the B2B personal-data entities
+    (`b2b_companies`, `b2b_addresses`, `b2b_users`, `b2b_super_admins`) requires
+    `anonymise_customer_data: true`. Without it the request is rejected:
 
     ```json
     { "error": "anonymise_required", "message": "orders/customers require anonymise_customer_data=true" }
@@ -297,7 +322,8 @@ an entity is never created before the ids it points at exist on the destination.
 
   <Accordion title="Source and destination must differ" icon="ban">
     A store can never migrate onto itself, identical source and destination hashes are rejected. A
-    store labelled **Production** can never be a destination.
+    production destination additionally refuses `conflict_strategy: "replace"` (see the strategy
+    accordion above) — other strategies are allowed against it.
   </Accordion>
 
   <Accordion title="Storefront scope (multi-storefront)" icon="store">
@@ -313,6 +339,29 @@ an entity is never created before the ids it points at exist on the destination.
     one theme (a channel has exactly one active theme). `selection.page_template_globals` must be a
     subset of `selection.page_templates`.
   </Accordion>
+
+  <Accordion title="True Replica: the platform owns the configuration" icon="copy">
+    `mode: "true-replica"` is a server-configured exact-copy flow: the platform expands its own
+    entity preset (everything storefront-visible - theme, catalogue, content, pricing, promotions,
+    look-alike settings - and **no** PII flows), locks the options (`conflict_strategy: skip`,
+    theme activation on, anonymisation off since no PII entities run), and auto-includes File
+    Storage sync when source WebDAV credentials exist. After the migration, an automated pipeline
+    (heal → compare → delta → report) crawls both storefronts and produces a store-owner report.
+
+    Rules in this mode:
+
+    - `selected_entities`, `selection`, `theme_activation`, and `conflict_strategy` must **not** be
+      sent - each is rejected with `422 true_replica_fixed_configuration`.
+    - The destination store must have WebDAV credentials configured, or the request is refused with
+      `422 webdav_required` (image and link mirroring is a defining part of a look-alike copy).
+    - True Replica is on for every organisation by default; if it has been explicitly disabled for
+      yours, requests return `403 true_replica_not_enabled`.
+    - The run's status stays `in_progress` until the verification pipeline finishes. Run detail then
+      carries a `replica` step tracker and a `reportAvailable` flag; the report itself is viewed from
+      the StagingPro UI's run detail page.
+    - The `201` response reports `mode: "full"` (the engine's run mode) with `flow: "true_replica"`
+      alongside; the History row's `mode` is `true-replica`.
+  </Accordion>
 </AccordionGroup>
 
 ## Invalid values and errors
@@ -324,9 +373,13 @@ an entity is never created before the ids it points at exist on the destination.
 | `orders` / `customers` / `gift_certificates` without `anonymise_customer_data: true` | `400 anonymise_required`. |
 | `replace` targeting a production destination | `422 replace_not_allowed_on_production`. |
 | A store hash not connected to your organisation | `422 store_not_found`. |
-| More ids than the cap (`products`/`categories` 5000, `pages`/`promotions` 2000, `themes` 20) | Validation error (`400` direct, `422` via the platform). |
+| More ids than the cap (`products`/`categories` 5000, `pages`/`promotions` 2000, `themes` 20, `page_templates` 50) | Validation error (`400` direct, `422` via the platform). |
 | A non-UUID theme id, or a `page_templates` entry not starting `pages/` | Validation error. |
 | `theme_activation` referencing an unpicked theme, or two themes on one channel | `422` with an explanatory message. |
+| `webdav_files` without source WebDAV credentials configured | `422 source_webdav_required`. |
+| `selected_entities`, `selection`, `theme_activation`, or `conflict_strategy` alongside `mode: "true-replica"` | `422 true_replica_fixed_configuration`. |
+| `mode: "true-replica"` without destination WebDAV credentials | `422 webdav_required`. |
+| `mode: "true-replica"` for an organisation not enabled for it | `403 true_replica_not_enabled`. |
 
 <Tip>
   Because unknown keys are accepted without complaint, the safest way to build `selected_entities` is
