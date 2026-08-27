@@ -84,6 +84,7 @@ exists (see [Dependencies](#dependencies-and-automatic-includes)).
     | `scripts` | Script Manager scripts (API-visible only) | - |
     | `content_assets` | Mirrors content **images and links** referenced by pages, blog posts, banners, and Page Builder widgets | - |
     | `page_widget_images` | Mirrors Page Builder **widget images** only (a narrower `content_assets`) | - |
+    | `webdav_files` | **File Storage sync** - copies the source store's WebDAV file storage (the `content/`, `product_images/` and template files themselves) to the destination, additively, before the other phases run | - |
 
     <Note>The theme key is `page_templates`, not `theme`. `theme` is accepted by the counts badge only and does **not** trigger a migration.</Note>
 
@@ -92,6 +93,14 @@ exists (see [Dependencies](#dependencies-and-automatic-includes)).
       something when (a) the destination store has WebDAV credentials configured, and (b) the run also
       migrates the content that references them (pages, blog posts, banners, or `page_widgets`).
       Otherwise they are skipped with a note.
+    </Note>
+
+    <Note>
+      `webdav_files` needs **both** stores' WebDAV credentials configured (Settings → WebDAV). Unlike
+      the two mirror keys above, a bulk run that selects it without **source** credentials is refused
+      outright with `422 source_webdav_required` rather than silently skipped - the sync reads the
+      files straight from the source store's file storage. The engine only ever reads from the source
+      (never writes to it).
     </Note>
 
     <Warning>
@@ -313,6 +322,28 @@ an entity is never created before the ids it points at exist on the destination.
     one theme (a channel has exactly one active theme). `selection.page_template_globals` must be a
     subset of `selection.page_templates`.
   </Accordion>
+
+  <Accordion title="True Replica: the platform owns the configuration" icon="copy">
+    `mode: "true-replica"` is a server-configured exact-copy flow: the platform expands its own
+    entity preset (everything storefront-visible - theme, catalogue, content, pricing, promotions,
+    look-alike settings - and **no** PII flows), locks the options (`conflict_strategy: skip`,
+    theme activation on, anonymisation off since no PII entities run), and auto-includes File
+    Storage sync when source WebDAV credentials exist. After the migration, an automated pipeline
+    (heal → compare → delta → report) crawls both storefronts and produces a store-owner report.
+
+    Rules in this mode:
+
+    - `selected_entities`, `selection`, `theme_activation`, and `conflict_strategy` must **not** be
+      sent - each is rejected with `422 true_replica_fixed_configuration`.
+    - The destination store must have WebDAV credentials configured, or the request is refused with
+      `422 webdav_required` (image and link mirroring is a defining part of a look-alike copy).
+    - The organisation must be enabled for True Replica (`403 true_replica_not_enabled`).
+    - The run's status stays `in_progress` until the verification pipeline finishes. Run detail then
+      carries a `replica` step tracker and a `reportAvailable` flag; the report itself is viewed from
+      the StagingPro UI's run detail page.
+    - The `201` response reports `mode: "full"` (the engine's run mode) with `flow: "true_replica"`
+      alongside; the History row's `mode` is `true-replica`.
+  </Accordion>
 </AccordionGroup>
 
 ## Invalid values and errors
@@ -324,9 +355,13 @@ an entity is never created before the ids it points at exist on the destination.
 | `orders` / `customers` / `gift_certificates` without `anonymise_customer_data: true` | `400 anonymise_required`. |
 | `replace` targeting a production destination | `422 replace_not_allowed_on_production`. |
 | A store hash not connected to your organisation | `422 store_not_found`. |
-| More ids than the cap (`products`/`categories` 5000, `pages`/`promotions` 2000, `themes` 20) | Validation error (`400` direct, `422` via the platform). |
+| More ids than the cap (`products`/`categories` 5000, `pages`/`promotions` 2000, `themes` 20, `page_templates` 50) | Validation error (`400` direct, `422` via the platform). |
 | A non-UUID theme id, or a `page_templates` entry not starting `pages/` | Validation error. |
 | `theme_activation` referencing an unpicked theme, or two themes on one channel | `422` with an explanatory message. |
+| `webdav_files` without source WebDAV credentials configured | `422 source_webdav_required`. |
+| `selected_entities`, `selection`, `theme_activation`, or `conflict_strategy` alongside `mode: "true-replica"` | `422 true_replica_fixed_configuration`. |
+| `mode: "true-replica"` without destination WebDAV credentials | `422 webdav_required`. |
+| `mode: "true-replica"` for an organisation not enabled for it | `403 true_replica_not_enabled`. |
 
 <Tip>
   Because unknown keys are accepted without complaint, the safest way to build `selected_entities` is
