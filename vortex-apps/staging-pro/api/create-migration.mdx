@@ -211,11 +211,14 @@ runs `pages`. The parent has to run so its source→destination id-map exists. T
 one-way: selecting the **parent** (`products`) does *not* pull in its children, list each child key
 you want (see the warning under [Supported entities](#supported-entities)).
 
-**Selecting products auto-pulls the brands and categories they reference.** On a selective product
-run, the engine reads each picked product's `brand_id` and category ids and migrates only those
-brands and categories (plus category **ancestors**, so the tree is intact). For API-token callers, a
-product's custom fields also travel automatically on a selective product run, even if
-`custom_fields` isn't listed.
+**Brands and categories ride with products only when you list them.** With `brands` and
+`categories` in `selected_entities` alongside `products`, a selective product run migrates only the
+brands and categories the picked products reference (plus category **ancestors**, so the tree is
+intact). Leave either key out to migrate the products **without** those links: no brand or category
+is created or deleted, new products land without the link, and existing destination products keep
+the brand or categories they already have (the app's **Include Brand** / **Include Categories** ticks
+send exactly this). For API-token callers, a product's custom fields also travel automatically on a
+selective product run, even if `custom_fields` isn't listed.
 
 **Hierarchies auto-include ancestors.** Selective category picks pull in their parent categories;
 selective page picks pull in their parent pages.
@@ -362,6 +365,45 @@ an entity is never created before the ids it points at exist on the destination.
     - The `201` response reports `mode: "full"` (the engine's run mode) with `flow: "true_replica"`
       alongside; the History row's `mode` is `true-replica`.
   </Accordion>
+  <Accordion title="Hide products on the destination" icon="eye-off">
+    `hide_products_on_destination: true` lands the migrated products on the destination as hidden
+    (not visible on the storefront) so they can be reviewed before going live. What lands hidden
+    depends on the strategy:
+
+    - with `conflict_strategy: "update"` on a **selective product run** (`selection.products`,
+      which is what the app's selective runs send): every product the run creates **or updates** is
+      saved hidden, including products already live on the destination. Re-enable them on the
+      destination after review.
+    - with `conflict_strategy: "skip"` (Add New Only, bulk or selective): only the products the run
+      creates land hidden; matched products are never written.
+
+    Refused with `422 hide_products_not_allowed_with_strategy` under `replace` (an exact copy keeps
+    the source visibility) and under `update` when no products are picked (a bulk update would hide
+    every matched product on a live store), and with `422 true_replica_fixed_configuration` in
+    `mode: "true-replica"`. The flag is
+    only honoured once the migration service confirms it supports it: `422 hide_products_support_unknown`
+    means the check could not be made right now (retry in a moment), `422 hide_products_not_available`
+    means the deployed service does not offer it yet. The choice is recorded on the run and comes
+    back as `runOptions.hide_products_on_destination` on
+    [List migrations](/vortex-apps/staging-pro/api/list-migrations) and
+    [Get migration](/vortex-apps/staging-pro/api/get-migration).
+  </Accordion>
+  <Accordion title="Two heavy migrations never share a store" icon="traffic-cone">
+    A **bulk** create (any mode, including dry-run and verify) and a **True Replica** create
+    (`mode: "true-replica"`) are heavy; a **selective** create is light. Two migrations share a store when either one's source
+    or destination is the other's source or destination, in any direction. A heavy create is
+    refused:
+
+    - with `422 stores_busy` while a heavy run is active (`queued`, `in_progress` or `paused`)
+      on a shared store; the message names the running migration.
+    - with `422 schedule_imminent` while a bulk or True Replica migration
+      [scheduled from the app](/vortex-apps/staging-pro/scheduled-migrations) on a shared store is
+      due within the next 2 hours; the message names the schedule.
+
+    Selective creates are exempt both ways: they are never refused for a busy store, and they
+    never make a heavy create wait. Retry a refused create once the running migration has
+    finished or the scheduled one has started.
+  </Accordion>
 </AccordionGroup>
 
 ## Invalid values and errors
@@ -377,9 +419,13 @@ an entity is never created before the ids it points at exist on the destination.
 | A non-UUID theme id, or a `page_templates` entry not starting `pages/` | Validation error. |
 | `theme_activation` referencing an unpicked theme, or two themes on one channel | `422` with an explanatory message. |
 | `webdav_files` without source WebDAV credentials configured | `422 source_webdav_required`. |
-| `selected_entities`, `selection`, `theme_activation`, or `conflict_strategy` alongside `mode: "true-replica"` | `422 true_replica_fixed_configuration`. |
+| `selected_entities`, `selection`, `theme_activation`, `conflict_strategy`, or `hide_products_on_destination` alongside `mode: "true-replica"` | `422 true_replica_fixed_configuration`. |
 | `mode: "true-replica"` without destination WebDAV credentials | `422 webdav_required`. |
 | `mode: "true-replica"` for an organisation not enabled for it | `403 true_replica_not_enabled`. |
+| A bulk or True Replica create while a bulk or True Replica run is active on a shared store | `422 stores_busy`, naming the running migration. |
+| A bulk or True Replica create while a scheduled bulk or True Replica migration on a shared store is due within 2 hours | `422 schedule_imminent`, naming the schedule. |
+| `hide_products_on_destination: true` with `replace`, or with `update` on a bulk run | `422 hide_products_not_allowed_with_strategy`. |
+| `hide_products_on_destination: true` while the migration service cannot confirm it supports the option, or does not offer it | `422 hide_products_support_unknown` (retry shortly) or `422 hide_products_not_available`. |
 
 <Tip>
   Because unknown keys are accepted without complaint, the safest way to build `selected_entities` is
