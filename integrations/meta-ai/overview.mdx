@@ -1,0 +1,103 @@
+---
+title: "Vortex IQ connector for Meta AI"
+sidebarTitle: "Overview"
+description: "How Meta AI and Meta Muse connect to Vortex IQ: an MCP server with OAuth 2.1 account linking for merchants, and a product catalogue for shoppers, starting with BigCommerce and Adobe Commerce stores."
+---
+
+Vortex IQ is an AI operating system for ecommerce merchants on BigCommerce, Adobe Commerce (including Magento Open Source) and Shopify. It brings a merchant's store, analytics, ads and payments data together, watches their KPIs, audits the store and prepares fixes for the merchant to approve.
+
+This page is the technical reference for connecting Meta AI and Meta Muse to Vortex IQ. The connector has two parts:
+
+| Part | Who it serves | Status |
+|---|---|---|
+| [Merchant workspace](#merchant-workspace-mcp-server) | Merchants asking about their own store | **Live** |
+| [Product catalogue](#product-catalogue) | Shoppers looking for products | **In development** |
+
+## Merchant workspace (MCP server)
+
+A remote [Model Context Protocol](https://modelcontextprotocol.io) server. A merchant links their Vortex IQ account once, then asks Meta AI about their store in plain English.
+
+| | |
+|---|---|
+| **Server URL** | `https://app.vortexiq.ai/mcp` |
+| **Transport** | Streamable HTTP, JSON-RPC 2.0, one message per `POST`, no server-sent stream |
+| **Protocol versions** | `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05` |
+| **Account linking** | OAuth 2.1 authorization code + PKCE (S256), dynamic client registration, public clients |
+| **Scope** | `mcp:read` |
+| **Access** | Read-only, scoped to the signed-in merchant's organisation and role |
+| **Tools** | [29 read-only tools](/integrations/claude-mcp/tools) |
+| **Rate limit** | 120 requests a minute per merchant |
+
+### What merchants can ask
+
+| Prompt | What happens |
+|---|---|
+| "How did my store do this week?" | Fetches KPI cards and trends for the store. |
+| "Any alerts I should know about?" | Lists active Nerve Centre alerts and the 24-hour incident summary. |
+| "What did my last store audit find?" | Lists audit runs, then pulls the findings report with its health score. |
+| "What fixes are waiting for my approval?" | Returns the health-fix board and the before/after changes of a fix run. |
+
+### Linking an account
+
+<Steps>
+  <Step title="Discover">
+    ```
+    GET https://app.vortexiq.ai/.well-known/oauth-protected-resource/mcp
+    GET https://app.vortexiq.ai/.well-known/oauth-authorization-server
+    ```
+    An unauthenticated call to `/mcp` also returns `401` with a `WWW-Authenticate` header pointing at the first document.
+  </Step>
+  <Step title="Register your client">
+    `POST https://app.vortexiq.ai/oauth/mcp/register` with your https redirect URIs and `"token_endpoint_auth_method": "none"`. No pre-provisioned credentials are needed. If you would rather use a fixed `client_id`, contact [support@vortexiq.ai](mailto:support@vortexiq.ai).
+  </Step>
+  <Step title="Authorize">
+    Send the merchant to `https://app.vortexiq.ai/oauth/mcp/authorize` with `response_type=code`, your `client_id` and `redirect_uri`, a PKCE S256 `code_challenge`, `state`, `resource=https://app.vortexiq.ai/mcp` and `scope=mcp:read`. They sign in to Vortex IQ and approve on a consent screen that names your app and says the access is read-only.
+  </Step>
+  <Step title="Exchange and refresh">
+    Exchange the code at `POST /oauth/mcp/token`. Access tokens last 1 hour. Refresh tokens last 30 days and rotate on every use.
+  </Step>
+  <Step title="Call the server">
+    `POST https://app.vortexiq.ai/mcp` with `Authorization: Bearer <access_token>`. Methods: `initialize`, `tools/list`, `tools/call`, `ping`.
+  </Step>
+  <Step title="Unlink">
+    When the merchant unlinks, call `POST /oauth/mcp/revoke` (RFC 7009) with either token. The whole grant ends at once. Merchants can also disconnect from **Connected apps** inside Vortex IQ.
+  </Step>
+</Steps>
+
+Every request and response, with examples, is in the [OAuth guide](/integrations/claude-mcp/oauth).
+
+### Security and data handling
+
+- **Per merchant.** Each call runs as the merchant who linked their account. It returns only their organisation's data, within their role's permissions. There is no shared or service account.
+- **Read-only, end to end.** Every tool is read-only, and the access token only works through the MCP server. It cannot be used against any other Vortex IQ API, and the connector never changes a merchant's store, products, orders or settings.
+- **Short-lived, revocable tokens.** PKCE S256 is required, authorization codes are single-use and expire in 5 minutes, and access tokens are audience-bound to `https://app.vortexiq.ai/mcp` (RFC 8707). Revoking any token ends the whole grant.
+- **Origins.** Server-to-server calls are always accepted. Browser calls are accepted from `meta.ai`, `muse.ai` and their subdomains (and from Claude); any other origin gets 403.
+- **Transport.** HTTPS only.
+- **Policies.** [Privacy policy](https://www.vortexiq.ai/privacy-policy), [terms of service](https://www.vortexiq.ai/terms-of-service), [Trust Centre](https://www.vortexiq.ai/trust/trust-center).
+
+### Errors
+
+| Response | When | What to do |
+|---|---|---|
+| `401` with `WWW-Authenticate` | Token missing, invalid, expired or revoked | Refresh, or send the merchant through linking again |
+| `400` | Malformed JSON-RPC, or an unsupported `MCP-Protocol-Version` after `initialize` | Send the version agreed at `initialize` |
+| `403` | Browser `Origin` not on the allow list | Call server-to-server, or ask us to add the origin |
+| `429` with `Retry-After` | Rate limit reached | Wait for the number of seconds given |
+| `200` with `isError: true` | A tool ran but could not answer, for example an unknown id or missing permission | Read the message; it says what to change |
+
+## Product catalogue
+
+So shoppers can find products from merchants who choose to take part. This part is **in development**.
+
+- **Merchants opt in, one store at a time.** Sharing is off until the merchant ticks a box in Vortex IQ Settings, and only opted-in stores are ever searched. See [Show your products in Meta AI](/integrations/meta-ai/catalogue-sharing).
+- **Rollout.** BigCommerce stores first. Adobe Commerce (including Magento Open Source) follows once those stores' product catalogues are syncing to Vortex IQ.
+- **Read-only, checkout on the merchant's site.** Results carry the store's own price and currency and link to the product page. There is no basket or checkout in Meta AI in the first release.
+- **One product format.** BigCommerce and Adobe Commerce products are returned in the same shape, whichever platform a store runs on.
+
+The planned API is in the [catalogue API preview](/integrations/meta-ai/catalogue-api/overview). The same operations will also be available as MCP tools on the server above.
+
+## Support
+
+- Email: [support@vortexiq.ai](mailto:support@vortexiq.ai)
+- System status: [monitor.vortexiq.ai](https://monitor.vortexiq.ai/)
+- Documentation: [docs.vortexiq.ai](https://docs.vortexiq.ai/)
