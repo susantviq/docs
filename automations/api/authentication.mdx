@@ -1,0 +1,166 @@
+---
+title: "Authentication"
+description: "How to authenticate against the Vortex IQ Automations API - a bearer token from your organisation's API credential and your identity."
+---
+
+The Automations API is served from `https://automations-api.vortexiq.ai`. Every request is authenticated as a
+Vortex IQ user and scoped to a single organisation, with a **bearer token** you get from the login on
+`https://app.vortexiq.ai`:
+
+| Step | Where | How it travels |
+| --- | --- | --- |
+| **Log in** | `POST https://app.vortexiq.ai/v2/api/automations/login` | Your identity and your organisation's API credential, in the body |
+| **Call the API** | `https://automations-api.vortexiq.ai/v1/automations/...` | `Authorization: Bearer <token>` header |
+
+## Bearer tokens (server-to-server)
+
+Exchange your identity and your organisation's API credential for a token on the
+[Login](/automations/api/login) endpoint:
+
+```bash
+curl -X POST https://app.vortexiq.ai/v2/api/automations/login \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
+  -d '{
+    "username": "Jane Merchant",
+    "email": "jane@example.com",
+    "organization_name": "Example Retail Ltd",
+    "client_id": "viq_auto_Ab12Cd34Ef56Gh78Ij90Kl12",
+    "client_secret": "<client-secret>"
+  }'
+```
+
+A successful login returns the token, what it may do, when it expires, and where to send it:
+
+```json
+{
+  "access_token": "eyJ0eXAiOiJhdCtqd3QiLCJhbGciOiJFZERTQSIsImtpZCI6InByb2R1Y3Rpb24tMSJ9...",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "scope": "automations:read automations:write",
+  "service_url": "https://automations-api.vortexiq.ai",
+  "direct": true,
+  "user": { "email": "jane@example.com", "first_name": "Jane", "last_name": "Merchant" },
+  "organization": { "id": 42, "name": "Example Retail Ltd" },
+  "expires_at": "2026-10-16T10:26:00+00:00"
+}
+```
+
+Send the token on every subsequent call:
+
+```bash
+curl https://automations-api.vortexiq.ai/v1/automations/templates \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Accept: application/json"
+```
+
+<Note>
+  Always send `Accept: application/json`. Without it, a refused login can come back as an HTML page instead of
+  the JSON errors documented here.
+</Note>
+
+### With an OAuth 2.0 client (Postman)
+
+The login also accepts the OAuth 2.0 **client credentials** form, so an OAuth client such as Postman can fetch the
+token for you. Send `grant_type=client_credentials` as `application/x-www-form-urlencoded`, the client id and
+secret as HTTP Basic authentication, and `username`, `email` and `organization_name` as extra form fields.
+
+In Postman, on the request's **Authorization** tab, choose **OAuth 2.0** and **Configure New Token**:
+
+| Setting | Value |
+| --- | --- |
+| Grant type | Client Credentials |
+| Access Token URL | `https://app.vortexiq.ai/v2/api/automations/login` |
+| Client ID / Client Secret | your organisation's credential |
+| Client Authentication | Send as Basic Auth header |
+| Advanced, Token Request | `username`, `email` and `organization_name`, each sent in the **Request Body** |
+
+Then **Get New Access Token** and **Use Token**. Postman sends it as the bearer token on your requests to
+`https://automations-api.vortexiq.ai`.
+
+<Note>
+  Values in the address are ignored: send the credential and the identity in the body (or the client as HTTP
+  Basic), never in a query string, so they never reach an access log.
+</Note>
+
+### What you need before you can log in
+
+<Steps>
+  <Step title="An API credential for your organisation">
+    The `client_id` / `client_secret` pair is issued per organisation by Vortex IQ (see
+    [Client id & Client secret](/automations/api/client-id)). The secret is shown once at issue time - store it in
+    a secret manager, never in client-side code. Contact [support](https://www.vortexiq.ai/contact-us) to have a
+    credential provisioned or rotated.
+  </Step>
+  <Step title="Automations switched on for your organisation">
+    Automations are switched on per organisation; while they are off, every call with a token answers
+    `403 forbidden` ("Automations are switched off for this organisation.").
+  </Step>
+  <Step title="An active Vortex IQ user in that organisation">
+    The token acts as the person you name at login. That person's account must be active and belong to the
+    organisation named.
+  </Step>
+</Steps>
+
+### What a token may do
+
+A token carries scopes. Each endpoint needs one, and a call without it answers `403`.
+
+| Scope | Lets you | A credential's token |
+| --- | --- | --- |
+| `automations:read` | Read templates, stores, automations, runs, the calendar, approvals and imports; preview schedules and workflow changes | Yes |
+| `automations:write` | Create and change automations, run them, cancel runs, move and skip coming runs, keep and delete imports | Yes |
+| `automations:approve` | Approve or reject a run's changes | **Never.** Approvals are decided in the Vortex IQ app |
+
+Everything a token creates is recorded as made by the person named at login, through the API: `created_by`,
+`created_via: api-token` and `api_client_id` on the automation or run.
+
+### Token lifetime and revocation
+
+- Tokens live for **60 minutes** (`expires_in` in the login response is authoritative). Log in again to get a fresh
+  one - there is no refresh endpoint.
+- **Rotating or disabling** your organisation's API credential invalidates every outstanding token on its next
+  call, not just future logins. Rotation keeps the same `client_id`; only the secret changes.
+- A token is bound to the user and organisation it was issued for.
+- The token is a signed JWT: its claims are readable (no secrets inside), but any change invalidates it. Treat the
+  whole token as a secret - it acts as you.
+- Login is rate limited to **10 attempts per minute** (`429` beyond that), and failed logins return a deliberately
+  generic `401 invalid_credentials` that does not reveal which field was wrong.
+
+### Rate limits
+
+Up to **600 calls a minute** for each person and **3,000** for each organisation. Beyond that a call answers `429`
+with a `Retry-After` header giving the seconds to wait; nothing was done. Polling a running run every few seconds
+stays far below the limit.
+
+### Browsers
+
+Call the API from your server, scripts or CI. Browsers are allowed to call it only from the Vortex IQ app's own
+pages (CORS); a page on another site cannot use it directly.
+
+## Answers
+
+Every answer is JSON in the same envelope. A success carries `data`:
+
+```json
+{ "success": true, "contract_version": 1, "data": { "automation": { "id": "01M520GSDQH5TQ3CAAQ584TTKH" } } }
+```
+
+A refusal carries a stable `code` to act on, plain words in `message`, and `errors` by field for a `422`:
+
+```json
+{ "success": false, "contract_version": 1, "code": "validation_failed", "message": "Check the highlighted fields.", "errors": { "name": ["is required"], "inputs": ["is required"], "schedule": ["is required"] } }
+```
+
+## Errors you may hit
+
+| Status | Meaning |
+| --- | --- |
+| `401` | Login: one of the provided values could not be validated (deliberately unspecific). Other endpoints: a missing, expired or revoked token; the answer carries `WWW-Authenticate`. Log in again. |
+| `403` | The token lacks the scope, the endpoint is not part of the Automations API (such as approving), or Automations are switched off for your organisation. |
+| `404` | Not found, including anything that belongs to another organisation. |
+| `409` | The version you sent is stale (`stale_version`, with what is current in `data`), or it is not in a state that allows this (`wrong_state`). |
+| `413` | The body is over its size limit (an n8n export too large to read). |
+| `422` | The request failed validation (`errors` names the fields), or the action cannot happen now, such as a run when your allowance is spent (`allowance_spent`). |
+| `429` | Rate limit exceeded; wait the seconds in `Retry-After`. |
+| `503` | The service could not complete the request just now, or API access is not configured on this environment. |

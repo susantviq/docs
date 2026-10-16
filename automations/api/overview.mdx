@@ -1,0 +1,153 @@
+---
+title: "Vortex IQ Automations API"
+sidebarTitle: "Overview"
+description: "REST API reference for Vortex IQ Automations - list templates, set automations up on your stores, schedule and run them, and follow every run."
+---
+
+Everything the **Automations** screens in the Vortex IQ app do with your automations is available over REST:
+set an automation up from a template, schedule it, run it now, follow the run, and plan around the calendar. Drive
+automations from your own tooling instead of the app. (Approving and rejecting a run's changes stays in the app.)
+
+The API, and the login that gives you a token:
+
+```
+https://automations-api.vortexiq.ai/v1/automations
+https://app.vortexiq.ai/v2/api/automations/login
+```
+
+Calls are authenticated as your Vortex IQ user and scoped to your organisation, with a **bearer token** from the
+[Login](/automations/api/login) endpoint: your organisation's API credential plus your own identity, the same way
+the [StagingPro API](/vortex-apps/staging-pro/api/overview) logs in. Stores are referenced by the
+`integration_id` the API lists; their keys stay in Vortex IQ and never travel through your requests.
+See [Authentication](/automations/api/authentication).
+
+The API answers with the same templates, automations and runs the app shows:
+
+<Frame>
+  ![The Templates screen of the Automations app](/images/AutomationsAPI-Templates.png "The Templates screen of the Automations app")
+</Frame>
+
+## How it is organised
+
+<CardGroup cols={2}>
+  <Card title="Authentication" icon="key" href="/automations/api/login">
+    Exchange your identity and your organisation's API credential for a bearer token valid for 60 minutes.
+  </Card>
+  <Card title="Templates & stores" icon="shapes" href="/automations/api/list-templates">
+    What you can set up, whether it is ready, and the stores and accounts it can run on.
+  </Card>
+  <Card title="Automations" icon="cog" href="/automations/api/create-automation">
+    Set automations up from templates, read and change them; pause, resume, archive and restore.
+  </Card>
+  <Card title="Runs" icon="play" href="/automations/api/run-now">
+    Run an automation now, follow a run step by step, read the history, cancel a run.
+  </Card>
+  <Card title="Schedules & calendar" icon="calendar" href="/automations/api/list-occurrences">
+    Preview a schedule before you save it, list the coming runs, move or skip one.
+  </Card>
+  <Card title="Imported workflows" icon="workflow" href="/automations/api/analyse-import">
+    Bring an n8n workflow in, see how it would run, and run it as your own automation.
+  </Card>
+</CardGroup>
+
+## A typical flow
+
+<Steps>
+  <Step title="Log in">
+    [Log in](/automations/api/login) with your organisation's API credential and your identity to get a bearer
+    token. Send it as `Authorization: Bearer <token>` on every call; log in again when it expires after an hour.
+  </Step>
+  <Step title="Know what you can set up">
+    `GET /v1/automations/templates` lists the templates your organisation can use, each with `readiness`, and
+    `GET /v1/automations/stores` lists your connected stores with the `integration_id` an automation runs on.
+  </Step>
+  <Step title="Set it up">
+    `POST /v1/automations` with a `template_id`, an `integration_id`, the template's `inputs` and a `schedule`.
+    With a schedule it is `active` at once; with `cadence: manual` it is a draft you run by hand.
+  </Step>
+  <Step title="Run it">
+    The schedule queues runs by itself. To run now, `POST /v1/automations/{automationId}/runs` with an
+    `idempotency_key`: you get the run back at once, `queued`.
+  </Step>
+  <Step title="Follow it">
+    `GET /v1/automations/runs/{runId}` every few seconds while the run is `queued` or `running`, passing
+    `after_seq` for just the new steps. A finished run carries its `summary` and `result`.
+  </Step>
+  <Step title="Plan around it">
+    `GET /v1/automations/occurrences` gives the calendar of coming runs; move one or skip one with the endpoints
+    beside it.
+  </Step>
+</Steps>
+
+A run started through the API is a run like any other: the app's **Runs** screen shows it, with its steps and
+findings.
+
+<Frame>
+  ![A run started through the API, on the Runs screen](/images/AutomationsAPI-Run.png "A run started through the API, on the Runs screen")
+</Frame>
+
+## Automation states
+
+| State | What it means |
+| --- | --- |
+| `draft` | Set up with a manual schedule, or an imported workflow with a step still unbound. Runs only by hand. |
+| `active` | Turned on: its schedule, when it has one, queues runs. A manual automation becomes active after its first run. |
+| `paused` | Its schedule is stopped, by you or after repeated failures (`paused_reason` says which). You can still run it by hand. |
+| `archived` | Nothing runs; its history stays readable. Restore brings it back paused. |
+
+## Run statuses
+
+| Status | What it means |
+| --- | --- |
+| `queued` | Waiting to start. |
+| `running` | Running now. |
+| `waiting_approval` | Waiting for someone to approve its changes in the Vortex IQ app. |
+| `succeeded` | Finished. `summary` and `result` say what it found or did. |
+| `failed` | Ended with an error; `reason_code` and `message` say why and what to do. |
+| `refused` | Not started, for a reason in `message`, such as a disconnected store. |
+| `cancelled` | Stopped by a person, or by an approval that expired. |
+| `expired` | Ended without finishing, for a reason on Vortex IQ's side (`platform_fault`); it never counts against the automation. |
+
+## Schedules
+
+| Cadence | Runs |
+| --- | --- |
+| `manual` | Only when you run it. |
+| `once` | On one `date` at `run_at`, then has no next run. |
+| `hourly`, `every_6_hours` | Every hour, or every six hours. |
+| `daily` | Every day at `run_at`. |
+| `weekdays` | On the `days` you give (1 is Monday), Monday to Friday unless you say. |
+| `weekly` | Every week on `day_of_week` at `run_at`. |
+| `monthly` | On `day_of_month`, or on the `week_of_month` and `day_of_week` you give. |
+
+Times are in the automation's timezone: its store's unless you set `timezone`. A scheduled run starts within ten
+minutes after its time. [Preview schedule](/automations/api/preview-schedule) tells you the next three times before
+you save anything.
+
+## Who did it
+
+Every automation and run records who made it and how, the way StagingPro records who started a migration:
+
+| Field | Value |
+| --- | --- |
+| `created_by` | The person: the one you named at login, for anything made through the API. |
+| `created_via` | `api-token` through this API, `ui` in the Vortex IQ app; null for a run the schedule queued. |
+| `api_client_id` | Your credential's client id, for anything made through the API. |
+
+## Safety
+
+- **A credential never approves.** A run that would change your store waits for approval in the Vortex IQ app; the
+  approve and reject endpoints refuse an API credential's token with `403`.
+- **Everything is scoped to your organisation.** Another organisation's automation, run or import answers `404`.
+- **Changes need the version you read.** Update automation and moving a coming run carry a `version`; a stale one
+  is refused with `409 stale_version`, so two tools never overwrite each other.
+- **Run now is idempotent.** The same `idempotency_key` returns the same run, so a retried request never starts two.
+- **Test runs change nothing.** `mode: test` reads your store for real and refuses every change.
+- **Organisation switch.** While Automations are switched off for your organisation, every call answers `403`.
+- **Limits.** Up to 600 calls a minute for each person and 3,000 for each organisation, then `429` with
+  `Retry-After`. The login allows 10 attempts a minute.
+- **Stores are connected in the app.** Connect and disconnect stores in Vortex IQ (**Settings**,
+  **Connected Sources**); this API reads them, never changes them.
+- **Poll, do not stream.** There is no streaming endpoint: ask for a run again every few seconds while it runs.
+
+Start with [Authentication](/automations/api/authentication).
